@@ -7,14 +7,21 @@
 > [!WARNING]
 > 应用会保存网盘登录态、Cookie、Telegram Session 和 API 凭据。后端只监听本机 `127.0.0.1`，请勿将端口暴露到公网。
 
-## 获取安装包（GitHub Actions 自动构建）
+## 下载安装包（Releases）
 
-安装包由 GitHub Actions 云端构建，无需本地安装 Python / Node：
+正式版发布在 [Releases](../../releases) 页面，任何人无需登录 GitHub 即可直接下载：
 
-1. 推送代码到 `main` 或打 `v*` 标签，[Actions](../../actions) 自动运行：先跑后端测试与前端构建校验，再在 macOS / Windows 两个 runner 上分别出包；
-2. 进入对应的运行页面，在 **Artifacts** 下载：
-   - `123Cloud-macOS` → `123Cloud-<version>-arm64.dmg`（ad-hoc 签名，首次打开右键 →「打开」）
-   - `123Cloud-Windows` → `123Cloud Setup <version>.exe`（未签名，SmartScreen 点「仍要运行」）
+| 平台 | 文件 | 说明 |
+| --- | --- | --- |
+| macOS (Apple Silicon) | `123Cloud-<版本>-macOS-arm64.dmg` | ad-hoc 签名，首次打开右键 →「打开」 |
+| Windows x64 | `123Cloud-<版本>-Windows-x64-setup.exe` | 未签名，SmartScreen 弹窗点「仍要运行」 |
+
+每个 Release 附带自动生成的更新日志（changelog）。
+
+## 发版流程（维护者）
+
+1. 改完代码推送 `main` → Actions 先跑测试与构建校验（Artifacts 供内部测试，需登录下载）；
+2. 发版时打标签：`git tag v1.2.3 && git push origin v1.2.3` → 云端用标签号作为版本号构建双平台安装包，自动创建 Release 并附上安装包与更新日志；
 3. 签名接入、开发模式与目录说明见 [desktop/README.md](desktop/README.md)。
 
 ## 功能

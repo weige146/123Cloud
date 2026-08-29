@@ -20,6 +20,7 @@ mac:
   icon: build/icon.icns
   category: public.app-category.utilities
   identity: null
+  artifactName: ${productName}-${version}-macOS-arm64.${ext}
   target:
     - target: dmg
   darkModeSupport: true
@@ -32,6 +33,7 @@ dmg:
 
 win:
   icon: build/icon.ico
+  artifactName: ${productName}-${version}-Windows-x64.${ext}
   target:
     - target: nsis
       arch: [x64]
@@ -43,4 +45,3 @@ nsis:
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: 123Cloud
-  artifactName: ${productName} Setup ${version}.${ext}
