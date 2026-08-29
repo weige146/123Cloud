@@ -1,0 +1,46 @@
+appId: com.123cloud.desktop
+productName: 123Cloud
+copyright: 123Cloud
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - electron/**/*
+  - package.json
+
+extraResources:
+  - from: backend-dist/cloudgateway
+    to: cloudgateway
+    filter:
+      - "**/*"
+
+mac:
+  icon: build/icon.icns
+  category: public.app-category.utilities
+  identity: null
+  target:
+    - target: dmg
+  darkModeSupport: true
+
+dmg:
+  title: 123Cloud
+  window:
+    width: 540
+    height: 380
+
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 123Cloud
+  artifactName: ${productName} Setup ${version}.${ext}

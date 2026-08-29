@@ -1,0 +1,351 @@
+/* ============================================================
+   123Cloud Admin — Non-MoviePilot brand palette
+   This file intentionally overrides the legacy MoviePilot-derived
+   token values with the 123Cloud blue/slate workbench palette.
+   ============================================================ */
+
+:root,
+html[data-theme="light"] {
+  --bg-primary: #F5F7FB;
+  --bg-surface: #FFFFFF;
+  --bg-surface-variant: #F2F5FA;
+  --bg-hover: #EDF2F8;
+  --bg-active: #E3EDFB;
+
+  --text-primary: #111827;
+  --text-secondary: rgba(17, 24, 39, 0.72);
+  --text-muted: rgba(17, 24, 39, 0.60);
+  --text-disabled: rgba(17, 24, 39, 0.38);
+
+  --border: rgba(15, 23, 42, 0.12);
+  --border-strong: rgba(15, 23, 42, 0.24);
+
+  --accent: #2563EB;
+  --accent-hover: #1D4ED8;
+  --accent-soft: rgba(37, 99, 235, 0.12);
+  --accent-soft-hover: rgba(37, 99, 235, 0.20);
+
+  --success: #16A34A;
+  --success-soft: rgba(22, 163, 74, 0.12);
+  --warning: #D97706;
+  --warning-soft: rgba(217, 119, 6, 0.12);
+  --error: #DC2626;
+  --error-soft: rgba(220, 38, 38, 0.12);
+  --info: #0284C7;
+  --info-soft: rgba(2, 132, 199, 0.12);
+
+  --grad-success: linear-gradient(135deg, #059669 0%, #10B981 100%);
+  --grad-warning: linear-gradient(135deg, #D97706 0%, #F59E0B 100%);
+  --grad-error: linear-gradient(135deg, #DC2626 0%, #F87171 100%);
+  --grad-info: linear-gradient(135deg, #0284C7 0%, #38BDF8 100%);
+
+  --link: #2563EB;
+  --link-hover: #1D4ED8;
+
+  --sidebar-bg: rgba(255, 255, 255, 0.82);
+  --sidebar-border: rgba(15, 23, 42, 0.10);
+  --appbar-bg: rgba(255, 255, 255, 0.78);
+  --glass-bg: #FFFFFF;
+  --glass-border: rgba(15, 23, 42, 0.14);
+
+  --glass-bg-1: rgba(255, 255, 255, 0.86);
+  --glass-bg-2: rgba(255, 255, 255, 0.68);
+  --glass-bg-3: rgba(255, 255, 255, 0.46);
+  --glass-border-1: rgba(15, 23, 42, 0.16);
+  --glass-border-2: rgba(15, 23, 42, 0.13);
+  --glass-border-3: rgba(15, 23, 42, 0.10);
+  --glass-highlight: rgba(255, 255, 255, 0.92);
+  --glass-blur: 10px;
+  --glass-blur-2: 6px;
+  --glass-blur-3: 0px;
+  --glass-blur-heavy: 16px;
+  --glass-saturate: 1.45;
+
+  --mesh-bg:
+    radial-gradient(at 12% 8%, rgba(56, 189, 248, 0.18) 0px, transparent 48%),
+    radial-gradient(at 88% 12%, rgba(37, 99, 235, 0.15) 0px, transparent 48%),
+    radial-gradient(at 72% 88%, rgba(16, 185, 129, 0.11) 0px, transparent 46%),
+    #F5F7FB;
+  --mesh-glow-1: rgba(56, 189, 248, 0.26);
+  --mesh-glow-2: rgba(37, 99, 235, 0.22);
+  --mesh-glow-3: rgba(16, 185, 129, 0.18);
+
+  --group-dashboard: linear-gradient(135deg, #2563EB 0%, #38BDF8 100%);
+  --group-dashboard-soft: rgba(37, 99, 235, 0.12);
+  --group-dashboard-glow: rgba(56, 189, 248, 0.28);
+
+  --group-pan115: linear-gradient(135deg, #059669 0%, #34D399 100%);
+  --group-pan115-soft: rgba(5, 150, 105, 0.12);
+  --group-pan115-glow: rgba(52, 211, 153, 0.28);
+
+  --group-recognition: linear-gradient(135deg, #D97706 0%, #FBBF24 100%);
+  --group-recognition-soft: rgba(217, 119, 6, 0.12);
+  --group-recognition-glow: rgba(251, 191, 36, 0.28);
+
+  --group-media: linear-gradient(135deg, #DB2777 0%, #F472B6 100%);
+  --group-media-soft: rgba(219, 39, 119, 0.12);
+  --group-media-glow: rgba(244, 114, 182, 0.28);
+
+  --surface-card: rgba(255, 255, 255, 0.92);
+  --surface-subtle: rgba(255, 255, 255, 0.64);
+  --surface-hover: rgba(15, 23, 42, 0.04);
+  --surface-input: rgba(255, 255, 255, 0.82);
+  --overlay-surface: rgba(255, 255, 255, 0.94);
+  --overlay-border: rgba(15, 23, 42, 0.12);
+  --surface-border: rgba(15, 23, 42, 0.10);
+  --surface-shadow: 0 4px 18px rgba(15, 23, 42, 0.08);
+  --shadow-overlay: 0 18px 50px rgba(15, 23, 42, 0.18);
+  --surface-sheen: none;
+  --surface-filter: none;
+  --overlay-filter: none;
+  --sidebar-gradient: none;
+  --appbar-gradient: none;
+  --mobile-dock-space: calc(82px + env(safe-area-inset-bottom, 0px));
+  --card-accent-start-opacity: 0.035;
+  --card-accent-end-opacity: 0.015;
+  --card-surface-opacity: 0.96;
+
+  --v-overlay-scrim-background: 15, 23, 42;
+  --v-overlay-scrim-opacity: 0.50;
+  --v-table-header-background: 245, 247, 251;
+}
+
+html.dark,
+html[data-theme="dark"] {
+  --bg-primary: #0B1220;
+  --bg-surface: #111A2C;
+  --bg-surface-variant: #182338;
+  --bg-hover: rgba(229, 238, 255, 0.06);
+  --bg-active: rgba(96, 165, 250, 0.14);
+
+  --text-primary: #E5EEFF;
+  --text-secondary: rgba(229, 238, 255, 0.72);
+  --text-muted: rgba(229, 238, 255, 0.60);
+  --text-disabled: rgba(229, 238, 255, 0.38);
+
+  --border: rgba(229, 238, 255, 0.12);
+  --border-strong: rgba(229, 238, 255, 0.24);
+
+  --accent: #60A5FA;
+  --accent-hover: #93C5FD;
+  --accent-soft: rgba(96, 165, 250, 0.14);
+  --accent-soft-hover: rgba(96, 165, 250, 0.24);
+
+  --success: #34D399;
+  --success-soft: rgba(52, 211, 153, 0.14);
+  --warning: #FBBF24;
+  --warning-soft: rgba(251, 191, 36, 0.14);
+  --error: #F87171;
+  --error-soft: rgba(248, 113, 113, 0.14);
+  --info: #38BDF8;
+  --info-soft: rgba(56, 189, 248, 0.14);
+
+  --grad-success: linear-gradient(135deg, #059669 0%, #10B981 100%);
+  --grad-warning: linear-gradient(135deg, #D97706 0%, #F59E0B 100%);
+  --grad-error: linear-gradient(135deg, #DC2626 0%, #F87171 100%);
+  --grad-info: linear-gradient(135deg, #0284C7 0%, #38BDF8 100%);
+
+  --link: #60A5FA;
+  --link-hover: #93C5FD;
+
+  --sidebar-bg: rgba(11, 18, 32, 0.84);
+  --sidebar-border: rgba(229, 238, 255, 0.10);
+  --appbar-bg: rgba(11, 18, 32, 0.78);
+  --glass-bg: #111A2C;
+  --glass-border: rgba(229, 238, 255, 0.14);
+
+  --glass-bg-1: rgba(17, 26, 44, 0.90);
+  --glass-bg-2: rgba(17, 26, 44, 0.74);
+  --glass-bg-3: rgba(17, 26, 44, 0.50);
+  --glass-border-1: rgba(229, 238, 255, 0.20);
+  --glass-border-2: rgba(229, 238, 255, 0.16);
+  --glass-border-3: rgba(229, 238, 255, 0.12);
+  --glass-highlight: rgba(255, 255, 255, 0.10);
+  --glass-blur: 10px;
+  --glass-blur-2: 6px;
+  --glass-blur-3: 0px;
+  --glass-blur-heavy: 16px;
+  --glass-saturate: 1.35;
+
+  --mesh-bg:
+    radial-gradient(at 12% 8%, rgba(56, 189, 248, 0.18) 0px, transparent 48%),
+    radial-gradient(at 88% 12%, rgba(37, 99, 235, 0.17) 0px, transparent 48%),
+    radial-gradient(at 72% 88%, rgba(16, 185, 129, 0.10) 0px, transparent 46%),
+    #0B1220;
+  --mesh-glow-1: rgba(56, 189, 248, 0.24);
+  --mesh-glow-2: rgba(37, 99, 235, 0.22);
+  --mesh-glow-3: rgba(16, 185, 129, 0.16);
+
+  --group-dashboard-soft: rgba(96, 165, 250, 0.16);
+  --group-dashboard-glow: rgba(56, 189, 248, 0.34);
+  --group-pan115-soft: rgba(52, 211, 153, 0.16);
+  --group-pan115-glow: rgba(52, 211, 153, 0.34);
+  --group-recognition-soft: rgba(251, 191, 36, 0.16);
+  --group-recognition-glow: rgba(251, 191, 36, 0.34);
+  --group-media-soft: rgba(244, 114, 182, 0.16);
+  --group-media-glow: rgba(244, 114, 182, 0.34);
+
+  --surface-card: rgba(17, 26, 44, 0.92);
+  --surface-subtle: rgba(24, 35, 56, 0.74);
+  --surface-hover: rgba(229, 238, 255, 0.06);
+  --surface-input: rgba(24, 35, 56, 0.82);
+  --overlay-surface: rgba(17, 26, 44, 0.94);
+  --overlay-border: rgba(229, 238, 255, 0.12);
+  --surface-border: rgba(229, 238, 255, 0.10);
+  --surface-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  --shadow-overlay: 0 22px 60px rgba(0, 0, 0, 0.46);
+  --surface-sheen: none;
+  --surface-filter: none;
+  --overlay-filter: none;
+  --sidebar-gradient: none;
+  --appbar-gradient: none;
+  --card-accent-start-opacity: 0.045;
+  --card-accent-end-opacity: 0.018;
+  --card-surface-opacity: 0.94;
+
+  --v-overlay-scrim-background: 3, 7, 18;
+  --v-overlay-scrim-opacity: 0.60;
+  --v-table-header-background: 17, 26, 44;
+}
+
+html[data-theme="glass"] {
+  --bg-primary: #0D1B3A;
+  --bg-surface: #152B54;
+  --bg-surface-variant: #1D3768;
+  --bg-hover: rgba(255, 255, 255, 0.10);
+  --bg-active: rgba(91, 147, 248, 0.20);
+
+  --text-primary: #EDF5FF;
+  --text-secondary: rgba(237, 245, 255, 0.72);
+  --text-muted: rgba(237, 245, 255, 0.60);
+  --text-disabled: rgba(237, 245, 255, 0.38);
+
+  --border: rgba(237, 245, 255, 0.14);
+  --border-strong: rgba(237, 245, 255, 0.24);
+
+  --accent: #5B93F8;
+  --accent-hover: #7AABFA;
+  --accent-soft: rgba(91, 147, 248, 0.16);
+  --accent-soft-hover: rgba(91, 147, 248, 0.26);
+
+  --success: #52D2A2;
+  --success-soft: rgba(82, 210, 162, 0.16);
+  --warning: #F4C97D;
+  --warning-soft: rgba(244, 201, 125, 0.16);
+  --error: #FF808A;
+  --error-soft: rgba(255, 128, 138, 0.16);
+  --info: #56C6FF;
+  --info-soft: rgba(86, 198, 255, 0.16);
+
+  --link: #7AABFA;
+  --link-hover: #A9C8FF;
+
+  --sidebar-bg: rgba(13, 27, 58, 0.72);
+  --sidebar-border: rgba(255, 255, 255, 0.16);
+  --appbar-bg: rgba(13, 27, 58, 0.54);
+  --glass-bg: rgba(21, 43, 84, 0.58);
+  --glass-border: rgba(255, 255, 255, 0.18);
+
+  --glass-bg-1: rgba(21, 43, 84, 0.62);
+  --glass-bg-2: rgba(21, 43, 84, 0.42);
+  --glass-bg-3: rgba(21, 43, 84, 0.26);
+  --glass-border-1: rgba(255, 255, 255, 0.22);
+  --glass-border-2: rgba(255, 255, 255, 0.18);
+  --glass-border-3: rgba(255, 255, 255, 0.12);
+  --glass-highlight: rgba(255, 255, 255, 0.20);
+  --glass-blur: 22px;
+  --glass-blur-2: 16px;
+  --glass-blur-3: 8px;
+  --glass-blur-heavy: 32px;
+  --glass-saturate: 1.5;
+
+  --mesh-bg:
+    radial-gradient(circle at 12% 8%, rgba(86, 198, 255, 0.20), transparent 44%),
+    radial-gradient(circle at 86% 12%, rgba(91, 147, 248, 0.22), transparent 42%),
+    radial-gradient(circle at 72% 88%, rgba(82, 210, 162, 0.12), transparent 42%),
+    #0D1B3A;
+  --mesh-glow-1: rgba(86, 198, 255, 0.26);
+  --mesh-glow-2: rgba(91, 147, 248, 0.24);
+  --mesh-glow-3: rgba(82, 210, 162, 0.16);
+
+  --group-dashboard-soft: rgba(91, 147, 248, 0.18);
+  --group-dashboard-glow: rgba(86, 198, 255, 0.36);
+  --group-pan115-soft: rgba(82, 210, 162, 0.18);
+  --group-pan115-glow: rgba(82, 210, 162, 0.36);
+  --group-recognition-soft: rgba(244, 201, 125, 0.18);
+  --group-recognition-glow: rgba(244, 201, 125, 0.36);
+  --group-media-soft: rgba(255, 142, 172, 0.18);
+  --group-media-glow: rgba(255, 142, 172, 0.36);
+
+  --surface-card: rgba(21, 43, 84, 0.52);
+  --surface-subtle: rgba(21, 43, 84, 0.40);
+  --surface-hover: rgba(255, 255, 255, 0.10);
+  --surface-input: rgba(21, 43, 84, 0.56);
+  --overlay-surface: rgba(13, 27, 58, 0.78);
+  --overlay-border: rgba(255, 255, 255, 0.20);
+  --surface-border: rgba(255, 255, 255, 0.14);
+  --surface-shadow: 0 12px 32px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  --shadow-overlay: 0 18px 48px rgba(0, 0, 0, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  --surface-sheen: linear-gradient(135deg, rgba(255, 255, 255, 0.12), transparent 28%, rgba(255, 255, 255, 0.04) 72%, transparent);
+  --surface-filter: blur(18px) saturate(1.5);
+  --overlay-filter: blur(22px) saturate(1.5);
+  --card-accent-start-opacity: 0.05;
+  --card-accent-end-opacity: 0.018;
+  --card-surface-opacity: 0.48;
+
+  --v-overlay-scrim-background: 3, 7, 18;
+  --v-overlay-scrim-opacity: 0.62;
+  --v-table-header-background: 21, 43, 84;
+}
+
+html[data-theme="glass"],
+html[data-theme="glass"] .v-theme--glass,
+.v-theme--glass {
+  --v-high-emphasis-opacity: 1;
+  --v-medium-emphasis-opacity: 0.72;
+  --v-disabled-opacity: 0.45;
+  --v-hover-opacity: 0.08;
+  --v-focus-opacity: 0.14;
+  --v-selected-opacity: 0.16;
+  --v-activated-opacity: 0.14;
+  --v-pressed-opacity: 0.18;
+}
+
+html[data-theme] {
+  --group-dashboard: linear-gradient(135deg, #2563EB 0%, #38BDF8 100%);
+  --group-pan115: linear-gradient(135deg, #059669 0%, #34D399 100%);
+  --group-recognition: linear-gradient(135deg, #D97706 0%, #FBBF24 100%);
+  --group-media: linear-gradient(135deg, #DB2777 0%, #F472B6 100%);
+}
+
+[data-group="dashboard"] {
+  --group-color: #2563EB;
+  --group-color-2: #38BDF8;
+  --group-gradient: var(--group-dashboard);
+  --group-soft: var(--group-dashboard-soft);
+  --group-glow: var(--group-dashboard-glow);
+}
+
+[data-group="pan115"] {
+  --group-color: #059669;
+  --group-color-2: #34D399;
+  --group-gradient: var(--group-pan115);
+  --group-soft: var(--group-pan115-soft);
+  --group-glow: var(--group-pan115-glow);
+}
+
+[data-group="recognition"] {
+  --group-color: #D97706;
+  --group-color-2: #FBBF24;
+  --group-gradient: var(--group-recognition);
+  --group-soft: var(--group-recognition-soft);
+  --group-glow: var(--group-recognition-glow);
+}
+
+[data-group="media"] {
+  --group-color: #DB2777;
+  --group-color-2: #F472B6;
+  --group-gradient: var(--group-media);
+  --group-soft: var(--group-media-soft);
+  --group-glow: var(--group-media-glow);
+}

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloud123-backend"
+version = "0.1.0"
+description = "123 Cloud Gateway backend"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.100",
+  "uvicorn[standard]>=0.23",
+  "httpx>=0.24",
+  "pydantic>=1.10",
+  "telethon>=1.36",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

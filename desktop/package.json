@@ -1,0 +1,17 @@
+{
+  "name": "cloud123-desktop",
+  "productName": "123Cloud",
+  "version": "1.0.0",
+  "description": "123Cloud 桌面应用 — Telegram 投稿与 115 协作工作台",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "node electron/dev.cjs",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^43.4.1",
+    "electron-builder": "^25.1.8"
+  }
+}

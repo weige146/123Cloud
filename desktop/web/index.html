@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-theme-preference="auto">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#11131f" />
+    <script>
+      (() => {
+        try {
+          const raw = JSON.parse(localStorage.getItem("admin-ui-preferences-v3") || "{}");
+          const legacyUi = JSON.parse(localStorage.getItem("admin-ui-preferences-v2") || "{}");
+          const legacy = localStorage.getItem("admin-theme-preference");
+          const normalize = (value) => ["auto", "light", "dark"].includes(value)
+            ? value
+            : (["purple", "transparent", "glass"].includes(value) ? "auto" : "");
+          const preference = normalize(raw.theme)
+            || normalize(legacyUi.theme)
+            || normalize(legacy)
+            || "auto";
+          const resolved = preference === "auto"
+            ? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+            : preference;
+          const dark = resolved === "dark";
+          const root = document.documentElement;
+          root.dataset.theme = resolved;
+          root.dataset.themePreference = preference;
+          root.classList.toggle("dark", dark);
+          root.style.colorScheme = dark ? "dark" : "light";
+          document.querySelector('meta[name="theme-color"]')?.setAttribute(
+            "content",
+            ({ light: "#f3f4f5", dark: "#111315" })[resolved]
+          );
+        } catch {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%2338BDF8'/%3E%3Cstop offset='100%25' stop-color='%23A78BFA'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Ctext x='32' y='40' font-family='Inter,sans-serif' font-size='26' font-weight='800' text-anchor='middle' fill='white' letter-spacing='0'%3E123%3C/text%3E%3C/svg%3E" />
+    <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%2338BDF8'/%3E%3Cstop offset='100%25' stop-color='%23A78BFA'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Ctext x='32' y='40' font-family='Inter,sans-serif' font-size='26' font-weight='800' text-anchor='middle' fill='white' letter-spacing='0'%3E123%3C/text%3E%3C/svg%3E" />
+    <title>123 Cloud · Gateway Admin</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
