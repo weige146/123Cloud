@@ -14,7 +14,7 @@
 | 平台 | 文件 | 说明 |
 | --- | --- | --- |
 | macOS (Apple Silicon) | `123Cloud-<版本>-macOS-arm64.dmg` | ad-hoc 签名，首次打开右键 →「打开」 |
-| Windows x64 | `123Cloud-<版本>-Windows-x64-setup.exe` | 未签名，SmartScreen 弹窗点「仍要运行」 |
+| Windows x64 | `123Cloud-<版本>-Windows-x64.exe` | 未签名，SmartScreen 弹窗点「仍要运行」 |
 
 每个 Release 附带自动生成的更新日志（changelog）。
 
