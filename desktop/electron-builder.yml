@@ -1,6 +1,7 @@
 appId: com.123cloud.desktop
 productName: 123Cloud
 copyright: 123Cloud
+afterSign: build/afterSign.cjs
 
 directories:
   output: release

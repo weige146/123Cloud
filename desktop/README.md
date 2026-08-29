@@ -43,8 +43,10 @@ npm run dev
 
 ## 首次打开（未签名）
 
-- **macOS**：ad-hoc 签名。下载的 DMG 首次打开需右键 App →「打开」，或执行 `xattr -cr "/Applications/123Cloud.app"`。
-- **Windows**：未签名，SmartScreen 弹窗时点「更多信息」→「仍要运行」。
+安装包在 CI 上做了 ad-hoc 签名（无付费开发者证书），首次打开会提示「无法验证开发者」：
+
+- **macOS**：右键 App →「打开」→ 再点「打开」即可；若仍提示已损坏（旧版安装包），执行 `xattr -cr "/Applications/123Cloud.app"`。
+- **Windows**：SmartScreen 弹窗时点「更多信息」→「仍要运行」。
 
 ## 接入签名（可选）
 
