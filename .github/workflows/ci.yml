@@ -81,9 +81,9 @@ jobs:
       - name: Use tag as app version
         if: startsWith(github.ref, 'refs/tags/v')
         working-directory: desktop
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version
+        run: node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\\n')"
         env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          VERSION: ${{ github.ref_name }}
       - name: Install desktop dependencies
         working-directory: desktop
         run: npm ci
