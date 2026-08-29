@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main, open-source]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: desktop/backend/requirements.txt
+      - name: Install backend dependencies
+        run: python -m pip install -e './desktop/backend[dev]'
+      - name: Run backend tests
+        working-directory: desktop/backend
+        run: python -m pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/web/package-lock.json
+      - name: Build admin web
+        working-directory: desktop/web
+        run: |
+          npm ci
+          npm run build
+
+  package:
+    name: Package (${{ matrix.os }})
+    needs: tests
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: desktop/backend/requirements.txt
+      - name: Install backend build dependencies
+        working-directory: desktop
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt pyinstaller
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/web/package-lock.json
+      - name: Build admin web
+        working-directory: desktop/web
+        run: |
+          npm ci
+          npm run build
+      - name: Package backend sidecar (PyInstaller)
+        working-directory: desktop
+        run: python -m PyInstaller backend.spec --noconfirm --distpath backend-dist --workpath backend-build
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+      - name: Build macOS DMG
+        if: matrix.platform == 'macos'
+        working-directory: desktop
+        run: npx electron-builder --mac
+      - name: Build Windows installer
+        if: matrix.platform == 'windows'
+        working-directory: desktop
+        run: npx electron-builder --win
+      - name: Upload macOS installer
+        if: matrix.platform == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: 123Cloud-macOS
+          path: desktop/release/*.dmg
+          if-no-files-found: error
+      - name: Upload Windows installer
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: 123Cloud-Windows
+          path: desktop/release/*.exe
+          if-no-files-found: error
