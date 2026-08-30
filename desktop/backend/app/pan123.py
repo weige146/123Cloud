@@ -569,7 +569,10 @@ class Pan123OpenAPIClient:
 
     async def create_offline_download(self, url: str, dir_id: str, filename: str = "") -> int:
         last_error = ""
-        for attempt in range(1, 4):
+        # 撞"同时下载的任务超出最大限制"时按 5/15/30 秒退避重试；参照成熟工具的做法，
+        # 大分享集中提交离线时这几乎必然发生，100ms 级重试等于直接放弃
+        backoff_seconds = (5, 15, 30)
+        for attempt in range(1, 5):
             try:
                 data = await self.request(
                     "POST",
@@ -583,9 +586,9 @@ class Pan123OpenAPIClient:
                 return task_id
             except Exception as error:
                 last_error = str(error)
-                if attempt >= 3 or not re.search(r"同时下载|最大限制|maximum|limit", last_error, re.I):
+                if attempt >= 4 or not re.search(r"同时下载|最大限制|maximum|limit", last_error, re.I):
                     break
-                await sleep_seconds(100)
+                await sleep_seconds(backoff_seconds[min(attempt, len(backoff_seconds)) - 1] * 1000)
         raise Pan123Error(f"123 OpenAPI 离线创建失败（目录 ID {dir_id}）：{last_error or '未知错误'}")
 
     async def get_offline_process(self, task_id: int) -> Dict[str, Any]:

@@ -1,4 +1,5 @@
 .DS_Store
+.zcode/
 node_modules/
 dist/
 !userscripts/dist/

@@ -26,12 +26,36 @@ from pydantic import BaseModel, Field
 
 # 配置日志格式：包含时间戳、级别、logger 名、消息，便于排查
 # uvicorn 已有自己的日志配置，这里只接管应用层 logger
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
+_log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format=_log_format,
     datefmt="%Y-%m-%d %H:%M:%S",
     force=True,
 )
+# httpx 每个请求打一条 INFO（含 TG getUpdates 长轮询），会把应用内日志环形缓冲刷屏，降噪到 WARNING
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# 参照成熟工具的日志方案：除控制台/内存外，落盘轮转文件，重启后仍可排查
+try:
+    from logging.handlers import RotatingFileHandler
+
+    _log_file = os.environ.get("LOG_FILE")
+    if _log_file is None:
+        _log_file = str(DATA_DIR / "logs" / "backend.log")
+    if _log_file and _log_file.lower() not in {"off", "none", "disabled"}:
+        Path(_log_file).resolve().parent.mkdir(parents=True, exist_ok=True)
+        _file_handler = RotatingFileHandler(
+            _log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        _file_handler.setLevel(logging.INFO)
+        _file_handler.setFormatter(logging.Formatter(_log_format, datefmt="%Y-%m-%d %H:%M:%S"))
+        logging.getLogger().addHandler(_file_handler)
+except Exception as _log_file_error:  # 落盘失败不应阻塞启动
+    print(f"[main] log file init failed: {_log_file_error}", flush=True)
 
 from .pan115 import empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
 from .pan115_cookie import (
@@ -67,10 +91,6 @@ from .submission import (
 )
 from .transfer_service import TransferService
 from .wallpapers import BingWallpaperService, WallpaperUpstreamError
-
-
-ROOT_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
 
 
 def _resolve_admin_web_dir() -> Path:
@@ -132,6 +152,7 @@ async def start_background_tasks() -> None:
     await start_telegram_client()
     transfer_service.set_queued_notifier(send_telegram_transfer_queued_messages)
     transfer_service.set_notifier(send_telegram_transfer_status_message)
+    transfer_service.set_cookie_notifier(send_telegram_account_expired_message)
     transfer_service.set_cleanup_notifier(cleanup_telegram_transfer_messages)
     if telegram_polling_task and not telegram_polling_task.done():
         pass
@@ -523,7 +544,8 @@ async def send_telegram_transfer_queued_messages(tasks: List[Dict[str, Any]]) ->
 
 
 async def send_telegram_transfer_status_message(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if str(task.get("kind") or "") != "pan123_share_copy" or str(task.get("source") or "") != "telegram":
+    kind = str(task.get("kind") or "")
+    if kind not in {"pan123_share_copy", "pan115_share"} or str(task.get("source") or "") != "telegram":
         return None
     if str(task.get("status") or "") not in {"success", "failed", "partial"}:
         return None
@@ -532,17 +554,64 @@ async def send_telegram_transfer_status_message(task: Dict[str, Any]) -> Optiona
     chat_id = safe_int(task.get("chatId"))
     if not bot_token or not chat_id:
         return None
-    title = str(task.get("title") or task.get("shareUrl") or "123 分享")
-    remote_id = safe_int(task.get("remoteTaskId"))
-    if task.get("status") == "success":
-        text = f"✅ 123 分享转存成功：{title}\n目标目录 ID：{task.get('targetDirId') or '0'}"
+    is_pan123_copy = kind == "pan123_share_copy"
+    is_local = str(task.get("shareCode") or "").lower().startswith("local:")
+    if is_pan123_copy:
+        title = str(task.get("title") or task.get("shareUrl") or "123 分享")
     else:
-        text = f"❌ 123 分享转存失败：{title}\n原因：{task.get('error') or '未知错误'}"
-    if remote_id:
+        title = str(task.get("title") or task.get("shareUrl") or ("115 本地盘" if is_local else "115 分享"))
+    remote_id = safe_int(task.get("remoteTaskId"))
+    status = str(task.get("status") or "")
+    if status == "success":
+        if is_pan123_copy:
+            text = f"✅ 123 分享转存成功：{title}\n目标目录 ID：{task.get('targetDirId') or '0'}"
+        else:
+            done = len([f for f in task.get("files") or [] if str(f.get("status")) in {"success", "skipped"}])
+            text = f"✅ {'115 本地盘搬运' if is_local else '115 分享搬运'}完成：{title}\n已处理 {done} 个文件"
+    else:
+        files = [f for f in task.get("files") or [] if str(f.get("status")) == "failed"]
+        failed_count = len(files)
+        reason = str(files[0].get("error") or task.get("error") or "未知错误")[:200] if files else str(task.get("error") or "未知错误")[:200]
+        if is_pan123_copy:
+            text = f"❌ 123 分享转存失败：{title}\n原因：{reason}"
+        else:
+            label = "115 本地盘搬运" if is_local else "115 分享搬运"
+            head = f"⚠️ {label}部分失败：{title}" if status == "partial" else f"❌ {label}失败：{title}"
+            text = f"{head}\n失败 {failed_count} 个文件\n原因：{reason}"
+    if is_pan123_copy and remote_id:
         text += f"\n远端任务 ID：{remote_id}"
     sent = await send_telegram_text(bot_token, chat_id, text)
     message_id = telegram_message_id(sent)
     return {"chatId": chat_id, "messageId": message_id} if message_id else None
+
+
+async def send_telegram_account_expired_message(payload: Dict[str, Any]) -> None:
+    """115 Cookie 失效告警：发给 telegramAdminUserIds 管理员。"""
+    if not isinstance(payload, dict):
+        return
+    config = store.read_submission_config()
+    bot_token = str(config.get("botToken") or "").strip()
+    if not bot_token:
+        return
+    admin_ids = config.get("telegramAdminUserIds")
+    admin_list = [safe_int(value) for value in admin_ids] if isinstance(admin_ids, list) else []
+    legacy = config.get("allowedUserIds")
+    if legacy and isinstance(legacy, list):
+        admin_list.extend(safe_int(value) for value in legacy)
+    chat_ids = list(dict.fromkeys([chat_id for chat_id in admin_list if chat_id]))
+    if not chat_ids:
+        return
+    account = str(payload.get("account") or "未命名账号")
+    reason = str(payload.get("reason") or "未知原因")[:200]
+    minutes = safe_int(payload.get("cooldownMinutes")) or 30
+    text = (
+        f"⚠️ 115 Cookie 已失效：{account}\n"
+        f"原因：{reason}\n"
+        f"已暂时停用 {minutes} 分钟并改用其他账号，请尽快更新 Cookie。"
+    )
+    for chat_id in chat_ids:
+        with contextlib.suppress(Exception):
+            await send_telegram_text(bot_token, chat_id, text)
 
 
 async def cleanup_telegram_transfer_messages(payload: Dict[str, Any]) -> None:

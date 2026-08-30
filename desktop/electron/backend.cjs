@@ -12,7 +12,8 @@ const fs = require("fs");
 const { EventEmitter } = require("events");
 
 const RESTART_MAX = 5;
-const LOG_BUFFER_MAX_LINES = 800;
+// 对齐 tdr-123help 的 Web 日志队列容量（10000 条），避免刷屏把有用日志顶掉
+const LOG_BUFFER_MAX_LINES = 10000;
 
 class BackendManager extends EventEmitter {
   constructor() {

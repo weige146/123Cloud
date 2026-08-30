@@ -16,7 +16,7 @@ PyInstaller 侧车 (backend.spec → backend-dist/cloudgateway/)
 
 - 侧车只监听 `127.0.0.1`，端口由壳动态注入（`CLOUD123_PORT`），也可在应用「设置 → 服务端口」固定。
 - 数据目录由壳注入（`DATA_DIR`）：macOS `~/Library/Application Support/123Cloud/`，Windows `%APPDATA%/123Cloud/`。
-- 运行日志在应用「设置 → 运行日志」实时查看（内存环形缓冲，最近 800 行，不写磁盘）。
+- 运行日志在应用「设置 → 运行日志」实时查看（内存环形缓冲，最近 10000 行），同时轮转落盘到 `DATA_DIR/logs/backend.log`（5MB×3 份），重启后仍可排查。
 
 ## 开发模式
 

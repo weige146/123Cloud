@@ -6,10 +6,12 @@ Translated from the legacy TypeScript project.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -18,7 +20,12 @@ from uuid import uuid4
 import httpx
 
 from .pan115 import select_115_account
-from .pan115_transfer import extract_115_links, PAN123_OFFLINE_USER_AGENT, Pan115TransferClient
+from .pan115_transfer import (
+    classify_pan115_account_error,
+    extract_115_links,
+    PAN123_OFFLINE_USER_AGENT,
+    Pan115TransferClient,
+)
 from .pan123 import Pan123Client, Pan123OpenAPIClient, Pan123OpenTokenStore
 from .session_store import SessionStore, pan123_open_token_key
 
@@ -58,6 +65,14 @@ PAN123_SHARE_COPY_RETRY_BASE_MS = int(os.environ.get("PAN123_SHARE_COPY_RETRY_BA
 TRANSFER_PROGRESS_NOTIFY_INTERVAL_MS = _normalize_non_negative_ms(
     os.environ.get("TRANSFER_PROGRESS_NOTIFY_INTERVAL_MS"), 60_000
 )
+# 失效 115 账号的全局冷却时长；期间其他任务不再选用该账号
+PAN115_ACCOUNT_COOLDOWN_MS = _normalize_non_negative_ms(
+    os.environ.get("TRANSFER_115_ACCOUNT_COOLDOWN_MS"), 30 * 60_000
+)
+# 123 离线任务失败后自动重新提交的最大次数（参照 tdr-123help 的 retries 机制）
+TRANSFER_OFFLINE_RESUBMIT_MAX = max(0, int(os.environ.get("TRANSFER_OFFLINE_RESUBMIT_MAX", "3")))
+# 全局 123 离线提交并发闸门，避免多 worker 同时提交撞"同时下载超出最大限制"
+TRANSFER_OFFLINE_SUBMIT_CONCURRENCY = max(1, int(os.environ.get("TRANSFER_OFFLINE_SUBMIT_CONCURRENCY", "3")))
 PAN123_FORBIDDEN_NAME_RE = re.compile(r'["\\/:*?|><]')
 
 
@@ -70,6 +85,73 @@ TransferQueuedNotifier = Callable[[List[Dict[str, Any]]], Coroutine[Any, Any, Op
 TransferCookieNotifier = Callable[[Dict[str, Any]], Coroutine[Any, Any, Optional[TransferNoticeRef]]]
 TransferCleanupNotifier = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
 AsyncLimiter = Callable[[Callable[[], Coroutine[Any, Any, Any]]], Coroutine[Any, Any, Any]]
+
+
+# ---------------------------------------------------------------------------
+# 123 目录缓存
+# ---------------------------------------------------------------------------
+class TransferDirCache:
+    """任务级 123 目录缓存。
+
+    ensure_path / find_same_file 每个文件都全量列目录，大分享会放大为 O(N²) 页请求并
+    触发 123 限流。缓存 (root,path)->dirId 与 dirId->文件清单；写操作后由调用方失效。
+    """
+
+    def __init__(self) -> None:
+        self._path_ids: Dict[str, str] = {}
+        self._listings: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._registry_lock = asyncio.Lock()
+
+    async def _lock_for(self, dir_id: str) -> asyncio.Lock:
+        async with self._registry_lock:
+            lock = self._locks.get(dir_id)
+            if lock is None:
+                lock = self._locks.setdefault(dir_id, asyncio.Lock())
+            return lock
+
+    async def resolve_dir(self, pan123: "Pan123OpenAPIClient", root_dir_id: str, path: List[str]) -> str:
+        key = f"{root_dir_id}:{'/'.join(path)}"
+        cached = self._path_ids.get(key)
+        if cached:
+            return cached
+        dir_id = str(await pan123.ensure_path(root_dir_id, path))
+        self._path_ids[key] = dir_id
+        return dir_id
+
+    async def list_dir(
+        self, pan123: "Pan123OpenAPIClient", dir_id: str, force: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
+        if not force:
+            cached = self._listings.get(str(dir_id))
+            if cached is not None:
+                return cached
+        async with await self._lock_for(str(dir_id)):
+            if not force:
+                cached = self._listings.get(str(dir_id))
+                if cached is not None:
+                    return cached
+            files = await pan123.list_files(dir_id)
+            listing = {
+                str(file.get("name") or ""): file
+                for file in files
+                if file.get("name")
+            }
+            self._listings[str(dir_id)] = listing
+            return listing
+
+    def invalidate_dir(self, dir_id: Optional[str]) -> None:
+        if dir_id:
+            self._listings.pop(str(dir_id), None)
+
+    async def find_same_file(
+        self, pan123: "Pan123OpenAPIClient", dir_id: str, name: str, size: int, force: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        listing = await self.list_dir(pan123, dir_id, force=force)
+        file = listing.get(str(name))
+        if file and int(file.get("type") or 0) != 1 and int(file.get("size") or 0) == int(size or 0):
+            return file
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +183,17 @@ class TransferService:
         self._pan123_web_client = Pan123Client()
         self._active_pan123_share_copy_task_id: Optional[str] = None
         self._last_pan123_share_copy_submit_at = 0.0
+        # 任务级 123 目录缓存（path->dirId、dirId->文件清单），大分享能把 O(N²) 次列目录降为常数次
+        self._dir_caches: Dict[str, "TransferDirCache"] = {}
+        # 115 账号健康状态：cookie 指纹 -> {"name", "coolUntilMs"}；失效账号冷却期内跳过
+        self._account_health: Dict[str, Dict[str, Any]] = {}
+        # Python 3.9 下在无事件循环时创建 Semaphore 会踩 get_event_loop 的坑，推迟到协程里创建
+        self._offline_submit_semaphore: Optional[asyncio.Semaphore] = None
+
+    def _get_offline_submit_semaphore(self) -> asyncio.Semaphore:
+        if self._offline_submit_semaphore is None:
+            self._offline_submit_semaphore = asyncio.Semaphore(TRANSFER_OFFLINE_SUBMIT_CONCURRENCY)
+        return self._offline_submit_semaphore
 
     def set_notifier(self, notifier: Optional[TransferNotifier]) -> None:
         self._notifier = notifier
@@ -395,6 +488,77 @@ class TransferService:
             "cookie": str(account.get("cookie") or ""),
         }
 
+    # -----------------------------------------------------------------------
+    # 115 账号池健康（失效跳过 + 全局冷却）
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _account_fingerprint(cookie: str) -> str:
+        return hashlib.sha1(str(cookie or "").strip().encode("utf-8")).hexdigest()[:16]
+
+    def _is_account_cooling(self, account: Dict[str, str]) -> bool:
+        health = self._account_health.get(self._account_fingerprint(account.get("cookie", "")))
+        if not health:
+            return False
+        return time.monotonic() * 1000 < health.get("coolUntilMs", 0)
+
+    def _filter_live_accounts(self, accounts: List[Dict[str, str]], task: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+        live = [account for account in accounts if not self._is_account_cooling(account)]
+        cooling = [account for account in accounts if self._is_account_cooling(account)]
+        if cooling and task is not None:
+            _add_unique_task_log(
+                task, "info",
+                "跳过冷却中的 115 账号：" + "、".join(account.get("name") or "?" for account in cooling)
+            )
+        if not live and cooling:
+            # 全部冷却时回退使用全部账号，总比不跑强
+            if task is not None:
+                _add_unique_task_log(task, "warn", "所有 115 账号均在冷却中，仍尝试使用现有账号")
+            return list(accounts)
+        return live if live else list(accounts)
+
+    async def _mark_account_cooling(self, task: Optional[Dict[str, Any]], account: Dict[str, str], reason: str) -> bool:
+        """标记账号进入冷却；返回是否为本次周期首次标记（用于通知去重）。"""
+        fingerprint = self._account_fingerprint(account.get("cookie", ""))
+        now_ms = time.monotonic() * 1000
+        health = self._account_health.get(fingerprint)
+        if health and now_ms < health.get("coolUntilMs", 0):
+            return False
+        self._account_health[fingerprint] = {
+            "name": account.get("name") or "未命名账号",
+            "coolUntilMs": now_ms + PAN115_ACCOUNT_COOLDOWN_MS,
+        }
+        if task is not None:
+            minutes = round(PAN115_ACCOUNT_COOLDOWN_MS / 60000)
+            _add_unique_task_log(
+                task, "warn",
+                f"115 账号失效，冷却 {minutes} 分钟：{account.get('name') or '?'}（{reason}）"
+            )
+        if self._cookie_notifier:
+            try:
+                await self._cookie_notifier({
+                    "account": account.get("name") or "未命名账号",
+                    "reason": reason,
+                    "cooldownMinutes": round(PAN115_ACCOUNT_COOLDOWN_MS / 60000),
+                })
+            except Exception as error:
+                logger.warning("115 Cookie 失效通知失败", extra={"error": str(error)})
+        return True
+
+    def _download_url_candidates(self, primary: Optional[Dict[str, str]], allow_rotation: bool) -> List[Dict[str, str]]:
+        """取直链候选账号：主账号优先，其余活账号按池顺序兜底（仅分享任务允许换号）。"""
+        candidates: List[Dict[str, str]] = []
+        if primary and primary.get("cookie"):
+            candidates.append(primary)
+        if allow_rotation:
+            try:
+                pool = self._filter_live_accounts(_transfer_cookie_pool(self._cached_transfer_config or {}))
+            except Exception:
+                pool = []
+            for account in pool:
+                if account.get("cookie") and all(account["cookie"] != c.get("cookie") for c in candidates):
+                    candidates.append(account)
+        return candidates or ([primary] if primary else [])
+
     async def create_status_pan123_client(self) -> Pan123OpenAPIClient:
         return await self._create_pan123_client()
 
@@ -449,6 +613,7 @@ class TransferService:
             logger.error("115 搬运任务失败", extra={"task_id": task["id"], "error": task["error"]})
         finally:
             self._active_task_ids.discard(task["id"])
+            self._dir_caches.pop(task["id"], None)
             if self._active_pan123_share_copy_task_id == task["id"]:
                 self._active_pan123_share_copy_task_id = None
             self.kick()
@@ -467,7 +632,8 @@ class TransferService:
         if not await self._save_transfer_task(task):
             return
 
-        pan115_accounts = _transfer_cookie_pool(transfer_config)
+        dir_cache = self._dir_caches.setdefault(task["id"], TransferDirCache())
+        pan115_accounts = self._filter_live_accounts(_transfer_cookie_pool(transfer_config), task)
         pan115_cursor = 0
         selected_pan115_account: Optional[Dict[str, str]] = None
 
@@ -559,7 +725,7 @@ class TransferService:
                     continue
                 await self._process_file(
                     task, file, next_pan115_account(), pan123,
-                    transfer_config.get("targetDirId") or "0", offline_limiter
+                    transfer_config.get("targetDirId") or "0", offline_limiter, dir_cache
                 )
                 task["doneFiles"] = len([f for f in task["files"] if _is_done_file(f)])
                 if not await self._save_transfer_task(task):
@@ -754,6 +920,8 @@ class TransferService:
             except Exception as error:
                 message = str(error)
                 errors.append(f"{account['name']}：{message}")
+                if classify_pan115_account_error(error) == "expired":
+                    await self._mark_account_cooling(task, account, message)
                 if len(candidates) > 1:
                     _add_task_log(task, "warn", f"115 分享解析失败：{account['name']}（{message}）")
 
@@ -857,7 +1025,9 @@ class TransferService:
         pan123: Pan123OpenAPIClient,
         target_root_id: str,
         offline_limiter: AsyncLimiter,
+        dir_cache: Optional[TransferDirCache] = None,
     ) -> None:
+        dir_cache = dir_cache or self._dir_caches.setdefault(task["id"], TransferDirCache())
         file["status"] = "running"
         file["startedAt"] = _utc_now_iso()
         file["error"] = None
@@ -872,17 +1042,19 @@ class TransferService:
                     task, "info",
                     f"已将 123 不支持的目录名映射为安全目录：{'/'.join(file.get('path', []) or ['/'])} -> {'/'.join(target_path or ['/'])}"
                 )
-            target_dir_id = await pan123.ensure_path(target_root_id, target_path)
+            target_dir_id = await dir_cache.resolve_dir(pan123, target_root_id, target_path)
             file["targetDirId"] = target_dir_id
 
             async def refresh_target_dir(stage: str) -> None:
                 nonlocal target_dir_id
                 previous_dir_id = target_dir_id
+                dir_cache.invalidate_dir(target_dir_id)
                 target_dir_id = await pan123.ensure_path(target_root_id, target_path)
+                dir_cache.invalidate_dir(target_dir_id)
                 file["targetDirId"] = target_dir_id
                 _add_task_log(task, "warn", f"{stage}发现目标目录失效，已重新解析：{previous_dir_id} -> {target_dir_id}")
 
-            existing = await pan123.find_same_file(target_dir_id, file["name"], file.get("size", 0))
+            existing = await dir_cache.find_same_file(pan123, target_dir_id, file["name"], file.get("size", 0))
             if existing:
                 await self._remember_transfer_hash(file, existing)
                 file["status"] = "skipped"
@@ -936,7 +1108,7 @@ class TransferService:
                 file["offlineTaskId"] = existing_offline_task["id"]
                 _add_unique_task_log(task, "info", f"继续等待已有 123 离线任务 #{existing_offline_task['id']}")
                 resumed = await self._wait_for_offline_file(
-                    task, file, pan123, target_root_id, target_dir_id, {}
+                    task, file, pan123, target_root_id, target_dir_id, {}, dir_cache
                 )
                 if not resumed:
                     raise RuntimeError("等待已有 123 离线文件落盘超时")
@@ -959,6 +1131,7 @@ class TransferService:
                     try:
                         reused_file_id = await pan123.sha1_reuse(target_dir_id, file["name"], file["sha1"], file.get("size", 0))
                         if reused_file_id:
+                            dir_cache.invalidate_dir(target_dir_id)
                             file["status"] = "success"
                             file["method"] = "sha1_reuse"
                             file["pan123FileId"] = reused_file_id
@@ -993,6 +1166,7 @@ class TransferService:
                     try:
                         reused_file_id = await pan123.md5_reuse(target_dir_id, file["name"], rapid_etag, file.get("size", 0))
                         if reused_file_id:
+                            dir_cache.invalidate_dir(target_dir_id)
                             await self._remember_known_transfer_hash(file, rapid_etag)
                             file["status"] = "success"
                             file["method"] = "md5_reuse"
@@ -1022,7 +1196,7 @@ class TransferService:
                 )
                 await self._notify_cookie_use(task, file, pan115_account["name"])
                 pan115 = Pan115TransferClient(pan115_account["cookie"])
-                download_url = await self._get_pan115_download_url(task, file, pan115)
+                download_url = await self._get_pan115_download_url(task, file, pan115, pan115_account)
                 file["sourceUrl"] = download_url
                 offline_submit_name = _build_offline_submit_name(file)
                 file["offlineSubmitName"] = None if offline_submit_name == file["name"] else offline_submit_name
@@ -1036,9 +1210,10 @@ class TransferService:
                 if not await self._save_transfer_task(task):
                     return None
                 try:
-                    offline_task_id = await pan123.create_offline_download(
-                        download_url, target_dir_id, file.get("offlineSubmitName") or file["name"]
-                    )
+                    async with self._get_offline_submit_semaphore():
+                        offline_task_id = await pan123.create_offline_download(
+                            download_url, target_dir_id, file.get("offlineSubmitName") or file["name"]
+                        )
                 except Exception as error:
                     if not _is_missing_target_dir_error(error):
                         raise
@@ -1046,13 +1221,15 @@ class TransferService:
                     before_offline_file_ids = await self._snapshot_candidate_file_ids(
                         pan123, target_root_id, target_dir_id
                     )
-                    offline_task_id = await pan123.create_offline_download(
-                        download_url, target_dir_id, file.get("offlineSubmitName") or file["name"]
-                    )
+                    async with self._get_offline_submit_semaphore():
+                        offline_task_id = await pan123.create_offline_download(
+                            download_url, target_dir_id, file.get("offlineSubmitName") or file["name"]
+                        )
                 file["offlineTaskId"] = offline_task_id
                 file["offlineStatus"] = "running"
                 file["offlineStatusText"] = "离线中"
                 file["offlineProgress"] = 0
+                file["offlineResubmits"] = 0
                 file["method"] = "offline"
                 display = _display_path(file)
                 if not file.get("offlineSubmitName"):
@@ -1067,7 +1244,7 @@ class TransferService:
                 if not await self._save_transfer_task(task):
                     return None
                 return await self._wait_for_offline_file(
-                    task, file, pan123, target_root_id, target_dir_id, before_offline_file_ids
+                    task, file, pan123, target_root_id, target_dir_id, before_offline_file_ids, dir_cache
                 )
 
             created = await offline_limiter(offline_job)
@@ -1097,10 +1274,9 @@ class TransferService:
     # Notification helpers
     # -----------------------------------------------------------------------
     async def _notify_task(self, task: Dict[str, Any]) -> None:
-        if task["status"] == "success" and str(task.get("kind") or "") != "pan123_share_copy":
+        is_success_115 = task["status"] == "success" and str(task.get("kind") or "") != "pan123_share_copy"
+        if is_success_115:
             await self._cleanup_successful_task_messages(task)
-            self._progress_notice_state.pop(task["id"], None)
-            return
         if not self._notifier:
             self._progress_notice_state.pop(task["id"], None)
             return
@@ -1206,19 +1382,25 @@ class TransferService:
         finally:
             self._progress_notice_state.pop(task["id"], None)
 
-    async def _get_pan115_download_url(self, task: Dict[str, Any], file: Dict[str, Any], pan115: Pan115TransferClient) -> str:
+    async def _get_pan115_download_url(
+        self,
+        task: Dict[str, Any],
+        file: Dict[str, Any],
+        pan115: Pan115TransferClient,
+        pan115_account: Optional[Dict[str, str]] = None,
+    ) -> str:
         transfer_config = await self._get_transfer_config()
         max_attempts = max(1, int(transfer_config.get("downloadMaxAttempts") or PAN115_DOWNLOAD_MAX_ATTEMPTS))
         retry_base_ms = max(0, int(transfer_config.get("downloadRetryBaseMs") or PAN115_DOWNLOAD_RETRY_BASE_MS))
 
-        async def _job() -> str:
+        async def _attempt(client: Pan115TransferClient) -> str:
             last_error = ""
             for attempt in range(1, max_attempts + 1):
                 try:
                     if _is_local_115_file(file):
-                        download_url = await pan115.get_local_download_url(str(file.get("pickCode") or file.get("pick_code") or ""))
+                        download_url = await client.get_local_download_url(str(file.get("pickCode") or file.get("pick_code") or ""))
                     else:
-                        download_url = await pan115.get_download_url(task["shareCode"], task.get("receiveCode") or "", file["id"])
+                        download_url = await client.get_download_url(task["shareCode"], task.get("receiveCode") or "", file["id"])
                     try:
                         await self._validate_pan115_download_url(task, file, download_url)
                     except Exception as validation_error:
@@ -1236,6 +1418,40 @@ class TransferService:
                         f"115 取直链受限，{round(wait_ms / 1000)} 秒后重试：{_display_path(file)}（第 {attempt}/{max_attempts} 次，{last_error}）"
                     )
                     await _delay(wait_ms)
+            raise RuntimeError(last_error or "115 未返回文件直链")
+
+        async def _job() -> str:
+            # 本地盘文件只存在于指定账号的网盘里，不换号；分享任务可换池内其他活账号
+            allow_rotation = not _is_local_115_file(file) and not _is_local_115_task(task)
+            candidates = self._download_url_candidates(pan115_account, allow_rotation)
+            if not candidates:
+                return await _attempt(pan115)
+            last_error = ""
+            for index, candidate in enumerate(candidates):
+                if index == 0:
+                    client = pan115
+                else:
+                    client = Pan115TransferClient(str(candidate.get("cookie") or ""))
+                try:
+                    return await _attempt(client)
+                except Exception as error:
+                    last_error = str(error)
+                    classification = classify_pan115_account_error(error)
+                    if classification == "expired":
+                        await self._mark_account_cooling(task, candidate, last_error)
+                    elif classification != "transient":
+                        # 未知错误换号意义不大，直接失败便于排查
+                        raise
+                    elif index + 1 < len(candidates):
+                        _add_task_log(task, "warn", f"115 取直链持续受限，换号重试：{candidate.get('name') or '?'}")
+                    if index + 1 < len(candidates):
+                        _add_task_log(
+                            task, "warn",
+                            f"改用其他 115 账号取直链：{candidates[index + 1].get('name') or '?'}（{_display_path(file)}）"
+                        )
+                finally:
+                    if index > 0:
+                        await client.close()
             raise RuntimeError(last_error or "115 未返回文件直链")
 
         return await self._enqueue_pan115_download(_job)
@@ -1436,13 +1652,19 @@ class TransferService:
         target_root_id: str,
         target_dir_id: str,
         before_offline_file_ids: Dict[str, Set[int]],
+        dir_cache: Optional[TransferDirCache] = None,
     ) -> Optional[Dict[str, Any]]:
+        dir_cache = dir_cache or self._dir_caches.setdefault(task["id"], TransferDirCache())
         transfer_config = await self._get_transfer_config()
         max_polls = max(1, int(transfer_config.get("offlineMaxPolls") or DEFAULT_MAX_POLLS))
         poll_ms = max(2000, int(transfer_config.get("offlinePollMs") or DEFAULT_POLL_MS))
-        for i in range(max_polls):
+        # 大文件的离线排队/下载远超默认窗口，按大小放宽总等待时限
+        deadline_ms = _offline_wait_deadline_ms(file.get("size", 0), max_polls * poll_ms)
+        started_ms = time.monotonic() * 1000
+        while True:
             candidate_names = _offline_candidate_names(file)
-            offline = await self._find_offline_task(pan123, file.get("offlineTaskId"), candidate_names)
+            # 进度接口 best-effort：失败/异常只提示，不终止等待；完成与否以下面的落盘检测为准
+            offline = await self._find_offline_task(pan123, file.get("offlineTaskId"), candidate_names, task=task)
             if offline:
                 file["offlineStatus"] = offline["status"]
                 file["offlineStatusText"] = offline["statusText"]
@@ -1453,13 +1675,43 @@ class TransferService:
                     return None
                 await self._notify_task_progress(task)
                 if offline["status"] == "failed":
+                    resubmits = int(file.get("offlineResubmits") or 0)
+                    if file.get("sourceUrl") and resubmits < TRANSFER_OFFLINE_RESUBMIT_MAX:
+                        file["offlineResubmits"] = resubmits + 1
+                        _add_task_log(
+                            task, "warn",
+                            f"123 离线任务失败，重新提交（第 {resubmits + 1}/{TRANSFER_OFFLINE_RESUBMIT_MAX} 次）：{_display_path(file)}"
+                        )
+                        try:
+                            async with self._get_offline_submit_semaphore():
+                                new_task_id = await pan123.create_offline_download(
+                                    file["sourceUrl"], target_dir_id, file.get("offlineSubmitName") or file["name"]
+                                )
+                        except Exception as submit_error:
+                            raise RuntimeError(offline.get("message") or "123 离线任务失败") from submit_error
+                        file["offlineTaskId"] = new_task_id
+                        if not await self._save_transfer_task(task):
+                            return None
+                        await _delay(poll_ms)
+                        continue
                     raise RuntimeError(offline.get("message") or "123 离线任务失败")
 
+            # 落盘检测：每轮只列一次目标目录，按候选名+大小比对（参照 tdr-123help 的完成判定）
             created = None
-            for candidate_name in candidate_names:
-                created = await pan123.find_same_file(target_dir_id, candidate_name, file.get("size", 0))
-                if created:
-                    break
+            try:
+                listing = await dir_cache.list_dir(pan123, target_dir_id, force=True)
+                for candidate_name in candidate_names:
+                    candidate = listing.get(candidate_name)
+                    if (
+                        candidate
+                        and int(candidate.get("type") or 0) != 1
+                        and int(candidate.get("size") or 0) == int(file.get("size", 0))
+                    ):
+                        created = candidate
+                        break
+            except Exception as error:
+                # 列目录失败（限流等）不算失败，下一轮再查
+                _add_unique_task_log(task, "warn", f"123 目标目录查询失败，本轮跳过：{error}")
             if not created:
                 suspicious = await self._find_suspicious_offline_artifact(task, pan123, target_dir_id, file, before_offline_file_ids)
                 if suspicious:
@@ -1468,15 +1720,18 @@ class TransferService:
                     )
                 created = await self._recover_offline_file(task, file, pan123, target_root_id, target_dir_id, before_offline_file_ids)
             if created:
+                dir_cache.invalidate_dir(target_dir_id)
                 return await self._rename_offline_result_if_needed(task, file, pan123, created)
+            if time.monotonic() * 1000 - started_ms >= deadline_ms:
+                return None
             await _delay(poll_ms)
-        return None
 
     async def _find_offline_task(
         self,
         pan123: Pan123OpenAPIClient,
         task_id: Optional[int],
         filenames: List[str],
+        task: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if task_id and getattr(pan123, "clientKind", "") == "openapi":
             try:
@@ -1492,6 +1747,12 @@ class TransferService:
                     "progress": process["process"],
                 }
             except Exception as error:
+                # 进度接口失败是常态（限流/超时），去重提示一次即可；等待循环会用
+                # 目录落盘检测兜底，不因进度接口失败而判定任务失败
+                if task is not None:
+                    _add_unique_task_log(
+                        task, "warn", f"123 离线进度查询暂不可用，改用目录落盘检测：{error}"
+                    )
                 logger.warning(
                     "123 API 离线任务状态查询失败",
                     extra={"task_id": task_id, "error": str(error)},
@@ -2078,11 +2339,17 @@ def _is_within_transfer_pause(now: datetime, settings: Optional[Dict[str, Any]] 
 
 
 def _hour_in_time_zone(now: datetime, time_zone: str) -> int:
+    # 优先标准库 zoneinfo（pytz 不一定是依赖，缺失时曾静默回退 UTC 小时，导致暂停窗口按错时区生效）
+    try:
+        from zoneinfo import ZoneInfo
+
+        return now.astimezone(ZoneInfo(time_zone)).hour
+    except Exception:
+        pass
     try:
         import pytz
-        tz = pytz.timezone(time_zone)
-        localized = now.astimezone(tz)
-        return localized.hour
+
+        return now.astimezone(pytz.timezone(time_zone)).hour
     except Exception:
         return now.hour
 
@@ -2140,6 +2407,20 @@ def _format_bytes(bytes_val: Union[int, float]) -> str:
     if value < 1024 * 1024 * 1024:
         return f"{(value / (1024 * 1024)):.1f} MB" if value < 10 * 1024 * 1024 else f"{(value / (1024 * 1024)):.0f} MB"
     return f"{(value / (1024 * 1024 * 1024)):.1f} GB"
+
+
+def _offline_wait_deadline_ms(file_size: int, configured_ms: int) -> int:
+    """按文件大小放宽离线等待上限：默认沿用配置，大文件给足排队+下载时间。"""
+    size = max(0, int(file_size or 0))
+    if size >= 10 * 1024 * 1024 * 1024:
+        adaptive = 4 * 60 * 60_000
+    elif size >= 2 * 1024 * 1024 * 1024:
+        adaptive = 2 * 60 * 60_000
+    elif size >= 500 * 1024 * 1024:
+        adaptive = 90 * 60_000
+    else:
+        adaptive = configured_ms
+    return max(configured_ms, adaptive)
 
 
 async def _delay(ms: int) -> None:

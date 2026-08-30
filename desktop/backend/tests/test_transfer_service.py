@@ -216,6 +216,7 @@ class TransferServiceTests(unittest.TestCase):
                     "enabled": True,
                     "pan115Cookie": "UID=1; CID=x; SEID=y",
                     "targetDirId": "0",
+                    "pauseEnabled": False,
                 }
             })
             service = TransferService(store)
@@ -240,6 +241,7 @@ class TransferServiceTests(unittest.TestCase):
                     "enabled": True,
                     "pan115Cookie": "UID=1; CID=x; SEID=y",
                     "targetDirId": "0",
+                    "pauseEnabled": False,
                 }
             })
             service = TransferService(store)
@@ -403,11 +405,11 @@ class TransferServiceTests(unittest.TestCase):
                 service._save_transfer_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
                 service._notify_cookie_use = AsyncMock()  # type: ignore[method-assign]
                 service._get_pan115_download_url = AsyncMock(  # type: ignore[method-assign]
-                    side_effect=lambda task, file, client: f"https://115.invalid/{file['id']}"
+                    side_effect=lambda task, file, client, account=None: f"https://115.invalid/{file['id']}"
                 )
                 service._snapshot_candidate_file_ids = AsyncMock(return_value={})  # type: ignore[method-assign]
 
-                async def wait_for_file(task, file, pan123, target_root_id, target_dir_id, before_ids):
+                async def wait_for_file(task, file, pan123, target_root_id, target_dir_id, before_ids, dir_cache=None):
                     return {
                         "fileId": int(file["id"]),
                         "filename": file["name"],
@@ -492,7 +494,7 @@ class TransferServiceTests(unittest.TestCase):
                     ))
                     return 777
 
-                async def wait_for_file(_task, file, _pan123, _root_id, _dir_id, _before_ids):
+                async def wait_for_file(_task, file, _pan123, _root_id, _dir_id, _before_ids, _dir_cache=None):
                     self.assertTrue(any(
                         item.get("offlineTaskId") == 777
                         for snapshot in snapshots for item in snapshot
@@ -573,6 +575,70 @@ class TransferServiceTests(unittest.TestCase):
                 pan123.list_offline_tasks.assert_not_awaited()
 
         asyncio.run(run())
+
+    def test_account_cooling_skips_and_recovers(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                service = TransferService(SessionStore(Path(directory)))
+                task = {"id": "t", "logs": []}
+                accounts = [
+                    {"name": "A", "cookie": "UID=1; CID=a; SEID=x"},
+                    {"name": "B", "cookie": "UID=2; CID=b; SEID=y"},
+                ]
+
+                self.assertEqual(service._filter_live_accounts(accounts, task), accounts)
+                marked = await service._mark_account_cooling(task, accounts[0], "[errno 990001] 需要登录")
+                self.assertTrue(marked)
+                live = service._filter_live_accounts(accounts, task)
+                self.assertEqual([a["name"] for a in live], ["B"])
+                # 冷却期内重复标记不重复通知
+                again = await service._mark_account_cooling(task, accounts[0], "[errno 990001] 需要登录")
+                self.assertFalse(again)
+                # 冷却到期恢复
+                fingerprint = service._account_fingerprint(accounts[0]["cookie"])
+                service._account_health[fingerprint]["coolUntilMs"] = 0
+                self.assertEqual(service._filter_live_accounts(accounts, task), accounts)
+
+        asyncio.run(run())
+
+    def test_expired_download_url_rotates_to_next_account(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                store = SessionStore(Path(directory))
+                store.write_config({"transfer": {"pan115Cookies": ["B|UID=2; CID=b; SEID=y"], "downloadMinIntervalMs": 0}})
+                service = TransferService(store)
+                service._remember_config(store.read_config().get("transfer"))
+                task = {"id": "t", "shareCode": "abc", "receiveCode": "pass", "logs": []}
+                file = {"id": "9", "name": "movie.mkv", "size": 1, "sourceType": "115_share"}
+
+                primary = {"name": "A", "cookie": "UID=1; CID=a; SEID=x"}
+                good_client = AsyncMock()
+                good_client.get_download_url.return_value = "https://115.invalid/ok"
+                # 主账号客户端返回未登录错误，验证池内换号
+                bad_client = AsyncMock()
+                bad_client.get_download_url.side_effect = ValueError("[errno 990001] 需要登录账号")
+                service._validate_pan115_download_url = AsyncMock()  # type: ignore[method-assign]
+
+                with patch("app.transfer_service.Pan115TransferClient", side_effect=lambda cookie: good_client):
+                    url = await service._get_pan115_download_url(task, file, bad_client, primary)
+
+                self.assertEqual(url, "https://115.invalid/ok")
+                # 主账号被标记冷却
+                self.assertTrue(service._is_account_cooling(primary))
+                self.assertTrue(any("115 账号失效" in item["message"] for item in task["logs"]))
+
+        asyncio.run(run())
+
+    def test_offline_wait_deadline_adapts_to_file_size(self):
+        from app.transfer_service import _offline_wait_deadline_ms
+
+        configured = 60 * 60_000
+        self.assertEqual(_offline_wait_deadline_ms(100 * 1024 * 1024, configured), configured)
+        self.assertEqual(_offline_wait_deadline_ms(600 * 1024 * 1024, configured), 90 * 60_000)
+        self.assertEqual(_offline_wait_deadline_ms(3 * 1024 * 1024 * 1024, configured), 2 * 60 * 60_000)
+        self.assertEqual(_offline_wait_deadline_ms(20 * 1024 * 1024 * 1024, configured), 4 * 60 * 60_000)
+        # 配置更长时以配置为准
+        self.assertEqual(_offline_wait_deadline_ms(20 * 1024 * 1024 * 1024, 5 * 60 * 60_000), 5 * 60 * 60_000)
 
 
 if __name__ == "__main__":

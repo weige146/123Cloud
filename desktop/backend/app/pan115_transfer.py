@@ -1,6 +1,9 @@
+import asyncio
 import base64
 import json
+import os
 import re
+import time
 from typing import Any, Dict, Iterable, List, Optional, Set, TypedDict
 
 import httpx
@@ -34,6 +37,10 @@ _LOCAL_GETID_URL = "https://webapi.115.com/files/getid"
 _LOCAL_DOWN_CHROME_URL = "https://proapi.115.com/app/chrome/downurl"
 _LOCAL_DELETE_URL = "https://webapi.115.com/rb/delete"
 _USER_INFO_URL = "https://my.115.com/?ct=ajax&ac=get_user_aq"
+# 分享目录展开的页间节流与瞬时错误重试参数；目录多的分享连发请求会触发 115 风控
+PAN115_SHARE_LIST_INTERVAL_MS = int(os.environ.get("PAN115_SHARE_LIST_INTERVAL_MS", "300"))
+PAN115_SHARE_LIST_MAX_ATTEMPTS = int(os.environ.get("PAN115_SHARE_LIST_MAX_ATTEMPTS", "3"))
+PAN115_SHARE_LIST_RETRY_BASE_MS = int(os.environ.get("PAN115_SHARE_LIST_RETRY_BASE_MS", "2000"))
 
 _G_KEY_L = bytes([0x78, 0x06, 0xAD, 0x4C, 0x33, 0x86, 0x5D, 0x18, 0x4C, 0x01, 0x3F, 0x46])
 _RSA_RAND_KEY = bytes(16)
@@ -129,9 +136,12 @@ def extract_115_links(text: str) -> List[Pan115ShareLink]:
 # 客户端
 # ---------------------------------------------------------------------------
 class Pan115TransferClient:
-    def __init__(self, cookie: str):
+    def __init__(self, cookie: str, list_interval_ms: int = PAN115_SHARE_LIST_INTERVAL_MS):
         self._cookie = cookie
-        self._client = httpx.AsyncClient()
+        # 115 大分享单页响应大且慢，httpx 默认 5 秒读超时会直接掐断解析阶段
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
+        self._list_interval_ms = max(0, int(list_interval_ms))
+        self._last_list_at = 0.0
         self._cached_user_id = ""
 
     async def close(self) -> None:
@@ -154,11 +164,14 @@ class Pan115TransferClient:
         title = (root_data.get("shareinfo") or {}).get("share_title")
         actual_receive_code = (root_data.get("shareinfo") or {}).get("receive_code") or receive_code
 
-        async def visit(dir_id: str, path: List[str]) -> None:
+        # 根目录与子目录统一走翻页遍历，避免根条目超过 1000 时被静默截断
+        async def visit(dir_id: str, path: List[str], first_page: Optional[Dict[str, Any]] = None) -> None:
             nonlocal files
             offset = 0
+            page = first_page
             while True:
-                page = await self._list(share_code, actual_receive_code, dir_id, 1000, offset)
+                if page is None:
+                    page = await self._list(share_code, actual_receive_code, dir_id, 1000, offset)
                 page_data = page.get("data") or {}
                 page_list = page_data.get("list") or []
                 for item in page_list:
@@ -188,27 +201,9 @@ class Pan115TransferClient:
                 total_count = int(page_data.get("count") or len(page_list))
                 if not page_list or offset >= total_count:
                     break
+                page = None
 
-        root_list = root_data.get("list") or []
-        for item in root_list:
-            name = str(item.get("n") or "").strip()
-            is_dir = int(item.get("fc", 1)) == 0
-            if is_dir:
-                child_dir_id = str(item.get("cid") or item.get("fid") or "")
-                if child_dir_id:
-                    await visit(child_dir_id, [name] if name else [])
-            elif item.get("fid") and name:
-                files.append(
-                    {
-                        "id": str(item.get("fid")),
-                        "name": name,
-                        "size": int(item.get("s") or 0),
-                        "sha1": str(item.get("sha")).lower() if item.get("sha") else None,
-                        "path": [],
-                        "status": "pending",
-                    }
-                )
-
+        await visit("", [], root)
         return {"title": title, "receive_code": actual_receive_code, "files": files}
 
     async def inspect_local_path(
@@ -475,10 +470,32 @@ class Pan115TransferClient:
             "format": "json",
         }
         url = f"{_SHARE_SNAP_URL}?{urlencode(params)}"
-        data = await self._fetch_json(url, share_code, receive_code)
-        if not data.get("data"):
-            raise ValueError(data.get("error") or data.get("message") or "115 分享列表为空或无权限访问")
-        return data
+        # 页间节流 + 瞬时错误（超时/风控网页/频繁）指数退避重试；超时与风控在 5 秒默认
+        # 超时时代是"大分享发完就失败"的直接原因
+        await self._throttle_share_list()
+        last_error: Exception = ValueError("115 分享列表未请求")
+        for attempt in range(1, PAN115_SHARE_LIST_MAX_ATTEMPTS + 1):
+            try:
+                data = await self._fetch_json(url, share_code, receive_code)
+                if not data.get("data"):
+                    raise ValueError(data.get("error") or data.get("message") or "115 分享列表为空或无权限访问")
+                return data
+            except Exception as error:
+                last_error = error
+                if attempt >= PAN115_SHARE_LIST_MAX_ATTEMPTS or not _is_transient_share_list_error(error):
+                    raise
+                await asyncio.sleep(PAN115_SHARE_LIST_RETRY_BASE_MS * attempt / 1000)
+                await self._throttle_share_list()
+        raise last_error
+
+    async def _throttle_share_list(self) -> None:
+        if self._list_interval_ms <= 0:
+            return
+        elapsed_ms = (time.monotonic() - self._last_list_at) * 1000
+        wait_ms = self._list_interval_ms - elapsed_ms
+        if wait_ms > 0:
+            await asyncio.sleep(wait_ms / 1000)
+        self._last_list_at = time.monotonic()
 
     async def _fetch_json(self, url: str, share_code: str, receive_code: str) -> Dict[str, Any]:
         response = await self._client.get(
@@ -496,7 +513,11 @@ class Pan115TransferClient:
             or data.get("state") is False
             or (data.get("errno") is not None and data.get("errno") != 0)
         ):
-            raise ValueError(data.get("error") or data.get("message") or f"115 API {response.status_code}")
+            errno = data.get("errno")
+            message = data.get("error") or data.get("message") or f"115 API {response.status_code}"
+            if errno is not None and str(errno) != "0":
+                message = f"[errno {errno}] {message}"
+            raise ValueError(message)
         return data
 
     async def _request_json(
@@ -547,7 +568,41 @@ def _assert_pan115_ok(response: httpx.Response, payload: Dict[str, Any], label: 
     errno = payload.get("errno")
     if response.is_success and payload.get("state") is not False and (errno is None or str(errno) == "0"):
         return
-    raise ValueError(payload.get("error") or payload.get("message") or f"{label} {response.status_code}")
+    message = payload.get("error") or payload.get("message") or f"{label} {response.status_code}"
+    if errno is not None and str(errno) != "0":
+        message = f"[errno {errno}] {message}"
+    raise ValueError(message)
+
+
+# 115 账号（Cookie）失效的典型特征：未登录错误码 990001、"需要登录"类文案
+_PAN115_EXPIRED_ERROR_RE = re.compile(
+    r"\[errno\s*990001?\]|需要登录|请重新登录|未登录|登录已失效|登录失效|登录状态失效|账号未登录|请登录",
+    re.IGNORECASE,
+)
+# 瞬时错误：限流/风控网页/超时，可重试；网页页面也可能是临时风控，先重试再换号
+_PAN115_TRANSIENT_ERROR_RE = re.compile(
+    r"操作频繁|请稍后|频繁|too many|rate|429|错误页|返回了网页页面|ReadTimeout|timed? ?out|timeout",
+    re.IGNORECASE,
+)
+# 网页页面（登录页/验证页）：对该账号应冷却停用，换其他账号
+_PAN115_PAGE_ERROR_RE = re.compile(r"返回了网页页面|需要验证|登录页", re.IGNORECASE)
+
+
+def _is_transient_share_list_error(error: Exception) -> bool:
+    message = str(error)
+    if _PAN115_EXPIRED_ERROR_RE.search(message):
+        return False
+    return bool(_PAN115_TRANSIENT_ERROR_RE.search(message))
+
+
+def classify_pan115_account_error(error: Exception) -> str:
+    """分类 115 账号错误：expired（Cookie 失效/账号不可用）/ transient（限流风控）/ other。"""
+    message = str(error)
+    if _PAN115_EXPIRED_ERROR_RE.search(message) or _PAN115_PAGE_ERROR_RE.search(message):
+        return "expired"
+    if _PAN115_TRANSIENT_ERROR_RE.search(message):
+        return "transient"
+    return "other"
 
 
 def _pan115_api_label(url_str: str) -> str:
