@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.2.2
-// @description  增强 123 云盘文件与分享管理：文件页全盘搜索、批量重命名与 TMDB 媒体整理（中文标题/英文别名命名、剧集季集校准、自动归类媒体库），按扩展名/关键词/大小清理文件并统计容量、检测空目录，秒传导入导出与转换（含分享口令规范化）、链接复制与 CSV 导出，支持液态玻璃主题与文件页纯净模式。
+// @version      1.2.3
+// @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @author       local
 // @license      MIT
 // @match        *://*.123pan.com/*
@@ -12903,6 +12903,10 @@ ${end.comment}` : end.comment;
     const text2 = toSimplified(String(value || ""));
     return /(?:Season\s*\d+|\bS\d{1,3}\b|[\u4E00-\u9FFF]{1,12}\u5B63)/i.test(text2);
   }
+  function namedSeasonAliasToken(value) {
+    // “中醫季”/“机长季”这类命名季标记（无数字季号）。
+    return (toSimplified(String(value || "")).match(/[\u4E00-\u9FFF]{1,8}\u5B63/g) || []).map((token) => token.replace(/[\s._·-]+/g, ""));
+  }
   function extractReleaseGroup(value, configured = []) {
     return extractReleaseGroupName(value, configured);
   }
@@ -13168,7 +13172,17 @@ ${end.comment}` : end.comment;
     const wanted = tmdbTitleKey(title);
     const wantedEquivalent = tmdbEquivalentTitleKey(title);
     if (!media || !wanted && !wantedEquivalent) return false;
-    return tmdbCandidateTitles(media).some((name) => tmdbTitleKey(name) === wanted || tmdbEquivalentTitleKey(name) === wantedEquivalent);
+    // 「主标题·命名季」（初入职场·中医季）接受主标题的命中。
+    const baseTitle = baseTitleWithoutSeasonAlias(title);
+    const wantedBase = baseTitle && baseTitle !== String(title || "").trim() ? tmdbTitleKey(toSimplified(baseTitle)) : "";
+    return tmdbCandidateTitles(media).some((name) => {
+      const key = tmdbTitleKey(name);
+      const simplifiedKey = wantedBase ? tmdbTitleKey(toSimplified(name)) : "";
+      return key === wanted || tmdbEquivalentTitleKey(name) === wantedEquivalent || wantedBase && wantedBase.length >= 4 && simplifiedKey === wantedBase;
+    });
+  }
+  function baseTitleWithoutSeasonAlias(title) {
+    return toSimplified(String(title || "")).replace(/[\s._·-]*[\u4E00-\u9FFF]{1,8}季\s*$/, "").trim();
   }
   function scoreTmdbCandidate(candidate, fields) {
     const media = normalizeTmdbMedia(candidate);
@@ -13180,6 +13194,22 @@ ${end.comment}` : end.comment;
     const titleKeys = titles.map(tmdbTitleKey).filter(Boolean);
     const equivalentKeys = titles.map(tmdbEquivalentTitleKey).filter(Boolean);
     const exact = titleKeys.includes(wanted) || equivalentKeys.includes(wantedEquivalent);
+    // 「主标题·命名季」（初入职场·中医季 → 初入职场）按主标题命中的候选也算
+    // 精确命中；命名季 alias 与 TMDB 某一季的季名/播出年份能对上时，宽恕
+    // 文件名年份（季播出年）与剧集首播年的偏差。
+    const baseTitle = baseTitleWithoutSeasonAlias(fields.title);
+    const wantedBase = baseTitle && baseTitle !== String(fields.title || "").trim() ? tmdbTitleKey(toSimplified(baseTitle)) : "";
+    const aliasExact = Boolean(wantedBase && wantedBase.length >= 4 && titles.some((name) => tmdbTitleKey(toSimplified(name)) === wantedBase));
+    let seasonYearMatchesAlias = false;
+    if (aliasExact && fields.year && Array.isArray(media.seasons)) {
+      const aliasToken = (toSimplified(String(fields.title || "")).match(/[\u4E00-\u9FFF]{1,8}季\s*$/) || [""])[0].trim();
+      seasonYearMatchesAlias = media.seasons.some((season) => {
+        const seasonNumber = Number(season.season_number ?? season.seasonNumber);
+        const seasonName = namedSeasonAliasToken(season.name || season.originalName || "");
+        const seasonYearMatch = String(season.air_date || season.airDate || "").slice(0, 4) === String(fields.year);
+        return seasonYearMatch || aliasToken && seasonName.includes(aliasToken.replace(/[\s._·-]+/g, ""));
+      });
+    }
     const compactWanted = wanted;
     const contains = titleKeys.some((name) => {
       const compact = name;
@@ -13187,9 +13217,10 @@ ${end.comment}` : end.comment;
       return compact.length >= 4 && compactWanted.length >= 4 && (compact.includes(compactWanted) || compactWanted.includes(compact));
     });
     if (exact) score += 220;
+    else if (aliasExact) score += 200;
     else if (contains) score += 35;
     else if (compactWanted) score -= 60;
-    if (fields.year) score += media.year === fields.year ? 140 : media.year ? -100 : -25;
+    if (fields.year) score += media.year === fields.year ? 140 : media.year ? seasonYearMatchesAlias ? 0 : -100 : -25;
     if (fields.mediaType && fields.mediaType !== "unknown") score += media.mediaType === fields.mediaType ? 80 : -160;
     const wantedSeason = Number(fields.season || 0);
     if (media.mediaType === "tv" && wantedSeason > 0 && Array.isArray(media.seasons) && media.seasons.length) {
@@ -13243,7 +13274,7 @@ ${end.comment}` : end.comment;
     const time = Date.parse(`${text2}T00:00:00Z`);
     return Number.isFinite(time) ? time : null;
   }
-  function relatedSpecialEpisodes(specials, targetSeason, fileNames) {
+  function relatedSpecialEpisodes(specials, targetSeason, fileNames, seasonAliases = null) {
     const regular = [];
     const special = [];
     for (const episode of specials) {
@@ -13258,13 +13289,14 @@ ${end.comment}` : end.comment;
     const requestedKinds = new Set((fileNames || []).flatMap((name) => specialContext(name).strongKeywords));
     const regularDates = regular.map((episode) => parseEpisodeAirDate(episode.airDate)).filter((value) => value !== null);
     const window2 = regularDates.length ? [Math.min(...regularDates) - 45 * 24 * 60 * 60 * 1e3, Math.max(...regularDates) + 120 * 24 * 60 * 60 * 1e3] : null;
+    // 命名季（TMDB 季名“中醫季”）没有数字季号，靠季名别名对应目标季；
+    // 其余命名季标记（如“金融季”）仍视为别的季而排除。
+    const targetAliases = new Set((seasonAliases || []).map((alias) => String(alias || "").replace(/[\s._·-]+/g, "")).filter(Boolean));
     const related = special.filter((episode) => {
       const context = specialContext(episode.name);
       if (context.seasonMarkers.length) return context.seasonMarkers.includes(targetSeason);
-      // Named season aliases such as “山海季” are season-scoped even when
-      // TMDB exposes no numeric marker. Do not let a coincident air date or
-      // shared “加更/Plus” type pull in another season's S00 entry.
-      if (hasNamedSeasonMarker(episode.name)) return false;
+      const episodeAliases = namedSeasonAliasToken(episode.name);
+      if (episodeAliases.length) return episodeAliases.some((alias) => targetAliases.has(alias));
       const airDate = parseEpisodeAirDate(episode.airDate);
       if (airDate !== null && window2 && airDate >= window2[0] && airDate <= window2[1]) return true;
       if (requestedKinds.size && context.strongKeywords.some((kind) => requestedKinds.has(kind))) return true;
@@ -13272,10 +13304,10 @@ ${end.comment}` : end.comment;
     });
     return [...regular, ...related];
   }
-  function filterEpisodeCandidatesForTargetSeason(episodes, targetSeason, fileNames = []) {
+  function filterEpisodeCandidatesForTargetSeason(episodes, targetSeason, fileNames = [], seasonAliases = null) {
     const normalized = [...episodes || []].map(normalizedEpisode);
     const season = Number(targetSeason || 0);
-    if (season > 0) return relatedSpecialEpisodes(normalized, season, fileNames);
+    if (season > 0) return relatedSpecialEpisodes(normalized, season, fileNames, seasonAliases);
     const regular = normalized.filter((episode) => episode.seasonNumber !== 0);
     const specials = normalized.filter((episode) => episode.seasonNumber === 0);
     if (!specials.length) return regular;
@@ -13621,6 +13653,19 @@ ${end.comment}` : end.comment;
     const value = Number(entry?.effectiveEpisode ?? entry?.hint?.episode ?? entry?.sourceEpisode ?? 0);
     return Number.isFinite(value) ? value : 0;
   }
+  function derivativeLabelSpecial(sourceName, candidate) {
+    // 文件与 S00 条目共享同一命名季标记（如“中医季”），且条目标题在去掉季名
+    // 之后仍有独立的衍生段（如“药食同源”），才允许衍生段标签压过文件名里
+    // 的正片 SxxExx 记号；普通正集文件（无命名季标记）永远不走这条路径。
+    const sourceAliases = namedSeasonAliasToken(sourceName);
+    if (!sourceAliases.length) return false;
+    const candidateName = String(candidate?.name || "");
+    const candidateAliases = namedSeasonAliasToken(candidateName);
+    if (!candidateAliases.some((alias) => sourceAliases.includes(alias))) return false;
+    const label = distinctiveEpisodeLabel(candidateName.split(/[：:]/, 1)[0] || candidateName);
+    const labelWithoutSeason = label.replace(/[\u4e00-\u9fff]{1,8}季/g, "");
+    return [...labelWithoutSeason].length >= 2;
+  }
   function matchEpisodeCandidates(files, episodes, season, targetSeason = 0, seasonRemap = null) {
     const sortedEpisodes = [...episodes].map(normalizedEpisode).sort((left, right) => left.seasonNumber - right.seasonNumber || left.episodeNumber - right.episodeNumber);
     const output = /* @__PURE__ */ new Map();
@@ -13664,6 +13709,18 @@ ${end.comment}` : end.comment;
       // unresolved so the source identity is retained — never onto an S00
       // entry.
       if (tokenAnchored && !entry2.context.strong) {
+        // 命名季的衍生段（如“中医季 药食同源第 1 期”）发布组仍会打上正片的
+        // SxxExx 记号；若 S00 里存在同命名季、同期数/日期的衍生条目，优先于
+        // 正片记号。期数以文件名标题里的「第N期」为准（发布组的记号沿用的是
+        // 正片流水号，与衍生段的期数错位）。普通正集文件没有命名季标记，不会
+        // 进入这条路径。
+        const derivativeHint = { ...entry2.hint, episode: entry2.hint.absolute || entry2.hint.episode };
+        const labelCandidate = specialEpisodeByLabel(derivativeHint, entry2.context, sortedEpisodes, entry2.file.name);
+        const derivativeSpecial = labelCandidate && derivativeLabelSpecial(entry2.file.name, labelCandidate) ? labelCandidate : null;
+        if (derivativeSpecial) {
+          output.set(String(entry2.file.id), { ...derivativeSpecial, reason: "TMDB 特别篇标题标签匹配", confidence: "high" });
+          continue;
+        }
         const explicitRegular = !entry2.combined && regularEpisode >= 0 ? sortedEpisodes.find((episode) => episode.seasonNumber === entry2.hint.season && episode.episodeNumber === regularEpisode) : null;
         if (explicitRegular) {
           const endEpisode = Number(entry2.effectiveEndEpisode || 0);
@@ -13677,7 +13734,12 @@ ${end.comment}` : end.comment;
       // the regular season. The S00 special chain therefore runs first and
       // must not be preempted by a regular episode sharing the token number.
       if (entry2.context.strong && !entry2.isRegularSource) {
-        const label = specialEpisodeByLabel(entry2.hint, entry2.context, sortedEpisodes, entry2.file.name);
+        // 发布组给加更/会员版打的正片记号可能与其标题里的「第N期」错位；
+        // 命名季衍生条目优先按标题期数匹配（derivativeLabelSpecial 守卫）。
+        const absoluteHint = { ...entry2.hint, episode: entry2.hint.absolute || entry2.hint.episode };
+        const absoluteLabel = entry2.hint.absolute > 0 && entry2.hint.absolute !== entry2.hint.episode ? specialEpisodeByLabel(absoluteHint, entry2.context, sortedEpisodes, entry2.file.name) : null;
+        const guardedAbsolute = absoluteLabel && derivativeLabelSpecial(entry2.file.name, absoluteLabel) ? absoluteLabel : null;
+        const label = guardedAbsolute || specialEpisodeByLabel(entry2.hint, entry2.context, sortedEpisodes, entry2.file.name);
         const identitySpecial = label ? null : specialEpisodeByIdentity(entry2.hint, entry2.context, sortedEpisodes);
         const specialCandidate = label || identitySpecial || specialEpisodeCandidate(entry2.hint, entry2.context, sortedEpisodes) || specialEpisodeByIssueNumber(entry2.hint, sortedEpisodes);
         // A variant file must not be pulled onto an unrelated lone S00
@@ -13934,6 +13996,38 @@ ${end.comment}` : end.comment;
   function looseGroupAnchor(file) {
     return String(file.sourceFolderId || file.parentId || file.parentFileId || "0");
   }
+  function stripLooseEpisodeTail(title) {
+    let value = String(title || "").trim();
+    const tailPatterns = [
+      /[\s._·-]*第\s*(?:[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+\s*)[期集話话](?:[\s._·-]*[上中下])?$/i,
+      /[\s._·-]*(?:EP?|ep)\s*\d{1,5}(?:[\s._·-]*[上中下])?$/,
+      /[\s._·-]*\d{1,4}(?:[\s._·-]*[上中下])?$/
+    ];
+    for (const pattern of tailPatterns) {
+      const stripped = value.replace(pattern, "").trim();
+      if (stripped && stripped !== value) return stripped;
+    }
+    return value;
+  }
+  function looseGroupBaseTitle(title) {
+    const stripped = stripLooseEpisodeTail(title);
+    return stripped && !isWeakLooseTitle(stripped) ? stripped : String(title || "").trim();
+  }
+  function looseGroupKeyTitle(baseTitle, text) {
+    const normalized = String(baseTitle || "").replace(/[\s._-]+/g, "").toLocaleLowerCase() || "unknown";
+    const season = seasonNumberFromText(text);
+    return Number.isInteger(season) ? `${normalized}:s${String(season).padStart(3, "0")}` : normalized;
+  }
+  function looseVariantRemainder(title, baseTitle) {
+    const value = String(title || "").trim();
+    const base = String(baseTitle || "").trim();
+    if (!base || !value.toLocaleLowerCase().startsWith(base.toLocaleLowerCase()) || value.length <= base.length) return "";
+    const rest = value.slice(base.length).replace(/^[\s._·-]+/, "").trim();
+    if (!rest || rest.length > 12 || isWeakLooseTitle(rest)) return "";
+    if (/(?:19|20)\d{2}|S\d{1,3}(?:E\d{1,5})?(?=$|[^A-Za-z0-9])/i.test(rest)) return "";
+    if (seasonNumberFromText(rest) !== null) return "";
+    return rest;
+  }
   function buildLooseGroups(loose, config) {
     const groups = [];
     const grouped = /* @__PURE__ */ new Map();
@@ -13943,22 +14037,56 @@ ${end.comment}` : end.comment;
       const title = inferTitle(text2);
       const unidentified = isWeakLooseTitle(title);
       const targetSeason = Number(file.targetSeason || 0);
-      const key = unidentified ? `unknown:${looseGroupAnchor(file)}:${targetSeason || ""}` : mediaKey(text2);
-      if (!grouped.has(key)) grouped.set(key, { key, files: [], names: [], unidentified, targetSeason: targetSeason || null });
+      // 结尾集号（01 / 第01集 / E02…）不参与分组键，同一标题的各集归为一组。
+      const baseTitle = unidentified ? title : looseGroupBaseTitle(title);
+      const key = unidentified ? `unknown:${looseGroupAnchor(file)}:${targetSeason || ""}` : looseGroupKeyTitle(baseTitle, text2);
+      if (!grouped.has(key)) grouped.set(key, { key, baseTitle, files: [], names: [], titles: [], unidentified, targetSeason: targetSeason || null });
       const group = grouped.get(key);
       group.files.push(file);
       group.names.push(text2);
+      group.titles.push(title);
       if (targetSeason && !group.targetSeason) group.targetSeason = targetSeason;
       group.unidentified &&= unidentified;
     }
-    for (const entry2 of grouped.values()) {
+    // 「主标题 + 短后缀」的衍生分组（如「X 药食同源」）并入主标题组；
+    // 后缀记录为每个文件的 variantLabel，命名时补回以避免同名冲突。
+    const entries = [...grouped.values()].sort((left, right) => left.baseTitle.length - right.baseTitle.length || left.key.localeCompare(right.key));
+    const mergedEntries = [];
+    for (const entry of entries) {
+      if (entry.unidentified || !entry.baseTitle) {
+        mergedEntries.push(entry);
+        continue;
+      }
+      let base = null;
+      let baseRemainder = "";
+      for (const candidate of mergedEntries) {
+        if (candidate.unidentified || !candidate.baseTitle) continue;
+        const remainder = looseVariantRemainder(entry.baseTitle, candidate.baseTitle);
+        if (remainder && (!base || candidate.baseTitle.length > base.baseTitle.length)) {
+          base = candidate;
+          baseRemainder = remainder;
+        }
+      }
+      if (base) {
+        for (const file of entry.files) file.variantLabel = baseRemainder;
+        base.files.push(...entry.files);
+        base.names.push(...entry.names);
+        base.titles.push(...entry.titles);
+        if (entry.targetSeason && !base.targetSeason) base.targetSeason = entry.targetSeason;
+        base.unidentified &&= entry.unidentified;
+        continue;
+      }
+      mergedEntries.push(entry);
+    }
+    for (const entry2 of mergedEntries) {
       const files = entry2.files;
       if (!files.some((file) => isVideoFile(file.name))) continue;
       const sortedNames = [...entry2.names].sort((left, right) => inferTitleLength(left) - inferTitleLength(right));
       const displayTitle = sortedNames.map(looseDisplayTitleWithSeason).find(Boolean);
-      const sourceTitle = entry2.unidentified ? "\u672A\u8BC6\u522B\u5A92\u4F53" : displayTitle || inferTitle(sortedNames.find((name) => !isWeakLooseTitle(inferTitle(name))) || sortedNames[0]) || "\u672A\u8BC6\u522B\u5A92\u4F53";
+      const shortestTitle = [...new Set(entry2.titles.filter((title) => title && !isWeakLooseTitle(title)))].sort((left, right) => left.length - right.length)[0] || "";
+      const sourceTitle = entry2.unidentified ? "\u672A\u8BC6\u522B\u5A92\u4F53" : displayTitle || (!isWeakLooseTitle(entry2.baseTitle) ? entry2.baseTitle : "") || shortestTitle || inferTitle(sortedNames.find((name) => !isWeakLooseTitle(inferTitle(name))) || sortedNames[0]) || "\u672A\u8BC6\u522B\u5A92\u4F53";
       const firstFile = files[0];
-      const idKey = entry2.unidentified ? `unknown:${looseGroupAnchor(firstFile)}${entry2.targetSeason ? `:s${String(entry2.targetSeason).padStart(3, "0")}` : ""}` : mediaKey(entry2.names[0]);
+      const idKey = entry2.unidentified ? `unknown:${looseGroupAnchor(firstFile)}${entry2.targetSeason ? `:s${String(entry2.targetSeason).padStart(3, "0")}` : ""}` : entry2.key;
       groups.push({
         id: `loose:${idKey}:${firstFile.parentId || firstFile.parentFileId || "0"}`,
         title: sourceTitle,
@@ -14251,6 +14379,53 @@ ${end.comment}` : end.comment;
   function episodeFieldSnapshot(fields) {
     return Object.fromEntries(EPISODE_FIELD_KEYS.filter((key) => hasOwn(fields, key)).map((key) => [key, fields[key]]));
   }
+  function organizeVariantTag(file, context = {}) {
+    // 同组内同集号的多版本文件（正片上/下、加更版、衍生段）必须产出不同的
+    // 文件名：执行阶段的同名冲突会把后写文件清进回收站，不能靠冲突兜底。
+    if (context.variantLabel) return cleanPathPart(context.variantLabel);
+    if (context.matchedToSpecial) return "";
+    const name = String(file?.name || "");
+    if (context.specialStrong) {
+      const keyword = (specialKeywordText(name).match(VARIETY_TITLE_SUFFIX) || [""])[0].replace(/^[\s._·-]+/, "").trim();
+      if (keyword) return cleanPathPart(keyword);
+    }
+    const part = episodePartOrder(name);
+    if (part > 0) {
+      const numeric = name.match(/(?:Part|Pt)[ ._-]*([0-9]+)/i);
+      if (numeric) return `Part${String(Number(numeric[1])).padStart(2, "0")}`;
+      const chinese = name.match(/([上中下])(?:集|期|篇|半|部)?(?=$|[\s._\-\]】)）])/);
+      if (chinese) return chinese[1];
+    }
+    return "";
+  }
+  function injectNameVariant(normalizedName, tag) {
+    const value = String(normalizedName || "");
+    const tagValue = String(tag || "").trim();
+    if (!value || !tagValue) return value;
+    if (value.toLocaleLowerCase().includes(tagValue.toLocaleLowerCase())) return value;
+    const [stem, extension] = splitExtension(value);
+    // 变体（Part01/药食同源/加更版…）插在季集记号之后、分辨率等技术参数之前，
+    // 与发布组命名习惯一致；无季集记号时退回扩展名前的老位置。
+    const anchor = stem.match(/^.*?\bS\d{1,3}(?:[ ._-]*E\d{1,5}(?:\s*-\s*(?:S\d{1,3}\s*)?E?\d{1,5})?)?(?=$|[^A-Za-z0-9])/i);
+    const merged = anchor ? `${stem.slice(0, anchor[0].length)}.${tagValue}${stem.slice(anchor[0].length)}` : `${stem}.${tagValue}`;
+    return cleanRenderedName(merged, extension);
+  }
+  function synthesizeEpisodeCandidatesFromNames(files) {
+    // TMDB 数据取不到（离线/超时/未收录）时，用文件名自身的季集号生成
+    // 候选列表，保证「自动季集」下拉框始终可用、可手动锁定。
+    const seen = /* @__PURE__ */ new Map();
+    for (const file of files || []) {
+      const name = String(file?.name || "");
+      if (!isVideoFile(name)) continue;
+      const parsed = parseSeasonEpisode(name, 0);
+      const season = Number(parsed?.season || 0);
+      const episode = Number(parsed?.episode || 0);
+      if (!parsed?.seasonEpisode || season < 0 || episode <= 0) continue;
+      const key = parsed.seasonEpisode.toUpperCase();
+      if (!seen.has(key)) seen.set(key, { id: `hint:${key}`, seasonNumber: season, episodeNumber: episode, seasonEpisode: parsed.seasonEpisode, name: "按文件名识别", airDate: "" });
+    }
+    return [...seen.values()].sort((left, right) => left.seasonNumber - right.seasonNumber || left.episodeNumber - right.episodeNumber);
+  }
   async function buildGroupPreview(tmdb, group, config, options, warnings) {
     const names = group.files.map((file) => file.name);
     let fields = inferFields(group.title, names.filter(isVideoFile), config.library);
@@ -14329,6 +14504,11 @@ ${end.comment}` : end.comment;
       const seasonFolder = buildSeasonFolder(fileFields, options.inPlace ? config.templates.inPlaceSeasonFolder : config.templates.seasonFolder);
       const extension = extensionOf(file.name);
       const normalizedName = buildFileName(fileFields, extension, config.templates) || cleanName(file.name);
+      const variantTag = organizeVariantTag(file, {
+        variantLabel: file.variantLabel,
+        specialStrong: Boolean(sourceSpecialContext.strong),
+        matchedToSpecial: Boolean(match && Number(match.seasonNumber) === 0)
+      });
       const hasManualName = Object.prototype.hasOwnProperty.call(options.manualNames || {}, String(file.id));
       const manualName = options.manualNames?.[String(file.id)];
       const newName = hasManualName ? String(manualName) : normalizedName;
@@ -14339,6 +14519,8 @@ ${end.comment}` : end.comment;
         sourceTitle: fields.title,
         newName,
         normalizedName,
+        variantTag,
+        hasManualName,
         folderParts,
         targetPath: [...folderParts, newName].join("/"),
         fields: { ...fileFields, category, mediaFolder, seasonFolder },
@@ -14352,6 +14534,7 @@ ${end.comment}` : end.comment;
       });
       if (isVideoFile(file.name)) videoIndex += 1;
     }
+    applyVariantTagsForCollisions(tasks);
     return {
       tasks,
       preview: {
@@ -14383,6 +14566,29 @@ ${end.comment}` : end.comment;
   ];
   function hasOwn(value, key) {
     return Object.prototype.hasOwnProperty.call(value || {}, key);
+  }
+  function applyVariantTagsForCollisions(tasks) {
+    // 集号校准后各文件名通常已天然不同（含 S00 特别篇），变体标记
+    // （Part01/加更版/药食同源…）只在归一化文件名仍然冲突时插入消歧。
+    const counts = /* @__PURE__ */ new Map();
+    for (const task of tasks) {
+      const key = String(task.normalizedName || "").toLocaleLowerCase();
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    for (const task of tasks) {
+      const tag = task.variantTag;
+      if (!tag) continue;
+      const key = String(task.normalizedName || "").toLocaleLowerCase();
+      if ((counts.get(key) || 0) <= 1) continue;
+      const injected = injectNameVariant(task.normalizedName, tag) || task.normalizedName;
+      if (injected === task.normalizedName) continue;
+      task.normalizedName = injected;
+      if (!task.hasManualName) {
+        task.newName = injected;
+        task.targetPath = [...(task.folderParts || []), injected].join("/");
+      }
+    }
+    return tasks;
   }
   function refreshOrganizeGroupTargets(group, config, options = {}) {
     if (!group) return group;
@@ -14431,6 +14637,11 @@ ${end.comment}` : end.comment;
       const season = fields.mediaType === "tv" && merged.seasonEpisode ? buildSeasonFolder({ ...merged, season: String(parseSeasonEpisode(merged.seasonEpisode, Number(merged.season || 1)).season || merged.season || 1) }, options.inPlace ? config.templates.inPlaceSeasonFolder : config.templates.seasonFolder) : "";
       merged.seasonFolder = season;
       const normalizedName = buildFileName(merged, extensionOf(file.name), config.templates) || cleanName(file.name);
+      const variantTag = organizeVariantTag(file, {
+        variantLabel: file.variantLabel,
+        specialStrong: Boolean(specialContext(file.name).strong),
+        matchedToSpecial: Number(merged.season || 0) === 0
+      });
       const hasManualName = Object.prototype.hasOwnProperty.call(options.manualNames || {}, String(file.id));
       const newName = hasManualName ? String(options.manualNames[String(file.id)]) : normalizedName;
       const folderParts = options.inPlace ? [fields.mediaFolder, season].filter(Boolean) : [fields.category, fields.mediaFolder, season].filter(Boolean);
@@ -14440,6 +14651,8 @@ ${end.comment}` : end.comment;
         seasonFolder: season,
         folderParts,
         normalizedName,
+        variantTag,
+        hasManualName,
         newName,
         targetPath: [...folderParts, newName].join("/"),
         discard: file.discard,
@@ -14453,6 +14666,7 @@ ${end.comment}` : end.comment;
       if (isVideoFile(file.name)) videoIndex += 1;
       return next;
     });
+    applyVariantTagsForCollisions(group.files || []);
     return group;
   }
   function collectOrganizeValidationWarnings(preview) {
@@ -14836,16 +15050,25 @@ ${end.comment}` : end.comment;
     // remapping files to the nearest season.
     const effectiveTargetSeason = targetSeason;
     const fileNames = group.files.map((file) => file.name);
+    // TMDB 季名（如“中醫季”）作为无数字季号的特别篇标题归属目标季的依据。
+    const seasonAliasesByNumber = new Map();
+    for (const season of Array.isArray(media.seasons) ? media.seasons : []) {
+      const number = Number(season.season_number ?? season.seasonNumber);
+      if (!Number.isInteger(number) || number <= 0) continue;
+      const aliases = namedSeasonAliasToken(season.name || "").concat(namedSeasonAliasToken(season.originalName || ""));
+      if (aliases.length) seasonAliasesByNumber.set(number, [...new Set(aliases)]);
+    }
+    const aliasesFor = (season) => seasonAliasesByNumber.get(Number(season)) || [];
     const positiveSeasons = [...new Set([...requested, effectiveTargetSeason].map(Number).filter((season) => Number.isInteger(season) && season > 0))];
     let episodes;
     if (positiveSeasons.length > 1) {
       const merged = new Map();
       for (const season of positiveSeasons) {
-        for (const episode of filterEpisodeCandidatesForTargetSeason(rawEpisodes, season, fileNames)) merged.set(String(episode.id), episode);
+        for (const episode of filterEpisodeCandidatesForTargetSeason(rawEpisodes, season, fileNames, aliasesFor(season))) merged.set(String(episode.id), episode);
       }
       episodes = [...merged.values()];
     } else {
-      episodes = filterEpisodeCandidatesForTargetSeason(rawEpisodes, effectiveTargetSeason, fileNames);
+      episodes = filterEpisodeCandidatesForTargetSeason(rawEpisodes, effectiveTargetSeason, fileNames, aliasesFor(effectiveTargetSeason));
     }
     const matches = matchEpisodeCandidates(group.files.filter((file) => isVideoFile(file.name)), episodes, Number(group.fields?.season || 1), effectiveTargetSeason, seasonRemap);
     return { episodes, matches: Object.fromEntries(matches), warnings };
@@ -18674,6 +18897,9 @@ ${end.comment}` : end.comment;
           const matched = Object.entries(calibration.matches || {});
           const matchedByFile = new Map(matched.map(([fileId, match]) => [String(fileId), match]));
           const candidates = (calibration.episodes || []).map((episode) => ({ ...episode }));
+          // TMDB 拿不到季集数据（离线/超时/未收录）时用文件名季集兜底，
+          // 保证每个文件仍有「自动季集」下拉框可以手动锁定。
+          if (!candidates.length) candidates.push(...synthesizeEpisodeCandidatesFromNames(group.files || []));
           // A calibration run is authoritative for this group. Replace the
           // candidate rail and clear locks/results from an earlier run before
           // applying the new matches; otherwise an unmatched S00 file can
