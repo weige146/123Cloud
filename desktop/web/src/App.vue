@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useGlobalState } from "@/composables/useGlobalState";
 import { useResponsive } from "@/composables/useResponsive";
+import { useUpdater } from "@/composables/useUpdater";
 import { displayName, formatBytes, normalizeAvatarUrl } from "@/utils/format";
 import AccountMenu from "@/components/AccountMenu.vue";
 import NavigationSearch from "@/components/NavigationSearch.vue";
@@ -23,12 +24,24 @@ const route = useRoute();
 const router = useRouter();
 const { state, loadStatus, setToast, confirmation, resolveConfirmation } = useGlobalState();
 const { isMobile } = useResponsive();
+const updater = useUpdater();
+
+// 新版本下载完成后全局提示一次；安装入口在设置页「软件更新」
+watch(
+  () => updater.state.status,
+  (status) => {
+    if (status === "downloaded") {
+      const version = updater.state.info?.version || "";
+      setToast(`新版本 ${version} 已下载，可在「设置 → 软件更新」里重启安装`, "success");
+    }
+  },
+);
 
 const isDesktop = Boolean((window as unknown as { cloud123?: { isDesktop?: boolean } }).cloud123?.isDesktop);
 const moreOpen = ref(false);
 
 const navigation: NavigationItem[] = [
-  { key: "home", label: "首页", shortLabel: "首页", icon: "mdi-view-dashboard-outline", path: "/admin/home", routes: ["/admin/home"] },
+  { key: "console", label: "控制台", shortLabel: "控制台", icon: "mdi-console", path: "/admin/console", routes: ["/admin/console"] },
   {
     key: "submission",
     label: "投稿",
@@ -62,7 +75,10 @@ const currentTitle = computed(() => String(route.meta?.title || "123Cloud"));
 const pan = computed(() => state.status?.pan123);
 const profile = computed(() => pan.value?.profile);
 const panName = computed(() => displayName(profile.value || null, pan.value?.user || ""));
+// 登录 token 过期后 profile 无法刷新，头像等缓存链接会失效，需要用户重新登录
+const panLoginExpired = computed(() => pan.value?.loginExpired === true);
 const panMeta = computed(() => {
+  if (panLoginExpired.value) return "登录已过期，请重新登录 123 账号";
   const currentProfile = profile.value;
   if (!currentProfile) return pan.value?.authenticated ? "账号已连接" : "未登录 123 云盘";
   const parts: string[] = [];
@@ -82,6 +98,18 @@ const avatarInitials = computed(() => panName.value.slice(0, 2) || "12");
 const railGroups = computed(() => navigation.filter((item) => item.children));
 const flatItems = computed(() => navigation.filter((item) => !item.children));
 
+// 侧栏收起（ZCode/Codex 同款）：收起后只剩图标栏，状态记忆在本地
+const RAIL_COLLAPSED_KEY = "navRailCollapsed";
+const railCollapsed = ref((() => {
+  try { return localStorage.getItem(RAIL_COLLAPSED_KEY) === "1"; } catch { return false; }
+})());
+watch(railCollapsed, (collapsed) => {
+  try { localStorage.setItem(RAIL_COLLAPSED_KEY, collapsed ? "1" : "0"); } catch { /* 隐私模式忽略 */ }
+});
+function toggleRail() {
+  railCollapsed.value = !railCollapsed.value;
+}
+
 const mobileDock = computed(() => [navigation[0], navigation[1], navigation[2], navigation[3]]);
 
 const morePages = computed(() => navigation.flatMap((item) => item.children || [{ label: item.label, path: item.path, icon: item.icon }]));
@@ -92,6 +120,10 @@ function isActive(item: NavigationItem) {
 
 function isChildActive(item: NavigationItem, child: { path: string }) {
   return item.routes.includes(child.path);
+}
+
+function isGroupActive(group: NavigationItem) {
+  return group.routes.includes(route.path);
 }
 
 function navigate(path: string) {
@@ -125,9 +157,9 @@ watch(isPublicPage, (isPublic) => {
 
     <template v-if="!isPublicPage">
       <div v-if="isDesktop" class="drag-strip" />
-      <div class="desktop-frame">
-        <aside class="side-rail">
-          <button type="button" class="side-rail__brand" aria-label="返回首页" @click="navigate('/admin/home')">
+      <div class="desktop-frame" :class="{ 'desktop-frame--no-rail': railCollapsed }">
+        <aside class="side-rail" :class="{ 'side-rail--collapsed': railCollapsed }">
+          <button type="button" class="side-rail__brand" aria-label="返回控制台" @click="navigate('/admin/console')">
             <span class="brand-mark">123</span>
             <span class="brand-copy">
               <strong>123Cloud</strong>
@@ -136,7 +168,7 @@ watch(isPublicPage, (isPublic) => {
           </button>
 
           <div class="side-rail__search">
-            <NavigationSearch v-if="!isMobile" />
+            <NavigationSearch v-if="!isMobile && !railCollapsed" />
           </div>
 
           <nav class="side-rail__nav" aria-label="主导航">
@@ -146,33 +178,48 @@ watch(isPublicPage, (isPublic) => {
                 type="button"
                 class="nav-item"
                 :class="{ active: isActive(item) }"
+                :title="item.label"
                 @click="navigate(item.path)"
               >
                 <v-icon :icon="item.icon" size="19" />
                 <span>{{ item.label }}</span>
-                <span v-if="item.key === 'home'" class="nav-dot" :data-online="Boolean(state.status)" />
+                <span v-if="item.key === 'console'" class="nav-dot" :data-online="Boolean(state.status)" />
               </button>
             </template>
 
             <template v-for="group in railGroups" :key="group.key">
-              <span class="nav-group-label">{{ group.label }}</span>
+              <span v-if="!railCollapsed" class="nav-group-label">{{ group.label }}</span>
               <button
-                v-for="child in group.children"
-                :key="child.path"
+                v-if="railCollapsed"
                 type="button"
                 class="nav-item"
-                :class="{ active: isChildActive(group, child) }"
-                @click="navigate(child.path)"
+                :class="{ active: isGroupActive(group) }"
+                :title="group.label"
+                :aria-label="group.label"
+                @click="navigate(group.path)"
               >
-                <v-icon :icon="child.icon" size="18" />
-                <span>{{ child.label }}</span>
+                <v-icon :icon="group.icon" size="19" />
               </button>
+              <template v-else>
+                <button
+                  v-for="child in group.children"
+                  :key="child.path"
+                  type="button"
+                  class="nav-item"
+                  :class="{ active: isChildActive(group, child) }"
+                  @click="navigate(child.path)"
+                >
+                  <v-icon :icon="child.icon" size="18" />
+                  <span>{{ child.label }}</span>
+                </button>
+              </template>
             </template>
 
             <button
               type="button"
               class="nav-item"
               :class="{ active: isActive(navigation[3]) }"
+              title="设置"
               @click="navigate('/admin/settings')"
             >
               <v-icon icon="mdi-cog-outline" size="19" />
@@ -188,11 +235,12 @@ watch(isPublicPage, (isPublic) => {
               :initials="avatarInitials"
               :authenticated="Boolean(pan?.authenticated)"
               :loading="state.loading"
+              :expired="panLoginExpired"
               @refresh="loadStatus"
             />
-            <span class="side-rail__account" :title="panMeta">
+            <span class="side-rail__account" :class="{ 'login-expired': panLoginExpired }" :title="panMeta">
               <strong>{{ panName }}</strong>
-              <small>{{ pan?.authenticated ? "已连接" : "未登录" }}</small>
+              <small>{{ panLoginExpired ? "登录已过期" : pan?.authenticated ? "已连接" : "未登录" }}</small>
             </span>
             <span class="side-rail__spacer" />
             <ThemeSettingsMenu button-class="rail-icon-button" />
@@ -210,7 +258,16 @@ watch(isPublicPage, (isPublic) => {
         </aside>
 
         <main class="content-canvas">
-          <div class="content-topline">
+          <div class="content-topline" :class="{ 'content-topline--no-rail': railCollapsed }">
+            <button
+              type="button"
+              class="rail-toggle"
+              aria-label="收起或展开侧栏"
+              :title="railCollapsed ? '展开侧栏' : '收起侧栏'"
+              @click="toggleRail"
+            >
+              <v-icon icon="mdi-dock-left" size="18" />
+            </button>
             <span class="content-title">{{ currentTitle }}</span>
             <span class="content-spacer" />
           </div>
@@ -314,6 +371,29 @@ watch(isPublicPage, (isPublic) => {
 </template>
 
 <style scoped>
+/* 侧栏收起/展开开关：常驻在内容区顶栏（ZCode 同款），侧栏收起时整体滑出隐藏 */
+.rail-toggle {
+  -webkit-app-region: no-drag;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-muted);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: color var(--transition), background-color var(--transition);
+}
+.rail-toggle:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.desktop-frame--no-rail { gap: 0; }
+
 .side-rail__search {
   padding: 0 12px 8px;
 }
@@ -338,6 +418,7 @@ watch(isPublicPage, (isPublic) => {
   white-space: nowrap;
 }
 .side-rail__account small { font-size: 10.5px; color: var(--text-muted); }
+.side-rail__account.login-expired small { color: var(--warning); }
 .side-rail__spacer { flex: 1; }
 
 .rail-icon-button {
@@ -348,15 +429,25 @@ watch(isPublicPage, (isPublic) => {
 .content-topline {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 14px 22px 0;
+  gap: 8px;
+  flex: 0 0 46px;
+  height: 46px;
+  padding: 0 14px;
   -webkit-app-region: drag;
+  user-select: none;
+  -webkit-user-select: none;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015));
+}
+/* 侧栏收起后窗口红绿灯落在顶栏上，左侧留出系统控件位置 */
+.content-topline--no-rail {
+  padding-left: 84px;
 }
 .content-topline .content-title {
-  font-size: 12px;
-  font-weight: 650;
-  color: var(--text-muted);
-  letter-spacing: 0.02em;
+  font-size: 13px;
+  font-weight: 620;
+  color: var(--text-secondary);
+  letter-spacing: 0.01em;
 }
 .content-topline .content-spacer { flex: 1; }
 

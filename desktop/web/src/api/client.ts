@@ -45,37 +45,6 @@ export async function apiJson<T = unknown>(url: string, method: "POST" | "PUT" |
   return readJson<T>(response);
 }
 
-type TelegramWebApp = { initData?: string };
-
-function telegramInitData(): string {
-  return ((window as Window & { Telegram?: { WebApp?: TelegramWebApp } }).Telegram?.WebApp?.initData || "").trim();
-}
-
-export async function apiTelegramGet<T = unknown>(url: string): Promise<T> {
-  const response = await fetch(url, {
-    cache: "no-store",
-    headers: {
-      accept: "application/json",
-      "X-Telegram-Init-Data": telegramInitData(),
-    },
-  });
-  return readJson<T>(response);
-}
-
-export async function apiTelegramJson<T = unknown>(url: string, method: "PUT" | "DELETE", body?: unknown): Promise<T> {
-  const init: RequestInit = {
-    method,
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json",
-      "X-Telegram-Init-Data": telegramInitData(),
-    },
-  };
-  if (body !== undefined) init.body = JSON.stringify(body);
-  const response = await fetch(url, init);
-  return readJson<T>(response);
-}
-
 export const api = {
   get: apiGet,
   post: <T = unknown>(url: string, body?: unknown) => apiJson<T>(url, "POST", body),

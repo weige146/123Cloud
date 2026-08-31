@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.2.1
+// @version      1.2.2
 // @description  增强 123 云盘文件与分享管理：文件页全盘搜索、批量重命名与 TMDB 媒体整理（中文标题/英文别名命名、剧集季集校准、自动归类媒体库），按扩展名/关键词/大小清理文件并统计容量、检测空目录，秒传导入导出与转换（含分享口令规范化）、链接复制与 CSV 导出，支持液态玻璃主题与文件页纯净模式。
 // @author       local
 // @license      MIT
@@ -13394,6 +13394,30 @@ ${end.comment}` : end.comment;
     if (context.strong && dated.length === 1) return dated[0];
     return context.strong && specials.length === 1 ? specials[0] : null;
   }
+  var MEMBER_VARIANT_KINDS = ["member", "memberBonus", "memberPlus"];
+  function isMemberVariantContext(context) {
+    return context.strongKeywords.length > 0 && context.strongKeywords.every((kind) => MEMBER_VARIANT_KINDS.includes(kind));
+  }
+  function specialCandidateAgrees(hint, episode, byLabel, context) {
+    if (byLabel) return true;
+    if (hint.date && episode.airDate === hint.date) return true;
+    if (Number(hint.episode || 0) > 0 && parseSeasonEpisode(String(episode.name || ""), Number(hint.season || 1)).episode === Number(hint.episode)) return true;
+    const candidateKinds = specialContext(String(episode.name || "")).strongKeywords;
+    return candidateKinds.some((kind) => context.strongKeywords.includes(kind));
+  }
+  function specialEpisodeByIssueNumber(hint, episodes) {
+    // 会员版/加更 numbering follows the 期数 of their own season ("会员版第01期"
+    // = S00 "第2季 第1期加更"), even when the air date drifted by a day.
+    const issue = Number(hint.episode || 0);
+    if (issue <= 0) return null;
+    const targetSeason = Number(hint.season || 0);
+    const byIssue = episodes.filter((episode) => episode.seasonNumber === 0 && parseSeasonEpisode(String(episode.name || ""), targetSeason || 1).episode === issue);
+    const scoped = targetSeason > 0 ? byIssue.filter((episode) => {
+      const markers = specialContext(episode.name).seasonMarkers;
+      return !markers.length || markers.includes(targetSeason);
+    }) : byIssue;
+    return scoped.length === 1 ? scoped[0] : null;
+  }
   function specialEpisodeByIdentity(hint, context, episodes) {
     if (!context.identityKinds?.length) return null;
     const targetSeason = Number(hint.season || 0);
@@ -13573,13 +13597,14 @@ ${end.comment}` : end.comment;
   function hasExplicitSeasonEpisodeToken(value) {
     return /(?:^|[^A-Za-z0-9])S\d{1,3}[ ._-]*E\d{1,5}(?=$|[^A-Za-z0-9])/i.test(String(value || ""));
   }
-  function detectPilotEpisodeOffset(files, episodes, targetSeason) {
-    const season = Number(targetSeason || 0);
+  function detectPilotEpisodeOffset(files, episodes, targetSeason, seasonRemap = null) {
+    const season = Number(remapCalibrationSeasonValue(targetSeason, seasonRemap) || 0);
     if (season <= 0) return 0;
     const sourceFiles = (files || []).filter((file) => {
       if (!isVideoFile(file.name) || !hasExplicitSeasonEpisodeToken(file.name)) return false;
       const hint = parseEpisodeHint(file.name, season);
-      if (hint.season !== season || hint.episode !== 0) return false;
+      const hintSeason = Number(remapCalibrationSeasonValue(hint.season, seasonRemap));
+      if (hintSeason !== season || hint.episode !== 0) return false;
       // A file explicitly labelled as Plus/特辑/etc. is an S00 candidate,
       // even when its filename happens to contain SxxE00.
       const context = specialContext(file.name);
@@ -13596,12 +13621,18 @@ ${end.comment}` : end.comment;
     const value = Number(entry?.effectiveEpisode ?? entry?.hint?.episode ?? entry?.sourceEpisode ?? 0);
     return Number.isFinite(value) ? value : 0;
   }
-  function matchEpisodeCandidates(files, episodes, season, targetSeason = 0) {
+  function matchEpisodeCandidates(files, episodes, season, targetSeason = 0, seasonRemap = null) {
     const sortedEpisodes = [...episodes].map(normalizedEpisode).sort((left, right) => left.seasonNumber - right.seasonNumber || left.episodeNumber - right.episodeNumber);
     const output = /* @__PURE__ */ new Map();
-    const pilotOffset = detectPilotEpisodeOffset(files, sortedEpisodes, targetSeason || season);
+    const pilotOffset = detectPilotEpisodeOffset(files, sortedEpisodes, targetSeason || season, seasonRemap);
     const entries = [...files].sort((left, right) => naturalCompare(left.relativePath || left.name, right.relativePath || right.name)).map((file) => {
       const hint = parseEpisodeHint(file.name, Number(targetSeason || season || 1));
+      if (seasonRemap && hint.season === seasonRemap.from) {
+        // Token seasons follow the release group's own numbering; the
+        // calibrated target season is authoritative (see reconcileCalibrationSeason).
+        hint.season = seasonRemap.to;
+        hint.seasonEpisode = hint.seasonEpisode ? hint.seasonEpisode.replace(/^S\d{1,3}/i, `S${String(seasonRemap.to).padStart(2, "0")}`) : hint.seasonEpisode;
+      }
       const context = specialContext(file.name);
       const pilotOnlyLabel = context.strongKeywords.length > 0 && context.strongKeywords.every((kind) => kind === "pilot");
       const isRegularSource = pilotOffset > 0 && hint.season === Number(targetSeason || season || 1) && hasExplicitSeasonEpisodeToken(file.name) && hint.episode >= 0 && (!context.strong || pilotOnlyLabel) && !context.contextual;
@@ -13609,6 +13640,7 @@ ${end.comment}` : end.comment;
         file,
         hint,
         context,
+        isRegularSource,
         part: hint.fraction ? 2 : episodePartOrder(file.name),
         physicalPart: /(?:^|[^A-Za-z0-9])(?:cd|disc|disk|dvd)[\s._-]*\d{1,2}(?=$|[^A-Za-z0-9])/i.test(file.name),
         combined: combinedPartHint(file.name),
@@ -13625,26 +13657,63 @@ ${end.comment}` : end.comment;
         output.set(String(entry2.file.id), last ? episodeRangeMatch(explicitSpecial, last, "TMDB \u663E\u5F0F S00 \u5B63\u96C6\u5339\u914D") : { ...explicitSpecial, reason: "TMDB \u663E\u5F0F S00 \u5B63\u96C6\u5339\u914D", confidence: "high" });
         continue;
       }
-      // An explicit positive-season SxxExx token is authoritative during
-      // calibration.  Special keywords such as Extra/幕后 may describe a
-      // release variant, but must not remap a file from S02 into an S00
-      // episode when the requested regular-season episode exists.
       const regularEpisode = regularSourceEpisode(entry2);
-      const explicitRegular = !entry2.combined && entry2.hint.season > 0 && regularEpisode >= 0 && hasExplicitSeasonEpisode(entry2.file.name) ? sortedEpisodes.find((episode) => episode.seasonNumber === entry2.hint.season && episode.episodeNumber === regularEpisode) : null;
-      if (explicitRegular) {
-        const endEpisode = Number(entry2.effectiveEndEpisode || 0);
-        const last = endEpisode > regularEpisode ? sortedEpisodes.find((episode) => episode.seasonNumber === entry2.hint.season && episode.episodeNumber === endEpisode) : null;
-        output.set(String(entry2.file.id), last ? episodeRangeMatch(explicitRegular, last, "TMDB \u6587\u4EF6\u540D\u5B63\u96C6\u8303\u56F4\u5339\u914D") : { ...explicitRegular, reason: "TMDB \u6587\u4EF6\u540D\u5B63\u96C6\u5339\u914D", confidence: "high" });
+      const tokenAnchored = entry2.hint.season > 0 && hasExplicitSeasonEpisode(entry2.file.name);
+      // An explicit positive-season SxxExx token is authoritative for
+      // regular files: it maps onto the matching regular episode or stays
+      // unresolved so the source identity is retained — never onto an S00
+      // entry.
+      if (tokenAnchored && !entry2.context.strong) {
+        const explicitRegular = !entry2.combined && regularEpisode >= 0 ? sortedEpisodes.find((episode) => episode.seasonNumber === entry2.hint.season && episode.episodeNumber === regularEpisode) : null;
+        if (explicitRegular) {
+          const endEpisode = Number(entry2.effectiveEndEpisode || 0);
+          const last = endEpisode > regularEpisode ? sortedEpisodes.find((episode) => episode.seasonNumber === entry2.hint.season && episode.episodeNumber === endEpisode) : null;
+          output.set(String(entry2.file.id), last ? episodeRangeMatch(explicitRegular, last, "TMDB \u6587\u4EF6\u540D\u5B63\u96C6\u8303\u56F4\u5339\u914D") : { ...explicitRegular, reason: "TMDB \u6587\u4EF6\u540D\u5B63\u96C6\u5339\u914D", confidence: "high" });
+        }
         continue;
       }
-      // A positive-season token that has no corresponding regular TMDB
-      // episode is still more trustworthy than a keyword-only S00 guess.
-      // Leave it unresolved so the source SxxExx identity can be retained.
-      if (entry2.hint.season > 0 && hasExplicitSeasonEpisode(entry2.file.name)) continue;
+      // 会员版/加更/先导片 release variants carry a strong special keyword,
+      // and their token numbers the release group's own sequence rather than
+      // the regular season. The S00 special chain therefore runs first and
+      // must not be preempted by a regular episode sharing the token number.
+      if (entry2.context.strong && !entry2.isRegularSource) {
+        const label = specialEpisodeByLabel(entry2.hint, entry2.context, sortedEpisodes, entry2.file.name);
+        const identitySpecial = label ? null : specialEpisodeByIdentity(entry2.hint, entry2.context, sortedEpisodes);
+        const specialCandidate = label || identitySpecial || specialEpisodeCandidate(entry2.hint, entry2.context, sortedEpisodes) || specialEpisodeByIssueNumber(entry2.hint, sortedEpisodes);
+        // A variant file must not be pulled onto an unrelated lone S00
+        // entry: require 期数/air-date/keyword agreement with the filename.
+        const special = specialCandidate && specialCandidateAgrees(entry2.hint, specialCandidate, Boolean(label), entry2.context) ? specialCandidate : null;
+        if (special) {
+          const dateReason = entry2.hint.date && special.airDate === entry2.hint.date;
+          output.set(String(entry2.file.id), {
+            ...special,
+            reason: label ? "TMDB \u7279\u522B\u7BC7\u6807\u9898\u6807\u7B7E\u5339\u914D" : identitySpecial ? "TMDB \u7279\u522B\u7BC7\u5177\u4F53\u8EAB\u4EFD\u5339\u914D" : dateReason ? "TMDB \u7279\u522B\u7BC7\u552F\u4E00\u64AD\u51FA\u65E5\u671F\u5339\u914D" : "TMDB \u7279\u522B\u7BC7\u5173\u952E\u8BCD/\u671F\u6570\u5339\u914D",
+            confidence: "high"
+          });
+          continue;
+        }
+        // 会员版 is an extended cut of the same-numbered episode, so with no
+        // S00 entry on TMDB it may land on that regular episode of the
+        // calibrated target season. Extra kinds (加更/先导/幕后…) are
+        // episodes in their own right and stay off the regular grid.
+        if (regularEpisode > 0 && isMemberVariantContext(entry2.context)) {
+          const variantSeason = Number(targetSeason || season || 0);
+          const variantEpisode = variantSeason > 0 ? sortedEpisodes.find((episode) => episode.seasonNumber === variantSeason && episode.episodeNumber === regularEpisode) : null;
+          if (variantEpisode) {
+            const endEpisode = Number(entry2.effectiveEndEpisode || 0);
+            const variantLast = endEpisode > regularEpisode ? sortedEpisodes.find((episode) => episode.seasonNumber === variantSeason && episode.episodeNumber === endEpisode) : null;
+            output.set(String(entry2.file.id), variantLast ? { ...episodeRangeMatch(variantEpisode, variantLast, "TMDB 会员版 变体期数映射"), confidence: "medium" } : { ...variantEpisode, reason: "TMDB 会员版 变体期数映射", confidence: "medium" });
+          }
+        }
+        continue;
+      }
       const label = specialEpisodeByLabel(entry2.hint, entry2.context, sortedEpisodes, entry2.file.name);
       const identitySpecial = label ? null : specialEpisodeByIdentity(entry2.hint, entry2.context, sortedEpisodes);
       const contextualSpecial = contextualSpecialEpisodeCandidate(entry2.hint, entry2.context, sortedEpisodes);
-      const special = label || identitySpecial || contextualSpecial || specialEpisodeCandidate(entry2.hint, entry2.context, sortedEpisodes);
+      const specialCandidate = label || identitySpecial || contextualSpecial || specialEpisodeCandidate(entry2.hint, entry2.context, sortedEpisodes);
+      // Never accept an S00 entry that shares no 期数/air-date/keyword
+      // agreement with the filename (guards the lone-special fallback).
+      const special = specialCandidate && specialCandidateAgrees(entry2.hint, specialCandidate, Boolean(label), entry2.context) ? specialCandidate : null;
       if (special) {
         const dateReason = entry2.hint.date && special.airDate === entry2.hint.date;
         output.set(String(entry2.file.id), {
@@ -14736,10 +14805,11 @@ ${end.comment}` : end.comment;
         warnings.push(`TMDB \u5267\u96C6\u8BE6\u60C5\u8BFB\u53D6\u5931\u8D25\uFF0C\u5DF2\u6309\u5F53\u524D\u8BC6\u522B\u5B63\u5EA6\u7EE7\u7EED\uFF08${error.message}\uFF09`);
       }
     }
-    const targetSeason = inferCalibrationTargetSeason(group);
+    const seasonRemap = reconcileCalibrationSeason(group, media);
+    const targetSeason = seasonRemap ? seasonRemap.to : inferCalibrationTargetSeason(group);
     const requested = [...seasonNumbers.length ? seasonNumbers : group.files.map((file) => {
       const parsed = parseSeasonEpisode(file.name, 0);
-      if (hasExplicitSeasonEpisode(file.name)) return parsed.season;
+      if (hasExplicitSeasonEpisode(file.name)) return remapCalibrationSeasonValue(parsed.season, seasonRemap);
       const fieldSeason = Number(file.fields?.season);
       return Number.isInteger(fieldSeason) && fieldSeason >= 0 ? fieldSeason : 1;
     })];
@@ -14777,7 +14847,7 @@ ${end.comment}` : end.comment;
     } else {
       episodes = filterEpisodeCandidatesForTargetSeason(rawEpisodes, effectiveTargetSeason, fileNames);
     }
-    const matches = matchEpisodeCandidates(group.files.filter((file) => isVideoFile(file.name)), episodes, Number(group.fields?.season || 1), effectiveTargetSeason);
+    const matches = matchEpisodeCandidates(group.files.filter((file) => isVideoFile(file.name)), episodes, Number(group.fields?.season || 1), effectiveTargetSeason, seasonRemap);
     return { episodes, matches: Object.fromEntries(matches), warnings };
   }
   function inferCalibrationTargetSeason(group) {
@@ -14798,6 +14868,36 @@ ${end.comment}` : end.comment;
     const counts = /* @__PURE__ */ new Map();
     for (const season of seasons) counts.set(season, (counts.get(season) || 0) + 1);
     return [...counts.entries()].sort((left, right) => right[1] - left[1] || left[0] - right[0])[0][0];
+  }
+  function namedSeasonMarkers(value) {
+    const text2 = toSimplified(String(value || ""));
+    return [...text2.matchAll(new RegExp(`(?:\u7B2C\\s*)?([${CHINESE_NUMBER_PATTERN}]+)\\s*\u5B63`, "g"))].map((match) => chineseInteger2(match[1])).filter((season) => season > 0);
+  }
+  function remapCalibrationSeasonValue(season, remap) {
+    return remap && Number(season) === remap.from ? remap.to : season;
+  }
+  function reconcileCalibrationSeason(group, media) {
+    // Release groups often number seasons per year ("Have.Fun.2022.S01E01")
+    // while TMDB and the Chinese title carry the absolute season (第二季).
+    // When every token season disagrees with one consistent named season
+    // marker and TMDB's season window matches the file years, shift the
+    // calibration target instead of matching onto the wrong season.
+    const files = (group?.files || []).filter((file) => isVideoFile(file.name) && hasExplicitSeasonEpisode(file.name));
+    if (!files.length) return null;
+    const tokenSeasons = new Set(files.map((file) => parseSeasonEpisode(file.name, 0).season).filter((season) => season > 0));
+    if (tokenSeasons.size !== 1) return null;
+    const markers = /* @__PURE__ */ new Set();
+    for (const file of files) for (const marker of namedSeasonMarkers(file.name)) markers.add(marker);
+    if (markers.size !== 1) return null;
+    const to = [...markers][0];
+    const from = [...tokenSeasons][0];
+    if (!to || to === from) return null;
+    const season = (Array.isArray(media?.seasons) ? media.seasons : []).find((item) => Number(item.season_number ?? item.seasonNumber) === to);
+    if (!season) return null;
+    const years = new Set(files.map((file) => extractYear(file.name)).filter(Boolean));
+    const seasonYear = String(season.air_date || season.airDate || "").slice(0, 4);
+    if (seasonYear && years.size && [...years].every((year) => Math.abs(Number(year) - Number(seasonYear)) > 1)) return null;
+    return { from, to };
   }
 
   // src/core/empty-folders.js
@@ -18546,7 +18646,7 @@ ${end.comment}` : end.comment;
           const groupId = this.organize.tool.groupId;
           const hint = this.organize.searchHints?.[groupId] || {};
           this.organize.mediaByGroup[groupId] = media;
-          if (hint.seasonEpisode) {
+          if (hint.seasonEpisode || hint.season) {
             this.organize.episodePlans[groupId] = {
               ...this.organize.episodePlans[groupId] || {},
               targetSeason: String(hint.season || 1),

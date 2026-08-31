@@ -3,6 +3,13 @@ productName: 123Cloud
 copyright: 123Cloud
 afterSign: build/afterSign.cjs
 
+# 自动更新元数据：打包时把 app-update.yml 写进应用资源，并生成 latest*.yml
+# 随安装包一起上传 Release，electron-updater 据此检测新版本。
+publish:
+  provider: github
+  owner: weige146
+  repo: 123Cloud
+
 directories:
   output: release
   buildResources: build

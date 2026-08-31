@@ -1,14 +1,6 @@
 // 后端 API 类型定义
 // 与 backend/app/main.py 中的 Pydantic 模型对齐
 
-export interface AdminConfig {
-  gatewayName: string;
-  pan123ClientMode: "web" | "openapi";
-  pan123OpenApiClientId: string;
-  pan123OpenApiClientSecret: string;
-  updatedAt?: string;
-}
-
 export interface Pan123Profile {
   uid?: number | null;
   nickname?: string;
@@ -32,10 +24,11 @@ export interface Pan123Session {
   loginUuid: string;
   updatedAt: string;
   profile: Pan123Profile | null;
+  /** 登录 token 已过期：profile 无法刷新，需重新登录（头像等缓存链接会失效） */
+  loginExpired?: boolean;
 }
 
 export interface Capabilities {
-  openapiConfigured: boolean;
   submissionConfigured: boolean;
   pan115HelperConfigured?: boolean;
   transferConfigured?: boolean;
@@ -43,24 +36,8 @@ export interface Capabilities {
 
 export interface AdminStatus {
   ok: boolean;
-  gateway: AdminConfig;
   capabilities: Capabilities;
   pan123: Pan123Session;
-}
-
-export interface WallpaperItem {
-  id: string;
-  url: string;
-  title: string;
-  copyright: string;
-  copyrightLink: string;
-  startDate: string;
-}
-
-export interface WallpaperResponse {
-  items: WallpaperItem[];
-  fetchedAt: string;
-  expiresAt: string;
 }
 
 export interface Channel {
@@ -109,36 +86,11 @@ export interface SourceLabel {
   order?: number;
 }
 
-export interface CategoryRule {
-  id?: string;
-  name: string;
-  enabled: boolean;
-  category: string;
-  keywords: string[];
-  mediaTypes?: string[];
-  genreIds?: number[];
-  order?: number;
-}
-
 export interface RecognitionConfig {
   movieKeywords?: string[];
   tvKeywords?: string[];
   releaseGroups?: string[];
   excludeWords?: string[];
-}
-
-export interface OrganizeConfig {
-  fixedCategories?: string[];
-  fallbackMovieCategory?: string;
-  fallbackTvCategory?: string;
-  movieTemplate?: string;
-  tvTemplate?: string;
-  mediaFolderTemplate?: string;
-  seasonFolderTemplate?: string;
-  excludeWords?: string[];
-  discardSidecarExtensions?: string[];
-  conflictPriority?: string[];
-  categoryRules?: CategoryRule[];
 }
 
 export interface DisplayConfig {
@@ -147,7 +99,6 @@ export interface DisplayConfig {
 
 export interface RuleConfig {
   recognition?: RecognitionConfig;
-  organize?: OrganizeConfig;
   display?: DisplayConfig;
   quality?: AliasRule[];
   source?: AliasRule[];
@@ -190,7 +141,6 @@ export interface SubmissionConfig {
   allowedUserIds?: number[];
   telegramAdminUserIds?: number[];
   channelOwnerUserIds?: number[];
-  channelSettingsUrl?: string;
   channels?: Channel[];
   routing?: Routing;
   ruleConfig?: RuleConfig;

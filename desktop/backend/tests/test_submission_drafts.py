@@ -25,15 +25,17 @@ from app.submission import (
     send_submission_preview,
     send_submission_preview_result,
     share_media_cache_key,
-    handle_submission_telegram_update,
+    publish_submission_draft,
     inspect_web_share,
     build_submission_resource_name,
     recognize_submission_metadata,
-    publish_submission_draft,
     render_submission_caption,
     send_telegram_rich_message,
     submission_publication_identity,
     submit_submission_links,
+    draft_channel_allowed,
+    get_submission_draft,
+    handle_submission_callback,
     submission_channel_candidates,
     telegram_submission_allowed,
     schedule_published_submission_history_cleanup,
@@ -142,53 +144,9 @@ class SubmissionDraftTests(unittest.TestCase):
                     "share": {"cleanUrl": "https://www.123pan.com/s/demo"},
                 },
             )
-            update = {"callback_query": {"id": "forged", "data": "sub:collab-draft:publish", "from": {"id": 303}, "message": {"message_id": 1, "chat": {"id": 303, "type": "private"}}}}
-            with patch("app.submission.answer_callback_query", AsyncMock()):
-                result = asyncio.run(handle_submission_telegram_update(store, update))
-            self.assertEqual(result["reason"], "draft_owner_mismatch")
-
-    def test_channel_owner_can_manage_only_their_own_channels(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = SessionStore(Path(directory))
-            store.write_submission_config({"botToken": "telegram-token", "channelOwnerUserIds": [101]})
-            add_update = {"message": {"message_id": 1, "text": "/channel_add main | Main | -1001 | private", "from": {"id": 101}, "chat": {"id": 101, "type": "private"}}}
-            allow_update = {"message": {"message_id": 2, "text": "/channel_allow main | 202", "from": {"id": 101}, "chat": {"id": 101, "type": "private"}}}
-            denied_update = {"message": {"message_id": 3, "text": "/channels", "from": {"id": 202}, "chat": {"id": 202, "type": "private"}}}
-            with patch("app.submission.send_telegram_text", AsyncMock()):
-                asyncio.run(handle_submission_telegram_update(store, add_update))
-                asyncio.run(handle_submission_telegram_update(store, allow_update))
-                result = asyncio.run(handle_submission_telegram_update(store, denied_update))
-            self.assertTrue(store.channel_user_allowed(101, "main", 202))
-            self.assertEqual(result["reason"], "channel_owner_required")
-
-    def test_any_private_user_can_get_their_own_uid_without_being_authorized(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = SessionStore(Path(directory))
-            store.write_submission_config({"botToken": "telegram-token"})
-            update = {"message": {"message_id": 1, "text": "/myid", "from": {"id": 202}, "chat": {"id": 202, "type": "private"}}}
-            send = AsyncMock()
-            with patch("app.submission.send_telegram_text", send):
-                result = asyncio.run(handle_submission_telegram_update(store, update))
-            self.assertEqual(result["action"], "myid")
-            self.assertIn("202", send.await_args.args[2])
-
-    def test_channels_command_opens_the_one_page_configuration_card(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = SessionStore(Path(directory))
-            store.write_submission_config({
-                "botToken": "telegram-token",
-                "channelOwnerUserIds": [101],
-                "channelSettingsUrl": "https://example.test/admin/channel-settings",
-            })
-            store.write_user_channel_config(101, {"channels": [{"id": "main", "title": "Main", "chatId": "-1001"}], "routing": {"fallbackChannelId": "main"}})
-            update = {"message": {"message_id": 1, "text": "/channels", "from": {"id": 101}, "chat": {"id": 101, "type": "private"}}}
-            send = AsyncMock()
-            with patch("app.submission.send_telegram_text", send):
-                result = asyncio.run(handle_submission_telegram_update(store, update))
-
-            self.assertEqual(result["action"], "channels")
-            self.assertEqual(send.await_args.kwargs["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"], "https://example.test/admin/channel-settings")
-            self.assertIn("一张卡片", send.await_args.args[2])
+            # TG 回调交互已移除：授权用户只能通过后台发布自己的草稿
+            self.assertTrue(draft_channel_allowed(store, get_submission_draft(store, "collab-draft"), 202))
+            self.assertFalse(draft_channel_allowed(store, get_submission_draft(store, "collab-draft"), 303))
 
     def test_shared_channel_skips_telethon_history_scan(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -671,18 +629,13 @@ class SubmissionDraftTests(unittest.TestCase):
                     return {"message_id": 99 if payload.get("chat_id") == "-1002" else 51}
                 return {}
 
-            update = {
-                "callback_query": {
-                    "id": "cb1",
-                    "data": "sub:draft1:publish",
-                    "from": {"id": 123456},
-                    "message": {"message_id": 20, "chat": {"id": 123456, "type": "private"}},
-                }
-            }
+            # TG 回调已移除：后台草稿页直接调 publish_submission_draft
             with patch("app.submission.telegram_post", side_effect=fake_telegram_post):
-                result = asyncio.run(handle_submission_telegram_update(store, update))
+                result = asyncio.run(publish_submission_draft(
+                    store, "telegram-token", store.read_submission_config(),
+                    get_submission_draft(store, "draft1"),
+                ))
 
-            self.assertTrue(result["handled"])
             self.assertTrue(result["ok"])
             self.assertTrue(any(method == "getChat" and payload["chat_id"] == "-1002" for method, payload in calls))
             sent = [payload for method, payload in calls if method in {"sendMessage", "sendPhoto"} and payload.get("chat_id") == "-1002"]
@@ -691,6 +644,59 @@ class SubmissionDraftTests(unittest.TestCase):
             edit = next(payload for method, payload in calls if method == "editMessageCaption" and payload["chat_id"] == "-1002")
             self.assertNotIn("路由：", edit["caption"])
             self.assertEqual(edit["reply_markup"]["inline_keyboard"][0][0]["text"], "123网盘")
+            self.assertEqual(store.read_value("submission_drafts"), [])
+
+    def test_preview_publish_button_callback_publishes_draft(self):
+        """草稿预览上的「发布到频道」按钮：回调后发布到频道并删除草稿。"""
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.write_submission_config(
+                {
+                    "botToken": "telegram-token",
+                    "allowedUserIds": [123456],
+                    "templates": {"shareName": "123", "caption": "🎬 <b>{title}</b>\n👤 分享：{shareLink}"},
+                    "channels": [
+                        {"id": "pub", "title": "公开", "chatId": "-1002", "enabled": True, "isDefault": True, "role": "public_completed"}
+                    ],
+                }
+            )
+            save_submission_draft(
+                store,
+                {
+                    "id": "draft-btn",
+                    "status": "draft",
+                    "ownerChatId": 123456,
+                    "ownerUserId": 123456,
+                    "share": {"provider": "123pan", "cleanUrl": "https://www.123pan.com/s/abc?pwd=ONWA"},
+                    "inspection": {"title": "电影 (2026)", "fileNames": ["Movie.2026.2160p.WEB-DL-HiveWeb.mkv"]},
+                    "metadata": {"title": "电影", "year": "2026", "mediaType": "movie", "quality": "2160p", "source": "WEB-DL"},
+                    "media": {"title": "电影", "year": "2026", "mediaType": "movie", "tmdbId": 1, "genres": [], "overview": ""},
+                    "caption": "预览",
+                    "text": "预览",
+                },
+            )
+            calls = []
+
+            async def fake_telegram_post(token, method, payload, timeout=20.0):
+                calls.append((method, payload))
+                if method in {"sendMessage", "sendPhoto"}:
+                    return {"message_id": 99 if payload.get("chat_id") == "-1002" else 51}
+                return {}
+
+            callback = {
+                "id": "cb1",
+                "data": "sub:draft-btn:publish",
+                "from": {"id": 123456},
+                "message": {"message_id": 20, "chat": {"id": 123456, "type": "private"}},
+            }
+            with patch("app.submission.telegram_post", side_effect=fake_telegram_post):
+                result = asyncio.run(handle_submission_callback(
+                    store, "telegram-token", store.read_submission_config(), callback
+                ))
+
+            self.assertTrue(result["ok"])
+            sent = [payload for method, payload in calls if method in {"sendMessage", "sendPhoto"} and payload.get("chat_id") == "-1002"]
+            self.assertEqual(len(sent), 1)
             self.assertEqual(store.read_value("submission_drafts"), [])
 
     def test_photo_caption_edit_failure_deletes_blank_photo_without_text_fallback(self):
@@ -767,19 +773,14 @@ class SubmissionDraftTests(unittest.TestCase):
                     return {"message_id": 99 if payload.get("chat_id") == "-1002" else 51}
                 return {}
 
-            update = {
-                "callback_query": {
-                    "id": "cb1",
-                    "data": "sub:draft1:publish",
-                    "from": {"id": 123456},
-                    "message": {"message_id": 20, "chat": {"id": 123456, "type": "private"}},
-                }
-            }
-            with patch("app.submission.telegram_post", side_effect=fake_telegram_post), self.assertLogs("app.submission", level="WARNING") as logs:
-                result = asyncio.run(handle_submission_telegram_update(store, update))
+            # callback 应答已随 TG 交互移除；answerCallbackQuery 失败不再出现
+            with patch("app.submission.telegram_post", side_effect=fake_telegram_post):
+                result = asyncio.run(publish_submission_draft(
+                    store, "telegram-token", store.read_submission_config(),
+                    get_submission_draft(store, "draft1"),
+                ))
 
             self.assertTrue(result["ok"])
-            self.assertTrue(any("Answering Telegram callback failed" in item for item in logs.output))
             deleted_ids = [payload["message_id"] for method, payload in calls if method == "deleteMessage"]
             self.assertEqual(deleted_ids, [10, 20, 30])
             channel_message = next(payload for method, payload in calls if method == "sendMessage" and payload.get("chat_id") == "-1002")
@@ -831,21 +832,16 @@ class SubmissionDraftTests(unittest.TestCase):
                 events.append(("history", message_id))
                 return ""
 
-            async def run_update():
-                update = {
-                    "callback_query": {
-                        "id": "cb1",
-                        "data": "sub:draft1:publish",
-                        "from": {"id": 123456},
-                        "message": {"message_id": 20, "chat": {"id": 123456, "type": "private"}},
-                    }
-                }
-                result = await handle_submission_telegram_update(store, update)
+            async def run_publish():
+                result = await publish_submission_draft(
+                    store, "telegram-token", store.read_submission_config(),
+                    get_submission_draft(store, "draft1"),
+                )
                 await asyncio.sleep(0)
                 return result
 
             with patch("app.submission.telegram_post", side_effect=fake_telegram_post), patch("app.submission.cleanup_published_submission_history", side_effect=fake_cleanup):
-                result = asyncio.run(run_update())
+                result = asyncio.run(run_publish())
 
             self.assertTrue(result["ok"])
             self.assertEqual(events[:3], [("delete", 10), ("delete", 20), ("delete", 30)])

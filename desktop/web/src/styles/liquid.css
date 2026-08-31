@@ -8,7 +8,7 @@
    ============================================================ */
 
 :root {
-  --font-sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, ui-sans-serif, "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-display: var(--font-sans);
   --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 
@@ -203,6 +203,23 @@ body {
   background: var(--mesh-bg);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
+  /* 客户端质感：界面文字不可选中，避免随手一拖就出现蓝色选区 */
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+/* 内容区文本仍可正常选择复制 */
+input,
+textarea,
+[contenteditable="true"],
+pre,
+code,
+.mono-value,
+.console-log-box,
+.console-log-message {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 #app {
@@ -350,7 +367,26 @@ a:hover { color: var(--link-hover); }
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   box-shadow: var(--surface-shadow), inset 0 1px 0 var(--glass-highlight);
   position: relative;
+  overflow: visible;
+  transition: width 220ms ease, flex-basis 220ms ease, opacity 180ms ease;
+}
+/* 收起 = 侧栏整体滑出（ZCode 同款）：宽度归零、无边框无阴影，开关在内容区顶栏。
+   内容保持 228px 固定宽度，动画期间被裁切而不是挤压。 */
+.side-rail--collapsed {
+  width: 0;
+  flex-basis: 0;
+  min-width: 0;
+  border-color: transparent;
+  box-shadow: none;
+  opacity: 0;
+  pointer-events: none;
   overflow: hidden;
+}
+.side-rail--collapsed .side-rail__brand,
+.side-rail--collapsed .side-rail__search,
+.side-rail--collapsed .side-rail__nav,
+.side-rail--collapsed .side-rail__footer {
+  min-width: 228px;
 }
 .side-rail::before {
   content: "";
@@ -1396,7 +1432,6 @@ a:hover { color: var(--link-hover); }
   background: var(--group-gradient, var(--grad-accent));
   opacity: 0.9;
 }
-.channel-settings { display: flex; flex-direction: column; gap: 16px; }
 
 .preview-meta-tile {
   padding: 10px 12px;

@@ -21,12 +21,7 @@ ADMIN_CONFIG_KEY = "admin_config"
 PAN123_SESSION_KEY = "pan123_session"
 SUBMISSION_CONFIG_KEY = "submission_config"
 
-DEFAULT_ADMIN_CONFIG = {
-    "gatewayName": "123 Cloud Gateway",
-    "pan123ClientMode": "web",
-    "pan123OpenApiClientId": "",
-    "pan123OpenApiClientSecret": "",
-}
+DEFAULT_ADMIN_CONFIG: Dict[str, Any] = {}
 
 
 def utc_now_iso() -> str:
@@ -60,7 +55,6 @@ class SessionStore:
     def write_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
         next_config = self.read_config()
         next_config.update(config)
-        next_config["gatewayName"] = str(next_config.get("gatewayName") or "123 Cloud Gateway").strip() or "123 Cloud Gateway"
         next_config["updatedAt"] = utc_now_iso()
         self.write_value(ADMIN_CONFIG_KEY, next_config)
         return next_config
@@ -962,6 +956,7 @@ class SessionStore:
             self._initialized = True
             self._seed_defaults()
             self._migrate_legacy_json()
+            self._migrate_legacy_admin_gateway()
             self._migrate_user_channel_configs()
             self._migrate_channel_access_grants()
             self._backfill_submission_publication_owners()
@@ -1086,6 +1081,30 @@ class SessionStore:
         except OSError:
             pass
 
+    def _migrate_legacy_admin_gateway(self) -> None:
+        """旧版把 123 OpenAPI 凭据存在网关配置顶层；现在统一收口到搬运配置。"""
+        raw = self._read_kv_value(ADMIN_CONFIG_KEY)
+        if not isinstance(raw, dict):
+            return
+        legacy_keys = ("gatewayName", "pan123ClientMode", "pan123OpenApiClientId", "pan123OpenApiClientSecret")
+        if not any(key in raw for key in legacy_keys):
+            return
+        next_config = dict(raw)
+        client_id = str(next_config.pop("pan123OpenApiClientId", "") or "").strip()
+        client_secret = str(next_config.pop("pan123OpenApiClientSecret", "") or "").strip()
+        next_config.pop("gatewayName", None)
+        next_config.pop("pan123ClientMode", None)
+        if client_id or client_secret:
+            transfer = next_config.get("transfer")
+            transfer = dict(transfer) if isinstance(transfer, dict) else {}
+            if client_id and not str(transfer.get("pan123ClientId") or "").strip():
+                transfer["pan123ClientId"] = client_id
+            if client_secret and not str(transfer.get("pan123ClientSecret") or "").strip():
+                transfer["pan123ClientSecret"] = client_secret
+            next_config["transfer"] = transfer
+        self._write_kv_value(ADMIN_CONFIG_KEY, next_config)
+
+
 def merge_dicts(defaults: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     result = copy.deepcopy(defaults)
     for key, value in override.items():
@@ -1096,17 +1115,11 @@ def merge_dicts(defaults: Dict[str, Any], override: Dict[str, Any]) -> Dict[str,
     return result
 
 
-LEGACY_MOVIE_ORGANIZE_TEMPLATE = "{{title}}{% if year %}.{{year}}{% endif %}{% if videoFormat %}.{{videoFormat}}{% endif %}{% if mediaSource %}.{{mediaSource}}{% endif %}{% if resourceType %}.{{resourceType}}{% endif %}{% if effect %}.{{effect}}{% endif %}{% if frameRate %}.{{frameRate}}{% endif %}{% if originalEdition %}.{{originalEdition}}{% endif %}{% if videoCodec %}.{{videoCodec}}{% endif %}{% if audioCodec %}.{{audioCodec}}{% endif %}{{releaseGroupSuffix}}{{fileExt}}"
-LEGACY_TV_ORGANIZE_TEMPLATE = "{{title}}{% if year %}.{{year}}{% endif %}{% if seasonEpisode %}.{{seasonEpisode}}{% endif %}{% if videoFormat %}.{{videoFormat}}{% endif %}{% if mediaSource %}.{{mediaSource}}{% endif %}{% if resourceType %}.{{resourceType}}{% endif %}{% if highQuality %}.{{highQuality}}{% endif %}{% if dolbyVision %}.{{dolbyVision}}{% endif %}{% if dynamicRange %}.{{dynamicRange}}{% endif %}{% if frameRate %}.{{frameRate}}{% endif %}{% if colorDepth %}.{{colorDepth}}{% endif %}{% if videoCodec %}.{{videoCodec}}{% endif %}{% if audioCodec %}.{{audioCodec}}{% endif %}{{releaseGroupSuffix}}{{fileExt}}"
-
-
 def normalize_rule_config(value: Any) -> Dict[str, Any]:
     defaults = DEFAULT_SUBMISSION_CONFIG.get("ruleConfig") if isinstance(DEFAULT_SUBMISSION_CONFIG.get("ruleConfig"), dict) else {}
     source = value if isinstance(value, dict) else {}
-    organize = source.get("organize") if isinstance(source.get("organize"), dict) else {}
     recognition = source.get("recognition") if isinstance(source.get("recognition"), dict) else {}
     display = source.get("display") if isinstance(source.get("display"), dict) else {}
-    default_organize = defaults.get("organize") if isinstance(defaults.get("organize"), dict) else {}
     default_recognition = defaults.get("recognition") if isinstance(defaults.get("recognition"), dict) else {}
     default_display = defaults.get("display") if isinstance(defaults.get("display"), dict) else {}
 
@@ -1124,19 +1137,6 @@ def normalize_rule_config(value: Any) -> Dict[str, Any]:
             "movieKeywords": normalize_list(recognition.get("movieKeywords"), default_recognition.get("movieKeywords") if isinstance(default_recognition.get("movieKeywords"), list) else []),
             "tvKeywords": normalize_list(recognition.get("tvKeywords"), default_recognition.get("tvKeywords") if isinstance(default_recognition.get("tvKeywords"), list) else []),
             "releaseGroups": normalize_list(recognition.get("releaseGroups"), default_recognition.get("releaseGroups") if isinstance(default_recognition.get("releaseGroups"), list) else []),
-        },
-        "organize": {
-            "fixedCategories": normalize_list(organize.get("fixedCategories"), default_organize.get("fixedCategories") if isinstance(default_organize.get("fixedCategories"), list) else []),
-            "fallbackMovieCategory": normalize_text(organize.get("fallbackMovieCategory"), str(default_organize.get("fallbackMovieCategory") or "电影")),
-            "fallbackTvCategory": normalize_text(organize.get("fallbackTvCategory"), str(default_organize.get("fallbackTvCategory") or "剧集")),
-            "excludeWords": normalize_list(organize.get("excludeWords"), default_organize.get("excludeWords") if isinstance(default_organize.get("excludeWords"), list) else []),
-            "discardSidecarExtensions": normalize_extensions(organize.get("discardSidecarExtensions")),
-            "conflictPriority": normalize_conflict_priority(organize.get("conflictPriority")),
-            "movieTemplate": normalize_organize_template(organize.get("movieTemplate"), str(default_organize.get("movieTemplate") or "{{title}}{{fileExt}}"), LEGACY_MOVIE_ORGANIZE_TEMPLATE),
-            "tvTemplate": normalize_organize_template(organize.get("tvTemplate"), str(default_organize.get("tvTemplate") or "{{title}}{{fileExt}}"), LEGACY_TV_ORGANIZE_TEMPLATE),
-            "mediaFolderTemplate": normalize_template(organize.get("mediaFolderTemplate"), str(default_organize.get("mediaFolderTemplate") or "{{folderTitle}}{% if year %} ({{year}}){% endif %}{% if tmdbId %} {tmdb-{{tmdbId}}}{% endif %}")),
-            "seasonFolderTemplate": normalize_template(organize.get("seasonFolderTemplate"), str(default_organize.get("seasonFolderTemplate") or "Season {{season}}")),
-            "categoryRules": normalize_category_rules(organize.get("categoryRules")),
         },
         "display": {
             "sourceLabels": normalize_source_label_rules(display.get("sourceLabels")),
@@ -1259,31 +1259,6 @@ def normalize_alias_rule(item: Dict[str, Any], base: Optional[Dict[str, Any]], p
     }
 
 
-def normalize_category_rules(value: Any) -> List[Dict[str, Any]]:
-    defaults = (((DEFAULT_SUBMISSION_CONFIG.get("ruleConfig") or {}).get("organize") or {}).get("categoryRules") or [])
-    source = value if isinstance(value, list) else defaults
-    default_by_id = {str(rule.get("id") or ""): rule for rule in defaults if isinstance(rule, dict)}
-    rules: List[Dict[str, Any]] = []
-    for index, item in enumerate(source):
-        record = item if isinstance(item, dict) else {}
-        base = default_by_id.get(str(record.get("id") or "")) or {}
-        category = str(record.get("category") if "category" in record else base.get("category") or "").strip()
-        media_types = normalize_media_types(record.get("mediaTypes") if "mediaTypes" in record else base.get("mediaTypes"))
-        genre_ids = normalize_positive_int_list(record.get("genreIds") if "genreIds" in record else base.get("genreIds"))
-        rule = {
-            "id": str(record.get("id") or base.get("id") or f"category_{index}_{slug_id(category or 'rule')}"),
-            "name": str(record.get("name") or base.get("name") or category or ""),
-            "enabled": record["enabled"] if "enabled" in record else (base.get("enabled") if "enabled" in base else True),
-            "category": category,
-            "keywords": normalize_list(record.get("keywords") if "keywords" in record else base.get("keywords"), base.get("keywords") if isinstance(base.get("keywords"), list) else []),
-            **({"mediaTypes": media_types} if media_types else {}),
-            **({"genreIds": genre_ids} if genre_ids else {}),
-        }
-        if rule["category"] and (rule["keywords"] or genre_ids):
-            rules.append(rule)
-    return rules
-
-
 def normalize_source_label_rules(value: Any) -> List[Dict[str, Any]]:
     defaults = (((DEFAULT_SUBMISSION_CONFIG.get("ruleConfig") or {}).get("display") or {}).get("sourceLabels") or [])
     source = value if isinstance(value, list) else defaults
@@ -1309,23 +1284,6 @@ def normalize_source_label_rules(value: Any) -> List[Dict[str, Any]]:
     return sorted(rules, key=lambda item: int(item.get("order") or 0), reverse=True)
 
 
-def normalize_extensions(value: Any) -> List[str]:
-    defaults = (((DEFAULT_SUBMISSION_CONFIG.get("ruleConfig") or {}).get("organize") or {}).get("discardSidecarExtensions") or [])
-    return [extension.lstrip(".").lower() for extension in normalize_list(value, defaults) if extension.lstrip(".").strip()]
-
-
-def normalize_conflict_priority(value: Any) -> List[str]:
-    allowed = ["remuxBluray", "resolution", "dolby", "size"]
-    defaults = (((DEFAULT_SUBMISSION_CONFIG.get("ruleConfig") or {}).get("organize") or {}).get("conflictPriority") or allowed)
-    source = value if isinstance(value, list) else defaults
-    selected: List[str] = []
-    for item in source:
-        key = str(item or "")
-        if key in allowed and key not in selected:
-            selected.append(key)
-    return selected + [item for item in allowed if item not in selected]
-
-
 def normalize_list(value: Any, fallback: Optional[List[Any]] = None) -> List[str]:
     source = value if isinstance(value, list) else (fallback if isinstance(fallback, list) else [])
     seen = set()
@@ -1340,90 +1298,9 @@ def normalize_list(value: Any, fallback: Optional[List[Any]] = None) -> List[str
     return out
 
 
-def normalize_media_types(value: Any) -> List[str]:
-    if not isinstance(value, list):
-        return []
-    return [item for item in (str(item or "").strip() for item in value) if item in {"movie", "tv", "unknown"}]
-
-
-def normalize_positive_int_list(value: Any) -> List[int]:
-    if not isinstance(value, list):
-        return []
-    normalized: List[int] = []
-    for item in value:
-        try:
-            number = int(item)
-        except (TypeError, ValueError):
-            continue
-        if number > 0 and number not in normalized:
-            normalized.append(number)
-    return normalized
-
-
-def merge_missing_template_blocks(persisted: str, default: str) -> str:
-    """把默认模板里有的、但老模板里没有的 {% if X %}...{% endif %} 块补到老模板里。
-
-    同时按默认模板的字段顺序重建 {% if %} 块，确保升级后字段排列与默认值一致。
-    这样发布新版在默认值里新增占位符（例如 originalEdition）或调整顺序时，
-    老用户的持久化命名模板会自动同步，无需手动重置。
-    """
-    block_pattern = re.compile(r"\{%\s*if\s+(\w+)\s*%\}(.*?)\{%\s*endif\s*%\}", re.S)
-    default_blocks = block_pattern.findall(default)
-    persisted_blocks = block_pattern.findall(persisted)
-    persisted_by_name = {name: body for name, body in persisted_blocks}
-    default_names = [name for name, _ in default_blocks]
-    default_body_by_name = {name: body for name, body in default_blocks}
-
-    new_blocks: List[Tuple[str, str]] = []
-    for name in default_names:
-        if name in persisted_by_name:
-            # 保留用户在 body 里可能改过的内容，但确保变量名出现在默认里
-            new_blocks.append((name, persisted_by_name[name]))
-        else:
-            new_blocks.append((name, default_body_by_name[name]))
-
-    rebuilt_blocks = "".join(f"{{% if {name} %}}{body}{{% endif %}}" for name, body in new_blocks)
-
-    # 取默认模板的前导（首块前）与收尾（{{releaseGroupSuffix}} 之后），
-    # 保证升级后模板结构与默认值一致（例如始终以 {{title}} 开头）。
-    first_block = default.find("{% if")
-    preamble = default[:first_block] if first_block >= 0 else ""
-    anchor = "{{releaseGroupSuffix}}"
-    anchor_idx = default.find(anchor)
-    postamble = default[anchor_idx:] if anchor_idx >= 0 else "{{fileExt}}"
-
-    # 若持久化模板已有 {{title}} 前导则保留，否则用默认的前导
-    if persisted.startswith("{{title}}"):
-        head_prefix = "{{title}}"
-    else:
-        head_prefix = preamble
-
-    # 若持久化已有锚点则保留其后的尾巴（含 {{fileExt}}），否则用默认的收尾
-    if anchor in persisted:
-        _, _, tail = persisted.partition(anchor)
-        return head_prefix + rebuilt_blocks + anchor + tail
-    return head_prefix + rebuilt_blocks + postamble
-
-
-def normalize_template(value: Any, fallback: str) -> str:
-    text = str(value or "").strip()
-    return text or fallback
-
-
-def normalize_text(value: Any, fallback: str) -> str:
-    text = str(value or "").strip()
-    return text or fallback
-
-
 def normalize_regex_flags(value: Any) -> str:
     flags = "".join(dict.fromkeys(re.sub(r"[^dgimsuvy]", "", str(value or "giu"))))
     return flags or "giu"
-
-
-def normalize_organize_template(value: Any, fallback: str, legacy_default: Optional[str] = None) -> str:
-    normalized = re.sub(r"{{\s*namingTitle\s*}}", "{{title}}", normalize_template(value, fallback))
-    normalized = merge_missing_template_blocks(normalized, fallback)
-    return fallback if legacy_default and normalized == legacy_default else normalized
 
 
 def normalize_number(value: Any, fallback: Any = None) -> Optional[int]:
@@ -1452,7 +1329,6 @@ def sanitize_submission_config(config: Dict[str, Any], migrate_legacy_authorizat
     config["allowedUserIds"] = legacy_allowed
     config["telegramAdminUserIds"] = admins if admins or not migrate_legacy_authorization else legacy_allowed
     config["channelOwnerUserIds"] = owners if owners or not migrate_legacy_authorization else legacy_allowed
-    config["channelSettingsUrl"] = str(config.get("channelSettingsUrl") or "").strip()
     telegram_api = config.get("telegramApi")
     if isinstance(telegram_api, dict):
         # Older saves could persist apiId as a number; every client expects

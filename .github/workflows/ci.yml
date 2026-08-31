@@ -91,24 +91,31 @@ jobs:
       - name: Build macOS DMG
         if: matrix.platform == 'macos'
         working-directory: desktop
-        run: npx electron-builder --mac
+        # latest*.yml 等更新元数据只落盘不发，由 publish job 统一上传 Release
+        run: npx electron-builder --mac --publish never
       - name: Build Windows installer
         if: matrix.platform == 'windows'
         working-directory: desktop
-        run: npx electron-builder --win
+        run: npx electron-builder --win --publish never
       - name: Upload macOS installer
         if: matrix.platform == 'macos'
         uses: actions/upload-artifact@v4
         with:
           name: 123Cloud-macOS-${{ github.ref_name }}
-          path: desktop/release/*.dmg
+          path: |
+            desktop/release/*.dmg
+            desktop/release/*.blockmap
+            desktop/release/latest-mac.yml
           if-no-files-found: error
       - name: Upload Windows installer
         if: matrix.platform == 'windows'
         uses: actions/upload-artifact@v4
         with:
           name: 123Cloud-Windows-${{ github.ref_name }}
-          path: desktop/release/*.exe
+          path: |
+            desktop/release/*.exe
+            desktop/release/*.blockmap
+            desktop/release/latest.yml
           if-no-files-found: error
 
   publish:
@@ -130,4 +137,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "123Cloud ${{ github.ref_name }}" \
             --generate-notes \
-            $(find artifacts -type f \( -name "*.dmg" -o -name "*.exe" \))
+            $(find artifacts -type f \( -name "*.dmg" -o -name "*.exe" -o -name "*.blockmap" -o -name "latest*.yml" \))

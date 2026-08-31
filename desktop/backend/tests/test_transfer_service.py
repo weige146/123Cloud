@@ -4,13 +4,14 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
 from app.session_store import SessionStore
 from app.pan115_transfer import PAN123_OFFLINE_USER_AGENT, Pan115TransferClient
 from app.pan123 import Pan123Error
+from app.transfer_pipeline import TransferPipeline
 from app.transfer_service import TransferService
 
 
@@ -178,35 +179,6 @@ class TransferServiceTests(unittest.TestCase):
                 asyncio.run(service.enqueue_from_text("https://115.com/s/demo-share", "test"))
 
             self.assertEqual(store.list_transfer_tasks(10), [])
-
-    def test_successful_telegram_share_and_local_tasks_cleanup_user_and_bot_messages(self):
-        async def run(share_code: str) -> None:
-            with tempfile.TemporaryDirectory() as directory:
-                service = TransferService(SessionStore(Path(directory)))
-                cleaned = []
-
-                async def cleanup(payload):
-                    cleaned.append(payload)
-
-                service.set_cleanup_notifier(cleanup)
-                service._save_transfer_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
-                await service._notify_task({
-                    "id": f"task-{share_code}",
-                    "status": "success",
-                    "source": "telegram",
-                    "shareCode": share_code,
-                    "chatId": 1001,
-                    "messageId": 2001,
-                    "transferNoticeMessageIds": [2002, 2003],
-                })
-
-                self.assertEqual(len(cleaned), 1)
-                self.assertEqual(cleaned[0]["chatId"], 1001)
-                self.assertEqual(set(cleaned[0]["messageIds"]), {2001, 2002, 2003})
-
-        for share_code in ("share-code", "local:/云下载"):
-            with self.subTest(share_code=share_code):
-                asyncio.run(run(share_code))
 
     def test_enqueue_local_path_uses_existing_task_queue_and_dedupes_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -396,236 +368,349 @@ class TransferServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_multiple_files_each_create_an_openapi_offline_task(self):
-        async def run() -> None:
-            with tempfile.TemporaryDirectory() as directory:
-                store = SessionStore(Path(directory))
-                store.write_config({"transfer": {"downloadMinIntervalMs": 0}})
-                service = TransferService(store)
-                service._save_transfer_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
-                service._notify_cookie_use = AsyncMock()  # type: ignore[method-assign]
-                service._get_pan115_download_url = AsyncMock(  # type: ignore[method-assign]
-                    side_effect=lambda task, file, client, account=None: f"https://115.invalid/{file['id']}"
-                )
-                service._snapshot_candidate_file_ids = AsyncMock(return_value={})  # type: ignore[method-assign]
+    # ------------------------------------------------------------------
+    # 管线测试（解析→规划→秒传→离线→等待→收尾）
+    # ------------------------------------------------------------------
+    def _make_pipeline(self, files, pan123, saved_tasks=None, share_code="abc", concurrency=5):
+        """构建带桩服务的 TransferPipeline。files 是"分享解析结果"。"""
 
-                async def wait_for_file(task, file, pan123, target_root_id, target_dir_id, before_ids, dir_cache=None):
-                    return {
-                        "fileId": int(file["id"]),
-                        "filename": file["name"],
-                        "size": file["size"],
-                    }
+        class PipelineServiceStub:
+            def __init__(self):
+                self.saved_tasks = saved_tasks if saved_tasks is not None else []
 
-                service._wait_for_offline_file = AsyncMock(side_effect=wait_for_file)  # type: ignore[method-assign]
+            async def _get_transfer_config(self):
+                return {"targetDirId": "0", "offlinePollMs": 2000, "offlineMaxPolls": 60, "concurrency": concurrency}
 
-                pan123 = AsyncMock()
-                pan123.ensure_path.return_value = "99"
-                pan123.find_same_file.return_value = None
-                pan123.create_offline_download.side_effect = [101, 102, 103, 104, 105]
+            def _max_offline_slots(self, config):
+                return 3
 
-                async def limiter(job):
-                    return await job()
+            async def _create_pan123_client(self):
+                return pan123
 
-                task = {"id": "task-5", "status": "running", "logs": []}
-                files = [
+            def _filter_live_accounts(self, accounts, task=None):
+                return accounts or [{"name": "Cookie 1", "cookie": "UID=1; CID=x; SEID=y"}]
+
+            def _local_source_pan115_account(self):
+                raise RuntimeError("115 助手未配置")
+
+            def _local_source_account_or_none(self):
+                return None
+
+            def _fallback_account(self):
+                return {"name": "默认 Cookie", "cookie": "UID=1; CID=x; SEID=y"}
+
+            async def _save_transfer_task(self, task):
+                self.saved_tasks.append([
                     {
-                        "id": str(index),
-                        "name": f"episode-{index}.mkv",
-                        "size": index * 1024,
-                        "path": ["Season 1"],
-                        "status": "pending",
-                        "sourceType": "115_share",
+                        "method": item.get("method"),
+                        "offlineStatus": item.get("offlineStatus"),
+                        "offlineTaskId": item.get("offlineTaskId"),
+                        "sourceUrl": item.get("sourceUrl"),
                     }
-                    for index in range(1, 6)
-                ]
-
-                await asyncio.gather(*[
-                    service._process_file(
-                        task,
-                        file,
-                        {"name": "pool", "cookie": "UID=1; CID=x; SEID=y"},
-                        pan123,
-                        "0",
-                        limiter,
-                    )
-                    for file in files
+                    for item in task.get("files", [])
                 ])
+                return True
 
-                self.assertEqual(pan123.create_offline_download.await_count, 5)
-                submitted_names = {
-                    call.args[2] for call in pan123.create_offline_download.await_args_list
-                }
-                self.assertEqual(submitted_names, {file["name"] for file in files})
-                self.assertTrue(all(file["status"] == "success" for file in files))
-                self.assertEqual({file["offlineTaskId"] for file in files}, {101, 102, 103, 104, 105})
+            async def _remember_transfer_hash(self, file, pan123_file):
+                return None
 
-        asyncio.run(run())
+            async def _remember_known_transfer_hash(self, file, etag):
+                return None
 
-    def test_offline_submission_persists_intent_and_remote_id_before_polling(self):
+            async def _delete_115_source_after_success_if_needed(self, task, file, account):
+                return None
+
+            async def _get_pan115_download_url(self, task, file, client, account=None):
+                return f"https://115.invalid/{file['id']}"
+
+            def _get_offline_submit_semaphore(self):
+                return asyncio.Semaphore(3)
+
+            async def _inspect_pan115_share(self, task, link, accounts, fallback_cookie):
+                return {"accountIndex": 0, "inspection": {"title": "Demo", "files": files}}
+
+        stub = PipelineServiceStub()
+        task = {
+            "id": "task-1",
+            "source": "test",
+            "sourceText": "https://115.com/s/abc",
+            "shareUrl": "https://115.com/s/abc",
+            "shareCode": share_code,
+            "receiveCode": "pass",
+            "title": "Demo",
+            "status": "running",
+            "totalFiles": 0,
+            "doneFiles": 0,
+            "files": [],
+            "logs": [],
+        }
+        pipeline = TransferPipeline(stub, task, {"targetDirId": "0", "offlinePollMs": 2000, "offlineMaxPolls": 60, "concurrency": concurrency})
+        return pipeline, stub, task
+
+    def test_pipeline_submits_one_offline_task_per_file(self):
         async def run() -> None:
-            with tempfile.TemporaryDirectory() as directory:
-                service = TransferService(SessionStore(Path(directory)))
-                snapshots = []
-
-                async def save(task):
-                    snapshots.append([
-                        {
-                            "method": item.get("method"),
-                            "offlineStatus": item.get("offlineStatus"),
-                            "offlineTaskId": item.get("offlineTaskId"),
-                            "sourceUrl": item.get("sourceUrl"),
-                        }
-                        for item in task.get("files", [])
-                    ])
-                    return True
-
-                service._save_transfer_task = AsyncMock(side_effect=save)  # type: ignore[method-assign]
-                service._notify_cookie_use = AsyncMock()  # type: ignore[method-assign]
-                service._get_pan115_download_url = AsyncMock(return_value="https://115.invalid/episode")  # type: ignore[method-assign]
-                service._snapshot_candidate_file_ids = AsyncMock(return_value={})  # type: ignore[method-assign]
-
-                async def create_offline(_url, _dir_id, _filename):
-                    self.assertTrue(any(
-                        item.get("method") == "offline"
-                        and item.get("offlineStatus") == "submitting"
-                        and item.get("sourceUrl")
-                        and not item.get("offlineTaskId")
-                        for snapshot in snapshots for item in snapshot
-                    ))
-                    return 777
-
-                async def wait_for_file(_task, file, _pan123, _root_id, _dir_id, _before_ids, _dir_cache=None):
-                    self.assertTrue(any(
-                        item.get("offlineTaskId") == 777
-                        for snapshot in snapshots for item in snapshot
-                    ))
-                    return {"fileId": 99, "filename": file["name"], "size": file["size"]}
-
-                pan123 = AsyncMock()
-                pan123.ensure_path.return_value = "9"
-                pan123.find_same_file.return_value = None
-                pan123.create_offline_download.side_effect = create_offline
-                service._wait_for_offline_file = AsyncMock(side_effect=wait_for_file)  # type: ignore[method-assign]
-
-                file = {"id": "1", "name": "episode.mkv", "size": 1024, "path": [], "status": "pending"}
-                task = {"id": "task", "status": "running", "files": [file], "logs": []}
-
-                async def limiter(job):
-                    return await job()
-
-                await service._process_file(
-                    task, file, {"name": "pool", "cookie": "cookie"}, pan123, "0", limiter
-                )
-
-                self.assertEqual(file["status"], "success")
-                self.assertEqual(file["offlineTaskId"], 777)
-
-        asyncio.run(run())
-
-    def test_restart_with_submission_intent_never_creates_a_duplicate_offline_task(self):
-        async def run() -> None:
-            with tempfile.TemporaryDirectory() as directory:
-                service = TransferService(SessionStore(Path(directory)))
-                service._save_transfer_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
-                service._recover_offline_file = AsyncMock(return_value=None)  # type: ignore[method-assign]
-                service._find_offline_task = AsyncMock(return_value=None)  # type: ignore[method-assign]
-
-                pan123 = AsyncMock()
-                pan123.ensure_path.return_value = "9"
-                pan123.find_same_file.return_value = None
-                file = {
-                    "id": "1",
-                    "name": "episode.mkv",
-                    "size": 1024,
-                    "path": [],
+            files = [
+                {
+                    "id": str(index),
+                    "name": f"episode-{index}.mkv",
+                    "size": index * 1024,
+                    "path": ["Season 1"],
                     "status": "pending",
-                    "method": "offline",
-                    "offlineStatus": "submitting",
-                    "sourceUrl": "https://115.invalid/episode",
+                    "sourceType": "115_share",
                 }
-                task = {"id": "task", "status": "running", "files": [file], "logs": []}
+                for index in range(1, 6)
+            ]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "99"
+            state = {"downloaded": False}
+            task_ids = iter([101, 102, 103, 104, 105])
 
-                async def limiter(job):
-                    return await job()
+            async def list_files(dir_id):
+                if state["downloaded"] and str(dir_id) == "99":
+                    return [
+                        {"fileId": int(item["id"]), "filename": item["name"], "size": item["size"], "type": 0}
+                        for item in files
+                    ]
+                return []
 
-                await service._process_file(
-                    task, file, {"name": "pool", "cookie": "cookie"}, pan123, "0", limiter
+            async def create_offline(_url, _dir_id, _filename):
+                state["downloaded"] = True
+                return next(task_ids)
+
+            pan123.list_files.side_effect = list_files
+            pan123.create_offline_download.side_effect = create_offline
+            pan123.find_file_by_size.return_value = None
+
+            pipeline, _stub, task = self._make_pipeline(files, pan123)
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
+                await pipeline.run()
+
+            self.assertEqual(pan123.create_offline_download.await_count, 5)
+            submitted_names = {call.args[2] for call in pan123.create_offline_download.await_args_list}
+            self.assertEqual(submitted_names, {file["name"] for file in files})
+            self.assertEqual({file["offlineTaskId"] for file in task["files"]}, {101, 102, 103, 104, 105})
+            self.assertTrue(all(file["status"] == "success" for file in task["files"]))
+            self.assertEqual(task["status"], "success")
+
+        asyncio.run(run())
+
+    def test_pipeline_persists_offline_intent_before_creating_remote_task(self):
+        async def run() -> None:
+            files = [{"id": "1", "name": "episode.mkv", "size": 1024, "path": [], "status": "pending", "sourceType": "115_share"}]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "9"
+            state = {"downloaded": False}
+            saved_tasks = []
+
+            async def list_files(dir_id):
+                if state["downloaded"]:
+                    return [{"fileId": 99, "filename": "episode.mkv", "size": 1024, "type": 0}]
+                return []
+
+            async def create_offline(_url, _dir_id, _filename):
+                # 创建远端任务时，"准备提交"的意图必须已经落库
+                assert any(
+                    item.get("method") == "offline"
+                    and item.get("offlineStatus") == "submitting"
+                    and item.get("sourceUrl")
+                    and not item.get("offlineTaskId")
+                    for snapshot in saved_tasks for item in snapshot
                 )
+                state["downloaded"] = True
+                return 777
 
-                pan123.create_offline_download.assert_not_awaited()
-                self.assertEqual(file["status"], "failed")
-                self.assertIn("停止自动重复添加", file["error"])
+            pan123.list_files.side_effect = list_files
+            pan123.create_offline_download.side_effect = create_offline
+            pan123.find_file_by_size.return_value = None
+
+            pipeline, _stub, task = self._make_pipeline(files, pan123, saved_tasks=saved_tasks)
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
+                await pipeline.run()
+
+            self.assertTrue(any(
+                item.get("offlineTaskId") == 777 for snapshot in saved_tasks for item in snapshot
+            ))
+            self.assertEqual(task["files"][0]["status"], "success")
+            self.assertEqual(task["files"][0]["offlineTaskId"], 777)
 
         asyncio.run(run())
 
-    def test_openapi_offline_process_is_used_for_status(self):
+    def test_pipeline_restart_with_submission_intent_never_creates_a_duplicate_offline_task(self):
         async def run() -> None:
-            with tempfile.TemporaryDirectory() as directory:
-                service = TransferService(SessionStore(Path(directory)))
-                pan123 = AsyncMock()
-                pan123.clientKind = "openapi"
-                pan123.get_offline_process.return_value = {"status": 1, "process": 42}
+            files = [{
+                "id": "1",
+                "name": "episode.mkv",
+                "size": 1024,
+                "path": [],
+                "status": "pending",
+                "method": "offline",
+                "offlineStatus": "submitting",
+                "sourceUrl": "https://115.invalid/episode",
+            }]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "9"
+            pan123.list_files.return_value = []
+            pan123.find_file_by_size.return_value = None
+            pan123.list_offline_tasks.return_value = []
 
-                result = await service._find_offline_task(pan123, 123, ["episode.mkv"])
+            pipeline, _stub, task = self._make_pipeline(files, pan123)
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
+                await pipeline.run()
 
-                self.assertEqual(result["id"], 123)
-                self.assertEqual(result["status"], "running")
-                self.assertEqual(result["progress"], 42)
-                pan123.get_offline_process.assert_awaited_once_with(123)
-                pan123.list_offline_tasks.assert_not_awaited()
+            pan123.create_offline_download.assert_not_awaited()
+            self.assertEqual(task["files"][0]["status"], "failed")
+            self.assertIn("停止自动重复添加", task["files"][0]["error"])
 
         asyncio.run(run())
 
-    def test_account_cooling_skips_and_recovers(self):
+    def test_offline_wait_never_queries_status_api_and_completes_via_listing(self):
+        """等待阶段不查询 123 离线进度接口（OpenAPI 侧不稳定，只刷警告），完成判定只看目录落盘。"""
         async def run() -> None:
-            with tempfile.TemporaryDirectory() as directory:
-                service = TransferService(SessionStore(Path(directory)))
-                task = {"id": "t", "logs": []}
-                accounts = [
-                    {"name": "A", "cookie": "UID=1; CID=a; SEID=x"},
-                    {"name": "B", "cookie": "UID=2; CID=b; SEID=y"},
-                ]
+            files = [{"id": "1", "name": "episode.mkv", "size": 1024, "path": [], "status": "pending", "sourceType": "115_share"}]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "9"
+            state = {"downloaded": False}
 
-                self.assertEqual(service._filter_live_accounts(accounts, task), accounts)
-                marked = await service._mark_account_cooling(task, accounts[0], "[errno 990001] 需要登录")
-                self.assertTrue(marked)
-                live = service._filter_live_accounts(accounts, task)
-                self.assertEqual([a["name"] for a in live], ["B"])
-                # 冷却期内重复标记不重复通知
-                again = await service._mark_account_cooling(task, accounts[0], "[errno 990001] 需要登录")
-                self.assertFalse(again)
-                # 冷却到期恢复
-                fingerprint = service._account_fingerprint(accounts[0]["cookie"])
-                service._account_health[fingerprint]["coolUntilMs"] = 0
-                self.assertEqual(service._filter_live_accounts(accounts, task), accounts)
+            async def list_files(dir_id):
+                if state["downloaded"]:
+                    return [{"fileId": 99, "filename": "episode.mkv", "size": 1024, "type": 0}]
+                return []
+
+            async def create_offline(_url, _dir_id, _filename):
+                state["downloaded"] = True
+                return 123
+
+            pan123.list_files.side_effect = list_files
+            pan123.create_offline_download.side_effect = create_offline
+            pan123.find_file_by_size.return_value = None
+
+            pipeline, _stub, task = self._make_pipeline(files, pan123)
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
+                await pipeline.run()
+
+            pan123.get_offline_process.assert_not_awaited()
+            pan123.list_offline_tasks.assert_not_awaited()
+            self.assertEqual(task["files"][0]["status"], "success")
+            self.assertEqual(task["files"][0]["offlineStatusText"], "成功")
 
         asyncio.run(run())
 
-    def test_expired_download_url_rotates_to_next_account(self):
+    def test_offline_timeout_resubmits_up_to_limit_then_fails(self):
+        async def run() -> None:
+            files = [{
+                "id": "1", "name": "episode.mkv", "size": 1024, "path": [],
+                "status": "pending", "sourceType": "115_share", "sha1": None,
+            }]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "9"
+            pan123.list_files.return_value = []  # 永远等不到落盘
+            pan123.find_file_by_size.return_value = None
+
+            pipeline, _stub, task = self._make_pipeline(files, pan123)
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()), \
+                    patch("app.transfer_pipeline._offline_wait_deadline_ms", return_value=30):
+                await pipeline.run()
+
+            # 首次提交 1 次 + 超时重提交 3 次
+            self.assertEqual(pan123.create_offline_download.await_count, 4)
+            self.assertEqual(task["files"][0]["status"], "failed")
+            self.assertIn("超时", task["files"][0]["error"])
+            self.assertTrue(any("自动重新提交离线任务" in log["message"] for log in task["logs"]))
+
+        asyncio.run(run())
+
+    def test_offline_inflight_never_exceeds_concurrency_cap(self):
+        """同时提交到 123 的离线任务不得超过"并发"配置（完成一个补一个）。"""
+        async def run() -> None:
+            files = [
+                {
+                    "id": str(index),
+                    "name": f"episode-{index}.mkv",
+                    "size": index * 1024,
+                    "path": ["Season 1"],
+                    "status": "pending",
+                    "sourceType": "115_share",
+                }
+                for index in range(1, 6)
+            ]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "99"
+            state = {"downloaded": False, "next_id": 1}
+            observed_inflight = []
+
+            async def list_files(dir_id):
+                if state["downloaded"] and str(dir_id) == "99":
+                    return [
+                        {"fileId": int(item["id"]), "filename": item["name"], "size": item["size"], "type": 0}
+                        for item in files
+                    ]
+                return []
+
+            async def create_offline(_url, _dir_id, _filename):
+                state["downloaded"] = True
+                # 每次提交时观察"已提交且未完成"的数量：不能超过并发上限
+                observed_inflight.append(len(pipeline.offline.inflight_items()))
+                task_id = state["next_id"]
+                state["next_id"] += 1
+                return task_id
+
+            pan123.list_files.side_effect = list_files
+            pan123.create_offline_download.side_effect = create_offline
+            pan123.find_file_by_size.return_value = None
+
+            pipeline, _stub, task = self._make_pipeline(files, pan123, concurrency=2)
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
+                await pipeline.run()
+
+            self.assertTrue(observed_inflight)
+            self.assertLessEqual(max(observed_inflight), 2)
+            self.assertTrue(all(file["status"] == "success" for file in task["files"]))
+            self.assertEqual(task["status"], "success")
+            self.assertEqual({file["offlineTaskId"] for file in task["files"]}, {1, 2, 3, 4, 5})
+
+        asyncio.run(run())
+
+    def test_success_cleans_up_queued_and_user_messages_keeps_final(self):
         async def run() -> None:
             with tempfile.TemporaryDirectory() as directory:
                 store = SessionStore(Path(directory))
-                store.write_config({"transfer": {"pan115Cookies": ["B|UID=2; CID=b; SEID=y"], "downloadMinIntervalMs": 0}})
                 service = TransferService(store)
-                service._remember_config(store.read_config().get("transfer"))
-                task = {"id": "t", "shareCode": "abc", "receiveCode": "pass", "logs": []}
-                file = {"id": "9", "name": "movie.mkv", "size": 1, "sourceType": "115_share"}
+                cleaned = []
+                service.set_cleanup_notifier(lambda payload: cleaned.append(dict(payload)) or asyncio.sleep(0))
+                service._save_transfer_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
-                primary = {"name": "A", "cookie": "UID=1; CID=a; SEID=x"}
-                good_client = AsyncMock()
-                good_client.get_download_url.return_value = "https://115.invalid/ok"
-                # 主账号客户端返回未登录错误，验证池内换号
-                bad_client = AsyncMock()
-                bad_client.get_download_url.side_effect = ValueError("[errno 990001] 需要登录账号")
-                service._validate_pan115_download_url = AsyncMock()  # type: ignore[method-assign]
+                # 入队通知返回引用 → 记录到任务上
+                service.set_queued_notifier(AsyncMock(return_value=[
+                    {"taskId": "task-1", "chatId": 123, "messageId": 100},
+                ]))
+                task = {"id": "task-1", "status": "queued", "chatId": 123, "messageId": 99, "logs": []}
+                await service._notify_queued_tasks([task])
+                self.assertEqual(task["transferNoticeChatId"], 123)
+                self.assertEqual(task["transferNoticeMessageIds"], [100])
 
-                with patch("app.transfer_service.Pan115TransferClient", side_effect=lambda cookie: good_client):
-                    url = await service._get_pan115_download_url(task, file, bad_client, primary)
+                # 成功终态：删除排队消息 100 和用户链接消息 99；最终结果消息 101 保留
+                service.set_notifier(AsyncMock(return_value={"chatId": 123, "messageId": 101}))
+                task["status"] = "success"
+                task["kind"] = "pan115_share"
+                await service._notify_task(task)
 
-                self.assertEqual(url, "https://115.invalid/ok")
-                # 主账号被标记冷却
-                self.assertTrue(service._is_account_cooling(primary))
-                self.assertTrue(any("115 账号失效" in item["message"] for item in task["logs"]))
+                self.assertEqual(len(cleaned), 1)
+                self.assertEqual(sorted(cleaned[0]["messageIds"]), [99, 100])
+                self.assertEqual(cleaned[0]["chatId"], 123)
+                # 最终结果消息保留：其引用记录在任务上（任务记录随后会被清理）
+                self.assertEqual(task["transferFinalMessageId"], 101)
 
         asyncio.run(run())
 

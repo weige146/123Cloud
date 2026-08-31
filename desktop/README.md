@@ -32,14 +32,26 @@ npm install
 npm run dev
 ```
 
-## 构建（GitHub Actions 自动出包）
+## 本地构建（先打包实测，再提交）
 
-安装包由 [.github/workflows/ci.yml](../.github/workflows/ci.yml) 在 GitHub 上构建，本地不需要跑脚本：
+> 项目约束：改动完成后先本地打包交给维护者实测，**实测确认前不 commit / push / 打 tag**（见根目录 [AGENTS.md](../AGENTS.md)）。
 
-1. 推送代码到 `main`（或打 `v*` 标签）自动触发；
-2. `tests` job 先跑后端 pytest 与前端构建校验；
-3. `package` job 在 macOS 与 Windows 两个 runner 上分别出包（PyInstaller 无法交叉编译，Windows 版必须由 Windows runner 构建）；
-4. 到仓库 **Actions → 对应运行 → Artifacts** 下载 `123Cloud-macOS`（DMG）与 `123Cloud-Windows`（安装器 exe）。
+```bash
+# 1. 前端构建（产物会内嵌进后端二进制）
+cd web && npm ci && npm run build && cd ..
+
+# 2. PyInstaller 打后端侧车 → backend-dist/cloudgateway/
+python3 -m PyInstaller backend.spec --noconfirm --distpath backend-dist --workpath backend-build
+
+# 3. Electron 出包 → release/123Cloud-<版本>-macOS-arm64.dmg
+npm ci && npm run dist:mac
+```
+
+推送 `main`（或打 `v*` 标签）后，[.github/workflows/ci.yml](../.github/workflows/ci.yml) 会跑同样的构建：
+
+1. `tests` job 先跑后端 pytest 与前端构建校验；
+2. `package` job 在 macOS 与 Windows 两个 runner 上分别出包（PyInstaller 无法交叉编译，Windows 版必须由 Windows runner 构建）；
+3. 到仓库 **Actions → 对应运行 → Artifacts** 下载 `123Cloud-macOS`（DMG）与 `123Cloud-Windows`（安装器 exe）。
 
 ## 首次打开（未签名）
 
@@ -64,7 +76,6 @@ npm run dev
 | `backend/` | FastAPI 后端源码（`python -m app` 即侧车入口，含 tests/） |
 | `web/` | Vue 3 液态玻璃前端源码（`dist/` 为其构建产物） |
 | `electron/` | Electron 主进程 / 侧车管理 / preload / 开发编排 |
-| `scripts/test_backend.sh` | 本地快速跑后端测试 |
 | `build/` | 应用图标；`icon-source.jpg` 是 logo 源图，换图标就替换它再跑 `build/generate_icon.py` |
 | `backend.spec` | PyInstaller 打包配置（内嵌前端） |
 | `sidecar_entry.py` | 侧车打包入口 |

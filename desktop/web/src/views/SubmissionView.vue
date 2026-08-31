@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { useGlobalState } from "@/composables/useGlobalState";
 import { submissionApi } from "@/api";
 import type { SubmissionConfig, SubmissionDraft } from "@/api/types";
@@ -8,8 +9,37 @@ import PageHero from "@/components/PageHero.vue";
 import GlassCard from "@/components/GlassCard.vue";
 import FormGrid from "@/components/FormGrid.vue";
 import FormField from "@/components/FormField.vue";
+import SegmentedTabs from "@/components/SegmentedTabs.vue";
+import SubmissionRoutingPanel from "@/components/SubmissionRoutingPanel.vue";
 
+const route = useRoute();
+const router = useRouter();
 const { state, writeSubmissionConfig, notifySuccess, notifyError, confirm } = useGlobalState();
+
+// 「机器人」= Bot 连接/权限/草稿；「频道路由」= 各频道主账号的分发规则
+type SubmissionTab = "bot" | "routing";
+const tabsList = [
+  { key: "bot", label: "机器人", icon: "mdi-robot" },
+  { key: "routing", label: "频道路由", icon: "mdi-routes" },
+];
+
+function tabFromQuery(): SubmissionTab {
+  return route.query.tab === "routing" ? "routing" : "bot";
+}
+const tab = ref<SubmissionTab>(tabFromQuery());
+watch(
+  () => route.query.tab,
+  () => {
+    const next = tabFromQuery();
+    if (tab.value !== next) tab.value = next;
+  },
+);
+watch(tab, (next) => {
+  const target = next === "routing" ? { query: { tab: "routing" } } : { query: {} };
+  if (route.query.tab !== (next === "routing" ? "routing" : undefined)) {
+    router.replace({ path: "/admin/submission", ...target });
+  }
+});
 
 const form = reactive({
   botToken: "",
@@ -20,7 +50,6 @@ const form = reactive({
   tgSession: "",
   telegramAdminUserIds: "",
   channelOwnerUserIds: "",
-  channelSettingsUrl: "",
 });
 
 const statusText = ref("投稿配置未加载");
@@ -43,7 +72,6 @@ function syncFromConfig() {
   form.tgSession = String(c.telegramApi?.session ?? "");
   form.telegramAdminUserIds = (c.telegramAdminUserIds || c.allowedUserIds || []).join("\n");
   form.channelOwnerUserIds = (c.channelOwnerUserIds || c.allowedUserIds || []).join("\n");
-  form.channelSettingsUrl = String(c.channelSettingsUrl ?? "");
   const s = state.submissionStatus;
   if (s) {
     statusText.value = [
@@ -145,16 +173,11 @@ async function save() {
       telegramAdminUserIds: parseIds(form.telegramAdminUserIds),
       channelOwnerUserIds: parseIds(form.channelOwnerUserIds),
     };
-    // Do not let an older already-open page with a blank field erase the URL
-    // that was configured elsewhere.  A dedicated clear action can be added
-    // later if that is ever needed.
-    const cardUrl = String(form.channelSettingsUrl ?? "").trim();
-    if (cardUrl) next.channelSettingsUrl = cardUrl;
     await writeSubmissionConfig(next);
     // Reflect the server's persisted value immediately.  This also makes a
     // backend-side normalization visible without requiring a page refresh.
     syncFromConfig();
-    saveFeedback.value = form.channelSettingsUrl ? "投稿配置和频道卡片地址已保存。" : "投稿配置已保存。";
+    saveFeedback.value = "投稿配置已保存。";
     notifySuccess(saveFeedback.value);
   } catch (error) {
     saveFailed.value = true;
@@ -185,7 +208,7 @@ onMounted(() => {
       group="dashboard"
       icon="mdi-robot"
       title="投稿机器人"
-      desc="分享和秒传链接会自动提交到投稿机器人。"
+      desc="分享和秒传链接会自动提交到投稿机器人；Bot 配置与频道路由都在这里。"
     >
       <template #status>
         <span class="chip-status" :data-tone="submissionStatus?.botConfigured ? 'success' : 'warning'">
@@ -205,7 +228,7 @@ onMounted(() => {
           草稿 {{ submissionStatus?.draftCount || 0 }}
         </span>
       </template>
-      <template #actions>
+      <template v-if="tab === 'bot'" #actions>
         <v-btn variant="text" @click="testBot">
           <v-icon start>mdi-connection</v-icon>
           测试 Bot
@@ -217,7 +240,9 @@ onMounted(() => {
       </template>
     </PageHero>
 
-    <div class="section-grid">
+    <SegmentedTabs v-model="tab" :tabs="tabsList" />
+
+    <div v-show="tab === 'bot'" class="section-grid">
       <GlassCard
         accent="group"
         icon="mdi-connection"
@@ -285,15 +310,6 @@ onMounted(() => {
               hide-details
             />
           </FormField>
-          <FormField label="频道配置卡片地址" :full="true" hint="填写部署后可从 Telegram 访问的 HTTPS 地址。频道所有者发送 /channels 后会一键打开此卡片。">
-            <v-text-field
-              v-model="form.channelSettingsUrl"
-              placeholder="https://你的域名/admin/channel-settings"
-              variant="outlined"
-              density="compact"
-              hide-details
-            />
-          </FormField>
           <FormField label="TG 用户 Session" :full="true" hint="Telegram 用户 Session（StringSession 格式），用于发布后清理频道旧帖。">
             <v-textarea
               v-model="form.tgSession"
@@ -327,16 +343,21 @@ onMounted(() => {
             hide-details
           />
         </FormField>
-        <FormField label="频道所有者 Telegram UID" hint="可通过 /channels 打开自己的频道配置卡片；每行一个 UID。">
+        <FormField label="频道所有者 Telegram UID" hint="可在「频道路由」标签页管理其频道与路由；每行一个 UID。">
           <v-textarea
             v-model="form.channelOwnerUserIds"
             :rows="4"
-            placeholder="可通过 /channels 打开自己的频道配置卡片；每行一个 UID"
+            placeholder="可在「频道路由」标签页管理其频道与路由；每行一个 UID"
             variant="outlined"
             density="compact"
             hide-details
           />
         </FormField>
+        <p class="routing-link-row">
+          <button type="button" class="routing-link" @click="tab = 'routing'">
+            去配置频道路由 →
+          </button>
+        </p>
       </GlassCard>
 
       <GlassCard
@@ -379,6 +400,8 @@ onMounted(() => {
         </div>
       </GlassCard>
     </div>
+
+    <SubmissionRoutingPanel v-show="tab === 'routing'" />
   </div>
 </template>
 
@@ -487,6 +510,27 @@ onMounted(() => {
   background: var(--glass-bg-3);
   color: var(--text-muted);
   border-color: var(--glass-border-3);
+}
+
+.routing-link-row {
+  margin: 10px 2px 0;
+  font-size: 12.5px;
+}
+
+.routing-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.routing-link:hover {
+  text-decoration: underline;
 }
 
 @media (max-width: 760px) {

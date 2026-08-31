@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 
-type GroupKey = "dashboard" | "pan115" | "recognition" | "media";
+type GroupKey = "dashboard" | "submission" | "pan115" | "recognition" | "media";
 
 const props = withDefaults(
   defineProps<{

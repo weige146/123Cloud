@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -14,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, parse_qsl, urlparse
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -24,38 +22,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-# 配置日志格式：包含时间戳、级别、logger 名、消息，便于排查
-# uvicorn 已有自己的日志配置，这里只接管应用层 logger
+# 统一日志：控制台 + 落盘轮转 + 内存环形缓冲（GET /api/logs 读取）
+# 必须在导入业务模块前初始化，保证第三方库降噪与应用日志格式一致
+from .logsetup import recent_logs, setup_logging
+
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
-_log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format=_log_format,
-    datefmt="%Y-%m-%d %H:%M:%S",
-    force=True,
-)
-# httpx 每个请求打一条 INFO（含 TG getUpdates 长轮询），会把应用内日志环形缓冲刷屏，降噪到 WARNING
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-# 参照成熟工具的日志方案：除控制台/内存外，落盘轮转文件，重启后仍可排查
-try:
-    from logging.handlers import RotatingFileHandler
-
-    _log_file = os.environ.get("LOG_FILE")
-    if _log_file is None:
-        _log_file = str(DATA_DIR / "logs" / "backend.log")
-    if _log_file and _log_file.lower() not in {"off", "none", "disabled"}:
-        Path(_log_file).resolve().parent.mkdir(parents=True, exist_ok=True)
-        _file_handler = RotatingFileHandler(
-            _log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-        )
-        _file_handler.setLevel(logging.INFO)
-        _file_handler.setFormatter(logging.Formatter(_log_format, datefmt="%Y-%m-%d %H:%M:%S"))
-        logging.getLogger().addHandler(_file_handler)
-except Exception as _log_file_error:  # 落盘失败不应阻塞启动
-    print(f"[main] log file init failed: {_log_file_error}", flush=True)
+setup_logging(DATA_DIR)
 
 from .pan115 import empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
 from .pan115_cookie import (
@@ -69,28 +42,28 @@ from .pan115_cookie import (
 )
 from .pan123 import Pan123Client, Pan123Error, parse_pan123_share_url
 from .pan115_transfer import extract_115_links
-from .session_store import SessionStore
+from .session_store import SessionStore, positive_user_ids
 from .submission import (
     build_submission_display_preview,
     clear_submission_drafts,
     close_telegram_client,
-    delete_telegram_messages,
     delete_submission_draft,
+    delete_telegram_messages,
     extract_submission_links,
-    handle_submission_telegram_update,
+    find_pending_submission_draft,
+    handle_pending_submission_input,
+    handle_submission_callback,
     list_submission_drafts,
     send_telegram_text,
     start_telegram_client,
     submit_existing_draft,
     submit_submission_links,
-    submit_submission_text,
-    telegram_message_text,
-    telegram_message_id,
     telegram_admin_allowed,
-    telegram_channel_owner_allowed,
+    telegram_message_id,
+    telegram_message_text,
+    telegram_user_allowed,
 )
 from .transfer_service import TransferService
-from .wallpapers import BingWallpaperService, WallpaperUpstreamError
 
 
 def _resolve_admin_web_dir() -> Path:
@@ -114,19 +87,16 @@ ADMIN_WEB_DIR = _resolve_admin_web_dir()
 store = SessionStore(DATA_DIR)
 pan123 = Pan123Client()
 transfer_service = TransferService(store)
-wallpaper_service = BingWallpaperService()
 logger = logging.getLogger(__name__)
-telegram_polling_task: Optional[asyncio.Task[None]] = None
 pan115_recycle_cleanup_task: Optional[asyncio.Task[None]] = None
+telegram_callback_polling_task: Optional[asyncio.Task[None]] = None
 PAN123_COPY_PASSWORD_PENDING_PREFIX = "telegram_pan123_copy_password:"
 PAN123_COPY_PASSWORD_TTL_SECONDS = 600
 TELEGRAM_BOT_COMMANDS = [
-    {"command": "start", "description": "搬运默认 115 本地盘目录"},
-    {"command": "help", "description": "查看使用说明"},
-    {"command": "myid", "description": "查看我的 Telegram UID"},
-    {"command": "recycle", "description": "清空 115 回收站"},
-    {"command": "channels", "description": "管理我的投稿频道"},
+    {"command": "start", "description": "启动本地盘搬运"},
+    {"command": "recycle", "description": "删除回收站"},
 ]
+
 
 @contextlib.asynccontextmanager
 async def app_lifespan(_app: FastAPI):
@@ -148,25 +118,25 @@ app.add_middleware(
 
 
 async def start_background_tasks() -> None:
-    global telegram_polling_task, pan115_recycle_cleanup_task
+    global pan115_recycle_cleanup_task, telegram_callback_polling_task
     await start_telegram_client()
     transfer_service.set_queued_notifier(send_telegram_transfer_queued_messages)
     transfer_service.set_notifier(send_telegram_transfer_status_message)
     transfer_service.set_cookie_notifier(send_telegram_account_expired_message)
     transfer_service.set_cleanup_notifier(cleanup_telegram_transfer_messages)
-    if telegram_polling_task and not telegram_polling_task.done():
-        pass
-    else:
-        telegram_polling_task = asyncio.create_task(telegram_polling_loop())
     if pan115_recycle_cleanup_task and not pan115_recycle_cleanup_task.done():
         pass
     else:
         pan115_recycle_cleanup_task = asyncio.create_task(pan115_recycle_cleanup_loop())
+    if telegram_callback_polling_task and not telegram_callback_polling_task.done():
+        pass
+    else:
+        telegram_callback_polling_task = asyncio.create_task(telegram_callback_polling_loop())
     await transfer_service.init()
 
 
 async def stop_background_tasks() -> None:
-    for task in (telegram_polling_task, pan115_recycle_cleanup_task):
+    for task in (pan115_recycle_cleanup_task, telegram_callback_polling_task):
         if not task or task.done():
             continue
         task.cancel()
@@ -177,7 +147,13 @@ async def stop_background_tasks() -> None:
     await close_telegram_client()
 
 
-async def telegram_polling_loop() -> None:
+async def telegram_callback_polling_loop() -> None:
+    """最小化 Telegram 轮询：只服务草稿预览按钮。
+
+    - 处理预览消息上的按钮回调（发布到频道 / 修改大小 / 修改备注 /
+      更改识别 / 指定频道），以及按钮触发的"下一条消息"输入
+    - 不接收任何投稿文本：投稿统一走油猴脚本 / 后台接口提交
+    """
     active_token = ""
     offset: Optional[int] = None
     async with httpx.AsyncClient(timeout=35.0) as client:
@@ -190,21 +166,20 @@ async def telegram_polling_loop() -> None:
                     offset = None
                     await asyncio.sleep(5)
                     continue
-
                 if bot_token != active_token:
                     active_token = bot_token
                     offset = None
-                    await client.post(
-                        f"https://api.telegram.org/bot{bot_token}/deleteWebhook",
-                        json={"drop_pending_updates": False},
-                        timeout=20.0,
-                    )
-                    await client.post(
-                        f"https://api.telegram.org/bot{bot_token}/setMyCommands",
-                        json={"commands": TELEGRAM_BOT_COMMANDS},
-                        timeout=20.0,
-                    )
-
+                    with contextlib.suppress(Exception):
+                        await client.post(
+                            f"https://api.telegram.org/bot{bot_token}/deleteWebhook",
+                            json={"drop_pending_updates": False},
+                            timeout=20.0,
+                        )
+                        await client.post(
+                            f"https://api.telegram.org/bot{bot_token}/setMyCommands",
+                            json={"commands": TELEGRAM_BOT_COMMANDS},
+                            timeout=20.0,
+                        )
                 response = await client.get(
                     f"https://api.telegram.org/bot{bot_token}/getUpdates",
                     params={
@@ -217,16 +192,13 @@ async def telegram_polling_loop() -> None:
                 if response.status_code >= 400 or not data.get("ok", True):
                     await asyncio.sleep(5)
                     continue
-
                 for update in data.get("result") or []:
                     update_id = update.get("update_id")
                     if isinstance(update_id, int):
                         offset = update_id + 1
                     if isinstance(update, dict):
                         with contextlib.suppress(Exception):
-                            if await handle_transfer_telegram_update(update, bot_token, config):
-                                continue
-                            await handle_submission_telegram_update(store, update)
+                            await handle_telegram_button_update(update, bot_token, config)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -330,7 +302,6 @@ async def handle_transfer_telegram_update(update: Dict[str, Any], bot_token: str
         except Exception as error:
             await send_telegram_text(bot_token, chat_id, f"115 离线提交失败：{error}")
     return True
-
 
 async def handle_admin_pan123_share_links(
     bot_token: str,
@@ -437,7 +408,6 @@ async def handle_admin_pan123_share_links(
         await send_telegram_text(bot_token, chat_id, "123 分享处理异常：\n" + "\n".join(errors[:3]))
     return bool(submission_links or copy_count or missing_passwords or errors)
 
-
 async def handle_pending_pan123_copy_password(
     bot_token: str,
     chat_id: int,
@@ -471,37 +441,19 @@ async def handle_pending_pan123_copy_password(
         await send_telegram_text(bot_token, chat_id, f"123 分享转存入队失败：{error}")
     return True
 
-
 def pan123_copy_password_key(user_id: int) -> str:
     return f"{PAN123_COPY_PASSWORD_PENDING_PREFIX}{int(user_id or 0)}"
-
-
-def explicit_pan123_share_password(link: Dict[str, Any], allow_source_fallback: bool) -> str:
-    share_url = str(link.get("cleanUrl") or link.get("url") or "")
-    try:
-        query = parse_qs(urlparse(share_url).query)
-        password = str((query.get("pwd") or [""])[0]).strip()
-        if password:
-            return password
-    except (TypeError, ValueError):
-        pass
-    if allow_source_fallback:
-        return str(link.get("password") or "").strip()
-    return ""
-
 
 def telegram_pan115_help_text() -> str:
     return "\n".join([
         "115 搬运机器人使用说明：",
-        "/start 搬运后台配置的默认 115 本地盘目录",
+        "/start 启动本地盘搬运（后台配置的默认 115 本地盘目录）",
         "/start 路径或CID 搬运指定的 115 本地盘目录",
-        "/help 查看本说明",
-        "/recycle 清空 115 回收站",
+        "/recycle 删除回收站（清空 115 回收站）",
         "",
         "直接发送 115 分享链接和提取码：搬运到 123 云盘",
         "直接发送 magnet / ed2k：提交到 115 助手离线下载",
     ])
-
 
 def format_pan115_action_result(title: str, result: Dict[str, Any]) -> str:
     total = int(result.get("total") or 0)
@@ -511,18 +463,60 @@ def format_pan115_action_result(title: str, result: Dict[str, Any]) -> str:
     return f"{message}，失败 {failed}" if failed else message
 
 
-async def send_telegram_transfer_queued_messages(tasks: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+async def handle_telegram_button_update(update: Dict[str, Any], bot_token: str, config: Dict[str, Any]) -> None:
+    callback = update.get("callback_query") if isinstance(update.get("callback_query"), dict) else None
+    if callback:
+        await handle_submission_callback(store, bot_token, config, callback)
+        return
+    message = update.get("message") if isinstance(update.get("message"), dict) else None
+    if not message:
+        return
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    if str(chat.get("type") or "") != "private":
+        return
+    user = message.get("from") if isinstance(message.get("from"), dict) else {}
+    user_id = safe_int(user.get("id"))
+    chat_id = safe_int(chat.get("id"))
+    if not user_id:
+        return
+
+    # 1) 点了"修改"按钮后的下一条消息：作为草稿编辑输入接收
+    draft = find_pending_submission_draft(store, chat_id, user_id)
+    if draft:
+        text = telegram_message_text(message).strip()
+        if text:
+            await handle_pending_submission_input(store, bot_token, config, draft, text, safe_int(message.get("message_id")))
+        return
+
+    # 2) 授权管理员发文本：115 链接→搬运、磁力→115 离线、123 链接→分流（与旧版一致）
+    if telegram_admin_allowed(config, user_id):
+        await handle_transfer_telegram_update(update, bot_token, config)
+
+
+async def _transfer_admin_chat_ids() -> List[int]:
+    """搬运通知的接收人：telegramAdminUserIds（兼容旧的 allowedUserIds）。"""
     config = store.read_submission_config()
-    bot_token = str(config.get("botToken") or "").strip()
-    if not bot_token:
+    admin_ids = config.get("telegramAdminUserIds")
+    admin_list = [safe_int(value) for value in admin_ids] if isinstance(admin_ids, list) else []
+    legacy = config.get("allowedUserIds")
+    if legacy and isinstance(legacy, list):
+        admin_list.extend(safe_int(value) for value in legacy)
+    return list(dict.fromkeys([chat_id for chat_id in admin_list if chat_id]))
+
+
+def _transfer_bot_token() -> str:
+    return str(store.read_submission_config().get("botToken") or "").strip()
+
+
+async def send_telegram_transfer_queued_messages(tasks: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """入队通知广播给所有管理员；返回第一个管理员聊天的消息引用供成功后清理。"""
+    bot_token = _transfer_bot_token()
+    chat_ids = await _transfer_admin_chat_ids()
+    if not bot_token or not chat_ids:
         return None
+    track_chat_id = chat_ids[0]
     refs: List[Dict[str, Any]] = []
     for task in tasks:
-        if str(task.get("source") or "") != "telegram":
-            continue
-        chat_id = safe_int(task.get("chatId"))
-        if not chat_id:
-            continue
         is_pan123_copy = str(task.get("kind") or "") == "pan123_share_copy"
         is_local = str(task.get("shareCode") or "").lower().startswith("local:")
         title = str(
@@ -532,73 +526,82 @@ async def send_telegram_transfer_queued_messages(tasks: List[Dict[str, Any]]) ->
         )
         label = "123 分享转存" if is_pan123_copy else ("115 本地盘搬运" if is_local else "115 分享搬运")
         detail = f"\n目标目录 ID：{task.get('targetDirId') or '0'}" if is_pan123_copy else ""
-        sent = await send_telegram_text(
-            bot_token,
-            chat_id,
-            f"{label}已加入队列：{title}{detail}\n任务 ID：{str(task.get('id') or '')[:8]}",
-        )
-        message_id = telegram_message_id(sent)
-        if message_id:
-            refs.append({"taskId": task.get("id"), "chatId": chat_id, "messageId": message_id})
+        text = f"📥 {label}已加入队列：{title}{detail}\n任务 ID：{str(task.get('id') or '')[:8]}"
+        for chat_id in chat_ids:
+            with contextlib.suppress(Exception):
+                sent = await send_telegram_text(bot_token, chat_id, text)
+                message_id = telegram_message_id(sent)
+                if chat_id == track_chat_id and message_id:
+                    refs.append({"taskId": task.get("id"), "chatId": chat_id, "messageId": message_id})
     return refs or None
 
 
 async def send_telegram_transfer_status_message(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     kind = str(task.get("kind") or "")
-    if kind not in {"pan123_share_copy", "pan115_share"} or str(task.get("source") or "") != "telegram":
+    if kind not in {"pan123_share_copy", "pan115_share"}:
         return None
-    if str(task.get("status") or "") not in {"success", "failed", "partial"}:
+    status = str(task.get("status") or "")
+    if status not in {"success", "failed", "partial"}:
         return None
-    config = store.read_submission_config()
-    bot_token = str(config.get("botToken") or "").strip()
-    chat_id = safe_int(task.get("chatId"))
-    if not bot_token or not chat_id:
+    bot_token = _transfer_bot_token()
+    chat_ids = await _transfer_admin_chat_ids()
+    if not bot_token or not chat_ids:
         return None
     is_pan123_copy = kind == "pan123_share_copy"
     is_local = str(task.get("shareCode") or "").lower().startswith("local:")
     if is_pan123_copy:
         title = str(task.get("title") or task.get("shareUrl") or "123 分享")
+        label = "123 分享转存"
     else:
         title = str(task.get("title") or task.get("shareUrl") or ("115 本地盘" if is_local else "115 分享"))
-    remote_id = safe_int(task.get("remoteTaskId"))
-    status = str(task.get("status") or "")
+        label = "115 本地盘搬运" if is_local else "115 分享搬运"
+    files = task.get("files") or []
+    success = len([f for f in files if str(f.get("status")) in {"success", "skipped"}])
+    failed_files = [f for f in files if str(f.get("status")) == "failed"]
+    failed_count = len(failed_files)
     if status == "success":
-        if is_pan123_copy:
-            text = f"✅ 123 分享转存成功：{title}\n目标目录 ID：{task.get('targetDirId') or '0'}"
-        else:
-            done = len([f for f in task.get("files") or [] if str(f.get("status")) in {"success", "skipped"}])
-            text = f"✅ {'115 本地盘搬运' if is_local else '115 分享搬运'}完成：{title}\n已处理 {done} 个文件"
+        icon = "✅"
+        summary = f"成功 {success}，跳过/失败 0"
+    elif status == "partial":
+        icon = "⚠️"
+        summary = f"成功 {success}，失败 {failed_count}"
     else:
-        files = [f for f in task.get("files") or [] if str(f.get("status")) == "failed"]
-        failed_count = len(files)
-        reason = str(files[0].get("error") or task.get("error") or "未知错误")[:200] if files else str(task.get("error") or "未知错误")[:200]
-        if is_pan123_copy:
-            text = f"❌ 123 分享转存失败：{title}\n原因：{reason}"
-        else:
-            label = "115 本地盘搬运" if is_local else "115 分享搬运"
-            head = f"⚠️ {label}部分失败：{title}" if status == "partial" else f"❌ {label}失败：{title}"
-            text = f"{head}\n失败 {failed_count} 个文件\n原因：{reason}"
-    if is_pan123_copy and remote_id:
-        text += f"\n远端任务 ID：{remote_id}"
-    sent = await send_telegram_text(bot_token, chat_id, text)
-    message_id = telegram_message_id(sent)
-    return {"chatId": chat_id, "messageId": message_id} if message_id else None
+        icon = "❌"
+        summary = f"失败 {max(1, failed_count)} 个文件"
+    text = f"{icon} {label}{'部分失败' if status == 'partial' else '完成' if status == 'success' else '失败'}：{title}\n{summary}"
+    if failed_files:
+        reason = str(failed_files[0].get("error") or task.get("error") or "未知错误")[:200]
+        text += f"\n失败原因：{reason}"
+    if is_pan123_copy and safe_int(task.get("remoteTaskId")):
+        text += f"\n远端任务 ID：{safe_int(task.get('remoteTaskId'))}"
+    first_ref: Optional[Dict[str, Any]] = None
+    for chat_id in chat_ids:
+        with contextlib.suppress(Exception):
+            sent = await send_telegram_text(bot_token, chat_id, text)
+            message_id = telegram_message_id(sent)
+            if first_ref is None and message_id:
+                first_ref = {"chatId": chat_id, "messageId": message_id}
+    return first_ref
+
+
+async def cleanup_telegram_transfer_messages(payload: Dict[str, Any]) -> None:
+    """搬运结束后删除 Telegram 里的排队/进度消息和用户的链接消息。"""
+    task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+    bot_token = _transfer_bot_token()
+    chat_id = safe_int(payload.get("chatId"))
+    message_ids = payload.get("messageIds") if isinstance(payload.get("messageIds"), list) else []
+    if bot_token and chat_id and message_ids:
+        await delete_telegram_messages(bot_token, chat_id, message_ids)
 
 
 async def send_telegram_account_expired_message(payload: Dict[str, Any]) -> None:
     """115 Cookie 失效告警：发给 telegramAdminUserIds 管理员。"""
     if not isinstance(payload, dict):
         return
-    config = store.read_submission_config()
-    bot_token = str(config.get("botToken") or "").strip()
+    bot_token = _transfer_bot_token()
     if not bot_token:
         return
-    admin_ids = config.get("telegramAdminUserIds")
-    admin_list = [safe_int(value) for value in admin_ids] if isinstance(admin_ids, list) else []
-    legacy = config.get("allowedUserIds")
-    if legacy and isinstance(legacy, list):
-        admin_list.extend(safe_int(value) for value in legacy)
-    chat_ids = list(dict.fromkeys([chat_id for chat_id in admin_list if chat_id]))
+    chat_ids = await _transfer_admin_chat_ids()
     if not chat_ids:
         return
     account = str(payload.get("account") or "未命名账号")
@@ -614,16 +617,137 @@ async def send_telegram_account_expired_message(payload: Dict[str, Any]) -> None
             await send_telegram_text(bot_token, chat_id, text)
 
 
-async def cleanup_telegram_transfer_messages(payload: Dict[str, Any]) -> None:
-    task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
-    if str(task.get("source") or "") != "telegram":
-        return
-    config = store.read_submission_config()
-    bot_token = str(config.get("botToken") or "").strip()
-    chat_id = safe_int(payload.get("chatId"))
-    message_ids = payload.get("messageIds") if isinstance(payload.get("messageIds"), list) else []
-    if bot_token and chat_id and message_ids:
-        await delete_telegram_messages(bot_token, chat_id, message_ids)
+async def route_submission_text(
+    text: str,
+    source_label: str,
+    submitter: Optional[Dict[str, Any]] = None,
+    max_links: int = 10,
+) -> Dict[str, Any]:
+    """统一分流入口（油猴脚本、后台提交共用）：拿到分享文本后自动分类处理。
+
+    - 第三方 123 分享 → 创建 123 转存任务（搬运到自己网盘）
+    - 自己的 123 分享 / 秒传链接 → 生成投稿草稿（后台"投稿草稿"里发布）
+    - 115 分享链接（带提取码）→ 创建 115 搬运任务
+    - magnet / ed2k → 提交到 115 助手离线下载
+
+    返回的 accepted 是受理条数；失败原因在 failures 列表里，详情看后台日志。
+    """
+    failures: List[str] = []
+    transfers = 0
+    offline_count = 0
+    drafts = 0
+
+    links = extract_submission_links(text)[:max_links]
+    web_link_count = sum(1 for link in links if str(link.get("provider") or "") == "123pan")
+
+    submission_links: List[Dict[str, Any]] = []
+    if links:
+        session = store.read_session()
+        current_uid = 0
+        if session and session.get("token"):
+            profile = session.get("profile") if isinstance(session.get("profile"), dict) else {}
+            current_uid = safe_int(profile.get("uid"))
+            if not current_uid:
+                try:
+                    profile = await pan123.get_user_info(session)
+                    session["profile"] = profile
+                    store.write_session(session)
+                    current_uid = safe_int(profile.get("uid"))
+                except Exception as error:
+                    logger.warning(f"获取 123 账号 UID 失败：{error}")
+        for link in links:
+            provider = str(link.get("provider") or "")
+            if provider != "123pan":
+                submission_links.append(link)
+                continue
+            share_url = str(link.get("cleanUrl") or link.get("url") or "")
+            try:
+                if not current_uid:
+                    raise RuntimeError("后端未登录 123 云盘，无法判断分享归属；请先登录")
+                parsed_share = parse_pan123_share_url(share_url)
+                canonical_share_url = f"{parsed_share['origin']}/s/{parsed_share['shareKey']}"
+                info = await pan123.get_share_info(canonical_share_url)
+                if info.get("expired"):
+                    raise ValueError("分享已过期")
+                share_owner_user_id = safe_int(info.get("userId"))
+                if not share_owner_user_id:
+                    raise ValueError("分享详情未返回 UserID")
+                if share_owner_user_id == current_uid:
+                    submission_links.append(link)
+                    continue
+                password = explicit_pan123_share_password(link, allow_source_fallback=web_link_count == 1)
+                if info.get("hasPassword") and not password:
+                    raise ValueError("分享需要提取码，链接里没有找到")
+                await transfer_service.enqueue_pan123_share_copy(canonical_share_url, password, info, source_label)
+                transfers += 1
+            except Exception as error:
+                failures.append(f"{share_url}：{error}")
+
+    share_links = extract_115_links(text)
+    offline_links = extract_pan115_offline_links(text)
+    if share_links:
+        try:
+            tasks = await transfer_service.enqueue_from_text(text, source_label)
+            transfers += len(tasks)
+        except Exception as error:
+            failures.append(f"115 分享搬运：{error}")
+    if offline_links:
+        submission = store.read_submission_config()
+        helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+        try:
+            offline_result = await submit_115_offline_from_text(helper, text)
+            offline_count = int(offline_result.get("success") or 0)
+            if offline_count <= 0:
+                raise RuntimeError("115 助手离线提交了 0 条")
+        except Exception as error:
+            failures.append(f"115 离线提交：{error}")
+
+    if submission_links:
+        try:
+            draft_result = await submit_submission_links(
+                store,
+                submission_links,
+                source_label,
+                source_text=text,
+                max_links=max_links,
+                submitter=submitter,
+            )
+            drafts = int(draft_result.get("draftCount") or 0)
+            draft_error = str(draft_result.get("error") or "").strip()
+            if drafts and draft_error:
+                logger.warning(f"投稿处理有提示：{draft_error}")
+        except Exception as error:
+            failures.append(f"投稿处理：{error}")
+
+    accepted = transfers + drafts + offline_count
+    if accepted:
+        logger.info(
+            f"收到投稿：受理 {accepted} 条（转存 {transfers}、投稿草稿 {drafts}、115 离线 {offline_count}）"
+            + (f"；失败 {len(failures)} 条" if failures else "")
+        )
+    else:
+        failures.insert(0, "没有可以处理的链接")
+    return {
+        "accepted": accepted,
+        "transfers": transfers,
+        "drafts": drafts,
+        "offline": offline_count,
+        "failures": failures,
+    }
+
+
+def explicit_pan123_share_password(link: Dict[str, Any], allow_source_fallback: bool) -> str:
+    share_url = str(link.get("cleanUrl") or link.get("url") or "")
+    try:
+        query = parse_qs(urlparse(share_url).query)
+        password = str((query.get("pwd") or [""])[0]).strip()
+        if password:
+            return password
+    except (TypeError, ValueError):
+        pass
+    if allow_source_fallback:
+        return str(link.get("password") or "").strip()
+    return ""
 
 
 async def pan115_recycle_cleanup_loop() -> None:
@@ -689,6 +813,7 @@ class SessionResponse(BaseModel):
     loginUuid: str = ""
     updatedAt: str = ""
     profile: Optional[Dict[str, Any]] = None
+    loginExpired: bool = False
 
 
 class SubmissionSubmitRequest(BaseModel):
@@ -763,56 +888,32 @@ def ms_to_iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-class AdminConfig(BaseModel):
-    gatewayName: str = "123 Cloud Gateway"
-    pan123ClientMode: str = "web"
-    pan123OpenApiClientId: str = ""
-    pan123OpenApiClientSecret: str = ""
-    updatedAt: Optional[str] = None
-
-
 @app.get("/api/health")
 async def health() -> Dict[str, Any]:
     return {"ok": True, "name": "123 Cloud Gateway", "version": "0.1.0"}
 
 
-@app.get("/api/admin/wallpapers")
-async def get_admin_wallpapers() -> Dict[str, Any]:
-    try:
-        return await wallpaper_service.get()
-    except WallpaperUpstreamError as exc:
-        logger.warning("Wallpaper upstream unavailable: %s", exc)
-        raise HTTPException(status_code=503, detail="壁纸服务暂不可用") from exc
-
-
-@app.get("/api/admin/config")
-async def read_admin_config() -> Dict[str, Any]:
-    return normalize_admin_config(store.read_config())
-
-
-@app.put("/api/admin/config")
-async def write_admin_config(config: AdminConfig) -> Dict[str, Any]:
-    return {"ok": True, "config": normalize_admin_config(store.write_config(config.dict(exclude_none=True)))}
+@app.get("/api/logs")
+async def read_backend_logs(limit: int = Query(1000, ge=1, le=10000)) -> Dict[str, Any]:
+    """最近的后端日志（内存环形缓冲），管理后台"运行日志"页面轮询读取。"""
+    return {"ok": True, "logs": recent_logs(limit)}
 
 
 @app.get("/api/admin/status")
 async def admin_status() -> Dict[str, Any]:
     session = store.read_session()
     raw_config = store.read_config()
-    config = normalize_admin_config(raw_config)
     submission = store.read_submission_config()
     helper_config = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
     transfer_config = raw_config.get("transfer") if isinstance(raw_config.get("transfer"), dict) else {}
     return {
         "ok": True,
-        "gateway": config,
         "capabilities": {
-            "openapiConfigured": bool(config.get("pan123OpenApiClientId") and config.get("pan123OpenApiClientSecret")),
             "submissionConfigured": bool(str(submission.get("botToken") or "").strip()),
             "pan115HelperConfigured": bool(helper_config.get("enabled")),
             "transferConfigured": bool(transfer_config.get("enabled")),
         },
-        "pan123": await session_payload(session),
+        "pan123": await session_payload(session, refresh_profile=True),
     }
 
 
@@ -888,98 +989,57 @@ async def preview_submission_display(request: SubmissionDisplayPreviewRequest) -
     return {"ok": True, "preview": build_submission_display_preview(request.config, request.sample)}
 
 
-def telegram_web_app_user_id(init_data: str) -> int:
-    """Validate Telegram Web App initData and return its signed Telegram UID.
+def _channel_owner_candidates() -> List[int]:
+    """频道主候选 = Bot 管理员 ∪ 已授权频道主（与投稿归属判断共用同一份配置）。"""
+    config = store.read_submission_config()
+    candidates = positive_user_ids(config.get("telegramAdminUserIds"))
+    for user_id in positive_user_ids(config.get("channelOwnerUserIds")):
+        if user_id not in candidates:
+            candidates.append(user_id)
+    return candidates
 
-    The UID is deliberately never accepted from the browser request body.  This
-    makes the public Mini App endpoints safe even though the normal desktop
-    administration API uses the existing local-session model.
-    """
-    token = str(store.read_submission_config().get("botToken") or "").strip()
-    if not token or not init_data:
-        raise HTTPException(status_code=401, detail="请从 Telegram Bot 打开频道配置卡片")
 
-    pairs = parse_qsl(init_data, keep_blank_values=True)
-    hashes = [value for key, value in pairs if key == "hash"]
-    if len(hashes) != 1 or not hashes[0]:
-        raise HTTPException(status_code=401, detail="Telegram 身份信息不完整")
-    data_pairs = [(key, value) for key, value in pairs if key != "hash"]
-    data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(data_pairs))
-    secret = hmac.new(b"WebAppData", token.encode("utf-8"), hashlib.sha256).digest()
-    expected_hash = hmac.new(secret, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected_hash, hashes[0]):
-        raise HTTPException(status_code=401, detail="Telegram 身份校验失败")
-
-    values = dict(data_pairs)
-    auth_date = safe_int(values.get("auth_date"))
-    now = int(time.time())
-    if not auth_date or auth_date > now + 300 or now - auth_date > 86_400:
-        raise HTTPException(status_code=401, detail="Telegram 身份信息已过期，请关闭后重新打开卡片")
-    try:
-        user = json.loads(values.get("user") or "{}")
-    except json.JSONDecodeError as error:
-        raise HTTPException(status_code=401, detail="Telegram 用户信息无效") from error
-    user_id = safe_int(user.get("id") if isinstance(user, dict) else 0)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Telegram 用户信息无效")
+def _require_channel_owner_user_id(user_id: int) -> int:
+    if user_id <= 0:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    if user_id not in _channel_owner_candidates() and not store.has_user_channel_config(user_id):
+        raise HTTPException(status_code=403, detail="该账号不是 Bot 管理员或已授权的频道主")
     return user_id
 
 
-def require_telegram_channel_owner(init_data: str) -> int:
-    user_id = telegram_web_app_user_id(init_data)
+@app.get("/api/submission/channel-owners")
+async def list_channel_owners() -> Dict[str, Any]:
     config = store.read_submission_config()
-    # A Bot administrator is allowed into the card as the bootstrap path for
-    # adding the first channel owner.  The card still reads and writes only
-    # that administrator's own channel configuration; it never grants access
-    # to another user's channels.
-    if not (
-        telegram_channel_owner_allowed(config, user_id, store)
-        or telegram_admin_allowed(config, user_id)
-    ):
-        raise HTTPException(status_code=403, detail="你没有频道管理权限；获授权用户只能投稿")
-    return user_id
+    candidates = _channel_owner_candidates()
+    existing = {int(item.get("ownerUserId") or 0) for item in store.list_users_with_channel_configs()}
+    for user_id in sorted(existing):
+        if user_id > 0 and user_id not in candidates:
+            candidates.append(user_id)
+    owners = positive_user_ids(config.get("channelOwnerUserIds"))
+    admins = positive_user_ids(config.get("telegramAdminUserIds"))
+    default_owner = owners[0] if owners else (admins[0] if admins else (candidates[0] if candidates else 0))
+    return {"ok": True, "owners": candidates, "defaultOwnerUserId": default_owner}
 
 
-@app.get("/api/submission/my-channel-config")
-async def read_my_channel_config(
-    x_telegram_init_data: str = Header(default="", alias="X-Telegram-Init-Data"),
-) -> Dict[str, Any]:
-    user_id = require_telegram_channel_owner(x_telegram_init_data)
-    config = store.read_submission_config()
-    own = store.read_user_channel_config(user_id)
-    if telegram_admin_allowed(config, user_id):
-        own["canManageChannelOwners"] = True
-        own["channelOwnerUserIds"] = config.get("channelOwnerUserIds") or []
-    return {"ok": True, "config": own}
+@app.get("/api/submission/channel-owners/{user_id}")
+async def read_channel_owner_config(user_id: int) -> Dict[str, Any]:
+    _require_channel_owner_user_id(user_id)
+    return {"ok": True, "config": store.read_user_channel_config(user_id)}
 
 
-@app.put("/api/submission/my-channel-config")
-async def write_my_channel_config(
-    payload: OwnUserChannelConfigRequest,
-    x_telegram_init_data: str = Header(default="", alias="X-Telegram-Init-Data"),
-) -> Dict[str, Any]:
-    user_id = require_telegram_channel_owner(x_telegram_init_data)
-    config = store.read_submission_config()
-    if payload.channelOwnerUserIds is not None:
-        if not telegram_admin_allowed(config, user_id):
-            raise HTTPException(status_code=403, detail="只有 Bot 管理员可以授权新的频道所有者")
-        store.write_submission_config({"channelOwnerUserIds": payload.channelOwnerUserIds})
+@app.put("/api/submission/channel-owners/{user_id}")
+async def write_channel_owner_config(user_id: int, payload: OwnUserChannelConfigRequest) -> Dict[str, Any]:
+    _require_channel_owner_user_id(user_id)
     try:
         saved = store.write_user_channel_config(user_id, {"channels": payload.channels, "routing": payload.routing})
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    current = store.read_submission_config()
-    if telegram_admin_allowed(current, user_id):
-        saved["canManageChannelOwners"] = True
-        saved["channelOwnerUserIds"] = current.get("channelOwnerUserIds") or []
     return {"ok": True, "config": saved}
 
 
-@app.delete("/api/submission/my-channel-config")
-async def delete_my_channel_config(
-    x_telegram_init_data: str = Header(default="", alias="X-Telegram-Init-Data"),
-) -> Dict[str, Any]:
-    user_id = require_telegram_channel_owner(x_telegram_init_data)
+@app.delete("/api/submission/channel-owners/{user_id}")
+async def delete_channel_owner_config(user_id: int) -> Dict[str, Any]:
+    _require_channel_owner_user_id(user_id)
     deleted = store.delete_user_channel_config(user_id)
     return {"ok": True, "deleted": deleted}
 
@@ -1031,12 +1091,17 @@ async def submit_submission(request: SubmissionSubmitRequest) -> Dict[str, Any]:
             if part
         ).strip()
     try:
-        result = await submit_submission_text(store, text, request.title or "投稿", request.targetUserId)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error))
+        routed = await route_submission_text(text, "油猴投稿", max_links=10)
     except Exception as error:
         raise HTTPException(status_code=502, detail=str(error))
-    return {"ok": True, **result}
+    accepted = int(routed.get("accepted") or 0)
+    failures = routed.get("failures") or []
+    if not accepted:
+        raise HTTPException(status_code=400, detail="；".join(str(item) for item in failures) or "没有可以处理的链接")
+    payload: Dict[str, Any] = {"ok": True, "draftCount": accepted, "sentCount": accepted, **routed}
+    if failures:
+        payload["error"] = f"成功受理 {accepted} 条，失败 {len(failures)} 条：" + "；".join(str(item) for item in failures[:3])
+    return payload
 
 
 @app.get("/api/submission/drafts")
@@ -1158,12 +1223,7 @@ async def read_transfer_config() -> Dict[str, Any]:
 @app.put("/api/transfer/config")
 async def write_transfer_config(config: TransferConfigRequest) -> Dict[str, Any]:
     payload = normalize_transfer_config(config.dict())
-    admin_update: Dict[str, Any] = {"transfer": payload}
-    if payload.get("pan123ClientId"):
-        admin_update["pan123OpenApiClientId"] = payload["pan123ClientId"]
-    if payload.get("pan123ClientSecret"):
-        admin_update["pan123OpenApiClientSecret"] = payload["pan123ClientSecret"]
-    saved = store.write_config(admin_update)
+    saved = store.write_config({"transfer": payload})
     transfer_service._remember_config(saved.get("transfer") if isinstance(saved.get("transfer"), dict) else {})
     transfer_service.kick()
     return {"ok": True, "config": normalize_transfer_config(saved)}
@@ -1242,15 +1302,39 @@ async def delete_completed_transfer_offline_tasks() -> Dict[str, Any]:
     return {"ok": True, "deleted": 0, "message": "123 OpenAPI 暂不支持列出并删除已完成离线任务"}
 
 
+PROFILE_TTL_SECONDS = 12 * 3600
+
+
+def _looks_like_login_expired(message: str) -> bool:
+    lowered = message.lower()
+    return "expired" in lowered or "过期" in message or "请登录" in message or "unauthorized" in lowered
+
+
 async def session_payload(session: Optional[Dict[str, Any]], refresh_profile: bool = False) -> Dict[str, Any]:
     if not session or not session.get("token"):
-        return {"backend": True, "authenticated": False, "user": "", "loginUuid": "", "updatedAt": "", "profile": None}
+        return {"backend": True, "authenticated": False, "user": "", "loginUuid": "", "updatedAt": "", "profile": None, "loginExpired": False}
     profile = session.get("profile")
-    if refresh_profile and (not isinstance(profile, dict) or not profile):
+    login_expired = False
+    if not isinstance(profile, dict) or not profile:
         profile = await load_profile(session, str(session.get("user") or ""))
+        login_expired = _looks_like_login_expired(str(profile.get("fetchError") or ""))
         session = dict(session)
         session["profile"] = profile
         store.write_session(session)
+    elif refresh_profile:
+        # 缓存的 profile 里头像是登录时的 CDN 签名链接，过期就成死链；到期自动重取
+        fetched_at = profile.get("fetchedAt") if isinstance(profile.get("fetchedAt"), (int, float)) else 0.0
+        if time.time() - float(fetched_at) > PROFILE_TTL_SECONDS:
+            fresh = await load_profile(session, str(session.get("user") or ""))
+            if fresh.get("uid") or fresh.get("headImage"):
+                fresh["fetchedAt"] = time.time()
+                profile = fresh
+                session = dict(session)
+                session["profile"] = profile
+                store.write_session(session)
+            else:
+                # 刷新失败（多为登录 token 过期）：保留旧缓存，但把状态暴露给前端提示重新登录
+                login_expired = _looks_like_login_expired(str(fresh.get("fetchError") or ""))
     return {
         "backend": True,
         "authenticated": True,
@@ -1258,13 +1342,17 @@ async def session_payload(session: Optional[Dict[str, Any]], refresh_profile: bo
         "loginUuid": str(session.get("loginUuid") or ""),
         "updatedAt": str(session.get("updatedAt") or ""),
         "profile": profile if isinstance(profile, dict) else None,
+        "loginExpired": login_expired,
     }
 
 
 async def load_profile(session: Dict[str, Any], fallback_user: str) -> Dict[str, Any]:
     try:
-        return await pan123.get_user_info(session)
-    except Exception:
+        profile = await pan123.get_user_info(session)
+        # 123 官方接口返回的头像等 CDN 链接会轮换过期，记录抓取时间供缓存 TTL 判断
+        profile["fetchedAt"] = time.time()
+        return profile
+    except Exception as error:
         return {
             "uid": None,
             "nickname": fallback_user or str(session.get("user") or ""),
@@ -1279,20 +1367,8 @@ async def load_profile(session: Dict[str, Any], fallback_user: str) -> Dict[str,
             "directTraffic": None,
             "isHideUID": None,
             "httpsCount": None,
+            "fetchError": str(error),
         }
-
-
-def normalize_admin_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    mode = str(config.get("pan123ClientMode") or "web").strip().lower()
-    if mode not in {"web", "openapi"}:
-        mode = "web"
-    return {
-        "gatewayName": str(config.get("gatewayName") or "123 Cloud Gateway").strip() or "123 Cloud Gateway",
-        "pan123ClientMode": mode,
-        "pan123OpenApiClientId": str(config.get("pan123OpenApiClientId") or "").strip(),
-        "pan123OpenApiClientSecret": str(config.get("pan123OpenApiClientSecret") or "").strip(),
-        "updatedAt": str(config.get("updatedAt") or ""),
-    }
 
 
 def normalize_transfer_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -1304,8 +1380,8 @@ def normalize_transfer_config(config: Dict[str, Any]) -> Dict[str, Any]:
         pan115_cookies = [line.strip() for line in re.split(r"\n\s*\n|[\r\n]+", pan115_cookie) if line.strip()]
     return {
         "enabled": bool(raw.get("enabled")),
-        "pan123ClientId": str(raw.get("pan123ClientId") or config.get("pan123OpenApiClientId") or "").strip(),
-        "pan123ClientSecret": str(raw.get("pan123ClientSecret") or config.get("pan123OpenApiClientSecret") or "").strip(),
+        "pan123ClientId": str(raw.get("pan123ClientId") or "").strip(),
+        "pan123ClientSecret": str(raw.get("pan123ClientSecret") or "").strip(),
         "pan115Cookie": "\n".join(pan115_cookies) if pan115_cookies else pan115_cookie,
         "pan115Cookies": pan115_cookies,
         "targetDirId": str(raw.get("targetDirId") or "0").strip() or "0",

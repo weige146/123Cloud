@@ -581,65 +581,6 @@ DEFAULT_SUBMISSION_CONFIG = {'botToken': '',
                                 'movieKeywords': ['movie', '电影', '影片', '🎬'],
                                 'tvKeywords': ['tv', '剧集', '电视剧', '连续剧', '番剧', '📺'],
                                 'releaseGroups': ['Mo Cuishle']},
-                'organize': {'fixedCategories': ['电影', '演唱会', '动漫', '综艺', '纪录片', '剧集', '儿童'],
-                             'fallbackMovieCategory': '电影',
-                             'fallbackTvCategory': '剧集',
-                             'excludeWords': [],
-                             'discardSidecarExtensions': ['ass',
-                                                          'srt',
-                                                          'ssa',
-                                                          'sub',
-                                                          'vtt',
-                                                          'nfo',
-                                                          'jpg',
-                                                          'jpeg',
-                                                          'png',
-                                                          'webp'],
-                             'conflictPriority': ['remuxBluray', 'resolution', 'dolby', 'size'],
-                             'movieTemplate': '{{title}}{% if year %}.{{year}}{% endif %}{% if videoFormat '
-                                              '%}.{{videoFormat}}{% endif %}{% if mediaSource %}.{{mediaSource}}{% '
-                                              'endif %}{% if resourceType %}.{{resourceType}}{% endif %}{% if effect '
-                                              '%}.{{effect}}{% endif %}{% if highQuality %}.{{highQuality}}{% endif '
-                                              '%}{% if dolbyVision %}.{{dolbyVision}}{% endif %}{% if dynamicRange '
-                                              '%}.{{dynamicRange}}{% endif %}{% if frameRate %}.{{frameRate}}{% endif '
-                                              '%}{% if colorDepth %}.{{colorDepth}}{% endif %}{% if originalEdition '
-                                              '%}.{{originalEdition}}{% endif %}{% if videoCodec %}.{{videoCodec}}{% '
-                                              'endif %}{% if audioCodec %}.{{audioCodec}}{% endif '
-                                              '%}{{releaseGroupSuffix}}{{fileExt}}',
-                             'tvTemplate': '{{title}}{% if year %}.{{year}}{% endif %}{% if seasonEpisode '
-                                           '%}.{{seasonEpisode}}{% endif %}{% if videoFormat %}.{{videoFormat}}{% '
-                                           'endif %}{% if mediaSource %}.{{mediaSource}}{% endif %}{% if resourceType '
-                                           '%}.{{resourceType}}{% endif %}{% if effect %}.{{effect}}{% endif %}{% if '
-                                           'highQuality %}.{{highQuality}}{% endif %}{% if dolbyVision '
-                                           '%}.{{dolbyVision}}{% endif %}{% if dynamicRange %}.{{dynamicRange}}{% '
-                                           'endif %}{% if frameRate %}.{{frameRate}}{% endif %}{% if colorDepth '
-                                           '%}.{{colorDepth}}{% endif %}{% if originalEdition %}.{{originalEdition}}{% '
-                                           'endif %}{% if videoCodec %}.{{videoCodec}}{% endif %}{% if audioCodec '
-                                           '%}.{{audioCodec}}{% endif %}{{releaseGroupSuffix}}{{fileExt}}',
-                             'mediaFolderTemplate': '{{folderTitle}}{% if year %} ({{year}}){% endif %}{% if tmdbId %} '
-                                                    '{tmdb-{{tmdbId}}}{% endif %}',
-                             'seasonFolderTemplate': 'Season {{season}}',
-                             'categoryRules': [{'id': 'category_children',
-                                                'enabled': True,
-                                                'category': '儿童',
-                                                'keywords': ['儿童', 'Kids', 'Family']},
-                                               {'id': 'category_concert',
-                                                'enabled': True,
-                                                'category': '演唱会',
-                                                'keywords': ['演唱会', 'Concert']},
-                                               {'id': 'category_documentary',
-                                                'enabled': True,
-                                                'category': '纪录片',
-                                                'keywords': ['纪录', 'Documentary']},
-                                               {'id': 'category_anime',
-                                                'enabled': True,
-                                                'category': '动漫',
-                                                'keywords': ['动画', 'Anime', 'Animation'],
-                                                'mediaTypes': ['tv']},
-                                               {'id': 'category_variety',
-                                                'enabled': True,
-                                                'category': '综艺',
-                                                'keywords': ['综艺', '真人秀', '脱口秀', 'Reality', 'Talk']}]},
                 'display': {'sourceLabels': [{'id': 'display_uhd_bluray_remux',
                                               'enabled': True,
                                               'source': 'UHD BluRay Remux',
@@ -682,16 +623,6 @@ DEFAULT_SUBMISSION_CONFIG = {'botToken': '',
                           '{overviewBlock}\n'
                           '\n'
                           '🏷 标签：{tags}'}}
-_CATEGORY_GENRE_IDS = {
-    "category_children": [10751, 10762],
-    "category_documentary": [99],
-    "category_anime": [16],
-    "category_variety": [10764, 10767],
-}
-for _category_rule in DEFAULT_SUBMISSION_CONFIG["ruleConfig"]["organize"]["categoryRules"]:
-    if _category_rule.get("id") in _CATEGORY_GENRE_IDS:
-        _category_rule["genreIds"] = _CATEGORY_GENRE_IDS[_category_rule["id"]]
-
 DEFAULT_SUBMISSION_CONFIG.setdefault("pan115Helper", {
     "enabled": False,
     "pan115Cookie": "",
@@ -704,7 +635,6 @@ DEFAULT_SUBMISSION_CONFIG.setdefault("pan115Helper", {
 })
 DEFAULT_SUBMISSION_CONFIG.setdefault("telegramAdminUserIds", [])
 DEFAULT_SUBMISSION_CONFIG.setdefault("channelOwnerUserIds", [])
-DEFAULT_SUBMISSION_CONFIG.setdefault("channelSettingsUrl", "")
 
 # --- 用户级频道配置默认值 ---
 

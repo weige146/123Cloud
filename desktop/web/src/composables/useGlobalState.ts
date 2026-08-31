@@ -77,7 +77,6 @@ export function ensureSubmissionConfig(): SubmissionConfig {
   config.routing = config.routing || {};
   config.pan115Helper = config.pan115Helper || {};
   config.ruleConfig = config.ruleConfig || {};
-  config.ruleConfig.organize = config.ruleConfig.organize || {};
   config.ruleConfig.recognition = config.ruleConfig.recognition || {};
   config.ruleConfig.display = config.ruleConfig.display || {};
   config.ruleConfig.display.sourceLabels = config.ruleConfig.display.sourceLabels || [];

@@ -104,19 +104,6 @@ class SessionStoreTests(unittest.TestCase):
             self.assertNotIn("cleanTargetDirIds", helper)
             self.assertNotIn("offlineRequestIntervalMs", helper)
 
-    def test_submission_config_keeps_channel_settings_url_when_a_legacy_client_saves_partial_fields(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = SessionStore(Path(directory))
-            url = "https://example.test/admin/channel-settings"
-            store.write_submission_config({"botToken": "token", "channelSettingsUrl": f"  {url}  "})
-
-            # A client released before channel cards knows nothing about this
-            # field, but must not erase the administrator's saved address.
-            saved = store.write_submission_config({"tmdbLanguage": "en-US"})
-
-            self.assertEqual(saved["channelSettingsUrl"], url)
-            self.assertEqual(store.read_submission_config()["channelSettingsUrl"], url)
-
     def test_user_channel_grants_are_normalized_and_isolated(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
@@ -198,22 +185,61 @@ class SessionStoreTests(unittest.TestCase):
     def test_admin_config_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
-            store.write_config({"pan123OpenApiClientId": "cid", "pan123OpenApiClientSecret": "secret"})
-            saved = store.write_config({"gatewayName": "测试网关"})
-            self.assertEqual(saved["gatewayName"], "测试网关")
-            self.assertEqual(saved["pan123OpenApiClientId"], "cid")
-            self.assertEqual(saved["pan123OpenApiClientSecret"], "secret")
-            self.assertEqual(store.read_config()["gatewayName"], "测试网关")
+            store.write_config({"transfer": {"enabled": True, "pan123ClientId": "cid"}})
+            saved = store.write_config({"transfer": {"enabled": False, "pan123ClientId": "cid", "pan123ClientSecret": "secret"}})
+            self.assertEqual(saved["transfer"]["pan123ClientId"], "cid")
+            self.assertEqual(saved["transfer"]["pan123ClientSecret"], "secret")
+            self.assertEqual(store.read_config()["transfer"]["pan123ClientId"], "cid")
+
+    def test_legacy_openapi_credentials_migrated_into_transfer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            store.write_value("admin_config", {
+                "gatewayName": "旧网关",
+                "pan123ClientMode": "openapi",
+                "pan123OpenApiClientId": "legacy-cid",
+                "pan123OpenApiClientSecret": "legacy-secret",
+                "transfer": {"enabled": True},
+            })
+
+            migrated = SessionStore(root)
+
+            config = migrated.read_value("admin_config")
+            assert isinstance(config, dict)
+            self.assertNotIn("gatewayName", config)
+            self.assertNotIn("pan123ClientMode", config)
+            self.assertNotIn("pan123OpenApiClientId", config)
+            self.assertNotIn("pan123OpenApiClientSecret", config)
+            self.assertEqual(config.get("transfer", {}).get("pan123ClientId"), "legacy-cid")
+            self.assertEqual(config.get("transfer", {}).get("pan123ClientSecret"), "legacy-secret")
+            self.assertTrue(config.get("transfer", {}).get("enabled"))
+
+    def test_legacy_openapi_migration_keeps_existing_transfer_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            store.write_value("admin_config", {
+                "pan123OpenApiClientId": "legacy-cid",
+                "transfer": {"pan123ClientId": "new-cid", "pan123ClientSecret": "new-secret"},
+            })
+
+            migrated = SessionStore(root)
+
+            config = migrated.read_value("admin_config")
+            assert isinstance(config, dict)
+            self.assertEqual(config.get("transfer", {}).get("pan123ClientId"), "new-cid")
+            self.assertEqual(config.get("transfer", {}).get("pan123ClientSecret"), "new-secret")
 
     def test_legacy_json_is_migrated_and_deleted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "config.json").write_text('{"gatewayName":"旧配置"}\n', encoding="utf-8")
+            (root / "config.json").write_text('{"transfer":{"enabled":true}}\n', encoding="utf-8")
             (root / "pan123-session.json").write_text('{"user":"u","token":"t","loginUuid":"d"}\n', encoding="utf-8")
 
             store = SessionStore(root)
 
-            self.assertEqual(store.read_config()["gatewayName"], "旧配置")
+            self.assertEqual(store.read_config()["transfer"]["enabled"], True)
             self.assertEqual(store.read_session()["token"], "t")
             self.assertFalse((root / "config.json").exists())
             self.assertFalse((root / "pan123-session.json").exists())

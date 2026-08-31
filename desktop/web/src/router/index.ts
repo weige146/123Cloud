@@ -1,31 +1,23 @@
-import { createRouter, createWebHistory, type RouteRecordRaw, type NavigationGuardNext, type RouteLocationNormalized } from "vue-router";
+import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router";
 
 const routes: RouteRecordRaw[] = [
   {
     path: "",
-    redirect: "/admin/home",
-  },
-  {
-    path: "/admin/login",
-    name: "login",
-    component: () => import("@/views/LoginView.vue"),
-    meta: { public: true },
-  },
-  {
-    path: "/admin/channel-settings",
-    name: "channel-settings",
-    component: () => import("@/views/ChannelSettingsView.vue"),
-    meta: { public: true },
+    redirect: "/admin/console",
   },
   {
     path: "/admin/",
-    redirect: "/admin/home",
+    redirect: "/admin/console",
+  },
+  {
+    path: "/admin/console",
+    name: "console",
+    component: () => import("@/views/ConsoleView.vue"),
+    meta: { title: "控制台", desc: "服务状态与后端实时日志。", icon: "mdi-console" },
   },
   {
     path: "/admin/home",
-    name: "home",
-    component: () => import("@/views/HomeView.vue"),
-    meta: { title: "首页", desc: "服务状态与快捷入口。", icon: "mdi-view-dashboard-outline" },
+    redirect: "/admin/console",
   },
   {
     path: "/admin/submission",
@@ -38,6 +30,11 @@ const routes: RouteRecordRaw[] = [
     name: "display",
     component: () => import("@/views/DisplayView.vue"),
     meta: { title: "投稿展示", desc: "投稿模板、片源备注和分享按钮展示。", icon: "mdi-file-document-outline" },
+  },
+  {
+    path: "/admin/submission-routing",
+    // 投稿路由已并入「投稿机器人」页的「频道路由」标签
+    redirect: { path: "/admin/submission", query: { tab: "routing" } },
   },
   {
     path: "/admin/transfer",
@@ -66,7 +63,7 @@ const routes: RouteRecordRaw[] = [
     component: () => import("@/views/SettingsView.vue"),
     meta: { title: "设置", desc: "外观、数据目录与应用信息。", icon: "mdi-cog-outline" },
   },
-  { path: "/admin/:pathMatch(.*)*", redirect: "/admin/home" },
+  { path: "/admin/:pathMatch(.*)*", redirect: "/admin/console" },
 ];
 
 export const router = createRouter({
@@ -75,28 +72,4 @@ export const router = createRouter({
   scrollBehavior() {
     return { top: 0, behavior: "smooth" };
   },
-});
-
-const LOGIN_PATH = "/admin/login";
-
-function isAuthenticated(): boolean {
-  const session = localStorage.getItem("admin_session");
-  return !!session;
-}
-
-router.beforeEach((to: RouteLocationNormalized, _from: RouteLocationNormalized, next: NavigationGuardNext) => {
-  const isPublic = to.meta?.public === true;
-
-  if (!isPublic && !isAuthenticated()) {
-    next({ path: LOGIN_PATH, query: { redirect: to.fullPath } });
-    return;
-  }
-
-  if (to.path === LOGIN_PATH && isAuthenticated()) {
-    const redirect = to.query.redirect as string || "/admin/home";
-    next({ path: redirect });
-    return;
-  }
-
-  next();
 });

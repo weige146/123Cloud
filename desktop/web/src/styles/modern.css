@@ -163,65 +163,6 @@ textarea:focus-visible,
 .app-shell,
 .v-application { background: transparent !important; }
 
-.wallpaper-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  overflow: hidden;
-  pointer-events: none;
-  background: var(--bg-primary);
-}
-
-.wallpaper-layer,
-.wallpaper-contrast {
-  position: absolute;
-  inset: 0;
-}
-
-.wallpaper-layer {
-  background-position: center;
-  background-repeat: no-repeat;
-  background-size: cover;
-}
-
-.wallpaper-layer--incoming {
-  opacity: 0;
-  transition: opacity 700ms ease;
-}
-
-.wallpaper-layer--incoming.visible { opacity: 1; }
-.wallpaper-contrast { background: rgba(8, 10, 12, 0.2); }
-html[data-theme="light"] .wallpaper-contrast { background: rgba(255, 255, 255, 0.07); }
-
-.wallpaper-attribution {
-  position: fixed;
-  right: 18px;
-  bottom: 14px;
-  z-index: 3;
-  max-width: min(540px, calc(100vw - 36px));
-  min-width: 0;
-  padding: 6px 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-control);
-  background: var(--surface-subtle);
-  color: var(--text-secondary);
-  backdrop-filter: var(--surface-filter);
-  -webkit-backdrop-filter: var(--surface-filter);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  text-decoration: none;
-  font-size: 10px;
-}
-
-.wallpaper-attribution span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.wallpaper-attribution small { color: var(--text-muted); }
-
 .app-frame {
   position: relative;
   z-index: 2;
@@ -672,33 +613,6 @@ html[data-theme="light"] .wallpaper-contrast { background: rgba(255, 255, 255, 0
 .login-page .login-submit { background: rgb(var(--v-theme-primary)) !important; background-image: none !important; }
 .login-footer { color: var(--text-muted) !important; }
 
-.channel-settings {
-  position: relative;
-  z-index: 2;
-  min-height: 100dvh;
-  background: transparent !important;
-}
-
-.channel-settings .bg-mesh,
-.channel-settings .bg-grid,
-.channel-settings .hero-eyebrow { display: none !important; }
-
-.channel-settings .settings-shell { width: min(1120px, calc(100% - 28px)) !important; }
-.channel-settings .settings-hero { background: transparent !important; border-bottom: 1px solid var(--border); }
-.channel-settings .hero-title { color: var(--text-primary) !important; font-size: 24px !important; }
-.channel-settings .stat-row {
-  overflow: hidden;
-  border: 1px solid var(--surface-border);
-  border-radius: var(--radius-surface);
-  background: var(--surface-card);
-  box-shadow: var(--surface-shadow);
-  backdrop-filter: var(--surface-filter);
-  -webkit-backdrop-filter: var(--surface-filter);
-}
-.channel-settings .stat-pill { border-right: 1px solid var(--border); border-radius: 0 !important; background: transparent !important; box-shadow: none !important; }
-.channel-settings .stat-pill:last-child { border-right: 0; }
-.channel-settings .settings-footer { background: var(--overlay-surface) !important; border-color: var(--border) !important; backdrop-filter: var(--overlay-filter); -webkit-backdrop-filter: var(--overlay-filter); }
-
 .mobile-dock {
   position: fixed;
   left: 50%;
@@ -818,21 +732,6 @@ html[data-theme="light"] .wallpaper-contrast { background: rgba(255, 255, 255, 0
   .glass-card-head { padding: 14px !important; }
   .glass-card-body.padded { padding: 14px !important; }
   .glass-card-actions .v-btn { flex: 1 1 auto; }
-  .wallpaper-attribution {
-    right: 12px;
-    bottom: calc(82px + env(safe-area-inset-bottom));
-    width: auto;
-    max-width: none;
-    padding: 5px 8px;
-  }
-  .wallpaper-attribution .v-icon,
-  .wallpaper-attribution span { display: none; }
-  .wallpaper-attribution small { color: var(--text-secondary); font-size: 10px; font-weight: 700; }
-  .channel-settings .settings-shell { width: min(100% - 20px, 720px) !important; padding-bottom: calc(92px + env(safe-area-inset-bottom)) !important; }
-  .channel-settings .stat-row { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .channel-settings .stat-pill { border-bottom: 1px solid var(--border); }
-  .channel-settings .stat-pill:nth-child(even) { border-right: 0; }
-  .channel-settings .stat-pill:nth-last-child(-n + 2) { border-bottom: 0; }
 }
 
 @media (max-width: 420px) {

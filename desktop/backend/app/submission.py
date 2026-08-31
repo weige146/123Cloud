@@ -310,34 +310,6 @@ def database_note_rich_block(draft: Dict[str, Any]) -> str:
     return f"📝 数据库备注：\n{rich}" if rich else ""
 
 
-async def submit_submission_text(
-    store: SessionStore,
-    text: str,
-    source_label: str,
-    target_user_id: Optional[int] = None,
-    owner_chat_id: Optional[int] = None,
-    owner_user_id: Optional[int] = None,
-    source_message_id: int = 0,
-    max_links: int = 10,
-    interaction_message_ids: Optional[List[int]] = None,
-    submitter: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    links = extract_submission_links(text)
-    return await submit_submission_links(
-        store,
-        links,
-        source_label,
-        target_user_id,
-        source_text=text,
-        owner_chat_id=owner_chat_id,
-        owner_user_id=owner_user_id,
-        source_message_id=source_message_id,
-        max_links=max_links,
-        interaction_message_ids=interaction_message_ids,
-        submitter=submitter,
-    )
-
-
 async def submit_submission_links(
     store: SessionStore,
     links: List[Dict[str, Any]],
@@ -2589,6 +2561,7 @@ async def send_submission_preview_result(
 
 
 def build_submission_preview_markup(draft: Dict[str, Any], config: Dict[str, Any], store: Optional["SessionStore"] = None) -> Optional[Dict[str, Any]]:
+    """投稿预览的操作键盘，样式与旧版 Telegram 机器人一致。"""
     share = draft.get("share") if isinstance(draft.get("share"), dict) else {}
     clean_url = str(share.get("cleanUrl") or share.get("url") or "").strip()
     draft_id = str(draft.get("id") or "").strip()
@@ -2746,418 +2719,6 @@ def telegram_message_id(message: Any) -> int:
     if hasattr(message, "id"):
         return safe_int(getattr(message, "id", 0))
     return 0
-
-
-async def handle_submission_telegram_update(store: SessionStore, update: Dict[str, Any]) -> Dict[str, Any]:
-    config = store.read_submission_config()
-    bot_token = str(config.get("botToken") or "").strip()
-    if not bot_token:
-        return {"handled": False, "reason": "bot_not_configured"}
-    if not isinstance(update, dict):
-        return {"handled": False, "reason": "invalid_update"}
-
-    callback = update.get("callback_query") if isinstance(update.get("callback_query"), dict) else None
-    if callback:
-        return await handle_submission_callback(store, bot_token, config, callback)
-
-    message = update.get("message") if isinstance(update.get("message"), dict) else update.get("edited_message") if isinstance(update.get("edited_message"), dict) else None
-    if message:
-        return await handle_submission_message(store, bot_token, config, message)
-
-    return {"handled": False, "reason": "unsupported_update"}
-
-
-async def handle_submission_message(store: SessionStore, bot_token: str, config: Dict[str, Any], message: Dict[str, Any]) -> Dict[str, Any]:
-    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
-    if str(chat.get("type") or "") != "private":
-        return {"handled": False, "reason": "non_private_chat"}
-    chat_id = safe_int(chat.get("id"))
-    user = message.get("from") if isinstance(message.get("from"), dict) else {}
-    user_id = safe_int(user.get("id"))
-    text = telegram_message_text(message)
-    command = text.split(None, 1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
-    # Onboarding must work before an administrator has added the user.  It
-    # reveals only the sender's own Telegram UID and grants no Bot capability.
-    if command == "/myid":
-        await send_telegram_text(bot_token, chat_id, f"你的 Telegram UID 是：<code>{user_id}</code>\n\n把这串数字发给频道所有者即可申请投稿或频道管理权限。", parse_mode="HTML")
-        return {"handled": True, "action": "myid", "userId": user_id}
-    if not telegram_user_allowed(config, user_id, store):
-        await send_telegram_text(bot_token, chat_id, "你没有权限使用这个投稿 Bot。")
-        return {"handled": True, "reason": "forbidden"}
-
-    if not text:
-        return {"handled": False, "reason": "empty_message"}
-
-    if text.startswith("/"):
-        managed = await handle_channel_management_command(store, bot_token, config, chat_id, user_id, text)
-        if managed:
-            return managed
-        if not telegram_admin_allowed(config, user_id):
-            await send_telegram_text(bot_token, chat_id, "你仅可发送 123 分享/秒传链接投稿；频道所有者可使用 /channels 管理自己的频道。")
-            return {"handled": True, "reason": "submission_only"}
-
-    links = extract_submission_links(text)
-    pan115_offline_links = extract_pan115_offline_links(text)
-    pending = find_pending_submission_draft(store, chat_id, user_id)
-    if pending and not links and not pan115_offline_links:
-        return await handle_pending_submission_input(store, bot_token, config, pending, text, safe_int(message.get("message_id")))
-
-    if not links and pan115_offline_links:
-        if not telegram_admin_allowed(config, user_id):
-            await send_telegram_text(bot_token, chat_id, "115 离线功能仅限 Bot 管理员使用；你仅拥有投稿权限。")
-            return {"handled": True, "reason": "admin_required"}
-        return await handle_pan115_helper_text(bot_token, config, chat_id, text, True, safe_int(message.get("message_id")))
-
-    if not links:
-        return {"handled": False, "reason": "no_submission_link"}
-
-    processing_id = 0
-    try:
-        processing = await send_telegram_text(bot_token, chat_id, "正在识别投稿链接并查询 TMDB...")
-        processing_id = telegram_message_id(processing)
-    except Exception:
-        pass
-
-    result = await submit_submission_text(
-        store,
-        text,
-        "Telegram 投稿",
-        chat_id,
-        owner_chat_id=chat_id,
-        owner_user_id=user_id,
-        source_message_id=safe_int(message.get("message_id")),
-        max_links=3,
-        interaction_message_ids=[processing_id] if processing_id else [],
-        submitter=user,
-    )
-    return {"handled": True, **result}
-
-
-CHANNEL_COMMAND_HELP = """📺 <b>我的频道管理</b>
-
-<b>/channels</b> 查看自己的频道与路由
-<b>/channel_add</b> <code>ID | 名称 | Chat ID | 角色</code>
-<b>/channel_edit</b> <code>ID | title|chatId|role|enabled|default | 值</code>
-<b>/channel_delete</b> <code>ID</code>
-<b>/route</b> <code>release|completed|updating|fallback | 频道ID或clear</code>
-<b>/route_groups</b> <code>发布组1 | 发布组2</code>（或 <code>clear</code>）
-<b>/channel_allow</b> <code>频道ID | Telegram UID</code>
-<b>/channel_deny</b> <code>频道ID | Telegram UID</code>
-
-角色：<code>private</code>、<code>public_completed</code>、<code>public_updating</code>。只有你本人可查看和管理这些配置。"""
-
-
-async def handle_channel_management_command(store: SessionStore, bot_token: str, config: Dict[str, Any], chat_id: int, user_id: int, text: str) -> Optional[Dict[str, Any]]:
-    command_text, _, payload = text.partition(" ")
-    command = command_text.split("@", 1)[0].lower()
-    commands = {"/channels", "/channel_add", "/channel_edit", "/channel_delete", "/route", "/route_groups", "/channel_allow", "/channel_deny"}
-    if command not in commands:
-        return None
-    if not telegram_channel_owner_allowed(config, user_id, store):
-        await send_telegram_text(bot_token, chat_id, "你没有频道管理权限；获授权用户只能投稿。")
-        return {"handled": True, "reason": "channel_owner_required"}
-
-    if command == "/channels":
-        own = store.read_user_channel_config(user_id)
-        channels = own.get("channels") or []
-        routing = own.get("routing") if isinstance(own.get("routing"), dict) else {}
-        configured_routes = sum(1 for key in ("releaseGroupChannelId", "noReleaseGroupCompletedChannelId", "noReleaseGroupUpdatingChannelId", "fallbackChannelId") if str(routing.get(key) or "").strip())
-        lines = [
-            "📺 <b>我的频道配置</b>",
-            f"已配置 <b>{len(channels)}</b> 个频道，启用 <b>{sum(1 for channel in channels if isinstance(channel, dict) and channel.get('enabled', True))}</b> 个。",
-            f"已设置 <b>{configured_routes}</b> 条自动路由。",
-            "\n点击下方按钮即可在一张卡片中查看和修改频道、自动路由、发布组白名单与投稿协作者。",
-        ]
-        web_app_url = str(config.get("channelSettingsUrl") or "").strip()
-        if re.match(r"^https://", web_app_url, re.IGNORECASE):
-            await send_telegram_text(
-                bot_token,
-                chat_id,
-                "\n".join(lines),
-                parse_mode="HTML",
-                reply_markup={"inline_keyboard": [[{"text": "打开我的频道配置", "web_app": {"url": web_app_url}}]]},
-            )
-        else:
-            lines.append("\n⚠️ 管理员尚未设置频道配置卡片地址，请联系管理员完成一次后台设置。")
-            await send_telegram_text(bot_token, chat_id, "\n".join(lines), parse_mode="HTML")
-        return {"handled": True, "action": "channels"}
-
-    parts = [part.strip() for part in payload.split("|")]
-    own = store.read_user_channel_config(user_id)
-    channels = [dict(item) for item in own.get("channels") or [] if isinstance(item, dict)]
-    routing = dict(own.get("routing") or {}) if isinstance(own.get("routing"), dict) else {}
-    try:
-        if command == "/channel_add":
-            if len(parts) != 4 or not all(parts[:3]):
-                raise ValueError("格式应为：/channel_add ID | 名称 | Chat ID | 角色")
-            channel_id, title, channel_chat_id, role = parts
-            if role not in {"private", "public_completed", "public_updating"}:
-                raise ValueError("角色必须是 private、public_completed 或 public_updating")
-            if any(str(item.get("id") or "") == channel_id for item in channels):
-                raise ValueError("频道 ID 已存在")
-            channels.append({"id": channel_id, "title": title, "chatId": channel_chat_id, "role": role, "enabled": True, "isDefault": not channels, "allowedUserIds": []})
-        elif command == "/channel_edit":
-            if len(parts) != 3 or not all(parts[:2]):
-                raise ValueError("格式应为：/channel_edit ID | 字段 | 值")
-            channel_id, field, value = parts
-            channel = next((item for item in channels if str(item.get("id") or "") == channel_id), None)
-            if not channel:
-                raise ValueError("频道不存在")
-            if field == "title":
-                channel["title"] = value
-            elif field == "chatId":
-                channel["chatId"] = value
-            elif field == "role" and value in {"private", "public_completed", "public_updating"}:
-                channel["role"] = value
-            elif field == "enabled":
-                channel["enabled"] = value.lower() in {"1", "true", "yes", "on", "启用"}
-            elif field == "default":
-                enabled = value.lower() in {"1", "true", "yes", "on", "启用"}
-                if enabled:
-                    for item in channels:
-                        item["isDefault"] = False
-                channel["isDefault"] = enabled
-            else:
-                raise ValueError("可编辑字段为 title、chatId、role、enabled、default")
-        elif command == "/channel_delete":
-            if len(parts) != 1 or not parts[0]:
-                raise ValueError("格式应为：/channel_delete 频道ID")
-            channel_id = parts[0]
-            if not any(str(item.get("id") or "") == channel_id for item in channels):
-                raise ValueError("频道不存在")
-            channels = [item for item in channels if str(item.get("id") or "") != channel_id]
-            for key in ("releaseGroupChannelId", "noReleaseGroupCompletedChannelId", "noReleaseGroupUpdatingChannelId", "fallbackChannelId"):
-                if str(routing.get(key) or "") == channel_id:
-                    routing[key] = ""
-        elif command == "/route":
-            if len(parts) != 2 or not parts[0]:
-                raise ValueError("格式应为：/route release|completed|updating|fallback | 频道ID或clear")
-            fields = {"release": "releaseGroupChannelId", "completed": "noReleaseGroupCompletedChannelId", "updating": "noReleaseGroupUpdatingChannelId", "fallback": "fallbackChannelId"}
-            key = fields.get(parts[0])
-            if not key:
-                raise ValueError("路由类型必须是 release、completed、updating 或 fallback")
-            channel_id = "" if parts[1].lower() == "clear" else parts[1]
-            if channel_id and not any(str(item.get("id") or "") == channel_id for item in channels):
-                raise ValueError("路由频道不存在")
-            routing[key] = channel_id
-        elif command == "/route_groups":
-            if not parts or not any(parts):
-                raise ValueError("格式应为：/route_groups 发布组1 | 发布组2，或 /route_groups clear")
-            routing["publicReleaseGroups"] = [] if len(parts) == 1 and parts[0].lower() == "clear" else list(dict.fromkeys(part for part in parts if part))
-        elif command in {"/channel_allow", "/channel_deny"}:
-            if len(parts) != 2 or not parts[0] or safe_int(parts[1]) <= 0:
-                raise ValueError(f"格式应为：{command} 频道ID | Telegram UID")
-            channel = next((item for item in channels if str(item.get("id") or "") == parts[0]), None)
-            if not channel:
-                raise ValueError("频道不存在")
-            members = {safe_int(value) for value in channel.get("allowedUserIds") or [] if safe_int(value) > 0}
-            if command == "/channel_allow":
-                members.add(safe_int(parts[1]))
-            else:
-                members.discard(safe_int(parts[1]))
-            channel["allowedUserIds"] = sorted(members)
-        saved = store.write_user_channel_config(user_id, {"channels": channels, "routing": routing})
-        await send_telegram_text(bot_token, chat_id, "✅ 频道配置已保存。使用 /channels 查看当前配置。")
-        return {"handled": True, "action": command.lstrip("/"), "channelCount": len(saved.get("channels") or [])}
-    except ValueError as error:
-        await send_telegram_text(bot_token, chat_id, f"❌ {escape(str(error))}\n\n{CHANNEL_COMMAND_HELP}", parse_mode="HTML")
-        return {"handled": True, "reason": "invalid_channel_command"}
-
-
-async def handle_pan115_helper_text(bot_token: str, config: Dict[str, Any], chat_id: int, text: str, has_offline: bool, source_message_id: int = 0) -> Dict[str, Any]:
-    helper = config.get("pan115Helper") if isinstance(config.get("pan115Helper"), dict) else {}
-    if not helper.get("enabled"):
-        await send_telegram_text(bot_token, chat_id, "检测到 115 离线链接，但 115 助手未启用。请到后台“115 助手”开启。")
-        return {"handled": True, "reason": "pan115_helper_disabled", "hasOffline": has_offline}
-
-    results: List[Dict[str, Any]] = []
-    try:
-        if has_offline:
-            offline_result = await submit_115_offline_from_text(helper, text)
-            results.append({"title": "115 离线提交", "result": offline_result})
-    except Exception as error:
-        await send_telegram_text(bot_token, chat_id, f"115 助手执行失败：{error}")
-        return {"handled": True, "reason": "pan115_helper_error", "error": str(error)}
-
-    if not results:
-        return {"handled": False, "reason": "no_pan115_action"}
-    sent = await send_telegram_text(bot_token, chat_id, "\n\n".join(format_pan115_helper_result(item["title"], item["result"]) for item in results))
-    cleanup_ids = [mid for mid in [source_message_id, telegram_message_id(sent)] if mid]
-    if cleanup_ids:
-        await delete_telegram_messages(bot_token, chat_id, cleanup_ids)
-    return {"handled": True, "reason": "pan115_helper_text", "actions": [item["title"] for item in results]}
-
-
-def format_pan115_helper_result(title: str, result: Dict[str, Any]) -> str:
-    total = int(result.get("total") or 0)
-    success = int(result.get("success") or 0)
-    failed = int(result.get("failed") or 0)
-    lines = [f"{title}完成：成功 {success} / 总计 {total}"]
-    if failed:
-        lines[0] += f"，失败 {failed}"
-    for item in (result.get("results") or [])[:8]:
-        if not isinstance(item, dict):
-            continue
-        icon = "✅" if item.get("ok") else "❌"
-        label = str(item.get("label") or item.get("link") or item.get("type") or "项目")
-        message = str(item.get("message") or "").strip()
-        lines.append(f"{icon} {label}" + (f"：{message}" if message else ""))
-    if len(result.get("results") or []) > 8:
-        lines.append("其余结果已省略。")
-    return "\n".join(lines)
-
-
-async def handle_submission_callback(store: SessionStore, bot_token: str, config: Dict[str, Any], callback: Dict[str, Any]) -> Dict[str, Any]:
-    data = str(callback.get("data") or "")
-    callback_id = str(callback.get("id") or "")
-    if not data.startswith("sub:"):
-        return {"handled": False, "reason": "unsupported_callback"}
-    user = callback.get("from") if isinstance(callback.get("from"), dict) else {}
-    user_id = safe_int(user.get("id"))
-    if not telegram_user_allowed(config, user_id, store):
-        await answer_callback_query(bot_token, callback_id, "你没有权限使用这个投稿 Bot。", True)
-        return {"handled": True, "reason": "forbidden"}
-
-    _prefix, draft_id, action, raw_value = (data.split(":", 3) + ["", "", "", ""])[:4]
-    draft = get_submission_draft(store, draft_id)
-    if not draft:
-        await answer_callback_query(bot_token, callback_id, "投稿草稿不存在或已过期，请重新投稿", True)
-        return {"handled": True, "reason": "draft_not_found"}
-    if safe_int(draft.get("ownerUserId")) != user_id:
-        await answer_callback_query(bot_token, callback_id, "这不是你的投稿草稿。", True)
-        return {"handled": True, "reason": "draft_owner_mismatch"}
-
-    message_id = callback_message_id(callback)
-    if action == "noop":
-        await answer_callback_query(bot_token, callback_id)
-        return {"handled": True, "action": action}
-
-    if action == "edit":
-        field = "recognition" if raw_value == "title" else raw_value
-        if field not in {"size", "note", "recognition"}:
-            await answer_callback_query(bot_token, callback_id, "未知编辑项", True)
-            return {"handled": True, "reason": "unknown_edit"}
-        draft["pendingEdit"] = field
-        draft["pendingRecognitionResults"] = []
-        save_submission_draft(store, draft)
-        await answer_callback_query(bot_token, callback_id)
-        if field == "recognition":
-            await delete_telegram_messages(bot_token, safe_int(draft.get("ownerChatId")), draft.get("interactionMessageIds") or [])
-            draft["interactionMessageIds"] = []
-            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), recognition_prompt(draft), parse_mode="HTML", reply_markup=cancel_keyboard(draft))
-        elif field == "note":
-            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), edit_prompt(field, draft, config), parse_mode="HTML", reply_markup={"force_reply": True, "selective": True, "input_field_placeholder": "粘贴并修改当前备注"})
-        else:
-            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), edit_prompt(field, draft, config), reply_markup=cancel_keyboard(draft))
-        track_interaction(draft, telegram_message_id(sent))
-        save_submission_draft(store, draft)
-        return {"handled": True, "action": action, "field": field}
-
-    if action == "picktmdb":
-        candidates = draft.get("pendingRecognitionResults") if isinstance(draft.get("pendingRecognitionResults"), list) else []
-        index = safe_int(raw_value)
-        candidate = candidates[index] if 0 <= index < len(candidates) and isinstance(candidates[index], dict) else None
-        if not candidate:
-            await answer_callback_query(bot_token, callback_id, "识别结果已过期，请重新更改识别", True)
-            return {"handled": True, "reason": "candidate_not_found"}
-        apply_media_to_submission_draft(draft, candidate, config, store)
-        draft["pendingEdit"] = ""
-        draft["pendingRecognitionResults"] = []
-        save_share_media_cache(store, str(draft.get("share", {}).get("cleanUrl") or ""), draft.get("media") if isinstance(draft.get("media"), dict) else {}, "manual")
-        await delete_telegram_messages(bot_token, safe_int(draft.get("ownerChatId")), draft.get("interactionMessageIds") or [])
-        draft["interactionMessageIds"] = []
-        save_submission_draft(store, draft)
-        await refresh_submission_preview_message(store, bot_token, draft, config, message_id)
-        await answer_callback_query(bot_token, callback_id, "已更新识别")
-        return {"handled": True, "action": action}
-
-    if action == "cancel":
-        draft["pendingEdit"] = ""
-        draft["pendingRecognitionResults"] = []
-        await delete_telegram_messages(bot_token, safe_int(draft.get("ownerChatId")), draft.get("interactionMessageIds") or [])
-        draft["interactionMessageIds"] = []
-        save_submission_draft(store, draft)
-        await answer_callback_query(bot_token, callback_id, "已取消")
-        return {"handled": True, "action": action}
-
-    if action == "channel":
-        await answer_callback_query(bot_token, callback_id)
-        try:
-            await edit_telegram_reply_markup(bot_token, safe_int(draft.get("ownerChatId")), message_id or safe_int(draft.get("previewMessageId")), channel_keyboard(draft, store))
-        except Exception:
-            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), "请选择发布频道：", reply_markup=channel_keyboard(draft, store))
-            track_interaction(draft, telegram_message_id(sent))
-            save_submission_draft(store, draft)
-        return {"handled": True, "action": action}
-
-    if action == "setch":
-        channels = submission_channel_candidates(store, user_id)
-        index = safe_int(raw_value)
-        candidate = channels[index] if 0 <= index < len(channels) else None
-        channel = candidate.get("channel") if isinstance(candidate, dict) and isinstance(candidate.get("channel"), dict) else None
-        if not channel or not candidate:
-            await answer_callback_query(bot_token, callback_id, "频道配置已变化，请重新打开频道选择", True)
-            return {"handled": True, "reason": "channel_not_found"}
-        route_owner_user_id = safe_int(candidate.get("ownerUserId"))
-        if not store.channel_user_allowed(route_owner_user_id, str(channel.get("id") or ""), user_id):
-            await answer_callback_query(bot_token, callback_id, "你没有权限使用此频道", True)
-            return {"handled": True, "reason": "channel_not_allowed"}
-        draft["routeOwnerUserId"] = route_owner_user_id
-        draft["channelId"] = str(channel.get("id") or "")
-        draft["channelTitle"] = str(channel.get("title") or "")
-        draft["channelChatId"] = str(channel.get("chatId") or "")
-        refresh_submission_caption(draft, config, store)
-        save_submission_draft(store, draft)
-        await refresh_submission_preview_message(store, bot_token, draft, config, message_id)
-        await answer_callback_query(bot_token, callback_id)
-        return {"handled": True, "action": action}
-
-    if action == "back":
-        await refresh_submission_preview_message(store, bot_token, draft, config, message_id)
-        await answer_callback_query(bot_token, callback_id)
-        return {"handled": True, "action": action}
-
-    if action == "publish":
-        result = await publish_submission_draft(store, bot_token, config, draft, callback_id, message_id, acting_user_id=user_id)
-        return {"handled": True, **result}
-
-    await answer_callback_query(bot_token, callback_id, "未知操作", True)
-    return {"handled": True, "reason": "unknown_action"}
-
-
-async def handle_pending_submission_input(store: SessionStore, bot_token: str, config: Dict[str, Any], draft: Dict[str, Any], text: str, source_message_id: int) -> Dict[str, Any]:
-    field = str(draft.get("pendingEdit") or "")
-    if field == "recognition":
-        candidates = await find_submission_recognition_candidates(config, text, 6)
-        draft["pendingRecognitionResults"] = candidates
-        save_submission_draft(store, draft)
-        if candidates:
-            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), recognition_results_text(text), parse_mode="HTML", reply_markup=recognition_results_keyboard(draft))
-        else:
-            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), f"没有找到 “{text.strip()}” 的 TMDB 结果，请换关键词或发送 movie:ID / tv:ID。", reply_markup=cancel_keyboard(draft))
-        track_interaction(draft, source_message_id, telegram_message_id(sent))
-        save_submission_draft(store, draft)
-        return {"handled": True, "action": "recognition_search", "candidateCount": len(candidates)}
-
-    if field == "size":
-        metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
-        metadata["size"] = text.strip()
-        draft["metadata"] = metadata
-    elif field == "note":
-        metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
-        metadata["note"] = text.strip()
-        draft["metadata"] = metadata
-    else:
-        return {"handled": False, "reason": "no_pending_edit"}
-
-    draft["pendingEdit"] = ""
-    refresh_submission_caption(draft, config, store)
-    saved = save_submission_draft(store, draft)
-    reply = await send_telegram_text(bot_token, safe_int(saved.get("ownerChatId")), "已更新投稿参数。")
-    track_interaction(saved, source_message_id, telegram_message_id(reply))
-    save_submission_draft(store, saved)
-    await refresh_submission_preview_message(store, bot_token, saved, config)
-    return {"handled": True, "action": "edit", "field": field}
 
 
 async def publish_submission_draft(store: SessionStore, bot_token: str, config: Dict[str, Any], draft: Dict[str, Any], callback_id: str = "", callback_message_id_value: int = 0, acting_user_id: int = 0) -> Dict[str, Any]:
@@ -3430,36 +2991,6 @@ async def cleanup_published_submission_history(config: Dict[str, Any], draft: Di
         return str(error)
 
 
-async def refresh_submission_preview_message(store: SessionStore, bot_token: str, draft: Dict[str, Any], config: Dict[str, Any], callback_message_id_value: int = 0) -> Dict[str, Any]:
-    refresh_submission_caption(draft, config, store)
-    chat_id = safe_int(draft.get("ownerChatId"))
-    message_id = callback_message_id_value or safe_int(draft.get("previewMessageId"))
-    if message_id:
-        try:
-            photo = media_photo(draft)
-            if photo:
-                await edit_telegram_message_media(bot_token, chat_id, message_id, photo, str(draft.get("caption") or ""), build_submission_preview_markup(draft, config, store))
-            else:
-                await edit_telegram_message_text(bot_token, chat_id, message_id, str(draft.get("caption") or ""), parse_mode="HTML", reply_markup=build_submission_preview_markup(draft, config, store))
-            draft["previewMessageId"] = message_id
-            return save_submission_draft(store, draft)
-        except Exception:
-            try:
-                await edit_telegram_message_caption(bot_token, chat_id, message_id, str(draft.get("caption") or ""), build_submission_preview_markup(draft, config, store))
-                draft["previewMessageId"] = message_id
-                return save_submission_draft(store, draft)
-            except Exception:
-                await delete_telegram_messages(bot_token, chat_id, [message_id])
-
-    preview = await send_submission_preview_result(bot_token, chat_id, draft, config)
-    draft["previewMessageId"] = int(preview.get("firstMessageId") or 0)
-    if int(preview.get("sentCount") or 0) > 0:
-        draft["sent"] = True
-        draft["sentAt"] = utc_now_iso()
-        draft["sentCount"] = int(preview.get("sentCount") or 0)
-    return save_submission_draft(store, draft)
-
-
 def refresh_submission_caption(draft: Dict[str, Any], config: Dict[str, Any], store: "SessionStore") -> None:
     owner_user_id = safe_int(draft.get("ownerUserId")) or 0
     channel = select_submission_channel(store, owner_user_id, draft)
@@ -3482,17 +3013,6 @@ def refresh_submission_caption(draft: Dict[str, Any], config: Dict[str, Any], st
     draft["text"] = caption
 
 
-def apply_media_to_submission_draft(draft: Dict[str, Any], media: Dict[str, Any], config: Dict[str, Any], store: "SessionStore") -> None:
-    metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
-    draft["media"] = media
-    metadata["tmdbId"] = media.get("tmdbId")
-    metadata["title"] = media.get("title") or metadata.get("title")
-    metadata["year"] = media.get("year") or metadata.get("year")
-    metadata["mediaType"] = media.get("mediaType") or metadata.get("mediaType")
-    draft["metadata"] = fill_submission_metadata(metadata, media, draft.get("inspection") if isinstance(draft.get("inspection"), dict) else {})
-    refresh_submission_caption(draft, config, store)
-
-
 async def find_submission_recognition_candidates(config: Dict[str, Any], query: str, limit: int = 6) -> List[Dict[str, Any]]:
     token = str(config.get("tmdbToken") or "").strip()
     if not token:
@@ -3510,29 +3030,6 @@ async def find_submission_recognition_candidates(config: Dict[str, Any], query: 
         return (await tmdb_search_candidates(token, language, lookup_query, "", media_type, limit))[:limit]
     except Exception:
         return []
-
-
-def find_pending_submission_draft(store: SessionStore, chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
-    for draft in list_submission_drafts(store, 20):
-        if str(draft.get("status") or "draft") != "draft":
-            continue
-        if safe_int(draft.get("ownerChatId")) == chat_id and safe_int(draft.get("ownerUserId")) == user_id and str(draft.get("pendingEdit") or ""):
-            return draft
-    return None
-
-
-def track_interaction(draft: Dict[str, Any], *ids: int) -> None:
-    existing = {safe_int(value) for value in draft.get("interactionMessageIds") or [] if safe_int(value) > 0}
-    source_id = safe_int(draft.get("sourceMessageId"))
-    for value in ids:
-        message_id = safe_int(value)
-        if message_id and message_id != source_id:
-            existing.add(message_id)
-    draft["interactionMessageIds"] = sorted(existing)
-
-
-def telegram_user_allowed(config: Dict[str, Any], user_id: int, store: Optional["SessionStore"] = None) -> bool:
-    return telegram_submission_allowed(config, user_id, store)
 
 
 def telegram_admin_allowed(config: Dict[str, Any], user_id: int) -> bool:
@@ -3561,118 +3058,13 @@ def channel_user_allowed(channel: Dict[str, Any], user_id: int, owner_user_id: i
     return user_id == owner_user_id or user_id in allowed
 
 
-def telegram_message_text(message: Dict[str, Any]) -> str:
-    text = str(message.get("text") or message.get("caption") or "")
-    parts = [text, *telegram_entity_urls(message, text)]
-    return "\n".join(dict.fromkeys(part.strip() for part in parts if str(part or "").strip()))
-
-
-def telegram_entity_urls(message: Dict[str, Any], text: str) -> List[str]:
-    entities: List[Dict[str, Any]] = []
-    if isinstance(message.get("entities"), list):
-        entities.extend(item for item in message.get("entities") or [] if isinstance(item, dict))
-    if isinstance(message.get("caption_entities"), list):
-        entities.extend(item for item in message.get("caption_entities") or [] if isinstance(item, dict))
-    urls: List[str] = []
-    for entity in entities:
-        if entity.get("type") == "text_link" and entity.get("url"):
-            urls.append(str(entity.get("url") or ""))
-            continue
-        if entity.get("type") == "url":
-            offset = safe_int(entity.get("offset"))
-            length = safe_int(entity.get("length"))
-            if length > 0:
-                urls.append(text[offset : offset + length])
-    return urls
-
-
-def callback_message_id(callback: Dict[str, Any]) -> int:
-    message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
-    return safe_int(message.get("message_id"))
-
-
 def enabled_submission_channels(channels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [channel for channel in channels if isinstance(channel, dict) and channel.get("enabled") is not False]
-
-
-def channel_keyboard(draft: Dict[str, Any], store: "SessionStore") -> Dict[str, Any]:
-    user_id = safe_int(draft.get("ownerUserId"))
-    channels = submission_channel_candidates(store, user_id)
-    rows = []
-    for index, candidate in enumerate(channels):
-        channel = candidate.get("channel") if isinstance(candidate, dict) else {}
-        selected = str(draft.get("channelId") or "") == str(channel.get("id") or "") and safe_int(draft.get("routeOwnerUserId")) == safe_int(candidate.get("ownerUserId"))
-        prefix = "✅ " if selected else ""
-        rows.append([{"text": f"{prefix}{channel.get('title') or channel.get('id') or '频道'}", "callback_data": f"sub:{draft.get('id')}:setch:{index}"}])
-    rows.append([{"text": "返回", "callback_data": f"sub:{draft.get('id')}:back"}])
-    return {"inline_keyboard": rows}
 
 
 def build_publish_markup(draft: Dict[str, Any], config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     share_row = build_share_markup_row(draft, config)
     return {"inline_keyboard": [share_row]} if share_row else None
-
-
-def cancel_keyboard(draft: Dict[str, Any]) -> Dict[str, Any]:
-    return {"inline_keyboard": [[{"text": "取消", "callback_data": f"sub:{draft.get('id')}:cancel"}]]}
-
-
-def recognition_prompt(draft: Dict[str, Any]) -> str:
-    media = draft.get("media") if isinstance(draft.get("media"), dict) else {}
-    title = str(media.get("title") or "未识别媒体")
-    year = str(media.get("year") or "")
-    display = title if not year or f"({year})" in title else f"{title} ({year})"
-    tmdb_id = media.get("tmdbId")
-    return "\n".join(
-        [
-            "🔍 <b>更改识别</b>",
-            "",
-            f"<blockquote>{escape(display)}{f' {{tmdb-{tmdb_id}}}' if tmdb_id else ''}</blockquote>",
-            "",
-            "请直接发送下面任一格式：",
-            "• <code>movie:363093</code> 指定电影 ID",
-            "• <code>tv:12345</code> 指定剧集 ID",
-            "• <code>363093</code> 纯 TMDB ID",
-            "• <code>达顿牧场 2026</code> 搜索关键词",
-        ]
-    )
-
-
-def recognition_results_text(query: str) -> str:
-    return f"🔍 <b>选择识别结果</b>\n\n搜索：<code>{escape(str(query or '').strip())}</code>"
-
-
-def recognition_results_keyboard(draft: Dict[str, Any]) -> Dict[str, Any]:
-    rows = []
-    for index, item in enumerate((draft.get("pendingRecognitionResults") or [])[:6]):
-        if not isinstance(item, dict):
-            continue
-        icon = "📺剧集" if item.get("mediaType") == "tv" else "🎬电影"
-        year = f" ({item.get('year')})" if item.get("year") else ""
-        rows.append([{"text": f"{index + 1}. [{icon}] {item.get('title') or '未命名'}{year}", "callback_data": f"sub:{draft.get('id')}:picktmdb:{index}"}])
-    rows.append([{"text": "取消", "callback_data": f"sub:{draft.get('id')}:cancel"}])
-    return {"inline_keyboard": rows}
-
-
-def edit_prompt(field: str, draft: Optional[Dict[str, Any]] = None, config: Optional[Dict[str, Any]] = None) -> str:
-    if field == "size":
-        return "请直接回复新的资源大小，例如：192.10GB"
-    note = current_draft_note(draft, config)
-    parts = ["请直接回复新的备注。"]
-    if note:
-        parts.extend(["", "当前备注：", f"<code>{escape(note)}</code>"])
-    return "\n".join(parts)
-
-
-def current_draft_note(draft: Optional[Dict[str, Any]], config: Optional[Dict[str, Any]] = None) -> str:
-    if not draft:
-        return ""
-    metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
-    note = combined_submission_note(metadata.get("note"), draft.get("databaseNote"))
-    if note:
-        return note
-    inspection = draft.get("inspection") if isinstance(draft.get("inspection"), dict) else {}
-    return build_submission_resource_name(metadata, inspection.get("fileNames") or [], config or {})
 
 
 async def send_telegram_photo_via_client(config: Dict[str, Any], chat_id: str, photo: str, caption: str, parse_mode: str = "HTML") -> Any:
@@ -3862,35 +3254,11 @@ def publish_error_hint(message: str, chat_id: Any) -> str:
     return f"发布失败：{message}"
 
 
-async def edit_telegram_reply_markup(bot_token: str, chat_id: Any, message_id: int, reply_markup: Dict[str, Any]) -> Dict[str, Any]:
-    return await telegram_post(bot_token, "editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup})
-
-
-async def edit_telegram_message_text(bot_token: str, chat_id: Any, message_id: int, text: str, parse_mode: Optional[str] = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text, "disable_web_page_preview": False}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return await telegram_post(bot_token, "editMessageText", payload)
-
-
 async def edit_telegram_message_caption(bot_token: str, chat_id: Any, message_id: int, caption: str, reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "caption": caption, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     return await telegram_post(bot_token, "editMessageCaption", payload)
-
-
-async def edit_telegram_message_media(bot_token: str, chat_id: Any, message_id: int, photo: str, caption: str, reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "media": {"type": "photo", "media": photo, "caption": caption, "parse_mode": "HTML"},
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return await telegram_post(bot_token, "editMessageMedia", payload)
 
 
 async def delete_telegram_messages(bot_token: str, chat_id: Any, ids: Iterable[Any]) -> None:
@@ -4216,3 +3584,351 @@ def normalize_submission_draft(value: Dict[str, Any]) -> Dict[str, Any]:
         "documents": normalize_submission_documents(value.get("documents") or []),
         **({"databaseNote": database_note} if database_note else {}),
     }
+
+
+# ---------------------------------------------------------------------------
+# Telegram 草稿按钮回调与后续输入（自旧版原样恢复；入口见 main.py 的 telegram_callback_polling_loop）
+# ---------------------------------------------------------------------------
+async def handle_submission_callback(store: SessionStore, bot_token: str, config: Dict[str, Any], callback: Dict[str, Any]) -> Dict[str, Any]:
+    data = str(callback.get("data") or "")
+    callback_id = str(callback.get("id") or "")
+    if not data.startswith("sub:"):
+        return {"handled": False, "reason": "unsupported_callback"}
+    user = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+    user_id = safe_int(user.get("id"))
+    if not telegram_user_allowed(config, user_id, store):
+        await answer_callback_query(bot_token, callback_id, "你没有权限使用这个投稿 Bot。", True)
+        return {"handled": True, "reason": "forbidden"}
+
+    _prefix, draft_id, action, raw_value = (data.split(":", 3) + ["", "", "", ""])[:4]
+    draft = get_submission_draft(store, draft_id)
+    if not draft:
+        await answer_callback_query(bot_token, callback_id, "投稿草稿不存在或已过期，请重新投稿", True)
+        return {"handled": True, "reason": "draft_not_found"}
+    if safe_int(draft.get("ownerUserId")) != user_id:
+        await answer_callback_query(bot_token, callback_id, "这不是你的投稿草稿。", True)
+        return {"handled": True, "reason": "draft_owner_mismatch"}
+
+    message_id = callback_message_id(callback)
+    if action == "noop":
+        await answer_callback_query(bot_token, callback_id)
+        return {"handled": True, "action": action}
+
+    if action == "edit":
+        field = "recognition" if raw_value == "title" else raw_value
+        if field not in {"size", "note", "recognition"}:
+            await answer_callback_query(bot_token, callback_id, "未知编辑项", True)
+            return {"handled": True, "reason": "unknown_edit"}
+        draft["pendingEdit"] = field
+        draft["pendingRecognitionResults"] = []
+        save_submission_draft(store, draft)
+        await answer_callback_query(bot_token, callback_id)
+        if field == "recognition":
+            await delete_telegram_messages(bot_token, safe_int(draft.get("ownerChatId")), draft.get("interactionMessageIds") or [])
+            draft["interactionMessageIds"] = []
+            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), recognition_prompt(draft), parse_mode="HTML", reply_markup=cancel_keyboard(draft))
+        elif field == "note":
+            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), edit_prompt(field, draft, config), parse_mode="HTML", reply_markup={"force_reply": True, "selective": True, "input_field_placeholder": "粘贴并修改当前备注"})
+        else:
+            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), edit_prompt(field, draft, config), reply_markup=cancel_keyboard(draft))
+        track_interaction(draft, telegram_message_id(sent))
+        save_submission_draft(store, draft)
+        return {"handled": True, "action": action, "field": field}
+
+    if action == "picktmdb":
+        candidates = draft.get("pendingRecognitionResults") if isinstance(draft.get("pendingRecognitionResults"), list) else []
+        index = safe_int(raw_value)
+        candidate = candidates[index] if 0 <= index < len(candidates) and isinstance(candidates[index], dict) else None
+        if not candidate:
+            await answer_callback_query(bot_token, callback_id, "识别结果已过期，请重新更改识别", True)
+            return {"handled": True, "reason": "candidate_not_found"}
+        apply_media_to_submission_draft(draft, candidate, config, store)
+        draft["pendingEdit"] = ""
+        draft["pendingRecognitionResults"] = []
+        save_share_media_cache(store, str(draft.get("share", {}).get("cleanUrl") or ""), draft.get("media") if isinstance(draft.get("media"), dict) else {}, "manual")
+        await delete_telegram_messages(bot_token, safe_int(draft.get("ownerChatId")), draft.get("interactionMessageIds") or [])
+        draft["interactionMessageIds"] = []
+        save_submission_draft(store, draft)
+        await refresh_submission_preview_message(store, bot_token, draft, config, message_id)
+        await answer_callback_query(bot_token, callback_id, "已更新识别")
+        return {"handled": True, "action": action}
+
+    if action == "cancel":
+        draft["pendingEdit"] = ""
+        draft["pendingRecognitionResults"] = []
+        await delete_telegram_messages(bot_token, safe_int(draft.get("ownerChatId")), draft.get("interactionMessageIds") or [])
+        draft["interactionMessageIds"] = []
+        save_submission_draft(store, draft)
+        await answer_callback_query(bot_token, callback_id, "已取消")
+        return {"handled": True, "action": action}
+
+    if action == "channel":
+        await answer_callback_query(bot_token, callback_id)
+        try:
+            await edit_telegram_reply_markup(bot_token, safe_int(draft.get("ownerChatId")), message_id or safe_int(draft.get("previewMessageId")), channel_keyboard(draft, store))
+        except Exception:
+            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), "请选择发布频道：", reply_markup=channel_keyboard(draft, store))
+            track_interaction(draft, telegram_message_id(sent))
+            save_submission_draft(store, draft)
+        return {"handled": True, "action": action}
+
+    if action == "setch":
+        channels = submission_channel_candidates(store, user_id)
+        index = safe_int(raw_value)
+        candidate = channels[index] if 0 <= index < len(channels) else None
+        channel = candidate.get("channel") if isinstance(candidate, dict) and isinstance(candidate.get("channel"), dict) else None
+        if not channel or not candidate:
+            await answer_callback_query(bot_token, callback_id, "频道配置已变化，请重新打开频道选择", True)
+            return {"handled": True, "reason": "channel_not_found"}
+        route_owner_user_id = safe_int(candidate.get("ownerUserId"))
+        if not store.channel_user_allowed(route_owner_user_id, str(channel.get("id") or ""), user_id):
+            await answer_callback_query(bot_token, callback_id, "你没有权限使用此频道", True)
+            return {"handled": True, "reason": "channel_not_allowed"}
+        draft["routeOwnerUserId"] = route_owner_user_id
+        draft["channelId"] = str(channel.get("id") or "")
+        draft["channelTitle"] = str(channel.get("title") or "")
+        draft["channelChatId"] = str(channel.get("chatId") or "")
+        refresh_submission_caption(draft, config, store)
+        save_submission_draft(store, draft)
+        await refresh_submission_preview_message(store, bot_token, draft, config, message_id)
+        await answer_callback_query(bot_token, callback_id)
+        return {"handled": True, "action": action}
+
+    if action == "back":
+        await refresh_submission_preview_message(store, bot_token, draft, config, message_id)
+        await answer_callback_query(bot_token, callback_id)
+        return {"handled": True, "action": action}
+
+    if action == "publish":
+        result = await publish_submission_draft(store, bot_token, config, draft, callback_id, message_id, acting_user_id=user_id)
+        return {"handled": True, **result}
+
+    await answer_callback_query(bot_token, callback_id, "未知操作", True)
+    return {"handled": True, "reason": "unknown_action"}
+
+
+async def handle_pending_submission_input(store: SessionStore, bot_token: str, config: Dict[str, Any], draft: Dict[str, Any], text: str, source_message_id: int) -> Dict[str, Any]:
+    field = str(draft.get("pendingEdit") or "")
+    if field == "recognition":
+        candidates = await find_submission_recognition_candidates(config, text, 6)
+        draft["pendingRecognitionResults"] = candidates
+        save_submission_draft(store, draft)
+        if candidates:
+            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), recognition_results_text(text), parse_mode="HTML", reply_markup=recognition_results_keyboard(draft))
+        else:
+            sent = await send_telegram_text(bot_token, safe_int(draft.get("ownerChatId")), f"没有找到 “{text.strip()}” 的 TMDB 结果，请换关键词或发送 movie:ID / tv:ID。", reply_markup=cancel_keyboard(draft))
+        track_interaction(draft, source_message_id, telegram_message_id(sent))
+        save_submission_draft(store, draft)
+        return {"handled": True, "action": "recognition_search", "candidateCount": len(candidates)}
+
+    if field == "size":
+        metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+        metadata["size"] = text.strip()
+        draft["metadata"] = metadata
+    elif field == "note":
+        metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+        metadata["note"] = text.strip()
+        draft["metadata"] = metadata
+    else:
+        return {"handled": False, "reason": "no_pending_edit"}
+
+    draft["pendingEdit"] = ""
+    refresh_submission_caption(draft, config, store)
+    saved = save_submission_draft(store, draft)
+    reply = await send_telegram_text(bot_token, safe_int(saved.get("ownerChatId")), "已更新投稿参数。")
+    track_interaction(saved, source_message_id, telegram_message_id(reply))
+    save_submission_draft(store, saved)
+    await refresh_submission_preview_message(store, bot_token, saved, config)
+    return {"handled": True, "action": "edit", "field": field}
+
+
+async def refresh_submission_preview_message(store: SessionStore, bot_token: str, draft: Dict[str, Any], config: Dict[str, Any], callback_message_id_value: int = 0) -> Dict[str, Any]:
+    refresh_submission_caption(draft, config, store)
+    chat_id = safe_int(draft.get("ownerChatId"))
+    message_id = callback_message_id_value or safe_int(draft.get("previewMessageId"))
+    if message_id:
+        try:
+            photo = media_photo(draft)
+            if photo:
+                await edit_telegram_message_media(bot_token, chat_id, message_id, photo, str(draft.get("caption") or ""), build_submission_preview_markup(draft, config, store))
+            else:
+                await edit_telegram_message_text(bot_token, chat_id, message_id, str(draft.get("caption") or ""), parse_mode="HTML", reply_markup=build_submission_preview_markup(draft, config, store))
+            draft["previewMessageId"] = message_id
+            return save_submission_draft(store, draft)
+        except Exception:
+            try:
+                await edit_telegram_message_caption(bot_token, chat_id, message_id, str(draft.get("caption") or ""), build_submission_preview_markup(draft, config, store))
+                draft["previewMessageId"] = message_id
+                return save_submission_draft(store, draft)
+            except Exception:
+                await delete_telegram_messages(bot_token, chat_id, [message_id])
+
+    preview = await send_submission_preview_result(bot_token, chat_id, draft, config)
+    draft["previewMessageId"] = int(preview.get("firstMessageId") or 0)
+    if int(preview.get("sentCount") or 0) > 0:
+        draft["sent"] = True
+        draft["sentAt"] = utc_now_iso()
+        draft["sentCount"] = int(preview.get("sentCount") or 0)
+    return save_submission_draft(store, draft)
+
+
+def apply_media_to_submission_draft(draft: Dict[str, Any], media: Dict[str, Any], config: Dict[str, Any], store: "SessionStore") -> None:
+    metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+    draft["media"] = media
+    metadata["tmdbId"] = media.get("tmdbId")
+    metadata["title"] = media.get("title") or metadata.get("title")
+    metadata["year"] = media.get("year") or metadata.get("year")
+    metadata["mediaType"] = media.get("mediaType") or metadata.get("mediaType")
+    draft["metadata"] = fill_submission_metadata(metadata, media, draft.get("inspection") if isinstance(draft.get("inspection"), dict) else {})
+    refresh_submission_caption(draft, config, store)
+
+
+def track_interaction(draft: Dict[str, Any], *ids: int) -> None:
+    existing = {safe_int(value) for value in draft.get("interactionMessageIds") or [] if safe_int(value) > 0}
+    source_id = safe_int(draft.get("sourceMessageId"))
+    for value in ids:
+        message_id = safe_int(value)
+        if message_id and message_id != source_id:
+            existing.add(message_id)
+    draft["interactionMessageIds"] = sorted(existing)
+
+
+def telegram_user_allowed(config: Dict[str, Any], user_id: int, store: Optional["SessionStore"] = None) -> bool:
+    return telegram_submission_allowed(config, user_id, store)
+
+
+def callback_message_id(callback: Dict[str, Any]) -> int:
+    message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+    return safe_int(message.get("message_id"))
+
+
+def channel_keyboard(draft: Dict[str, Any], store: "SessionStore") -> Dict[str, Any]:
+    user_id = safe_int(draft.get("ownerUserId"))
+    channels = submission_channel_candidates(store, user_id)
+    rows = []
+    for index, candidate in enumerate(channels):
+        channel = candidate.get("channel") if isinstance(candidate, dict) else {}
+        selected = str(draft.get("channelId") or "") == str(channel.get("id") or "") and safe_int(draft.get("routeOwnerUserId")) == safe_int(candidate.get("ownerUserId"))
+        prefix = "✅ " if selected else ""
+        rows.append([{"text": f"{prefix}{channel.get('title') or channel.get('id') or '频道'}", "callback_data": f"sub:{draft.get('id')}:setch:{index}"}])
+    rows.append([{"text": "返回", "callback_data": f"sub:{draft.get('id')}:back"}])
+    return {"inline_keyboard": rows}
+
+
+def cancel_keyboard(draft: Dict[str, Any]) -> Dict[str, Any]:
+    return {"inline_keyboard": [[{"text": "取消", "callback_data": f"sub:{draft.get('id')}:cancel"}]]}
+
+
+def recognition_prompt(draft: Dict[str, Any]) -> str:
+    media = draft.get("media") if isinstance(draft.get("media"), dict) else {}
+    title = str(media.get("title") or "未识别媒体")
+    year = str(media.get("year") or "")
+    display = title if not year or f"({year})" in title else f"{title} ({year})"
+    tmdb_id = media.get("tmdbId")
+    return "\n".join(
+        [
+            "🔍 <b>更改识别</b>",
+            "",
+            f"<blockquote>{escape(display)}{f' {{tmdb-{tmdb_id}}}' if tmdb_id else ''}</blockquote>",
+            "",
+            "请直接发送下面任一格式：",
+            "• <code>movie:363093</code> 指定电影 ID",
+            "• <code>tv:12345</code> 指定剧集 ID",
+            "• <code>363093</code> 纯 TMDB ID",
+            "• <code>达顿牧场 2026</code> 搜索关键词",
+        ]
+    )
+
+
+def recognition_results_text(query: str) -> str:
+    return f"🔍 <b>选择识别结果</b>\n\n搜索：<code>{escape(str(query or '').strip())}</code>"
+
+
+def recognition_results_keyboard(draft: Dict[str, Any]) -> Dict[str, Any]:
+    rows = []
+    for index, item in enumerate((draft.get("pendingRecognitionResults") or [])[:6]):
+        if not isinstance(item, dict):
+            continue
+        icon = "📺剧集" if item.get("mediaType") == "tv" else "🎬电影"
+        year = f" ({item.get('year')})" if item.get("year") else ""
+        rows.append([{"text": f"{index + 1}. [{icon}] {item.get('title') or '未命名'}{year}", "callback_data": f"sub:{draft.get('id')}:picktmdb:{index}"}])
+    rows.append([{"text": "取消", "callback_data": f"sub:{draft.get('id')}:cancel"}])
+    return {"inline_keyboard": rows}
+
+
+def edit_prompt(field: str, draft: Optional[Dict[str, Any]] = None, config: Optional[Dict[str, Any]] = None) -> str:
+    if field == "size":
+        return "请直接回复新的资源大小，例如：192.10GB"
+    note = current_draft_note(draft, config)
+    parts = ["请直接回复新的备注。"]
+    if note:
+        parts.extend(["", "当前备注：", f"<code>{escape(note)}</code>"])
+    return "\n".join(parts)
+
+
+def current_draft_note(draft: Optional[Dict[str, Any]], config: Optional[Dict[str, Any]] = None) -> str:
+    if not draft:
+        return ""
+    metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
+    note = combined_submission_note(metadata.get("note"), draft.get("databaseNote"))
+    if note:
+        return note
+    inspection = draft.get("inspection") if isinstance(draft.get("inspection"), dict) else {}
+    return build_submission_resource_name(metadata, inspection.get("fileNames") or [], config or {})
+
+
+async def edit_telegram_reply_markup(bot_token: str, chat_id: Any, message_id: int, reply_markup: Dict[str, Any]) -> Dict[str, Any]:
+    return await telegram_post(bot_token, "editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup})
+
+
+async def edit_telegram_message_text(bot_token: str, chat_id: Any, message_id: int, text: str, parse_mode: Optional[str] = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text, "disable_web_page_preview": False}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return await telegram_post(bot_token, "editMessageText", payload)
+
+
+async def edit_telegram_message_media(bot_token: str, chat_id: Any, message_id: int, photo: str, caption: str, reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "media": {"type": "photo", "media": photo, "caption": caption, "parse_mode": "HTML"},
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return await telegram_post(bot_token, "editMessageMedia", payload)
+
+def find_pending_submission_draft(store: SessionStore, chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+    for draft in list_submission_drafts(store, 20):
+        if str(draft.get("status") or "draft") != "draft":
+            continue
+        if safe_int(draft.get("ownerChatId")) == chat_id and safe_int(draft.get("ownerUserId")) == user_id and str(draft.get("pendingEdit") or ""):
+            return draft
+    return None
+
+
+def telegram_entity_urls(message: Dict[str, Any], text: str) -> List[str]:
+    entities: List[Dict[str, Any]] = []
+    if isinstance(message.get("entities"), list):
+        entities.extend(item for item in message.get("entities") or [] if isinstance(item, dict))
+    if isinstance(message.get("caption_entities"), list):
+        entities.extend(item for item in message.get("caption_entities") or [] if isinstance(item, dict))
+    urls: List[str] = []
+    for entity in entities:
+        if entity.get("type") == "text_link" and entity.get("url"):
+            urls.append(str(entity.get("url") or ""))
+            continue
+        if entity.get("type") == "url":
+            offset = safe_int(entity.get("offset"))
+            length = safe_int(entity.get("length"))
+            if length > 0:
+                urls.append(text[offset : offset + length])
+    return urls
+
+
+def telegram_message_text(message: Dict[str, Any]) -> str:
+    text = str(message.get("text") or message.get("caption") or "")
+    parts = [text, *telegram_entity_urls(message, text)]
+    return "\n".join(dict.fromkeys(part.strip() for part in parts if str(part or "").strip()))

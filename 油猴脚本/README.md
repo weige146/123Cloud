@@ -2,7 +2,7 @@
 
 增强 123 云盘网页端的文件与分享管理，并与 [123Cloud 桌面客户端](https://github.com/weige146/123Cloud)配套使用。
 
-- 脚本文件：[`123-helper.user.js`](./123-helper.user.js)（v1.2.1）
+- 脚本文件：[`123-helper.user.js`](./123-helper.user.js)（v1.2.2）
 
 ## 功能
 

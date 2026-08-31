@@ -1,6 +1,5 @@
-import { api, apiTelegramGet, apiTelegramJson } from "./client";
+import { api } from "./client";
 import type {
-  AdminConfig,
   AdminStatus,
   Pan115Device,
   Pan115HelperStatus,
@@ -14,7 +13,6 @@ import type {
   TransferTask,
   Channel,
   Routing,
-  WallpaperResponse,
 } from "./types";
 
 export interface MyChannelConfig {
@@ -23,28 +21,27 @@ export interface MyChannelConfig {
   routing: Routing;
   updatedAt?: string;
   createdAt?: string;
-  canManageChannelOwners?: boolean;
-  channelOwnerUserIds?: number[];
 }
 
 export interface MyChannelConfigUpdate {
   channels: Channel[];
   routing: Routing;
-  channelOwnerUserIds?: number[];
 }
 
-// ====== Admin / 网关 ======
+// ====== Admin / 123 网盘账号 ======
 export const adminApi = {
-  wallpapers: () => api.get<WallpaperResponse>("/api/admin/wallpapers"),
   status: () => api.get<AdminStatus>("/api/admin/status"),
-  getConfig: () => api.get<{ ok: boolean; config: AdminConfig }>("/api/admin/config"),
-  putConfig: (config: AdminConfig) => api.put<{ ok: boolean; config: AdminConfig }>("/api/admin/config", config),
   login: (user: string, password: string, remember: boolean) =>
     api.post<{ ok: boolean; user: string; loginUuid: string; reused: boolean; updatedAt: string }>(
       "/api/123/login",
       { user, password, remember }
     ),
   logout: () => api.post<{ ok: boolean }>("/api/123/logout"),
+};
+
+// ====== 后端日志 ======
+export const logsApi = {
+  tail: (limit = 2000) => api.get<{ ok: boolean; logs: string[] }>(`/api/logs?limit=${limit}`),
 };
 
 // ====== 投稿 ======
@@ -63,13 +60,15 @@ export const submissionApi = {
   submitDraft: (id: string) => api.post(`/api/submission/drafts/${encodeURIComponent(id)}/submit`, {}),
 };
 
-// This API intentionally has no UID parameter.  Telegram Web App initData is
-// verified by the server and decides which owner's configuration is visible.
-export const telegramChannelApi = {
-  get: () => apiTelegramGet<{ ok: boolean; config: MyChannelConfig }>("/api/submission/my-channel-config"),
-  put: (config: MyChannelConfigUpdate) =>
-    apiTelegramJson<{ ok: boolean; config: MyChannelConfig }>("/api/submission/my-channel-config", "PUT", config),
-  delete: () => apiTelegramJson<{ ok: boolean; deleted: boolean }>("/api/submission/my-channel-config", "DELETE"),
+// 桌面端「投稿路由」管理接口：按频道主 UID 读写频道/路由配置。
+export const channelOwnerApi = {
+  owners: () => api.get<{ ok: boolean; owners: number[]; defaultOwnerUserId: number }>("/api/submission/channel-owners"),
+  get: (userId: number) =>
+    api.get<{ ok: boolean; config: MyChannelConfig }>(`/api/submission/channel-owners/${encodeURIComponent(String(userId))}`),
+  put: (userId: number, config: MyChannelConfigUpdate) =>
+    api.put<{ ok: boolean; config: MyChannelConfig }>(`/api/submission/channel-owners/${encodeURIComponent(String(userId))}`, config),
+  delete: (userId: number) =>
+    api.delete<{ ok: boolean; deleted: boolean }>(`/api/submission/channel-owners/${encodeURIComponent(String(userId))}`),
 };
 
 // ====== 115 Cookie 扫码 ======
