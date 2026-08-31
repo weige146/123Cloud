@@ -516,7 +516,8 @@ a:hover { color: var(--link-hover); }
 }
 
 .page-body {
-  max-width: 1180px;
+  /* 大窗口时内容随窗口伸展（放大约至 1920px 封顶），不再固定 1180px 留死空隙 */
+  max-width: clamp(1180px, calc(100vw - 56px), 1920px);
   margin: 0 auto;
   padding: 30px 34px 44px;
 }

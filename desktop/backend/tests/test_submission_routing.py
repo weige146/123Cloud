@@ -219,6 +219,114 @@ class TelegramBotTextRoutingTests(unittest.TestCase):
         enqueue.assert_not_awaited()
 
 
+class TelegramFastlinkRoutingTests(unittest.TestCase):
+    """秒传链接 / 秒传 JSON 文件发给机器人 → 生成投稿草稿，发布后删原消息。"""
+
+    def setUp(self) -> None:
+        self.config = {
+            "botToken": "telegram-token",
+            "telegramAdminUserIds": [456],
+        }
+
+    @staticmethod
+    def update(payload: dict) -> dict:
+        return {"message": {"message_id": 99, "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, **payload}}
+
+    def test_fastlink_text_generates_submission_drafts(self):
+        submit = AsyncMock(return_value={"draftCount": 1, "sentCount": 1})
+        fastlink = "123FLCPV2$abc123#1024#Show.S01E01.2160p.WEB-DL.H265-HiveWeb.mkv"
+        with patch.object(main, "submit_submission_links", submit):
+            handled = asyncio.run(main.handle_transfer_telegram_update(
+                self.update({"text": fastlink}), "telegram-token", self.config
+            ))
+        self.assertTrue(handled)
+        submit.assert_awaited_once()
+        self.assertEqual(submit.await_args.args[2], "Telegram 投稿")
+        self.assertEqual(submit.await_args.kwargs["source_message_id"], 99)
+        self.assertEqual(submit.await_args.kwargs["owner_chat_id"], 123)
+        links = submit.await_args.args[1]
+        self.assertEqual(links[0]["provider"], "123fastlink")
+        self.assertIn("123FLCPV2$", links[0]["cleanUrl"])
+
+    def test_project_standard_json_converts_to_fastlink_link(self):
+        content = (
+            '{"scriptVersion":"3.2.0-tdr.4","exportVersion":"1.0","usesBase62EtagsInExport":true,'
+            '"commonPath":"乐园侵触死亡之岛（2023）{tmdb-222928}/Season 1/",'
+            '"totalFilesCount":2,"totalSize":6547244819,"formattedTotalSize":"6.10 GB",'
+            '"files":['
+            '{"path":"Rakuen.S01E01.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv",'
+            '"fileName":"Rakuen.S01E01.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv",'
+            '"etag":"GivR7wk9FQT4UwfLoCF0","size":3666910245,"type":0,"s3KeyFlag":"1813278387-0"},'
+            '{"path":"Rakuen.S01E02.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv",'
+            '"fileName":"Rakuen.S01E02.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv",'
+            '"etag":"7xkgV3G5Fyte1RQJooJKD","size":2880334574,"type":0,"s3KeyFlag":"1813278387-0"}]}'
+        )
+        links, names = main.build_fastlink_links_from_json(content)
+        self.assertEqual(len(links), 1)
+        expected = (
+            "123FLCPV2$乐园侵触死亡之岛（2023）{tmdb-222928}/Season 1/"
+            "%GivR7wk9FQT4UwfLoCF0#3666910245#Rakuen.S01E01.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv"
+            "$7xkgV3G5Fyte1RQJooJKD#2880334574#Rakuen.S01E02.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv"
+        )
+        self.assertEqual(links[0], expected)
+        self.assertEqual(names[0], "Rakuen.S01E01.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv")
+        # 非 JSON 内容返回空
+        self.assertEqual(main.build_fastlink_links_from_json("plain 123FLCPV2$x#1#a.mkv"), ([], []))
+
+    def test_fastlink_document_generates_submission_drafts(self):
+        submit = AsyncMock(return_value={"draftCount": 1, "sentCount": 1})
+        download = AsyncMock(return_value=(
+            '{"commonPath":"乐园侵触死亡之岛（2023）{tmdb-222928}/Season 1/",'
+            '"files":[{"path":"Rakuen.S01E01.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv",'
+            '"etag":"GivR7wk9FQT4UwfLoCF0","size":3666910245}]}'
+        ))
+        document = {"file_name": "乐园侵触死亡之岛 (2023) {tmdb-222928}.123fastlink.json", "file_id": "file-1", "file_size": 972}
+        with patch.object(main, "submit_submission_links", submit), \
+                patch.object(main, "download_telegram_document_text", download):
+            handled = asyncio.run(main.handle_transfer_telegram_update(
+                self.update({"document": document}), "telegram-token", self.config
+            ))
+        self.assertTrue(handled)
+        submit.assert_awaited_once()
+        links = submit.await_args.args[1]
+        self.assertEqual(links[0]["provider"], "123fastlink")
+        self.assertTrue(links[0]["cleanUrl"].startswith("123FLCPV2$乐园侵触死亡之岛（2023）{tmdb-222928}/Season 1/%GivR7wk9FQT4UwfLoCF0#"))
+        # 原始 JSON 挂在草稿链接上：预览不发文件，发布到频道时随消息附上
+        documents = links[0]["documents"]
+        self.assertEqual(documents[0]["type"], "fastlink_json")
+        self.assertIn("123fastlink", documents[0]["fileName"])
+        self.assertIn("GivR7wk9FQT4UwfLoCF0", documents[0]["content"])
+        source_text = submit.await_args.kwargs["source_text"]
+        self.assertIn("🎬：乐园侵触死亡之岛 (2023) {tmdb-222928}", source_text)
+        self.assertIn("🔗：123FLCPV2$", source_text)
+        self.assertIn("📄：Rakuen.S01E01.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv", source_text)
+        self.assertEqual(submit.await_args.kwargs["source_message_id"], 99)
+        self.assertEqual(submit.await_args.kwargs["submitter"], {"id": 456})
+
+    def test_unrelated_document_is_ignored(self):
+        submit = AsyncMock()
+        download = AsyncMock()
+        with patch.object(main, "submit_submission_links", submit), \
+                patch.object(main, "download_telegram_document_text", download):
+            handled = asyncio.run(main.handle_transfer_telegram_update(
+                self.update({"document": {"file_name": "notes.pdf", "file_id": "file-2", "file_size": 10}}),
+                "telegram-token",
+                self.config,
+            ))
+        self.assertFalse(handled)
+        submit.assert_not_awaited()
+        download.assert_not_awaited()
+
+    def test_empty_message_without_document_is_ignored(self):
+        submit = AsyncMock()
+        with patch.object(main, "submit_submission_links", submit):
+            handled = asyncio.run(main.handle_transfer_telegram_update(
+                self.update({}), "telegram-token", self.config
+            ))
+        self.assertFalse(handled)
+        submit.assert_not_awaited()
+
+
     def test_queued_message_returns_reference_for_success_cleanup(self):
         task = {
             "id": "task-1",

@@ -1388,13 +1388,13 @@ def collect_effect(files: Iterable[Any]) -> str:
 def extract_effect(value: str) -> str:
     effects = []
     for pattern, label in (
-        (r"\b(?:Dolby\s?Vision|DoVi|DV)\b", "DV"),
-        (r"\bHDR10\+\b", "HDR10"),
-        (r"\bHDR10\b", "HDR10"),
-        (r"\bHDR[\s.]?Vivid\b", "HDR.Vivid"),
+        (r"\b(?:Dolby[ ._-]?Vision|DoVi|DV)\b", "DV"),
+        (r"\bHDR10\+(?![A-Za-z0-9+])", "HDR10+"),
+        (r"\bHDR10(?![\s._-]?\+)", "HDR10"),
+        (r"\bHDR[\s._-]?Vivid\b", "HDR.Vivid"),
         (r"\bHLG\b", "HLG"),
         (r"\bSDR\b", "SDR"),
-        (r"\bHDR\b", "HDR"),
+        (r"\bHDR\b(?![\s._-]?Vivid)", "HDR"),
     ):
         if re.search(pattern, value, re.I) and label not in effects:
             effects.append(label)
@@ -1982,8 +1982,8 @@ def compact_effect(value: str) -> Optional[str]:
         upper = clean.replace(".", "").upper()
         if upper in {"DOLBYVISION", "DOVI"}:
             clean = "DV"
-        elif upper in {"HDR10+", "HDR10P"}:
-            clean = "HDR10"
+        elif upper == "HDR10P":
+            clean = "HDR10+"
         if clean not in parts:
             parts.append(clean)
     return " ".join(parts) if parts else None
@@ -2570,7 +2570,10 @@ def build_submission_preview_markup(draft: Dict[str, Any], config: Dict[str, Any
     provider = str(share.get("provider") or "")
     rows: List[List[Dict[str, Any]]] = []
     if provider == "123fastlink" and clean_url.startswith("123FLCPV2$"):
-        rows.append([{"text": "秒传链接", "copy_text": {"text": clean_url}}])
+        # copy_text 按钮文本上限 256 字符；超长的多文件秒传链接改由发布时
+        # 附带的秒传 JSON 文件承载，避免 BUTTON_COPY_TEXT_INVALID。
+        if len(clean_url) <= 256:
+            rows.append([{"text": "秒传链接", "copy_text": {"text": clean_url}}])
     elif re.match(r"^https?://", clean_url, re.I):
         share_name = submission_share_name(draft, config)
         rows.append([{"text": f"{share_name}网盘", "url": clean_url}])
@@ -2597,13 +2600,15 @@ def build_share_markup_row(draft: Dict[str, Any], config: Dict[str, Any]) -> Opt
     clean_url = str(share.get("cleanUrl") or share.get("url") or "").strip()
     provider = str(share.get("provider") or "")
     if provider == "123fastlink" and clean_url.startswith("123FLCPV2$"):
-        share_row = [{"text": "秒传链接", "copy_text": {"text": clean_url}}]
-    elif re.match(r"^https?://", clean_url, re.I):
-        share_name = submission_share_name(draft, config)
-        share_row = [{"text": f"{share_name}网盘", "url": clean_url}]
-    else:
+        # 同预览键盘：超过 copy_text 256 字符上限的链接不发按钮，
+        # 秒传内容改由随频道消息附带的 JSON 文件承载。
+        if len(clean_url) <= 256:
+            return [{"text": "秒传链接", "copy_text": {"text": clean_url}}]
         return None
-    return share_row
+    if re.match(r"^https?://", clean_url, re.I):
+        share_name = submission_share_name(draft, config)
+        return [{"text": f"{share_name}网盘", "url": clean_url}]
+    return None
 
 
 def media_photo(draft: Dict[str, Any]) -> Optional[str]:

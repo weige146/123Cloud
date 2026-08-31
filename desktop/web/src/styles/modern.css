@@ -305,7 +305,7 @@ textarea:focus-visible,
 
 .page-body {
   width: 100%;
-  max-width: 1580px;
+  max-width: clamp(1180px, calc(100vw - 56px), 1920px);
   min-width: 0;
   margin: 0 auto;
   padding: 22px clamp(18px, 2.4vw, 38px) 48px;

@@ -402,6 +402,7 @@ onBeforeUnmount(() => {
   position: relative;
   height: clamp(360px, 54vh, 680px);
   overflow-y: auto;
+  overflow-x: hidden;
   border-top: 1px solid var(--border);
   background: rgba(4, 5, 12, 0.55);
   padding: 12px 16px 20px;

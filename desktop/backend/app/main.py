@@ -11,7 +11,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -50,12 +50,15 @@ from .submission import (
     delete_submission_draft,
     delete_telegram_messages,
     extract_submission_links,
+    FASTLINK_RE,
     find_pending_submission_draft,
     handle_pending_submission_input,
     handle_submission_callback,
     list_submission_drafts,
+    parse_fastlink,
     send_telegram_text,
     start_telegram_client,
+    strip_fastlink_seed_ext,
     submit_existing_draft,
     submit_submission_links,
     telegram_admin_allowed,
@@ -107,7 +110,7 @@ async def app_lifespan(_app: FastAPI):
         await stop_background_tasks()
 
 
-app = FastAPI(title="123 Cloud Gateway", version="0.1.0", lifespan=app_lifespan)
+app = FastAPI(title="123 Cloud Gateway", version="1.0.0", lifespan=app_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -218,9 +221,23 @@ async def handle_transfer_telegram_update(update: Dict[str, Any], bot_token: str
     if not telegram_admin_allowed(config, user_id):
         return False
     text = telegram_message_text(message).strip()
+    source_message_id = safe_int(message.get("message_id"))
+
+    # 秒传 JSON / .123fastlink 文件：下载后提取秒传链接生成投稿草稿。
+    document = message.get("document") if isinstance(message.get("document"), dict) else None
+    if document:
+        return await handle_admin_fastlink_document(
+            bot_token,
+            chat_id,
+            user_id,
+            source_message_id,
+            document,
+            user,
+            text,
+        )
+
     if not text:
         return False
-    source_message_id = safe_int(message.get("message_id"))
 
     if await handle_pending_pan123_copy_password(bot_token, chat_id, user_id, source_message_id, text):
         return True
@@ -274,6 +291,11 @@ async def handle_transfer_telegram_update(update: Dict[str, Any], bot_token: str
             submission_links,
         )
 
+    # 秒传链接（123FLCPV2…）没有网页分享地址可判断归属，直接走投稿草稿。
+    fastlink_links = [link for link in submission_links if str(link.get("provider") or "") == "123fastlink"]
+    if fastlink_links:
+        return await handle_admin_fastlink_submission(bot_token, chat_id, user_id, source_message_id, text, user)
+
     share_links = extract_115_links(text)
     offline_links = extract_pan115_offline_links(text)
     if not share_links and not offline_links:
@@ -302,6 +324,168 @@ async def handle_transfer_telegram_update(update: Dict[str, Any], bot_token: str
         except Exception as error:
             await send_telegram_text(bot_token, chat_id, f"115 离线提交失败：{error}")
     return True
+
+
+FASTLINK_DOCUMENT_SUFFIX_RE = re.compile(r"\.(?:json|123fastlink|123share|txt)$", re.I)
+FASTLINK_DOCUMENT_MAX_BYTES = 20 * 1024 * 1024
+
+
+def build_fastlink_links_from_json(content: str) -> Tuple[List[str], List[str]]:
+    """项目标准 JSON（files[].etag/size/path）转 123FLCPV2 文本链接。
+
+    与油猴脚本 buildFastlinkText 同构：`123FLCPV2$<commonPath>%<etag#size#path>$…`。
+    返回 (链接列表, 文件名列表)；内容不是秒传 JSON 时返回空。
+    """
+    try:
+        data = json.loads(str(content or ""))
+    except (ValueError, TypeError):
+        return [], []
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, list) or not files:
+        return [], []
+    common_path = str(data.get("commonPath") or "")
+    entries: List[str] = []
+    names: List[str] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        etag = str(item.get("etag") or "").strip()
+        size = safe_int(item.get("size"))
+        path = str(item.get("path") or item.get("fileName") or "").strip()
+        if not etag or not path or size < 0:
+            continue
+        entries.append(f"{etag}#{size}#{path}")
+        names.append(path.rsplit("/", 1)[-1] or path)
+    if not entries:
+        return [], []
+    return [f"123FLCPV2${common_path}%{'$'.join(entries)}"], names
+
+
+async def handle_admin_fastlink_submission(
+    bot_token: str,
+    chat_id: int,
+    user_id: int,
+    source_message_id: int,
+    text: str,
+    submitter: Dict[str, Any],
+    links: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """秒传文本/秒传 JSON 统一走投稿草稿。
+
+    与分享链接一样把 sourceMessageId 记进草稿：发布成功后
+    cleanup_submission_draft_messages 会删掉发来的消息和预览。
+    """
+    if not links:
+        links = [
+            link
+            for link in extract_submission_links(text)
+            if str(link.get("provider") or "") == "123fastlink"
+        ]
+    if not links:
+        await send_telegram_text(bot_token, chat_id, "秒传投稿处理失败：没有可以处理的秒传链接")
+        return True
+    try:
+        await submit_submission_links(
+            store,
+            links,
+            "Telegram 投稿",
+            chat_id,
+            source_text=text,
+            owner_chat_id=chat_id,
+            owner_user_id=user_id,
+            source_message_id=source_message_id,
+            max_links=10,
+            submitter=submitter,
+        )
+    except Exception as error:
+        await send_telegram_text(bot_token, chat_id, f"秒传投稿处理失败：{error}")
+    return True
+
+
+async def handle_admin_fastlink_document(
+    bot_token: str,
+    chat_id: int,
+    user_id: int,
+    source_message_id: int,
+    document: Dict[str, Any],
+    submitter: Dict[str, Any],
+    caption: str = "",
+) -> bool:
+    file_name = str(document.get("file_name") or "")
+    if not FASTLINK_DOCUMENT_SUFFIX_RE.search(file_name):
+        return False
+    try:
+        content = await download_telegram_document_text(bot_token, document)
+    except Exception as error:
+        await send_telegram_text(bot_token, chat_id, f"读取秒传文件失败：{error}")
+        return True
+    links, file_names = build_fastlink_links_from_json(content)
+    if not links:
+        links = [match.group(0) for match in FASTLINK_RE.finditer(content)]
+    if not links and caption:
+        links = [match.group(0) for match in FASTLINK_RE.finditer(caption)]
+    if not links:
+        await send_telegram_text(bot_token, chat_id, f"秒传文件 {file_name or '(未命名)'} 里没有识别到秒传链接或秒传 JSON 文件记录。")
+        return True
+    if not file_names:
+        for link in links:
+            parsed = parse_fastlink(link)
+            name = str(parsed.get("fileName") or "").strip()
+            if name and name.lower() not in {existing.lower() for existing in file_names}:
+                file_names.append(name)
+    title = strip_fastlink_seed_ext(file_name) or "秒传投稿"
+    context_lines = [f"🎬：{title}", f"🔗：{links[0]}"]
+    context_lines.extend(f"📄：{name}" for name in file_names[:100])
+    if len(links) > 1:
+        context_lines.append(f"还有 {len(links) - 1} 个秒传链接")
+    text = "\n".join(context_lines)
+    if caption.strip():
+        text = f"{caption.strip()}\n{text}"
+    # 原始 JSON 挂到草稿：预览不带文件，发布到频道时随消息附上秒传 JSON。
+    link_dicts = [
+        {
+            "url": link,
+            "cleanUrl": link,
+            "provider": "123fastlink",
+            "title": title if index == 0 else "",
+            "sourceText": text,
+            "documents": [
+                {
+                    "type": "fastlink_json",
+                    "fileName": file_name or "123FastLink_Export.123fastlink.json",
+                    "mimeType": "application/json",
+                    "content": content,
+                }
+            ],
+        }
+        for index, link in enumerate(links)
+    ]
+    return await handle_admin_fastlink_submission(
+        bot_token, chat_id, user_id, source_message_id, text, submitter, links=link_dicts
+    )
+
+
+async def download_telegram_document_text(bot_token: str, document: Dict[str, Any]) -> str:
+    file_id = str(document.get("file_id") or "")
+    file_size = safe_int(document.get("file_size"))
+    if file_size > FASTLINK_DOCUMENT_MAX_BYTES:
+        raise ValueError("文件超过 20MB，请先拆分秒传 JSON")
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        info_response = await client.get(
+            f"https://api.telegram.org/bot{bot_token}/getFile",
+            params={"file_id": file_id},
+        )
+        info = info_response.json() if info_response.headers.get("content-type", "").startswith("application/json") else {}
+        if info_response.status_code >= 400 or not info.get("ok", True):
+            raise ValueError(str(info.get("description") or f"getFile 失败（HTTP {info_response.status_code}）"))
+        file_path = str((info.get("result") or {}).get("file_path") or "")
+        if not file_path:
+            raise ValueError("getFile 未返回文件路径")
+        content_response = await client.get(f"https://api.telegram.org/file/bot{bot_token}/{file_path}")
+        if content_response.status_code >= 400:
+            raise ValueError(f"下载秒传文件失败（HTTP {content_response.status_code}）")
+        return content_response.content.decode("utf-8", errors="replace")
+
 
 async def handle_admin_pan123_share_links(
     bot_token: str,
@@ -890,7 +1074,7 @@ def ms_to_iso(ms: int) -> str:
 
 @app.get("/api/health")
 async def health() -> Dict[str, Any]:
-    return {"ok": True, "name": "123 Cloud Gateway", "version": "0.1.0"}
+    return {"ok": True, "name": "123 Cloud Gateway", "version": "1.0.0"}
 
 
 @app.get("/api/logs")

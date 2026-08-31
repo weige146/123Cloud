@@ -13,6 +13,7 @@ from app.session_store import SessionStore
 from app.defaults import DEFAULT_SUBMISSION_CONFIG
 from app.submission import (
     build_submission_draft,
+    build_submission_preview_markup,
     build_share_markup_row,
     collect_release_group,
     append_submission_draft,
@@ -361,6 +362,50 @@ class SubmissionDraftTests(unittest.TestCase):
         self.assertIn("4K蓝光原盘REMUX", name)
         self.assertIn("HEVC", name)
         self.assertIn("[Group]", name)
+
+    def test_submission_resource_name_hdr_vivid_without_duplicate_hdr(self):
+        """HDR.Vivid 文件名不应在资源行里再补一个 HDR（回归：HDR.Vivid HDR）。"""
+        files = [
+            "A Father's Debt.2026.S01E01.2160p.WEB-DL.HDR.Vivid.60fps.H265.DDP.2.0-HiveWeb.mkv",
+            "A Father's Debt.2026.S01E02.2160p.WEB-DL.HDR.Vivid.60fps.H265.DDP.2.0-HiveWeb.mkv",
+        ]
+        metadata = recognize_submission_metadata("", {"fileNames": files}, {})
+        name = build_submission_resource_name(metadata, files, {})
+        self.assertIn("HDR.Vivid", name)
+        self.assertNotIn("HDR.Vivid HDR", name)
+        self.assertEqual(name.upper().count("HDR"), 1)
+
+    def test_submission_resource_name_keeps_hdr10_plus(self):
+        """HDR10+ 不应被降级成 HDR10，也不应与 HDR 重复。"""
+        files = [
+            "Show.2025.S01E01.2160p.WEB-DL.HDR10+.60fps.H265.DDP.2.0-HiveWeb.mkv",
+            "Show.2025.S01E02.2160p.WEB-DL.HDR10+.60fps.H265.DDP.2.0-HiveWeb.mkv",
+        ]
+        metadata = recognize_submission_metadata("", {"fileNames": files}, {})
+        name = build_submission_resource_name(metadata, files, {})
+        self.assertIn("HDR10+", name)
+        self.assertNotIn("HDR10 HDR", name)
+        self.assertNotIn("HDR10 HDR10", name)
+
+    def test_fastlink_copy_text_button_only_within_telegram_limit(self):
+        """超过 copy_text 256 字符上限的多文件秒传链接不应生成复制按钮。"""
+        draft = lambda link: {
+            "id": "draft-1",
+            "share": {"cleanUrl": link, "provider": "123fastlink"},
+        }
+        short_link = "123FLCPV2$abc#1024#Show.S01E01.mkv"
+        long_link = "123FLCPV2$" + "很长的路径/" + "x" * 300
+
+        for markup_builder in (build_submission_preview_markup,):
+            markup = markup_builder(draft(short_link), {}, None)
+            self.assertIn("copy_text", str(markup))
+            overflow = markup_builder(draft(long_link), {}, None)
+            self.assertNotIn("copy_text", str(overflow))
+            self.assertIn("发布到频道", str(overflow))  # 其余键盘保留
+
+        row = build_share_markup_row(draft(short_link), {})
+        self.assertIn("copy_text", str(row))
+        self.assertIsNone(build_share_markup_row(draft(long_link), {}))
 
     def test_submission_reuses_legacy_share_media_cache(self):
         with tempfile.TemporaryDirectory() as directory:
