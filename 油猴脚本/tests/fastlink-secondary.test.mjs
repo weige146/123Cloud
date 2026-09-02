@@ -25,6 +25,7 @@ globalThis.__fastlink = {
   md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag,
   buildFastlinkText, buildFastlinkJson, parseFastlink,
   generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile,
+  resolveAndImportFastlink, isSeedLikeName,
   normalizeSeedFolderId, readTableSelectionRecords
 };
 `;
@@ -38,7 +39,7 @@ sandbox.window = {};
 sandbox.document = { querySelectorAll: () => [], getElementById: () => null };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag, buildFastlinkText, buildFastlinkJson, parseFastlink, generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile, normalizeSeedFolderId, readTableSelectionRecords } = sandbox.__fastlink;
+const { md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag, buildFastlinkText, buildFastlinkJson, parseFastlink, generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile, resolveAndImportFastlink, isSeedLikeName, normalizeSeedFolderId, readTableSelectionRecords } = sandbox.__fastlink;
 
 const cases = [];
 const test = (name, fn) => cases.push([name, fn]);
@@ -227,6 +228,51 @@ test("从秒传文件获取：读取云盘文本并转存", async () => {
 
 test("readTableSelectionRecords 在无 React 表格时返回 null", () => {
   assert.equal(readTableSelectionRecords(), null);
+});
+
+test("isSeedLikeName 识别种子文件名", () => {
+  assert.ok(isSeedLikeName("剧名 (2026) {tmdb-1}.123fastlink.json"));
+  assert.ok(isSeedLikeName("链接备份.123fastlink.txt"));
+  assert.ok(!isSeedLikeName("普通视频.mkv"));
+  assert.ok(!isSeedLikeName("普通.json"));
+});
+
+test("自动识别：单文件种子名走二级还原，普通内容直接转存", async () => {
+  const episodeEtag = md5("第01集内容");
+  const firstLevel = buildFastlinkJson([{ name: "第01集.mp4", etag: episodeEtag, size: 5, path: "第01集.mp4" }]);
+  const seedEtag = md5(firstLevel);
+  const seedId = "9001";
+  const calls = { seedResolved: 0, transferred: [] };
+  const api = createMockApi({
+    uploadSeq: 0,
+    uploads: [],
+    tree: {},
+    info: {},
+    cloud: { [`${seedEtag}:${Buffer.byteLength(firstLevel, "utf8")}:剧名.123fastlink.json`]: seedId },
+    filesById: { [seedId]: { name: "剧名.123fastlink.json", content: firstLevel } },
+    transferred: []
+  });
+  api.reuseFile = async (file, parentFileId) => {
+    calls.transferred.push(file.fileName || file.name);
+    const key = `${file.etag}:${file.size}:${file.fileName || file.name}`;
+    if (api.__cloud && api.__cloud[key]) return api.__cloud[key];
+    if (calls.transferred.length === 1) {
+      calls.seedResolved += 1;
+      return seedId;
+    }
+    return `t-${calls.transferred.length}`;
+  };
+  api.readFileText = async (file) => ({ name: file.name, text: firstLevel });
+  const secondaryLink = `123FLCPV2$%${hexToBase62(seedEtag)}#${Buffer.byteLength(firstLevel, "utf8")}#剧名.123fastlink.json`;
+  const result = await resolveAndImportFastlink(api, secondaryLink, "7", { concurrency: 2 });
+  assert.equal(calls.seedResolved, 1, "单文件种子名应先还原种子");
+  assert.equal(result.ok, 1);
+
+  // 普通单文件链接（名字不是种子）不走二级还原，直接转存该文件
+  calls.transferred.length = 0;
+  const plainLink = `123FLCPV2$%${hexToBase62(md5("电影本体"))}#123#Movie.2026.1080p.mkv`;
+  await resolveAndImportFastlink(api, plainLink, "7", { concurrency: 2 });
+  assert.deepEqual(calls.transferred, ["Movie.2026.1080p.mkv"]);
 });
 
 let failed = 0;

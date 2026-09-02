@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.0
+// @version      1.2.4
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @author       local
 // @license      MIT
@@ -2644,14 +2644,21 @@
     return /(?:^|[-_\s])primary(?:$|[-_\s])/i.test(className) || /^(?:上传|分享|创建分享)$/.test(text2);
   }
   function readCurrentDirectoryId() {
+    // 新版网页（yun.123pan.cn）会把整条目录路径用逗号拼进 homeFilePath（如 1%2C2%2C3），
+    // 直接透传会被 123 接口以 ParentFileId 格式异常拒绝，必须取最后一段。
+    const normalize = (value) => {
+      const text = String(value ?? "").trim();
+      return /^\d+$/.test(text) ? text : "";
+    };
     try {
       const url = new URL(location.href);
       if (url.searchParams.has("homeFilePath")) {
-        return String(url.searchParams.get("homeFilePath") || "0").trim() || "0";
+        const parts = String(url.searchParams.get("homeFilePath") || "").split(",").map(normalize).filter(Boolean);
+        return parts.at(-1) || "0";
       }
       const parsed = JSON.parse(sessionStorage.getItem("filePath") || "{}");
       const path = Array.isArray(parsed.homeFilePath) ? parsed.homeFilePath : [];
-      return String(path.at(-1) || "0");
+      return normalize(path.at(-1)) || "0";
     } catch {
       return "0";
     }
@@ -5159,15 +5166,24 @@
       const cached = tableFiberFromElement(tableSelectionCache.host);
       if (cached) return cached;
     }
+    let best = null;
+    let bestScore = -1;
     for (const selector of TABLE_FIBER_HOSTS) {
       for (const element of document.querySelectorAll(selector)) {
         if (!element.isConnected) continue;
         const fiber = tableFiberFromElement(element);
-        if (fiber) {
-          tableSelectionCache.host = element;
-          return fiber;
+        if (!fiber) continue;
+        const selectedRowKeys = fiber.memoizedProps.rowSelection?.selectedRowKeys;
+        const score = (Array.isArray(selectedRowKeys) && selectedRowKeys.length ? 4 : 0) + (fiber.memoizedProps.dataSource.length ? 2 : 0) + (bestScore < 0 ? 1 : 0);
+        if (score > bestScore) {
+          best = { element, fiber };
+          bestScore = score;
         }
       }
+    }
+    if (best) {
+      tableSelectionCache.host = best.element;
+      return best.fiber;
     }
     const fiber = findTableFiberFromRoots();
     if (fiber) tableSelectionCache.host = null;
@@ -5745,12 +5761,34 @@
     if (parsed.files.length !== 1) throw new Error("\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u683C\u5F0F\u9519\u8BEF\uFF1A\u5E94\u53EA\u5305\u542B 1 \u4E2A\u79CD\u5B50\u6587\u4EF6");
     const seed = parsed.files[0];
     const parentId = normalizeSeedFolderId(options.seedFolderId) || String(rootId || "0");
-    options.onProgress?.(0, 2, `\u8F6C\u5B58\u79CD\u5B50\u6587\u4EF6\uFF1A${seed.fileName}`);
-    const seedId = await api.reuseFile(seed, parentId, options.signal);
+    let seedId = options.knownSeedId ? String(options.knownSeedId) : "";
+    if (seedId) {
+      options.onProgress?.(0, 2, `\u4F7F\u7528\u5DF2\u52FE\u9009\u7684\u79CD\u5B50\u6587\u4EF6\uFF1A${seed.fileName}`);
+    } else {
+      options.onProgress?.(0, 2, `\u8F6C\u5B58\u79CD\u5B50\u6587\u4EF6\uFF1A${seed.fileName}`);
+      let siblings = [];
+      try {
+        siblings = await api.listAll(parentId, { signal: options.signal });
+      } catch {
+      }
+      const existing = siblings.find((item) => Number(item.type) === 0 && item.name === seed.fileName && Number(item.size) === Number(seed.size) && (!item.etag || String(item.etag).toLowerCase() === String(seed.etag).toLowerCase()));
+      seedId = existing ? String(existing.id) : await api.reuseFile(seed, parentId, options.signal);
+    }
     options.onProgress?.(1, 2, "\u8BFB\u53D6\u79CD\u5B50\u5185\u5BB9");
     const { text: seedText } = await api.readFileText({ id: seedId, name: seed.fileName, etag: seed.etag, size: seed.size }, options.signal);
     options.onProgress?.(1, 2, "\u8F6C\u5B58\u79D2\u4F20\u5185\u5BB9");
     return importFastlink(api, seedText, rootId, options);
+  }
+  function isSeedLikeName(name) {
+    return /\.123fastlink\.(?:json|txt)$/i.test(String(name || "").trim());
+  }
+  async function resolveAndImportFastlink(api, content, rootId, options = {}) {
+    const parsed = parseFastlink(content);
+    const single = parsed.files.length === 1 ? parsed.files[0] : null;
+    if (single && isSeedLikeName(single.fileName || single.path)) {
+      return saveSecondaryFastlink(api, parsed, rootId, options);
+    }
+    return importFastlink(api, parsed, rootId, options);
   }
   async function saveFastlinkFromCloudFile(api, item, rootId, options = {}) {
     if (!item || Number(item.type) === 1) throw new Error("\u8BF7\u5728\u6587\u4EF6\u5217\u8868\u52FE\u9009\u4E00\u4E2A\u79D2\u4F20\u6587\u4EF6\uFF08\u800C\u975E\u6587\u4EF6\u5939\uFF09");
@@ -5758,7 +5796,7 @@
     const { text } = await api.readFileText(item, options.signal);
     options.onProgress?.(1, 1, "\u8F6C\u5B58\u79D2\u4F20\u5185\u5BB9");
     try {
-      return await importFastlink(api, text, rootId, options);
+      return await resolveAndImportFastlink(api, text, rootId, { ...options, knownSeedId: item.id });
     } catch (error) {
       const message = String(error?.message || "");
       if (/\u89E3\u6790\u5931\u8D25|\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55|\u65E0\u6548/.test(message)) {
@@ -16129,8 +16167,8 @@ ${end.comment}` : end.comment;
     <button class="button ghost compact" data-action="cancel-task">\u505C\u6B62\u540E\u7EED\u64CD\u4F5C</button>
   </div>`;
   }
-  var FASTLINK_TASK_LABELS = { export: "\u751F\u6210\u79D2\u4F20", secondaryExport: "\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5", import: "\u5BFC\u5165\u79D2\u4F20", secondaryImport: "\u8F6C\u5B58\u4E8C\u7EA7\u94FE\u63A5", cloudImport: "\u8F6C\u5B58\u79D2\u4F20\u6587\u4EF6" };
-  var FASTLINK_IMPORT_TASK_KINDS = ["import", "secondaryImport", "cloudImport"];
+  var FASTLINK_TASK_LABELS = { export: "\u751F\u6210\u79D2\u4F20", secondaryExport: "\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5", import: "\u5BFC\u5165\u79D2\u4F20", cloudImport: "\u8F6C\u5B58\u79D2\u4F20\u6587\u4EF6" };
+  var FASTLINK_IMPORT_TASK_KINDS = ["import", "cloudImport"];
   function renderBackgroundTask(ui) {
     const task = ui.backgroundTask;
     if (!task?.minimized) return "";
@@ -16245,21 +16283,20 @@ ${end.comment}` : end.comment;
     const filters = Array.isArray(settings.filters) ? settings.filters : [];
     const exportRows = state.items.map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${Number(item.type) === 1 ? "\u6587\u4EF6\u5939\uFF08\u9012\u5F52\uFF09" : "\u6587\u4EF6"}</td></tr>`).join("");
     const generatedLinks = state.artifacts.length ? `<div class="fastlink-results">${state.artifacts.map((artifact, index) => `<section class="fastlink-result-card"><div><strong>${escapeHtml(artifact.item.name)}</strong><span>${artifact.fileCount} \u4E2A\u6587\u4EF6</span></div><textarea readonly aria-label="${escapeHtml(artifact.item.name)} \u79D2\u4F20\u94FE\u63A5">${escapeHtml(artifact.link || "")}</textarea><button class="button" data-action="fastlink-copy-link" data-index="${index}">${icon("copy", 15)}\u590D\u5236\u94FE\u63A5</button></section>`).join("")}</div>` : "";
-    const exportPane = state.items.length ? `${notice("\u6BCF\u4E2A\u9876\u5C42\u9879\u76EE\u4F1A\u5206\u522B\u751F\u6210\u9879\u76EE\u683C\u5F0F\u7684 JSON \u4E0E 123FLCPV2 \u94FE\u63A5\uFF0C\u5BFC\u51FA\u4E0D\u4F1A\u4FEE\u6539\u6E90\u6587\u4EF6\u3002", "", "download")}<div class="table-wrap"><table><thead><tr><th>\u9876\u5C42\u9879\u76EE</th><th>\u8303\u56F4</th></tr></thead><tbody>${exportRows}</tbody></table></div>${state.artifacts.length ? `${notice(`\u5DF2\u5BFC\u51FA ${state.artifacts.length} \u4E2A\u79D2\u4F20\u6587\u4EF6\uFF0C\u5171\u5305\u542B ${state.fileCount} \u4E2A\u4E91\u76D8\u6587\u4EF6\u3002`, "success", "check")}${generatedLinks}` : ""}` : notice("\u5BFC\u51FA\u9700\u8981\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u4E00\u4E2A\u6216\u591A\u4E2A\u6587\u4EF6\u3001\u6587\u4EF6\u5939\u3002", "warning", "alert");
-    const importPane = `${notice("\u652F\u6301 123FastLink JSON\u3001V1/V2 \u79D2\u4F20\u6587\u672C\u548C .123share\uFF1B\u6587\u4EF6\u4F1A\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55\u5E76\u4FDD\u7559\u539F\u76EE\u5F55\u7ED3\u6784\u3002", "", "import")}<div class="button-row"><button class="button" data-action="fastlink-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u79D2\u4F20\u6587\u4EF6</button><span>${escapeHtml(state.importFileName || "\u672A\u9009\u62E9\u6587\u4EF6")}</span><input id="fastlink-file" type="file" accept=".json,.txt,.123fastlink,.123share,application/json,text/plain" hidden></div><div class="editor-surface"><textarea id="fastlink-input" placeholder="\u7C98\u8D34\u79D2\u4F20 JSON\u3001\u94FE\u63A5\u6216 .123share \u5185\u5BB9">${escapeHtml(state.input || "")}</textarea></div>`;
+    const exportPane = state.items.length ? `${notice("\u6BCF\u4E2A\u9876\u5C42\u9879\u76EE\u4F1A\u5206\u522B\u751F\u6210\u9879\u76EE\u683C\u5F0F\u7684 JSON \u4E0E 123FLCPV2 \u94FE\u63A5\uFF0C\u5BFC\u51FA\u4E0D\u4F1A\u4FEE\u6539\u6E90\u6587\u4EF6\u3002", "", "download")}<div class="table-wrap"><table><thead><tr><th>\u9876\u5C42\u9879\u76EE</th><th>\u8303\u56F4</th></tr></thead><tbody>${exportRows}</tbody></table></div><div class="button-row"><button class="button" data-action="fastlink-secondary-generate">${icon("link", 15)}\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\uFF08\u77ED\u94FE\uFF09</button><button class="button" data-action="fastlink-secondary-save-link">${icon("download", 15)}\u628A\u5DF2\u751F\u6210\u94FE\u63A5\u4FDD\u5B58\u5230\u4E91\u76D8</button></div>${state.artifacts.length ? `${notice(`\u5DF2\u5BFC\u51FA ${state.artifacts.length} \u4E2A\u79D2\u4F20\u6587\u4EF6\uFF0C\u5171\u5305\u542B ${state.fileCount} \u4E2A\u4E91\u76D8\u6587\u4EF6\u3002`, "success", "check")}${generatedLinks}` : ""}` : notice("\u5BFC\u51FA\u9700\u8981\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u4E00\u4E2A\u6216\u591A\u4E2A\u6587\u4EF6\u3001\u6587\u4EF6\u5939\u3002", "warning", "alert");
+    const importPane = `${notice("\u652F\u6301 123FastLink JSON\u3001V1/V2 \u79D2\u4F20\u6587\u672C\u3001.123share \u4E0E\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE\uFF08\u81EA\u52A8\u8BC6\u522B\uFF09\uFF1B\u6587\u4EF6\u4F1A\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55\u5E76\u4FDD\u7559\u539F\u76EE\u5F55\u7ED3\u6784\u3002", "", "import")}<div class="button-row"><button class="button" data-action="fastlink-secondary-from-file">${icon("folderOpen", 15)}\u4ECE\u52FE\u9009\u7684\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58</button><button class="button" data-action="fastlink-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u672C\u5730\u79D2\u4F20\u6587\u4EF6</button></div><span class="footer-note">${escapeHtml(state.importFileName || "\u672A\u9009\u62E9\u672C\u5730\u6587\u4EF6")}</span><input id="fastlink-file" type="file" accept=".json,.txt,.123fastlink,.123share,application/json,text/plain" hidden><div class="editor-surface"><textarea id="fastlink-input" placeholder="\u7C98\u8D34\u79D2\u4F20 JSON\u3001\u94FE\u63A5\u3001.123share \u6216\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE">${escapeHtml(state.input || "")}</textarea></div>`;
     const publicPane = `${notice("\u8F93\u5165 123 \u4E91\u76D8\u5206\u4EAB\u94FE\u63A5\uFF0C\u9012\u5F52\u8BFB\u53D6\u5176\u4E2D\u7684\u6587\u4EF6\u5E76\u4E0B\u8F7D\u53EF\u76F4\u63A5\u8F6C\u5B58\u7684\u6807\u51C6 JSON\uFF1B\u540C\u65F6\u4FDD\u7559 123FLCPV2 \u94FE\u63A5\u4F9B\u590D\u5236\u3002", "", "share")}<label class="field"><span>\u5206\u4EAB\u94FE\u63A5 / Key</span><input id="fastlink-public-input" value="${escapeHtml(state.publicInput || "")}" placeholder="\u652F\u6301 www.123865.com/s/... \u4E0E share.123pan.cn/123pan/..."></label><label class="field"><span>\u63D0\u53D6\u7801\uFF08\u53EF\u9009\uFF0C\u94FE\u63A5\u5DF2\u5305\u542B\u65F6\u65E0\u9700\u586B\u5199\uFF09</span><input id="fastlink-public-password" value="${escapeHtml(state.publicPassword || "")}"></label>`;
     const batchPane = `${notice("\u6BCF\u884C\u4E00\u4E2A\u5206\u4EAB\u94FE\u63A5\u3001Key \u6216\u5E26\u63D0\u53D6\u7801\u7684\u6587\u672C\uFF1B\u6BCF\u4E2A\u5206\u4EAB\u4F1A\u72EC\u7ACB\u4E0B\u8F7D\u4E00\u4E2A\u6807\u51C6 JSON\u3002", "", "share")}<div class="editor-surface"><textarea id="fastlink-public-batch" placeholder="https://www.123865.com/s/xxxx?pwd=ABCD&#10;xxxx \u63D0\u53D6\u7801:ABCD">${escapeHtml(state.publicBatch || "")}</textarea></div>`;
     const splitPane = `${notice("\u652F\u6301\u9879\u76EE JSON\u3001123FLCPV2 \u94FE\u63A5\u548C\u65E7\u7248 V1/V2 \u6587\u672C\u3002\u6309\u76EE\u5F55\u5C42\u7EA7\u4F1A\u4E3A\u6BCF\u4E2A\u76EE\u5F55\u7EC4\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\uFF0C\u6309\u6570\u91CF\u4F1A\u6309\u6761\u76EE\u5207\u5206\u3002", "", "download")}<div class="button-row"><button class="button" data-action="fastlink-split-file-open">${icon("folderOpen", 15)}\u9009\u62E9 JSON</button><span>${escapeHtml(state.splitFileName || "\u4E5F\u53EF\u4EE5\u76F4\u63A5\u7C98\u8D34")}</span><input id="fastlink-split-file" type="file" accept=".json,.txt,.123fastlink" hidden></div><div class="editor-surface"><textarea id="fastlink-split-input" placeholder="\u7C98\u8D34 JSON \u6216\u79D2\u4F20\u94FE\u63A5">${escapeHtml(state.splitInput || "")}</textarea></div><div class="inline-fields"><label class="field"><span>\u62C6\u5206\u65B9\u5F0F</span><select id="fastlink-split-method"><option value="folder" ${state.splitMethod === "folder" ? "selected" : ""}>\u6309\u76EE\u5F55\u5C42\u7EA7</option><option value="count" ${state.splitMethod === "count" ? "selected" : ""}>\u6309\u6587\u4EF6\u6570\u91CF</option></select></label><label class="field"><span>${state.splitMethod === "count" ? "\u6BCF\u4EFD\u6587\u4EF6\u6570" : "\u76EE\u5F55\u5C42\u6570"}</span><input id="fastlink-split-amount" type="number" min="1" value="${Math.max(1, Number(state.splitAmount) || 1)}"></label></div>`;
     const convertPane = `${notice("\u5728 .123share \u4E0E\u9879\u76EE\u6807\u51C6 JSON \u4E4B\u95F4\u4E92\u8F6C\u3002\u8F6C\u6362\u53EA\u5728\u672C\u5730\u5B8C\u6210\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u6587\u4EF6\u3002", "", "settings")}<div class="button-row"><button class="button" data-action="fastlink-convert-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u6587\u4EF6</button><span>${escapeHtml(state.convertFileName || "\u652F\u6301 .123share / .json")}</span><input id="fastlink-convert-file" type="file" accept=".123share,.json" hidden></div><div class="editor-surface"><textarea id="fastlink-convert-input" placeholder="\u4E5F\u53EF\u4EE5\u7C98\u8D34\u6587\u4EF6\u5185\u5BB9">${escapeHtml(state.convertInput || "")}</textarea></div>${state.converted ? notice(`\u5DF2\u8F6C\u6362\u4E3A ${state.converted === "json" ? "JSON" : ".123share"} \u5E76\u5F00\u59CB\u4E0B\u8F7D\u3002`, "success", "check") : ""}`;
-    const secondaryPane = `${notice("\u4E8C\u7EA7\u79D2\u4F20\uFF1A\u6574\u5305\u5185\u5BB9\u5B58\u4E3A\u4E91\u76D8\u79CD\u5B50\u6587\u4EF6\uFF0C\u5BF9\u5916\u53EA\u5206\u4EAB\u4E00\u6761\u77ED\u94FE\u63A5\uFF0C\u5BF9\u65B9\u8F6C\u5B58\u65F6\u81EA\u52A8\u8FD8\u539F\u5168\u90E8\u6587\u4EF6\u3002\u79CD\u5B50\u9ED8\u8BA4\u5B58\u5F53\u524D\u76EE\u5F55\uFF08\u53EF\u5728\u79D2\u4F20\u8BBE\u7F6E\u56FA\u5B9A\u6587\u4EF6\u5939\uFF09\uFF0C\u8BF7\u52FF\u5220\u9664\u3002", "", "link")}<div class="button-row"><button class="button" data-action="fastlink-secondary-save-link">${icon("download", 15)}\u628A\u5DF2\u751F\u6210\u94FE\u63A5\u4FDD\u5B58\u5230\u4E91\u76D8</button><button class="button" data-action="fastlink-secondary-from-file">${icon("folderOpen", 15)}\u4ECE\u52FE\u9009\u7684\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58</button><button class="button" data-action="fastlink-secondary-import">${icon("import", 15)}\u4ECE\u94FE\u63A5\u8F6C\u5B58</button></div><div class="editor-surface secondary-editor"><textarea id="fastlink-secondary-input" placeholder="\u7C98\u8D34\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\uFF08\u5F62\u5982 123FLCPV2$%xxx#size#\u540D\u79F0.json\uFF09\uFF0C\u70B9\u201C\u4ECE\u94FE\u63A5\u8F6C\u5B58\u201D\u8FD8\u539F\u5168\u90E8\u6587\u4EF6">${escapeHtml(state.secondaryInput || "")}</textarea></div>`;
     const filterPane =`${notice("\u542F\u7528\u540E\uFF0C\u751F\u6210\u6216\u8F6C\u5B58\u65F6\u4F1A\u8DF3\u8FC7\u5BF9\u5E94\u6269\u5C55\u540D\u3002\u8BBE\u7F6E\u4FDD\u5B58\u5728\u9879\u76EE\u914D\u7F6E\u4E2D\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-filter="share" ${settings.filterOnShareEnabled ? "checked" : ""}>\u751F\u6210\u65F6\u542F\u7528\u8FC7\u6EE4</label><label class="check-line"><input type="checkbox" data-fastlink-filter="transfer" ${settings.filterOnTransferEnabled ? "checked" : ""}>\u8F6C\u5B58\u65F6\u542F\u7528\u8FC7\u6EE4</label></div><div class="filter-actions"><button class="button compact" data-action="fastlink-filter-all">\u5168\u9009</button><button class="button compact" data-action="fastlink-filter-none">\u5168\u4E0D\u9009</button><button class="button compact" data-action="fastlink-filter-reset">\u6062\u590D\u9ED8\u8BA4</button></div><div class="fastlink-filter-list">${filters.map((item, index) => `<label class="check-line"><input type="checkbox" data-fastlink-filter="extension" data-index="${index}" ${item.enabled ? "checked" : ""}><span>.${escapeHtml(item.ext)}</span><small>${escapeHtml(item.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B")}</small></label>`).join("")}</div>`;
     const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939 ID\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C8 \u4F4D\u6570\u5B57\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><input type="number" inputmode="numeric" data-fastlink-setting="seedFolderId" value="${escapeHtml(String(settings.seedFolderId ?? ""))}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
-    const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["secondary", "\u4E8C\u7EA7\u79D2\u4F20", "link"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"]];
+    const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"]];
     const nav = `<div class="fastlink-tool-grid">${tools.map(([key, label, iconName]) => `<button class="button tool-button ${tool === key ? "active" : ""}" data-action="fastlink-tool" data-tool="${key}">${icon(iconName, 14)}${label}</button>`).join("")}</div>`;
-    let pane = tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "secondary" ? secondaryPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : settingsPane;
+    let pane = tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : settingsPane;
     const modeToolbar = `<div class="mode-toolbar"><div class="segmented"><button data-action="fastlink-mode" data-mode="import" class="${tool === "import" ? "active" : ""}">${icon("import", 15)}\u5BFC\u5165</button><button data-action="fastlink-mode" data-mode="export" class="${tool === "export" ? "active" : ""}">${icon("download", 15)}\u5BFC\u51FA</button></div></div>`;
     const body = `${nav}${["export", "import"].includes(tool) ? modeToolbar : ""}<div class="fastlink-pane">${pane}</div>${state.artifacts.length && !["export", "import"].includes(tool) ? generatedLinks : ""}`;
-    const action = tool === "export" ? `<button class="button primary" data-action="fastlink-export" ${state.items.length ? "" : "disabled"}>${icon("download", 15)}\u5BFC\u51FA ${state.items.length || ""}</button>` : tool === "import" ? `<button class="button primary" data-action="fastlink-import" ${String(state.input || "").trim() ? "" : "disabled"}>${icon("import", 15)}\u5F00\u59CB\u8F6C\u5B58</button>` : tool === "secondary" ? `<button class="button primary" data-action="fastlink-secondary-generate" ${state.items.length ? "" : "disabled"}>${icon("link", 15)}\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5</button>` : tool === "public" ? `<button class="button primary" data-action="fastlink-public-generate">${icon("download", 15)}\u751F\u6210 JSON \u6587\u4EF6</button>` : tool === "batch" ? `<button class="button primary" data-action="fastlink-public-batch">${icon("share", 15)}\u6279\u91CF\u751F\u6210</button>` : tool === "split" ? `<button class="button primary" data-action="fastlink-split">${icon("download", 15)}\u5F00\u59CB\u62C6\u5206</button>` : tool === "convert" ? `<button class="button primary" data-action="fastlink-convert">${icon("settings", 15)}\u5F00\u59CB\u8F6C\u6362</button>` : tool === "filters" || tool === "settings" ? `<button class="button primary" data-action="fastlink-settings-save">\u4FDD\u5B58\u8BBE\u7F6E</button>` : "";
+    const action = tool === "export" ? `<button class="button primary" data-action="fastlink-export" ${state.items.length ? "" : "disabled"}>${icon("download", 15)}\u5BFC\u51FA ${state.items.length || ""}</button>` : tool === "import" ? `<button class="button primary" data-action="fastlink-import" ${String(state.input || "").trim() ? "" : "disabled"}>${icon("import", 15)}\u5F00\u59CB\u8F6C\u5B58</button>` : tool === "public" ? `<button class="button primary" data-action="fastlink-public-generate">${icon("download", 15)}\u751F\u6210 JSON \u6587\u4EF6</button>` : tool === "batch" ? `<button class="button primary" data-action="fastlink-public-batch">${icon("share", 15)}\u6279\u91CF\u751F\u6210</button>` : tool === "split" ? `<button class="button primary" data-action="fastlink-split">${icon("download", 15)}\u5F00\u59CB\u62C6\u5206</button>` : tool === "convert" ? `<button class="button primary" data-action="fastlink-convert">${icon("settings", 15)}\u5F00\u59CB\u8F6C\u6362</button>` : tool === "filters" || tool === "settings" ? `<button class="button primary" data-action="fastlink-settings-save">\u4FDD\u5B58\u8BBE\u7F6E</button>` : "";
     return dialogFrame(ui, {
       title: "\u79D2\u4F20",
       subtitle: tool === "export" ? `${state.items.length} \u4E2A\u9876\u5C42\u9879\u76EE` : tool === "import" ? "\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55" : "\u79D2\u4F20\u5DE5\u5177\u7BB1",
@@ -17682,6 +17719,7 @@ ${end.comment}` : end.comment;
         organize: () => this.openSelectionCommand("organize"),
         share: () => this.openSelectionCommand("share"),
         fastlink: () => this.openSelectionCommand("fastlink"),
+        fastlinkImport: () => this.openSelectionCommand("fastlinkImport"),
         fileCleaner: () => this.openFileCleaner(),
         cleanEmptyFolders: () => this.openCleanEmptyFolders(),
         wrapLooseFiles: () => this.openWrapLooseFiles(),
@@ -17712,6 +17750,7 @@ ${end.comment}` : end.comment;
         ...!context.hasOfficialRename ? [["rename", "\u91CD\u547D\u540D", true]] : [],
         ["organize", "\u6574\u7406", true],
         ["fastlink", "\u79D2\u4F20", true],
+        ["fastlinkImport", "\u8F6C\u5B58\u79D2\u4F20", true],
       ];
       const tagName = context.controlTagName === "DIV" ? "div" : "button";
       const control = (command, label, requiresSelection, attributes = "") => {
@@ -17747,7 +17786,14 @@ ${end.comment}` : end.comment;
     }
     runToolbarCommand(control, event) {
       const command = control?.dataset?.command;
-      if (!command || control.disabled || control.getAttribute("aria-disabled") === "true") return;
+      if (!command || control.disabled || control.getAttribute("aria-disabled") === "true") {
+        if (command === "fastlinkImport") this.toast("\u300C\u8F6C\u5B58\u79D2\u4F20\u300D\u4EC5\u652F\u6301\u52FE\u9009 1 \u4E2A\u79D2\u4F20\u79CD\u5B50\u6587\u4EF6\uFF08.123fastlink.json / .txt\uFF09", "warning");
+        return;
+      }
+      if (command === "fastlinkImport" && control.dataset.seedReady !== "true") {
+        this.toast("\u300C\u8F6C\u5B58\u79D2\u4F20\u300D\u4EC5\u652F\u6301\u52FE\u9009 1 \u4E2A\u79D2\u4F20\u79CD\u5B50\u6587\u4EF6\uFF08.123fastlink.json / .txt\uFF09", "warning");
+        return;
+      }
       event?.preventDefault?.();
       event?.stopPropagation?.();
       event?.stopImmediatePropagation?.();
@@ -17759,7 +17805,11 @@ ${end.comment}` : end.comment;
     updateToolbarOverflow() {
       const container = this.toolbar;
       if (!container?.isConnected && !container?.parentElement) return;
-      for (const control of container.querySelectorAll('[data-toolbar-direct="true"]')) control.hidden = false;
+      for (const control of container.querySelectorAll('[data-toolbar-direct="true"]')) {
+        // 「转存秒传」只在选中秒传种子文件时显示，展开/溢出逻辑不得把它强行显示出来
+        if (control.dataset.command === "fastlinkImport" && control.dataset.seedReady !== "true") continue;
+        control.hidden = false;
+      }
     }
     mountShareToolbar(container, context = {}) {
       this.toolbarObserver?.disconnect();
@@ -17803,9 +17853,26 @@ ${end.comment}` : end.comment;
       if (!this.toolbar) return;
       this.toolbar.hidden = !this.selection.hasSelection;
       this.toolbar.dataset.hasSelection = this.selection.hasSelection ? "true" : "false";
+      let seedReady = false;
+      if (this.selection.hasSelection && !this.selection.selectAll && this.selection.selectedIds.size === 1) {
+        const records = readTableSelectionRecords();
+        seedReady = Array.isArray(records) && records.length === 1 && Number(records[0].type ?? records[0].Type ?? 0) !== 1 && isSeedLikeName(records[0].name || records[0].FileName || "");
+      }
       for (const button of this.toolbar.querySelectorAll("[data-requires-selection]")) {
         if ("disabled" in button) button.disabled = !this.selection.hasSelection;
         button.setAttribute("aria-disabled", this.selection.hasSelection ? "false" : "true");
+      }
+      const seedButton = this.toolbar.querySelector('[data-command="fastlinkImport"]');
+      if (seedButton) {
+        // 只在校验通过时（恰好勾选了 1 个秒传种子文件 .123fastlink.json / .txt）
+        // 才显示「转存秒传」按钮；选中文件夹、普通文件、多选或未选中时直接隐藏。
+        // 这样避免出现"置灰却点不出提示"的迷惑交互。
+        seedButton.hidden = !seedReady;
+        seedButton.disabled = !seedReady;
+        seedButton.setAttribute("aria-disabled", seedReady ? "false" : "true");
+        seedButton.dataset.seedReady = seedReady ? "true" : "false";
+        seedButton.style.opacity = "";
+        seedButton.title = "\u8F6C\u5B58\u9009\u4E2D\u7684\u79D2\u4F20\u6587\u4EF6\uFF08\u652F\u6301\u666E\u901A\u4E0E\u4E8C\u7EA7\u79D2\u4F20\uFF09";
       }
     }
     toast(message, type = "") {
@@ -17828,6 +17895,14 @@ ${end.comment}` : end.comment;
         return;
       }
       if (autoShare) this.shareSubmissionRunning = true;
+      if (command === "fastlinkImport") {
+        const records = readTableSelectionRecords();
+        const seedPicked = this.selection.hasSelection && !this.selection.selectAll && this.selection.selectedIds.size === 1 && Array.isArray(records) && records.length === 1 && Number(records[0].type ?? records[0].Type ?? 0) !== 1 && isSeedLikeName(records[0].name || records[0].FileName || "");
+        if (!seedPicked) {
+          this.toast("\u300C\u8F6C\u5B58\u79D2\u4F20\u300D\u4EC5\u652F\u6301\u52FE\u9009 1 \u4E2A\u79D2\u4F20\u79CD\u5B50\u6587\u4EF6\uFF08.123fastlink.json / .txt\uFF09", "warning");
+          return;
+        }
+      }
       const snapshot = frozenSelection(this.bridge.readSelection());
       this.previousFocus ||= document.activeElement instanceof HTMLElement ? document.activeElement : null;
       try {
@@ -17836,11 +17911,12 @@ ${end.comment}` : end.comment;
         this.state.result = null;
         this.render();
         const items = await this.bridge.selectedItems(void 0, snapshot);
-        if (!items.length && command !== "fastlink") throw new Error("\u8BF7\u5148\u5728\u6587\u4EF6\u5217\u8868\u4E2D\u9009\u62E9\u9879\u76EE");
+        if (!items.length && !["fastlink", "fastlinkImport"].includes(command)) throw new Error("\u8BF7\u5148\u5728\u6587\u4EF6\u5217\u8868\u4E2D\u9009\u62E9\u9879\u76EE");
         this.commandContext = { command, items: items.map((item) => ({ ...item })), currentDir: snapshot.currentDir, selection: snapshot };
         if (command === "rename") await this.openRename(items);
         else if (command === "share") await this.openShare(items);
         else if (command === "fastlink") await this.openFastlink(items, snapshot.currentDir);
+        else if (command === "fastlinkImport") await this.openFastlink(items, snapshot.currentDir, { autoImport: true });
         else if (command === "organize") await this.openOrganize(items, snapshot.currentDir);
       } catch (error) {
         this.state.view = "";
@@ -18202,7 +18278,7 @@ ${end.comment}` : end.comment;
         this.setResult(resultTitle, task.result);
         return;
       }
-      const toolByKind = { export: "export", import: "import", secondaryExport: "secondary", secondaryImport: "secondary", cloudImport: "secondary" };
+      const toolByKind = { export: "export", import: "import", secondaryExport: "export", secondaryImport: "import", cloudImport: "import" };
       this.fastlink.tool = toolByKind[task.kind] || task.kind;
       if (["export", "import"].includes(this.fastlink.tool)) this.fastlink.mode = this.fastlink.tool;
       this.state.view = "fastlink";
@@ -18578,16 +18654,17 @@ ${end.comment}` : end.comment;
       this.toast(`\u5DF2\u63A8\u9001 ${this.share.results.length} \u4EFD\u6295\u7A3F\u8349\u7A3F`, "success");
       this.restoreFocus();
     }
-    async openFastlink(items, currentDir) {
+    async openFastlink(items, currentDir, options = {}) {
+      const singleFile = items.length === 1 && Number(items[0].type) !== 1;
+      const autoImport = options.autoImport === true;
+      const openOnSecondary = autoImport || singleFile && isSeedLikeName(items[0].name);
       this.fastlink = {
         items: items.map((item) => ({ ...item })),
         currentDir: String(currentDir || "0"),
         mode: items.length ? "export" : "import",
-        tool: items.length ? "export" : "import",
+        tool: openOnSecondary ? "import" : items.length ? "export" : "import",
         input: "",
         importFileName: "",
-        secondaryInput: "",
-        secondaryLink: "",
         artifacts: [],
         fileCount: 0,
         publicInput: "",
@@ -18604,6 +18681,13 @@ ${end.comment}` : end.comment;
       };
       this.state.view = "fastlink";
       this.render();
+      if (singleFile && (autoImport || isSeedLikeName(items[0].name))) {
+        try {
+          await this.restoreFastlinkFromCloudFile();
+        } catch (error) {
+          this.toast(error.message, "error");
+        }
+      }
     }
     async generateFastlink() {
       if (!this.fastlink.items.length) throw new Error("\u8BF7\u5148\u9009\u62E9\u8981\u5BFC\u51FA\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
@@ -18628,8 +18712,9 @@ ${end.comment}` : end.comment;
       const text2 = String(this.fastlink.input || "").trim();
       const outcome = await this.runFastlinkTask("import", async (signal) => {
         this.setProgress(0, 1, "\u89E3\u6790\u79D2\u4F20\u5185\u5BB9");
-        return importFastlink(this.api, text2, this.fastlink.currentDir, {
+        return resolveAndImportFastlink(this.api, text2, this.fastlink.currentDir, {
           signal,
+          seedFolderId: (this.config.fastlinkTools || {}).seedFolderId,
           concurrency: this.config.requests.writeConcurrency,
           ...this.fastlinkTransferOptions(),
           onProgress: (done, total, name) => this.setProgress(done, total, `\u5BFC\u5165\u79D2\u4F20\uFF1A${name}`)
@@ -18662,30 +18747,9 @@ ${end.comment}` : end.comment;
       const artifact = outcome.result;
       this.fastlink.artifacts = [artifact];
       this.fastlink.fileCount = artifact.fileCount;
-      this.fastlink.secondaryLink = artifact.link;
       if (this.completeFastlinkTask(outcome.task, artifact)) return;
       this.toast("\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210\uFF0C\u53EF\u590D\u5236\u6216\u76F4\u63A5\u5206\u4EAB", "success");
       this.render();
-    }
-    async restoreSecondaryFastlink() {
-      const text2 = String(this.fastlink.secondaryInput || "").trim();
-      if (!text2) throw new Error("\u8BF7\u5148\u7C98\u8D34\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5");
-      const settings = this.config.fastlinkTools || {};
-      const outcome = await this.runFastlinkTask("secondaryImport", async (signal) => {
-        this.setProgress(0, 2, "\u89E3\u6790\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5");
-        return saveSecondaryFastlink(this.api, text2, this.fastlink.currentDir, {
-          signal,
-          seedFolderId: settings.seedFolderId,
-          concurrency: this.config.requests.writeConcurrency,
-          ...this.fastlinkTransferOptions(),
-          onProgress: (done, total, name) => this.setProgress(done, total, name)
-        });
-      });
-      if (outcome.error) return;
-      const result2 = outcome.result;
-      this.bridge.refresh();
-      if (this.completeFastlinkTask(outcome.task, result2)) return;
-      this.setResult("\u4E8C\u7EA7\u79D2\u4F20\u8F6C\u5B58\u7ED3\u679C", result2);
     }
     async restoreFastlinkFromCloudFile() {
       const snapshot = frozenSelection(this.bridge.readSelection());
@@ -19327,7 +19391,6 @@ ${end.comment}` : end.comment;
         "fastlink-split": () => this.splitFastlinkFile(),
         "fastlink-convert": () => this.convertFastlinkFile(),
         "fastlink-secondary-generate": () => this.generateSecondaryFastlink(),
-        "fastlink-secondary-import": () => this.restoreSecondaryFastlink(),
         "fastlink-secondary-from-file": () => this.restoreFastlinkFromCloudFile(),
         "fastlink-secondary-save-link": () => this.saveFastlinkLinkFile(),
         "fastlink-api-test": async () => {
@@ -19975,6 +20038,8 @@ ${end.comment}` : end.comment;
       }
       if (target.id === "fastlink-input") {
         this.fastlink.input = target.value;
+        const startButton = this.root.querySelector('[data-action="fastlink-import"]');
+        if (startButton && "disabled" in startButton) startButton.disabled = !String(target.value).trim();
         return;
       }
       if (target.id === "fastlink-public-input") {
@@ -19995,10 +20060,6 @@ ${end.comment}` : end.comment;
       }
       if (target.id === "fastlink-convert-input") {
         this.fastlink.convertInput = target.value;
-        return;
-      }
-      if (target.id === "fastlink-secondary-input") {
-        this.fastlink.secondaryInput = target.value;
         return;
       }
       if (target.id === "category-yaml-text" && this.settings) {
