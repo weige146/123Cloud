@@ -16,6 +16,7 @@ const slice = (fromMarker, toMarker) => {
 };
 const code = [
   slice("// src/core/utils.js", "// src/api.js"),
+  slice("// src/core/recognition-maps.js", "// src/config.js"),
   slice("// src/core/category-yaml.js", "// src/core/empty-folders.js")
 ].join("\n");
 const driver = `;
@@ -28,7 +29,7 @@ globalThis.__organize = {
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions } = sandbox.__organize;
+const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle } = sandbox.__organize;
 
 const config = { library: { recognition: { customWords: [] } } };
 const file = (name, id = name) => ({ id, name });
@@ -162,6 +163,35 @@ test("synthesizeEpisodeCandidatesFromNames 生成去重排序候选", () => {
   const candidates = synthesizeEpisodeCandidatesFromNames(files);
   assert.deepEqual(Array.from(candidates.map((candidate) => candidate.seasonEpisode)), ["S05E01", "S05E02"]);
   assert.equal(candidates[0].id, "hint:S05E01");
+});
+
+// —— part / 第N部分 分段标记剔除 ——
+test("标题里的 part/第N部分 标记全部剔除，不再进入新文件名", () => {
+  assert.equal(inferTitle("药食同源 第1部分 part1.mp4"), "药食同源");
+  assert.equal(inferTitle("药食同源 第1部分.mp4"), "药食同源");
+  assert.equal(inferTitle("药食同源.Part1.mp4"), "药食同源");
+  assert.equal(inferTitle("药食同源 Pt.2.mp4"), "药食同源");
+  assert.equal(inferTitle("X part1 part2 1080p.mp4"), "X");
+  assert.equal(inferTitle("回合 第一部分.mp4"), "回合");
+  assert.equal(inferTitle("【药食同源 第1部分】第2期.mp4"), "药食同源");
+  // 「第N部」是系列续作记号，不能误删
+  assert.equal(inferTitle("流浪地球 第2部.mp4"), "流浪地球 第2部");
+});
+
+test("同集多 part 重名时仍由变体标签区分（Part01/Part02 保留）", () => {
+  assert.equal(organizeVariantTag(file("药食同源 第1部分 part1.mp4"), {}), "Part01");
+  assert.equal(organizeVariantTag(file("药食同源 第1部分 part2.mp4"), {}), "Part02");
+  assert.equal(organizeVariantTag(file("药食同源 第1部分 上.mp4"), {}), "上");
+});
+
+test("同剧各 part 文件归入同一分组，分组标题不带分段标记", () => {
+  const groups = buildLooseGroups([
+    file("药食同源 第1部分 part1.mp4", "a1"),
+    file("药食同源 第1部分 part2.mp4", "a2"),
+    file("药食同源 第3期.mp4", "a3")
+  ], config);
+  assert.equal(groups.length, 1);
+  assert.ok(!groups[0].title.includes("部分"), `分组标题不应残留分段标记：${groups[0].title}`);
 });
 
 await chain;

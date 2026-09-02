@@ -16,15 +16,16 @@ const slice = (fromMarker, toMarker) => {
 };
 const code = [
   slice("// src/core/utils.js", "// src/api.js"),
+  slice("// src/core/categories.js", "// src/icons.js"),
   slice("// src/core/category-yaml.js", "// src/core/empty-folders.js")
 ].join("\n");
 const driver = `;
-globalThis.__recognition = { parseEpisodeHint, specialContext, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration, isVideoFile };
+globalThis.__recognition = { parseEpisodeHint, specialContext, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration, isVideoFile, extractKeywordKinds, applySpecialKeywordMappings, defaultSpecialKeywordPatterns, normalizeConfig, getSpecialKindTokens: () => SPECIAL_KIND_TOKENS };
 `;
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { parseEpisodeHint, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration } = sandbox.__recognition;
+const { parseEpisodeHint, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration, extractKeywordKinds, applySpecialKeywordMappings, defaultSpecialKeywordPatterns, specialContext, normalizeConfig, getSpecialKindTokens } = sandbox.__recognition;
 
 // —— TMDB《嗨放派》(id 131777) 真实季集数据（2026-08 从 themoviedb.org 核对）——
 const ep = (season, episode, name, airDate) => ({ id: `s${season}e${episode}`, seasonNumber: season, episodeNumber: episode, name, airDate });
@@ -299,6 +300,86 @@ test("端到端：第三季 加更 S03E01 → S00「第3季 第1期加更」，�
   assert.equal(extra.seasonNumber, 0);
   assert.equal(extra.episodeNumber, 23);
   assert.ok(extra.name.includes("第3季 第1期加更"), "加更版应命中「第3季 第1期加更」而不是正集 S03E01");
+});
+
+// —— 特别篇关键词映射配置化：默认词表与旧硬编码正则等价，设置项可扩展 ——
+const LEGACY_SPECIAL_KEYWORD_PATTERNS = [
+  ["先导片", /先导(?:片|篇)?|导赏|导览|先行(?:片|篇)?|序篇|序章|预热|尝鲜|抢先(?:看|版)?|抢鲜(?:看|版)?|预告|片花|Trailer|Teaser|Preview|Sneak\s*Peek|Promo|(?<![A-Za-z0-9])PV(?![A-Za-z0-9])/i],
+  ["番外衍生", /番外(?:篇|特辑|微综)?|衍生(?:篇|节目)?|Side[\s._-]*Story|Spin[\s._-]*Off|Spinoff/i],
+  ["加更", /加更(?:篇|版)?|加料(?:版)?|独家加更|(?<![A-Za-z0-9])(?:Plus|Extra)(?![A-Za-z0-9])/i],
+  ["彩蛋福利", /福利局|惊喜局|彩蛋(?:局)?|会员\s*彩蛋|VIP[\s._-]*Bonus(?:[\s._-]*Scene)?|(?<![A-Za-z0-9])Bonus(?![A-Za-z0-9])/i],
+  ["超前企划", /超前(?:营业|聚会|企划)|First[\s._-]*Look/i],
+  ["会员专享", /会员(?:版|加长|专享)|大会员|VIP(?:版|专享)?|SVIP|专享版|独享版|Members?\s*Only/i],
+  ["幕后花絮", /幕后(?:纪录|特辑|直击)?|花絮|制作特辑|探班|备采|采访|彩排|Behind(?:\s+the)?\s*Scenes?|Making\s*Of/i],
+  ["纯享直拍", /纯享|舞台纯享|歌曲纯享|完整纯享|单人直拍|多机位|练习室版|Fancam|Fan\s*Cam|Focus/i],
+  ["直播演出", /直播(?:回放)?|演唱会|见面会|发布会|(?<![A-Za-z0-9])Live(?:\s*(?:Show|Stream))?(?![A-Za-z0-9])/i],
+  ["陪看复盘", /陪看|聊天室|看片会|复盘|Reaction|Watch\s*Along/i],
+  ["日记Vlog", /PD\s*Vlog|Vlog|日记|手记/i],
+  ["收官重聚", /收官(?:篇|宴|特辑)?|庆功宴|重聚|售后|After\s*Show|Aftershow|After\s*Party|Afterparty|Reunion/i],
+  ["回顾前情", /回顾|前情提要|(?<![A-Za-z0-9])(?:Recap|Digest)(?![A-Za-z0-9])/i],
+  ["特辑", /特辑|特别(?:篇|节目|企划)?|特别\s*企划|Special[\s._-]*Program|(?<![A-Za-z0-9])(?:SP|Special|OVA|OAD)(?![A-Za-z0-9])/i],
+  ["好友记", /好友记|Old[\s._-]*Friends?/i],
+  ["加码放送", /加码放送|Special[\s._-]*Extra/i],
+  ["未播删减", /未播|未公开|正片未播|删减片段|Deleted\s*Scene|Outtake|Bloopers?/i]
+];
+test("特别篇关键词：默认词表与旧硬编码正则在样本库上完全等价", () => {
+  const corpus = [
+    "第2季 第1期加更", "会员版 第3期", "先导片", "超前营业", "纯享 舞台", "单人直拍",
+    "演唱会直播回放", "幕后花絮", "番外篇", "收官特辑", "前情提要", "第1期 Reaction",
+    "成员日记 Vlog", "好友记", "加码放送", "未播删减片段", "彩蛋局", "特别节目",
+    "Sneak Peek", "Making Of", "Watch Along", "会员 彩蛋", "VIP Bonus Scene", "PD Vlog",
+    "After Party", "Spin-Off", "First Look", "Members Only", "Deleted Scenes", "Bloopers",
+    "Special Program", "第3期PV", "抢先看", "练习室版", "见面会", "手记", "Old Friends",
+    "第3期正片", "完整版第5期", "第12期", "嗨放派 2024", "S03E01"
+  ];
+  const current = defaultSpecialKeywordPatterns();
+  assert.equal(current.length, LEGACY_SPECIAL_KEYWORD_PATTERNS.length);
+  for (const name of corpus) {
+    assert.deepEqual(
+      Array.from(extractKeywordKinds(name, current)).sort(),
+      Array.from(extractKeywordKinds(name, LEGACY_SPECIAL_KEYWORD_PATTERNS)).sort(),
+      `关键词识别不一致：${name}`
+    );
+  }
+});
+
+test("特别篇关键词：类型名可自定义（如「动脑吧」），新别名立即生效", () => {
+  applySpecialKeywordMappings([
+    { id: "video-format-1080p", field: "videoFormat", aliases: ["1080p"], output: "1080p" },
+    { id: "special-pilot", field: "specialKind", aliases: ["先导", "预告"], output: "先导片" },
+    { id: "special-extra", field: "specialKind", aliases: ["加更", "加餐"], output: "加更" },
+    { id: "custom-derivative", field: "specialKind", aliases: ["动脑吧", "体验版", "开推吧! X"], output: "动脑吧" }
+  ]);
+  assert.ok(specialContext("第3期加餐").strongKeywords.includes("加更"), "新别名「加餐」应识别为加更类特别篇");
+  assert.ok(specialContext("开始推理吧 第二季 动脑吧 第09期").strongKeywords.includes("动脑吧"), "自定义类型「动脑吧」应生效");
+  assert.ok(specialContext("第二季 体验版 第01期").strongKeywords.includes("动脑吧"), "同类型下的词共享一个标记");
+  assert.ok(!specialContext("第2期特辑").strong, "未配置的类型不再按强关键词识别（完全按配置）");
+  applySpecialKeywordMappings(undefined);
+  assert.ok(specialContext("第3期加更").strongKeywords.includes("加更"), "恢复默认后加更重新生效");
+  assert.ok(specialContext("第2期特辑").strongKeywords.includes("特辑"), "恢复默认后 17 类词表齐全");
+  applySpecialKeywordMappings([{ id: "special-pilot", field: "specialKind", aliases: ["先导"], output: "先锋场" }]);
+  assert.equal(getSpecialKindTokens().pilot, "先锋场", "先导片专属行为应跟随改名后的类型名");
+  applySpecialKeywordMappings(undefined);
+  assert.equal(getSpecialKindTokens().pilot, "先导片", "恢复默认后行为标记复位");
+});
+
+test("特别篇关键词：老配置自动补齐词表，旧英文类型名改写为类型名", () => {
+  const migrated = normalizeConfig({ schemaVersion: 10, library: { recognition: { customWords: [], fixedMappings: [{ id: "video-format-1080p", field: "videoFormat", aliases: ["1080p"], output: "1080p" }] } } });
+  const mappings = Array.from(migrated.library.recognition.fixedMappings);
+  assert.equal(migrated.schemaVersion, 11);
+  assert.ok(mappings.some((item) => item.id === "video-format-1080p"), "既有映射保留");
+  for (const kind of ["先导片", "加更", "会员专享", "特辑", "未播删减"]) {
+    assert.ok(mappings.some((item) => item.field === "specialKind" && item.output === kind), `缺失的特别篇默认条目应自动补齐：${kind}`);
+  }
+  assert.ok(specialContext("第1期加更").strongKeywords.includes("加更"), "迁移后默认词表在当前会话立即生效");
+  const rewritten = normalizeConfig({ schemaVersion: 11, library: { recognition: { customWords: [], fixedMappings: [
+    { id: "video-format-1080p", field: "videoFormat", aliases: ["1080p"], output: "1080p" },
+    { id: "special-pilot", field: "specialKind", aliases: ["先导"], output: "pilot" }
+  ] } } });
+  const pilot = Array.from(rewritten.library.recognition.fixedMappings).find((item) => item.id === "special-pilot");
+  assert.ok(pilot, "用户编辑过的特别篇条目保留");
+  assert.equal(pilot.output, "先导片", "旧英文类型名应改写为类型名");
+  assert.ok(!Array.from(rewritten.library.recognition.fixedMappings).some((item) => item.field === "specialKind" && item.output === "加更"), "已留有特别篇条目时不再强制补齐（尊重用户编辑）");
 });
 
 await chain;

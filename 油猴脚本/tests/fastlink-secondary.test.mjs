@@ -95,12 +95,13 @@ test("单文件二级链接格式为 123FLCPV2$%<b62>#<size>#<名称>", () => {
 });
 
 // ---------- normalizeSeedFolderId ----------
-test("种子文件夹 ID：空值放行，非 8 位数字报错", () => {
+test("种子文件夹 ID：空值放行，非数字报错，任意位数字均放行", () => {
   assert.equal(normalizeSeedFolderId(""), "");
   assert.equal(normalizeSeedFolderId(null), "");
   assert.equal(normalizeSeedFolderId(" 12345678 "), "12345678");
-  assert.throws(() => normalizeSeedFolderId("123"), /8 位数字/);
-  assert.throws(() => normalizeSeedFolderId("1234567a"), /8 位数字/);
+  assert.equal(normalizeSeedFolderId("123"), "123");
+  assert.throws(() => normalizeSeedFolderId("1234567a"), /数字 ID/);
+  assert.throws(() => normalizeSeedFolderId("abc"), /数字 ID/);
 });
 
 // ---------- 全链路：生成二级链接 → 保存二级链接 ----------

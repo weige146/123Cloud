@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.2.4
+// @version      1.2.5
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @author       local
 // @license      MIT
@@ -1506,7 +1506,8 @@
     { key: "videoCodec", label: "\u89C6\u9891\u7F16\u7801", hint: "\u7EDF\u4E00 H.264\u3001H.265 \u7B49\u7F16\u7801\u5199\u6CD5\u3002" },
     { key: "audioCodec", label: "\u97F3\u9891\u7F16\u7801", hint: "\u7EDF\u4E00\u97F3\u9891\u7F16\u7801\u540D\u79F0\uFF1B\u58F0\u9053\u548C Atmos \u4FE1\u606F\u4F1A\u7EE7\u7EED\u4FDD\u7559\u3002" },
     { key: "highQuality", label: "\u9AD8\u89C4\u683C", hint: "\u7EDF\u4E00\u9AD8\u89C4\u683C\u6807\u8BB0\u3002" },
-    { key: "originalEdition", label: "\u5730\u533A\u7248 / \u7248\u672C", hint: "\u7EDF\u4E00\u5730\u533A\u7801\u548C\u7248\u672C\u6807\u8BB0\u3002" }
+    { key: "originalEdition", label: "\u5730\u533A\u7248 / \u7248\u672C", hint: "\u7EDF\u4E00\u5730\u533A\u7801\u548C\u7248\u672C\u6807\u8BB0\u3002" },
+    { key: "specialKind", label: "\u7279\u522B\u7BC7\u5173\u952E\u8BCD", hint: "\u6587\u4EF6\u540D\u51FA\u73B0\u8FD9\u4E9B\u8BCD\u5C31\u6309\u5BF9\u5E94\u7C7B\u578B\u53C2\u4E0E\u7279\u522B\u7BC7\u914D\u5BF9\uFF1B\u53EF\u7ED9\u5DF2\u6709\u7C7B\u578B\u52A0\u8BCD\uFF0C\u4E5F\u53EF\u4EE5\u81EA\u5B9A\u4E49\u65B0\u7C7B\u578B\u540D\uFF08\u5982\u300C\u52A8\u8111\u5427\u300D\uFF09\u3002" }
   ];
   var DEFAULT_FIXED_MAPPINGS = [
     entry("video-format-4320p", "videoFormat", ["4320p", "8K"], "4320p"),
@@ -1646,6 +1647,42 @@
     entry("edition-mex", "originalEdition", ["MEX"], "MEX"),
     entry("edition-bra", "originalEdition", ["BRA"], "BRA")
   ];
+  // 特别篇触发词默认表：由代码里原硬编码正则（pilot/extra/member… 17 类）等价展开为纯词别名。
+  // 三元组为 [类型 id, 类型名, 触发词]；类型名只是特别篇配对用的标记，用户可自由自定义新类型名。
+  // 匹配语义见 keywordAliasPattern：别名内空格匹配 [ ._-]*，前后要求非字母数字边界，忽略大小写。
+  var DEFAULT_SPECIAL_KEYWORD_MAPPINGS = [
+    ["pilot", "\u5148\u5BFC\u7247", ["\u5148\u5BFC", "\u5BFC\u8D4F", "\u5BFC\u89C8", "\u5148\u884C", "\u5E8F\u7BC7", "\u5E8F\u7AE0", "\u9884\u70ED", "\u5C1D\u9C9C", "\u62A2\u5148", "\u62A2\u9C9C", "\u9884\u544A", "\u7247\u82B1", "Trailer", "Teaser", "Preview", "Sneak Peek", "Promo", "PV"]],
+    ["sideStory", "\u756A\u5916\u884D\u751F", ["\u756A\u5916", "\u884D\u751F", "Side Story", "Spin Off", "Spinoff"]],
+    ["extra", "\u52A0\u66F4", ["\u52A0\u66F4", "\u52A0\u6599", "\u72EC\u5BB6\u52A0\u66F4", "Plus", "Extra"]],
+    ["bonus", "\u5F69\u86CB\u798F\u5229", ["\u798F\u5229\u5C40", "\u60CA\u559C\u5C40", "\u5F69\u86CB", "\u4F1A\u5458 \u5F69\u86CB", "VIP Bonus", "VIP Bonus Scene", "Bonus"]],
+    ["advance", "\u8D85\u524D\u4F01\u5212", ["\u8D85\u524D\u8425\u4E1A", "\u8D85\u524D\u805A\u4F1A", "\u8D85\u524D\u4F01\u5212", "First Look"]],
+    ["member", "\u4F1A\u5458\u4E13\u4EAB", ["\u4F1A\u5458\u7248", "\u4F1A\u5458\u52A0\u957F", "\u4F1A\u5458\u4E13\u4EAB", "\u5927\u4F1A\u5458", "VIP", "SVIP", "\u4E13\u4EAB\u7248", "\u72EC\u4EAB\u7248", "Member Only", "Members Only"]],
+    ["behind", "\u5E55\u540E\u82B1\u7D6E", ["\u5E55\u540E", "\u82B1\u7D6E", "\u5236\u4F5C\u7279\u8F91", "\u63A2\u73ED", "\u5907\u91C7", "\u91C7\u8BBF", "\u5F69\u6392", "Behind The Scenes", "Behind Scenes", "Making Of"]],
+    ["pure", "\u7EAF\u4EAB\u76F4\u62CD", ["\u7EAF\u4EAB", "\u5355\u4EBA\u76F4\u62CD", "\u591A\u673A\u4F4D", "\u7EC3\u4E60\u5BA4\u7248", "Fancam", "Fan Cam", "Focus"]],
+    ["live", "\u76F4\u64AD\u6F14\u51FA", ["\u76F4\u64AD", "\u6F14\u5531\u4F1A", "\u89C1\u9762\u4F1A", "\u53D1\u5E03\u4F1A", "Live", "Live Show", "Live Stream"]],
+    ["companion", "\u966A\u770B\u590D\u76D8", ["\u966A\u770B", "\u804A\u5929\u5BA4", "\u770B\u7247\u4F1A", "\u590D\u76D8", "Reaction", "Watch Along"]],
+    ["vlog", "\u65E5\u8BB0Vlog", ["PD Vlog", "Vlog", "\u65E5\u8BB0", "\u624B\u8BB0"]],
+    ["aftershow", "\u6536\u5B98\u91CD\u805A", ["\u6536\u5B98", "\u5E86\u529F\u5BB4", "\u91CD\u805A", "\u552E\u540E", "After Show", "Aftershow", "After Party", "Afterparty", "Reunion"]],
+    ["recap", "\u56DE\u987E\u524D\u60C5", ["\u56DE\u987E", "\u524D\u60C5\u63D0\u8981", "Recap", "Digest"]],
+    ["special", "\u7279\u8F91", ["\u7279\u8F91", "\u7279\u522B", "Special Program", "SP", "Special", "OVA", "OAD"]],
+    ["friends", "\u597D\u53CB\u8BB0", ["\u597D\u53CB\u8BB0", "Old Friend", "Old Friends"]],
+    ["bonusBroadcast", "\u52A0\u7801\u653E\u9001", ["\u52A0\u7801\u653E\u9001", "Special Extra"]],
+    ["unreleased", "\u672A\u64AD\u5220\u51CF", ["\u672A\u64AD", "\u672A\u516C\u5F00", "\u6B63\u7247\u672A\u64AD", "\u5220\u51CF\u7247\u6BB5", "Deleted Scene", "Deleted Scenes", "Outtake", "Blooper", "Bloopers"]]
+  ];
+  function defaultSpecialKeywordMappingEntries() {
+    return DEFAULT_SPECIAL_KEYWORD_MAPPINGS.map(([kind, label, aliases]) => ({ id: `special-${kind}`, field: "specialKind", aliases: [...aliases], output: label }));
+  }
+  // 老配置升级/新装首载时补齐缺失的特别篇默认条目；只要用户还留有任意特别篇条目就尊重其编辑。
+  // 早期版本把英文类型 id 存进 output，这里统一改写为类型名。
+  function seedSpecialKeywordMappings(mappings) {
+    const list = Array.isArray(mappings) ? mappings.filter(Boolean) : [];
+    const labelOf = new Map(DEFAULT_SPECIAL_KEYWORD_MAPPINGS.map(([kind, label]) => [kind, label]));
+    for (const item of list) {
+      if (item?.field === "specialKind" && labelOf.has(item.output)) item.output = labelOf.get(item.output);
+    }
+    if (list.some((item) => item?.field === "specialKind")) return list;
+    return [...list, ...defaultSpecialKeywordMappingEntries()];
+  }
   var MAPPING_FIELDS = new Set(FIXED_MAPPING_GROUPS.map((group) => group.key));
   function splitAliases(value) {
     if (Array.isArray(value)) return value;
@@ -1706,7 +1743,7 @@
     return keys.flatMap((key, index) => index === 0 ? [field(key)] : [separator(" "), field(key)]);
   }
   var DEFAULT_CONFIG = {
-    schemaVersion: 10,
+    schemaVersion: 11,
     appearance: {
       theme: "system",
       finderMode: false,
@@ -1723,7 +1760,7 @@
       categories: clone(DEFAULT_LIBRARY_CATEGORIES),
       excludeWords: [],
       discardSidecarExtensions: ["ass", "srt", "ssa", "sub", "vtt", "nfo", "jpg", "jpeg", "png", "webp"],
-      recognition: { customWords: [], releaseGroups: ["Mo Cuishle"], fixedMappings: clone(DEFAULT_FIXED_MAPPINGS) }
+      recognition: { customWords: [], releaseGroups: ["Mo Cuishle"], fixedMappings: clone(DEFAULT_FIXED_MAPPINGS).concat(defaultSpecialKeywordMappingEntries()) }
     },
     share: {
       expiration: "2099-12-12T08:00:00+08:00",
@@ -1737,6 +1774,7 @@
       useFolderNameForJson: true,
       appendDateToJson: false,
       seedFolderId: "",
+      seedFolderName: "",
       secondaryUseJson: true,
       filterOnShareEnabled: false,
       filterOnTransferEnabled: false,
@@ -1854,7 +1892,7 @@
     config.library.recognition = {
       customWords: recognitionWords(config.library.recognition),
       releaseGroups: [.../* @__PURE__ */ new Set([...(config.library.recognition?.releaseGroups || []).map((item) => String(item || "").trim()).filter(Boolean), "Mo Cuishle"])],
-      fixedMappings: normalizeFixedMappings(config.library.recognition?.fixedMappings)
+      fixedMappings: seedSpecialKeywordMappings(normalizeFixedMappings(config.library.recognition?.fixedMappings))
     };
     config.fastlinkTools = config.fastlinkTools && typeof config.fastlinkTools === "object" ? config.fastlinkTools : clone(DEFAULT_CONFIG.fastlinkTools);
     config.fastlinkTools.filters = (Array.isArray(config.fastlinkTools.filters) ? config.fastlinkTools.filters : DEFAULT_CONFIG.fastlinkTools.filters).map((item) => ({
@@ -1863,10 +1901,12 @@
       enabled: item?.enabled === true
     })).filter((item) => item.ext);
     const seedFolderId = String(config.fastlinkTools.seedFolderId ?? "").trim();
-    config.fastlinkTools.seedFolderId = /^\d{8}$/.test(seedFolderId) ? seedFolderId : "";
+    config.fastlinkTools.seedFolderId = /^\d+$/.test(seedFolderId) ? seedFolderId : "";
+    if (!config.fastlinkTools.seedFolderId) config.fastlinkTools.seedFolderName = "";
     config.fastlinkTools.secondaryUseJson = config.fastlinkTools.secondaryUseJson !== false;
     delete config.appearance.hideOfficialPromotions;
-    config.schemaVersion = 10;
+    applySpecialKeywordMappings(config.library.recognition.fixedMappings);
+    config.schemaVersion = 11;
     delete config.metadata;
     return config;
   }
@@ -5737,7 +5777,7 @@
   function normalizeSeedFolderId(value) {
     const raw = String(value ?? "").trim();
     if (!raw) return "";
-    if (!/^\d{8}$/.test(raw)) throw new Error("\u79CD\u5B50\u6587\u4EF6\u5939 ID \u65E0\u6548\uFF1A\u5E94\u4E3A 8 \u4F4D\u6570\u5B57\uFF0C\u6216\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55");
+    if (!/^\d+$/.test(raw)) throw new Error("\u79CD\u5B50\u6587\u4EF6\u5939 ID \u65E0\u6548\uFF1A\u5E94\u4E3A\u6570\u5B57 ID\uFF0C\u6216\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55");
     return raw;
   }
   function buildSecondarySeedName(items, options = {}) {
@@ -13144,6 +13184,11 @@ ${end.comment}` : end.comment;
     const suffix = title.match(VARIETY_TITLE_SUFFIX);
     return cleanPathPart((suffix?.index >= 2 ? title.slice(0, suffix.index) : title).trim()).replace(/^[-· ]+|[-· ]+$/g, "");
   }
+  // 「第1部分」「part1」这类分段标记只用于区分同内容分段，不应留在标题里；
+  // 多分段文件同名冲突时由变体机制（Part01/上中下）负责区分。
+  function stripPartMarkers(value) {
+    return String(value || "").replace(new RegExp(`(?:^|[\\s._·-])(?:(?:Part|Pt)[ ._-]*\\d+|\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*\u90E8\u5206)(?=$|[\\s._·-])`, "gi"), " ");
+  }
   function normalizeBracketTitle(value) {
     let title = toSimplified(String(value || "")).normalize("NFKC").trim();
     title = title.replace(/^\s*(?:19|20)\d{2}(?:[年./_-]\d{1,2}(?:[月./_-]\d{1,2}(?:日)?)?)?\s*/, "");
@@ -13153,6 +13198,7 @@ ${end.comment}` : end.comment;
     if (season) title = season[1];
     title = title.replace(new RegExp(`\\s+\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*[\u671F\u96C6\u8BDD\u8A71].*$`), "");
     title = title.replace(/\s+S\d{1,3}(?:E\d{1,5})?.*$/i, "").replace(/\s+\d{4}$/, "");
+    title = stripPartMarkers(title);
     return trimVarietyTitleSuffix(title);
   }
   function titleFromBrackets(stem) {
@@ -13179,6 +13225,7 @@ ${end.comment}` : end.comment;
     const chineseLead = stem.match(/^([\u3400-\u9fff][\u3400-\u9fff\s·]{1,70}?)(?=\s+[A-Za-z])/);
     if (chineseLead) stem = chineseLead[1];
     stem = stem.replace(/\[[^\]]*]|\([^)]*\)|【[^】]*】/g, " ");
+    stem = stripPartMarkers(stem);
     stem = stem.replace(new RegExp(`(?:${CHINESE_SEASON_PATTERN}|\u7B2C\\s*\\d+\\s*[\u671F\u96C6]|\\d{4}[.\\-]\\d{1,2}[.\\-]\\d{1,2}|\\d{8}|EP?\\s*\\d+|Part\\s*\\d+)\\s*$`, "gi"), " ");
     stem = stem.replace(/[\s([{【._-]+$/g, " ");
     return trimVarietyTitleSuffix(toSimplified(stem.replace(/\s+/g, " ").trim()));
@@ -13334,25 +13381,44 @@ ${end.comment}` : end.comment;
     if (/幕后|Behind/i.test(text2)) specialKinds.push("behind");
     return { ...parsed, date, part, fraction: fraction ? [Number(fraction[1]), Number(fraction[2])] : null, absolute, specialKinds };
   }
-  var SPECIAL_KEYWORD_PATTERNS = [
-    ["pilot", new RegExp("\u5148\u5BFC(?:\u7247|\u7BC7)?|\u5BFC\u8D4F|\u5BFC\u89C8|\u5148\u884C(?:\u7247|\u7BC7)?|\u5E8F\u7BC7|\u5E8F\u7AE0|\u9884\u70ED|\u5C1D\u9C9C|\u62A2\u5148(?:\u770B|\u7248)?|\u62A2\u9C9C(?:\u770B|\u7248)?|\u9884\u544A|\u7247\u82B1|Trailer|Teaser|Preview|Sneak\\s*Peek|Promo|(?<![A-Za-z0-9])PV(?![A-Za-z0-9])", "i")],
-    ["sideStory", /番外(?:篇|特辑|微综)?|衍生(?:篇|节目)?|Side[\s._-]*Story|Spin[\s._-]*Off|Spinoff/i],
-    ["extra", new RegExp("\u52A0\u66F4(?:\u7BC7|\u7248)?|\u52A0\u6599(?:\u7248)?|\u72EC\u5BB6\u52A0\u66F4|(?<![A-Za-z0-9])(?:Plus|Extra)(?![A-Za-z0-9])", "i")],
-    ["bonus", new RegExp("\u798F\u5229\u5C40|\u60CA\u559C\u5C40|\u5F69\u86CB(?:\u5C40)?|\u4F1A\u5458\\s*\u5F69\u86CB|VIP[\\s._-]*Bonus(?:[\\s._-]*Scene)?|(?<![A-Za-z0-9])Bonus(?![A-Za-z0-9])", "i")],
-    ["advance", /超前(?:营业|聚会|企划)|First[\s._-]*Look/i],
-    ["member", /会员(?:版|加长|专享)|大会员|VIP(?:版|专享)?|SVIP|专享版|独享版|Members?\s*Only/i],
-    ["behind", /幕后(?:纪录|特辑|直击)?|花絮|制作特辑|探班|备采|采访|彩排|Behind(?:\s+the)?\s*Scenes?|Making\s*Of/i],
-    ["pure", /纯享|舞台纯享|歌曲纯享|完整纯享|单人直拍|多机位|练习室版|Fancam|Fan\s*Cam|Focus/i],
-    ["live", new RegExp("\u76F4\u64AD(?:\u56DE\u653E)?|\u6F14\u5531\u4F1A|\u89C1\u9762\u4F1A|\u53D1\u5E03\u4F1A|(?<![A-Za-z0-9])Live(?:\\s*(?:Show|Stream))?(?![A-Za-z0-9])", "i")],
-    ["companion", /陪看|聊天室|看片会|复盘|Reaction|Watch\s*Along/i],
-    ["vlog", /PD\s*Vlog|Vlog|日记|手记/i],
-    ["aftershow", /收官(?:篇|宴|特辑)?|庆功宴|重聚|售后|After\s*Show|Aftershow|After\s*Party|Afterparty|Reunion/i],
-    ["recap", new RegExp("\u56DE\u987E|\u524D\u60C5\u63D0\u8981|(?<![A-Za-z0-9])(?:Recap|Digest)(?![A-Za-z0-9])", "i")],
-    ["special", new RegExp("\u7279\u8F91|\u7279\u522B(?:\u7BC7|\u8282\u76EE|\u4F01\u5212)?|\u7279\u522B\\s*\u4F01\u5212|Special[\\s._-]*Program|(?<![A-Za-z0-9])(?:SP|Special|OVA|OAD)(?![A-Za-z0-9])", "i")],
-    ["friends", /好友记|Old[\s._-]*Friends?/i],
-    ["bonusBroadcast", /加码放送|Special[\s._-]*Extra/i],
-    ["unreleased", /未播|未公开|正片未播|删减片段|Deleted\s*Scene|Outtake|Bloopers?/i]
-  ];
+  function escapeKeywordAlias(alias) {
+    return String(alias || "").trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "[ ._-]*");
+  }
+  function keywordAliasPattern(aliases) {
+    const source = (aliases || []).map(escapeKeywordAlias).filter(Boolean).join("|");
+    return source ? new RegExp(`(?:^|[^A-Za-z0-9])(?:${source})(?=$|[^A-Za-z0-9])`, "i") : null;
+  }
+  function defaultSpecialKeywordPatterns() {
+    return DEFAULT_SPECIAL_KEYWORD_MAPPINGS.map(([kind, label, aliases]) => [label, keywordAliasPattern(aliases)]).filter(([, pattern]) => pattern);
+  }
+  var SPECIAL_KEYWORD_PATTERNS = defaultSpecialKeywordPatterns();
+  // 类型名（output）只是配对用的不透明标记，允许任意自定义名称。
+  function specialKeywordPatternsFromMappings(mappings) {
+    const byKind = /* @__PURE__ */ new Map();
+    for (const item of normalizeFixedMappings(seedSpecialKeywordMappings(mappings))) {
+      if (item.field !== "specialKind" || !item.output) continue;
+      if (!byKind.has(item.output)) byKind.set(item.output, []);
+      byKind.get(item.output).push(...item.aliases);
+    }
+    return [...byKind].map(([kind, aliases]) => [kind, keywordAliasPattern(aliases)]).filter(([, pattern]) => pattern);
+  }
+  // 「先导片」「会员专享」是带行为的类型（先导片命名守卫、会员版按期数映射同期正集），
+  // 行为跟随默认条目当前的类型名，而不是写死的类型字面量，用户改名后行为不丢。
+  function specialKindTokens(mappings) {
+    const entries = normalizeFixedMappings(seedSpecialKeywordMappings(mappings));
+    const tokenOf = (defaultKind) => entries.find((item) => item.field === "specialKind" && item.id === `special-${defaultKind}`)?.output || "";
+    return { pilot: tokenOf("pilot"), member: tokenOf("member") };
+  }
+  var SPECIAL_KIND_TOKENS = specialKindTokens(undefined);
+  function memberVariantKinds(tokens) {
+    return [tokens.member, "memberBonus", "memberPlus"].filter(Boolean);
+  }
+  var MEMBER_VARIANT_KINDS = memberVariantKinds(SPECIAL_KIND_TOKENS);
+  function applySpecialKeywordMappings(mappings) {
+    SPECIAL_KEYWORD_PATTERNS = specialKeywordPatternsFromMappings(mappings);
+    SPECIAL_KIND_TOKENS = specialKindTokens(mappings);
+    MEMBER_VARIANT_KINDS = memberVariantKinds(SPECIAL_KIND_TOKENS);
+  }
   var CONTEXTUAL_SPECIAL_KEYWORD_PATTERNS = [
     ["extra", new RegExp("\u7279\u8F91|\u7279\u522B|\u4F01\u5212|\u524D\u4F20|\u5F00\u64AD|\u9996\u53D1|\u52A0\u957F|\u5EF6\u957F|\u52A0\u91CF|\u52A0\u7801|\u52A0\u65F6|\u8425\u4E1A|Top\\s*10|(?<![A-Za-z0-9])Special(?![A-Za-z0-9])", "i")],
     ["member", /会员|专享|独享|独家|独播|Exclusive/i],
@@ -13922,7 +13988,6 @@ ${end.comment}` : end.comment;
     if (context.strong && dated.length === 1) return dated[0];
     return context.strong && specials.length === 1 ? specials[0] : null;
   }
-  var MEMBER_VARIANT_KINDS = ["member", "memberBonus", "memberPlus"];
   function isMemberVariantContext(context) {
     return context.strongKeywords.length > 0 && context.strongKeywords.every((kind) => MEMBER_VARIANT_KINDS.includes(kind));
   }
@@ -14136,7 +14201,7 @@ ${end.comment}` : end.comment;
       // A file explicitly labelled as Plus/特辑/etc. is an S00 candidate,
       // even when its filename happens to contain SxxE00.
       const context = specialContext(file.name);
-      return !context.strongKeywords.some((kind) => kind !== "pilot");
+      return !context.strongKeywords.some((kind) => kind !== SPECIAL_KIND_TOKENS.pilot);
     });
     if (!sourceFiles.length) return 0;
     const first = [...episodes].filter((episode) => episode.seasonNumber === season).sort((left, right) => left.episodeNumber - right.episodeNumber || left.airDate.localeCompare(right.airDate))[0];
@@ -14175,7 +14240,7 @@ ${end.comment}` : end.comment;
         hint.seasonEpisode = hint.seasonEpisode ? hint.seasonEpisode.replace(/^S\d{1,3}/i, `S${String(seasonRemap.to).padStart(2, "0")}`) : hint.seasonEpisode;
       }
       const context = specialContext(file.name);
-      const pilotOnlyLabel = context.strongKeywords.length > 0 && context.strongKeywords.every((kind) => kind === "pilot");
+      const pilotOnlyLabel = context.strongKeywords.length > 0 && context.strongKeywords.every((kind) => kind === SPECIAL_KIND_TOKENS.pilot);
       const isRegularSource = pilotOffset > 0 && hint.season === Number(targetSeason || season || 1) && hasExplicitSeasonEpisodeToken(file.name) && hint.episode >= 0 && (!context.strong || pilotOnlyLabel) && !context.contextual;
       return {
         file,
@@ -14298,7 +14363,7 @@ ${end.comment}` : end.comment;
     // split/merge sequence pass as well, while leaving special entries on
     // their original S00 identity.
     const sequenceEntries = pilotOffset ? entries.map((entry2) => {
-      const pilotOnlyLabel = entry2.context.strongKeywords.length > 0 && entry2.context.strongKeywords.every((kind) => kind === "pilot");
+      const pilotOnlyLabel = entry2.context.strongKeywords.length > 0 && entry2.context.strongKeywords.every((kind) => kind === SPECIAL_KIND_TOKENS.pilot);
       if (!entry2.video || entry2.context.contextual || entry2.hint.season !== Number(targetSeason || season || 1) || !hasExplicitSeasonEpisodeToken(entry2.file.name) || entry2.context.strong && !pilotOnlyLabel) return entry2;
       const shiftedEpisode = regularSourceEpisode(entry2);
       const shiftedEndEpisode = Number(entry2.effectiveEndEpisode || 0);
@@ -14309,7 +14374,7 @@ ${end.comment}` : end.comment;
       const { file, hint, context } = entry2;
       if (!entry2.video) continue;
       if (output.has(String(file.id))) continue;
-      const pilotOnlyLabel = context.strongKeywords.length > 0 && context.strongKeywords.every((kind) => kind === "pilot");
+      const pilotOnlyLabel = context.strongKeywords.length > 0 && context.strongKeywords.every((kind) => kind === SPECIAL_KIND_TOKENS.pilot);
       if (context.strong && !pilotOnlyLabel || hint.season === 0) continue;
       const regularEpisode = regularSourceEpisode(entry2);
       const exact = regularEpisode >= 0 && entry2.part <= 1 && !hint.fraction && hasExplicitSeasonEpisodeToken(file.name) ? sortedEpisodes.find((episode) => episode.seasonNumber === hint.season && episode.episodeNumber === regularEpisode) : null;
@@ -14496,6 +14561,8 @@ ${end.comment}` : end.comment;
     let value = String(title || "").trim();
     const tailPatterns = [
       /[\s._·-]*第\s*(?:[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+\s*)[期集話话](?:[\s._·-]*[上中下])?$/i,
+      new RegExp(`[\\s._·-]*\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*\u90E8\u5206$`, "i"),
+      /[\s._·-]*(?:Part|Pt)[ ._-]*\d{1,3}$/i,
       /[\s._·-]*(?:EP?|ep)\s*\d{1,5}(?:[\s._·-]*[上中下])?$/,
       /[\s._·-]*\d{1,4}(?:[\s._·-]*[上中下])?$/
     ];
@@ -16299,10 +16366,10 @@ ${end.comment}` : end.comment;
     const splitPane = `${notice("\u652F\u6301\u9879\u76EE JSON\u3001123FLCPV2 \u94FE\u63A5\u548C\u65E7\u7248 V1/V2 \u6587\u672C\u3002\u6309\u76EE\u5F55\u5C42\u7EA7\u4F1A\u4E3A\u6BCF\u4E2A\u76EE\u5F55\u7EC4\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\uFF0C\u6309\u6570\u91CF\u4F1A\u6309\u6761\u76EE\u5207\u5206\u3002", "", "download")}<div class="button-row"><button class="button" data-action="fastlink-split-file-open">${icon("folderOpen", 15)}\u9009\u62E9 JSON</button><span>${escapeHtml(state.splitFileName || "\u4E5F\u53EF\u4EE5\u76F4\u63A5\u7C98\u8D34")}</span><input id="fastlink-split-file" type="file" accept=".json,.txt,.123fastlink" hidden></div><div class="editor-surface"><textarea id="fastlink-split-input" placeholder="\u7C98\u8D34 JSON \u6216\u79D2\u4F20\u94FE\u63A5">${escapeHtml(state.splitInput || "")}</textarea></div><div class="inline-fields"><label class="field"><span>\u62C6\u5206\u65B9\u5F0F</span><select id="fastlink-split-method"><option value="folder" ${state.splitMethod === "folder" ? "selected" : ""}>\u6309\u76EE\u5F55\u5C42\u7EA7</option><option value="count" ${state.splitMethod === "count" ? "selected" : ""}>\u6309\u6587\u4EF6\u6570\u91CF</option></select></label><label class="field"><span>${state.splitMethod === "count" ? "\u6BCF\u4EFD\u6587\u4EF6\u6570" : "\u76EE\u5F55\u5C42\u6570"}</span><input id="fastlink-split-amount" type="number" min="1" value="${Math.max(1, Number(state.splitAmount) || 1)}"></label></div>`;
     const convertPane = `${notice("\u5728 .123share \u4E0E\u9879\u76EE\u6807\u51C6 JSON \u4E4B\u95F4\u4E92\u8F6C\u3002\u8F6C\u6362\u53EA\u5728\u672C\u5730\u5B8C\u6210\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u6587\u4EF6\u3002", "", "settings")}<div class="button-row"><button class="button" data-action="fastlink-convert-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u6587\u4EF6</button><span>${escapeHtml(state.convertFileName || "\u652F\u6301 .123share / .json")}</span><input id="fastlink-convert-file" type="file" accept=".123share,.json" hidden></div><div class="editor-surface"><textarea id="fastlink-convert-input" placeholder="\u4E5F\u53EF\u4EE5\u7C98\u8D34\u6587\u4EF6\u5185\u5BB9">${escapeHtml(state.convertInput || "")}</textarea></div>${state.converted ? notice(`\u5DF2\u8F6C\u6362\u4E3A ${state.converted === "json" ? "JSON" : ".123share"} \u5E76\u5F00\u59CB\u4E0B\u8F7D\u3002`, "success", "check") : ""}`;
     const filterPane =`${notice("\u542F\u7528\u540E\uFF0C\u751F\u6210\u6216\u8F6C\u5B58\u65F6\u4F1A\u8DF3\u8FC7\u5BF9\u5E94\u6269\u5C55\u540D\u3002\u8BBE\u7F6E\u4FDD\u5B58\u5728\u9879\u76EE\u914D\u7F6E\u4E2D\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-filter="share" ${settings.filterOnShareEnabled ? "checked" : ""}>\u751F\u6210\u65F6\u542F\u7528\u8FC7\u6EE4</label><label class="check-line"><input type="checkbox" data-fastlink-filter="transfer" ${settings.filterOnTransferEnabled ? "checked" : ""}>\u8F6C\u5B58\u65F6\u542F\u7528\u8FC7\u6EE4</label></div><div class="filter-actions"><button class="button compact" data-action="fastlink-filter-all">\u5168\u9009</button><button class="button compact" data-action="fastlink-filter-none">\u5168\u4E0D\u9009</button><button class="button compact" data-action="fastlink-filter-reset">\u6062\u590D\u9ED8\u8BA4</button></div><div class="fastlink-filter-list">${filters.map((item, index) => `<label class="check-line"><input type="checkbox" data-fastlink-filter="extension" data-index="${index}" ${item.enabled ? "checked" : ""}><span>.${escapeHtml(item.ext)}</span><small>${escapeHtml(item.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B")}</small></label>`).join("")}</div>`;
-    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939 ID\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C8 \u4F4D\u6570\u5B57\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><input type="number" inputmode="numeric" data-fastlink-setting="seedFolderId" value="${escapeHtml(String(settings.seedFolderId ?? ""))}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
+    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? `${settings.seedFolderName || ""}\uFF08${settings.seedFolderId}\uFF09` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
     const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"]];
     const nav = `<div class="fastlink-tool-grid">${tools.map(([key, label, iconName]) => `<button class="button tool-button ${tool === key ? "active" : ""}" data-action="fastlink-tool" data-tool="${key}">${icon(iconName, 14)}${label}</button>`).join("")}</div>`;
-    let pane = tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : settingsPane;
+    let pane = state.picker ? renderFolderPicker(ui, state.picker) : tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : settingsPane;
     const modeToolbar = `<div class="mode-toolbar"><div class="segmented"><button data-action="fastlink-mode" data-mode="import" class="${tool === "import" ? "active" : ""}">${icon("import", 15)}\u5BFC\u5165</button><button data-action="fastlink-mode" data-mode="export" class="${tool === "export" ? "active" : ""}">${icon("download", 15)}\u5BFC\u51FA</button></div></div>`;
     const body = `${nav}${["export", "import"].includes(tool) ? modeToolbar : ""}<div class="fastlink-pane">${pane}</div>${state.artifacts.length && !["export", "import"].includes(tool) ? generatedLinks : ""}`;
     const action = tool === "export" ? `<button class="button primary" data-action="fastlink-export" ${state.items.length ? "" : "disabled"}>${icon("download", 15)}\u5BFC\u51FA ${state.items.length || ""}</button>` : tool === "import" ? `<button class="button primary" data-action="fastlink-import" ${String(state.input || "").trim() ? "" : "disabled"}>${icon("import", 15)}\u5F00\u59CB\u8F6C\u5B58</button>` : tool === "public" ? `<button class="button primary" data-action="fastlink-public-generate">${icon("download", 15)}\u751F\u6210 JSON \u6587\u4EF6</button>` : tool === "batch" ? `<button class="button primary" data-action="fastlink-public-batch">${icon("share", 15)}\u6279\u91CF\u751F\u6210</button>` : tool === "split" ? `<button class="button primary" data-action="fastlink-split">${icon("download", 15)}\u5F00\u59CB\u62C6\u5206</button>` : tool === "convert" ? `<button class="button primary" data-action="fastlink-convert">${icon("settings", 15)}\u5F00\u59CB\u8F6C\u6362</button>` : tool === "filters" || tool === "settings" ? `<button class="button primary" data-action="fastlink-settings-save">\u4FDD\u5B58\u8BBE\u7F6E</button>` : "";
@@ -16655,9 +16722,9 @@ ${end.comment}` : end.comment;
 
   // src/ui/views/settings.js
   var TEMPLATE_TABS = [["movie", "\u7535\u5F71\u6587\u4EF6"], ["tv", "\u5267\u96C6\u6587\u4EF6"], ["mediaFolder", "\u5A92\u4F53\u76EE\u5F55"], ["seasonFolder", "\u5A92\u4F53\u5E93\u5B63\u76EE\u5F55"], ["inPlaceSeasonFolder", "\u539F\u5730\u5B63\u76EE\u5F55"]];
-  function renderFolderPicker(ui) {
-    const picker = ui.settings.picker;
-    return `<div class="folder-picker"><aside class="folder-path"><div><strong>\u5A92\u4F53\u5E93\u6839\u76EE\u5F55</strong><p>${picker.path.map((item) => escapeHtml(item.name)).join(" / ") || "\u5168\u90E8\u6587\u4EF6"}</p></div><button class="button" data-action="folder-up" ${picker.path.length ? "" : "disabled"}>${icon("arrowLeft", 15)}\u4E0A\u4E00\u7EA7</button></aside><div class="folder-list">${picker.loading ? `<div class="picker-loading">${icon("loading", 24, "spin")}</div>` : picker.folders.map((folder) => `<button class="folder-item" data-action="folder-open" data-id="${folder.id}">${icon("folder", 17)}<span>${escapeHtml(folder.name)}</span>${icon("chevronRight", 15)}</button>`).join("") || `<div class="picker-loading">\u6B64\u76EE\u5F55\u6CA1\u6709\u5B50\u6587\u4EF6\u5939</div>`}<div class="picker-actions"><button class="button" data-action="folder-cancel">\u53D6\u6D88</button><button class="button primary" data-action="folder-select">\u9009\u62E9\u5F53\u524D\u76EE\u5F55</button></div></div></div>`;
+  function renderFolderPicker(ui, picker = ui.settings.picker) {
+    const title = picker.title || "\u5A92\u4F53\u5E93\u6839\u76EE\u5F55";
+    return `<div class="folder-picker"><aside class="folder-path"><div><strong>${escapeHtml(title)}</strong><p>${picker.path.map((item) => escapeHtml(item.name)).join(" / ") || "\u5168\u90E8\u6587\u4EF6"}</p></div><button class="button" data-action="folder-up" ${picker.path.length ? "" : "disabled"}>${icon("arrowLeft", 15)}\u4E0A\u4E00\u7EA7</button></aside><div class="folder-list">${picker.loading ? `<div class="picker-loading">${icon("loading", 24, "spin")}</div>` : picker.folders.map((folder) => `<button class="folder-item" data-action="folder-open" data-id="${folder.id}">${icon("folder", 17)}<span>${escapeHtml(folder.name)}</span>${icon("chevronRight", 15)}</button>`).join("") || `<div class="picker-loading">\u6B64\u76EE\u5F55\u6CA1\u6709\u5B50\u6587\u4EF6\u5939</div>`}<div class="picker-actions"><button class="button" data-action="folder-cancel">\u53D6\u6D88</button><button class="button primary" data-action="folder-select">\u9009\u62E9\u5F53\u524D\u76EE\u5F55</button></div></div></div>`;
   }
   function recognitionDescription(line) {
     try {
@@ -16682,10 +16749,13 @@ ${end.comment}` : end.comment;
     const mappings = ui.settings.draft.library.recognition?.fixedMappings || [];
     const groups = FIXED_MAPPING_GROUPS.map((group) => {
       const entries = mappings.filter((item) => item.field === group.key);
-      const rows = entries.map((mapping) => `<div class="fixed-mapping-row" data-fixed-mapping-id="${escapeHtml(mapping.id)}"><input data-fixed-mapping-id="${escapeHtml(mapping.id)}" data-fixed-mapping-field="aliases" value="${escapeHtml(mapping.aliases.join(", "))}" placeholder="\u8BC6\u522B\u522B\u540D\uFF0C\u7528\u9017\u53F7\u5206\u9694" aria-label="${escapeHtml(group.label)}\u8BC6\u522B\u522B\u540D"><span class="fixed-mapping-arrow">\u2192</span><input data-fixed-mapping-id="${escapeHtml(mapping.id)}" data-fixed-mapping-field="output" value="${escapeHtml(mapping.output)}" placeholder="\u6574\u7406\u540E\u7684\u5199\u6CD5" aria-label="${escapeHtml(group.label)}\u6574\u7406\u540E\u7684\u5199\u6CD5"><button class="icon-button danger" data-action="fixed-mapping-delete" data-id="${escapeHtml(mapping.id)}" title="\u5220\u9664\u6620\u5C04">${icon("trash", 14)}</button></div>`).join("");
-      return `<details class="fixed-mapping-group"><summary><span><strong>${escapeHtml(group.label)}</strong><small>${escapeHtml(group.hint)}</small></span><em>${entries.length} \u6761</em></summary><div class="fixed-mapping-body"><div class="fixed-mapping-head"><span>\u8BC6\u522B\u522B\u540D</span><span>\u6574\u7406\u540E\u7684\u56FA\u5B9A\u5199\u6CD5</span><span></span></div>${rows || `<div class="fixed-mapping-empty">\u8FD9\u4E00\u7C7B\u6682\u65F6\u6CA1\u6709\u6620\u5C04\u3002</div>`}<div class="button-row"><button class="button compact" data-action="fixed-mapping-add" data-field="${escapeHtml(group.key)}">${icon("plus", 14)}\u6DFB\u52A0\u6620\u5C04</button></div></div></details>`;
+      const isSpecial = group.key === "specialKind";
+      const outputControl = (mapping) => `<input data-fixed-mapping-id="${escapeHtml(mapping.id)}" data-fixed-mapping-field="output" value="${escapeHtml(mapping.output)}"${isSpecial ? ` placeholder="\u7C7B\u578B\u540D\uFF0C\u53EF\u81EA\u5B9A\u4E49" aria-label="${escapeHtml(group.label)}\u7279\u522B\u7BC7\u7C7B\u578B"` : ` placeholder="\u6574\u7406\u540E\u7684\u5199\u6CD5" aria-label="${escapeHtml(group.label)}\u6574\u7406\u540E\u7684\u5199\u6CD5"`}>`;
+      const rows = entries.map((mapping) => `<div class="fixed-mapping-row" data-fixed-mapping-id="${escapeHtml(mapping.id)}"><input data-fixed-mapping-id="${escapeHtml(mapping.id)}" data-fixed-mapping-field="aliases" value="${escapeHtml(mapping.aliases.join(", "))}" placeholder="\u8BC6\u522B\u522B\u540D\uFF0C\u7528\u9017\u53F7\u5206\u9694" aria-label="${escapeHtml(group.label)}\u8BC6\u522B\u522B\u540D"><span class="fixed-mapping-arrow">\u2192</span>${outputControl(mapping)}<button class="icon-button danger" data-action="fixed-mapping-delete" data-id="${escapeHtml(mapping.id)}" title="\u5220\u9664\u6620\u5C04">${icon("trash", 14)}</button></div>`).join("");
+      const headLabels = isSpecial ? ["\u8BC6\u522B\u5173\u952E\u8BCD", "\u7C7B\u578B\uFF08\u53EF\u81EA\u5B9A\u4E49\uFF09"] : ["\u8BC6\u522B\u522B\u540D", "\u6574\u7406\u540E\u7684\u56FA\u5B9A\u5199\u6CD5"];
+      return `<details class="fixed-mapping-group"><summary><span><strong>${escapeHtml(group.label)}</strong><small>${escapeHtml(group.hint)}</small></span><em>${entries.length} \u6761</em></summary><div class="fixed-mapping-body"><div class="fixed-mapping-head"><span>${headLabels[0]}</span><span>${headLabels[1]}</span><span></span></div>${rows || `<div class="fixed-mapping-empty">\u8FD9\u4E00\u7C7B\u6682\u65F6\u6CA1\u6709\u6620\u5C04\u3002</div>`}<div class="button-row"><button class="button compact" data-action="fixed-mapping-add" data-field="${escapeHtml(group.key)}"${isSpecial ? ` data-default-output="\u7279\u522B\u7BC7"` : ""}>${icon("plus", 14)}\u6DFB\u52A0\u6620\u5C04</button></div></div></details>`;
     }).join("");
-    return `<div class="settings-section fixed-mappings-editor"><div class="section-head"><span class="section-icon">${icon("wand", 17)}</span><div><h3>\u81EA\u52A8\u8BC6\u522B\u56FA\u5B9A\u6620\u5C04</h3><p>\u8BC6\u522B\u522B\u540D\u4F1A\u7EDF\u4E00\u5199\u6210\u53F3\u4FA7\u7684\u540D\u79F0\u3002\u53EF\u4FEE\u6539\u5927\u5C0F\u5199\u3001\u7A7A\u683C\u548C\u54C1\u724C\u5199\u6CD5\uFF1B\u591A\u4E2A\u522B\u540D\u7528\u9017\u53F7\u5206\u9694\uFF0C\u4FDD\u5B58\u540E\u4E0B\u6B21\u6574\u7406\u751F\u6548\u3002</p></div><button class="button compact" data-action="fixed-mapping-reset">\u6062\u590D\u9ED8\u8BA4\u6620\u5C04</button></div><div class="form-card fixed-mapping-card"><div class="fixed-mapping-note">\u4F8B\u5982\u628A\u53F3\u4FA7\u7684 <code>myTVSUPER</code> \u6539\u6210 <code>MyTVSuper</code>\u3002\u540C\u4E00\u7C7B\u4E2D\u4ECE\u4E0A\u5230\u4E0B\u5339\u914D\uFF0C\u8D8A\u5177\u4F53\u7684\u6620\u5C04\u5EFA\u8BAE\u653E\u5728\u524D\u9762\u3002</div>${groups}</div></div>`;
+    return `<div class="settings-section fixed-mappings-editor"><div class="section-head"><span class="section-icon">${icon("wand", 17)}</span><div><h3>\u81EA\u52A8\u8BC6\u522B\u56FA\u5B9A\u6620\u5C04</h3><p>\u8BC6\u522B\u522B\u540D\u4F1A\u7EDF\u4E00\u5199\u6210\u53F3\u4FA7\u7684\u540D\u79F0\u3002\u53EF\u4FEE\u6539\u5927\u5C0F\u5199\u3001\u7A7A\u683C\u548C\u54C1\u724C\u5199\u6CD5\uFF1B\u591A\u4E2A\u522B\u540D\u7528\u9017\u53F7\u5206\u9694\uFF0C\u4FDD\u5B58\u540E\u4E0B\u6B21\u6574\u7406\u751F\u6548\u3002</p></div><button class="button compact" data-action="fixed-mapping-reset">\u6062\u590D\u9ED8\u8BA4\u6620\u5C04</button></div><div class="form-card fixed-mapping-card"><div class="fixed-mapping-note">\u4F8B\u5982\u628A\u53F3\u4FA7\u7684 <code>myTVSUPER</code> \u6539\u6210 <code>MyTVSuper</code>\u3002\u540C\u4E00\u7C7B\u4E2D\u4ECE\u4E0A\u5230\u4E0B\u5339\u914D\uFF0C\u8D8A\u5177\u4F53\u7684\u6620\u5C04\u5EFA\u8BAE\u653E\u5728\u524D\u9762\u3002\u7279\u522B\u7BC7\u5173\u952E\u8BCD\u7684\u7C7B\u578B\u540D\u53EF\u81EA\u7531\u586B\u5199\uFF0C\u65B0\u53EB\u6CD5\u76F4\u63A5\u81EA\u5B9A\u4E49\u65B0\u7C7B\u578B\u3002</div>${groups}</div></div>`;
   }
   function renderNaming(ui) {
     const key = ui.settings.template;
@@ -17315,10 +17385,10 @@ ${end.comment}` : end.comment;
   .fixed-mapping-group > summary::-webkit-details-marker { display:none; }
   .fixed-mapping-group > summary::before { content:"\u203A"; color:var(--accent); font-size:18px; line-height:1; transform:rotate(0deg); transition:transform .18s ease; }
   .fixed-mapping-group[open] > summary::before { transform:rotate(90deg); }
-  .fixed-mapping-group > summary > span { display:grid; gap:2px; min-width:0; }
-  .fixed-mapping-group > summary strong { font-size:12px; }
-  .fixed-mapping-group > summary small { color:var(--muted); font-size:10.5px; overflow-wrap:anywhere; }
-  .fixed-mapping-group > summary em { color:var(--muted); font-size:10px; font-style:normal; white-space:nowrap; }
+  .fixed-mapping-group > summary > span { display:grid; gap:3px; flex:1; min-width:0; }
+  .fixed-mapping-group > summary strong { font-size:12.5px; font-weight:600; letter-spacing:.01em; }
+  .fixed-mapping-group > summary small { color:var(--muted); font-size:11px; line-height:1.55; overflow-wrap:anywhere; }
+  .fixed-mapping-group > summary em { color:var(--muted); font-size:10px; font-style:normal; white-space:nowrap; border:1px solid var(--glass-border); border-radius:999px; padding:2px 8px; }
   .fixed-mapping-body { display:grid; gap:7px; padding:0 12px 11px; }
   .fixed-mapping-head,.fixed-mapping-row { display:grid; grid-template-columns:minmax(0,1fr) 20px minmax(0,1fr) 30px; gap:7px; align-items:center; }
   .fixed-mapping-head { color:var(--muted); font-size:10px; padding:2px 0; }
@@ -18690,7 +18760,8 @@ ${end.comment}` : end.comment;
         convertInput: "",
         convertFileName: "",
         converted: null,
-        filterDraft: null
+        filterDraft: null,
+        picker: null
       };
       this.state.view = "fastlink";
       this.render();
@@ -18834,6 +18905,11 @@ ${end.comment}` : end.comment;
       downloadText(filenameSafe(artifact.filename), artifact.text);
       this.toast(`\u5DF2\u751F\u6210 ${artifact.filename}`, "success");
       this.render();
+    }
+    async openFastlinkFolderPicker(target, title) {
+      this.fastlink.filterDraft ||= structuredClone(this.config.fastlinkTools || {});
+      this.fastlink.picker = { parentId: "0", path: [], folders: [], loading: true, target, title };
+      await this.loadFolderPicker("0", this.fastlink);
     }
     async generateFastlinkBatch() {
       const lines = String(this.fastlink.publicBatch || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -19238,14 +19314,15 @@ ${end.comment}` : end.comment;
       this.state.view = "settings";
       this.render();
     }
-    async loadFolderPicker(parentId = "0") {
-      if (!this.settings.picker) this.settings.picker = { parentId: "0", path: [], folders: [], loading: false };
-      this.settings.picker.loading = true;
+    async loadFolderPicker(parentId = "0", host = null) {
+      const store = host || (this.fastlink.picker ? this.fastlink : this.settings);
+      if (!store.picker) store.picker = { parentId: "0", path: [], folders: [], loading: false };
+      store.picker.loading = true;
       this.render();
       const files = await this.api.listAll(parentId);
-      this.settings.picker.parentId = String(parentId);
-      this.settings.picker.folders = files.filter((file) => Number(file.type) === 1).sort((left, right) => naturalCompare(left.name, right.name));
-      this.settings.picker.loading = false;
+      store.picker.parentId = String(parentId);
+      store.picker.folders = files.filter((file) => Number(file.type) === 1).sort((left, right) => naturalCompare(left.name, right.name));
+      store.picker.loading = false;
       this.render();
     }
     createActionHandlers() {
@@ -19395,6 +19472,13 @@ ${end.comment}` : end.comment;
           this.fastlink.tool = tool;
           if (["export", "import"].includes(tool)) this.fastlink.mode = tool;
           if (tool === "filters" && !this.fastlink.filterDraft) this.fastlink.filterDraft = structuredClone(this.config.fastlinkTools || {});
+          this.render();
+        },
+        "fastlink-pick-seed": async () => this.openFastlinkFolderPicker("fastlinkSeed", "\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939"),
+        "fastlink-folder-clear": (control) => {
+          const draft = this.fastlink.filterDraft ||= structuredClone(this.config.fastlinkTools || {});
+          draft.seedFolderId = "";
+          draft.seedFolderName = "";
           this.render();
         },
         "fastlink-export": () => this.generateFastlink(),
@@ -19658,7 +19742,7 @@ ${end.comment}` : end.comment;
         },
         "fixed-mapping-add": (control) => {
           const mappings = this.settings.draft.library.recognition.fixedMappings ||= [];
-          const mapping = { id: uniqueId("mapping"), field: control.dataset.field || "mediaSource", aliases: [""], output: "" };
+          const mapping = { id: uniqueId("mapping"), field: control.dataset.field || "mediaSource", aliases: [""], output: control.dataset.defaultOutput || "" };
           const scrollState = this.captureScrollState();
           mappings.push(mapping);
           this.render();
@@ -19680,24 +19764,34 @@ ${end.comment}` : end.comment;
           await this.loadFolderPicker("0");
         },
         "folder-open": async (control) => {
-          const folder = this.settings.picker.folders.find((item) => String(item.id) === String(control.dataset.id));
+          const store = this.fastlink.picker ? this.fastlink : this.settings;
+          const folder = store.picker.folders.find((item) => String(item.id) === String(control.dataset.id));
           if (!folder) return;
-          this.settings.picker.path.push({ id: String(folder.id), name: String(folder.name || "") });
-          await this.loadFolderPicker(folder.id);
+          store.picker.path.push({ id: String(folder.id), name: String(folder.name || "") });
+          await this.loadFolderPicker(folder.id, store);
         },
         "folder-up": async () => {
-          this.settings.picker.path.pop();
-          await this.loadFolderPicker(this.settings.picker.path.at(-1)?.id || "0");
+          const store = this.fastlink.picker ? this.fastlink : this.settings;
+          store.picker.path.pop();
+          await this.loadFolderPicker(store.picker.path.at(-1)?.id || "0", store);
         },
         "folder-cancel": () => {
-          this.settings.picker = null;
+          (this.fastlink.picker ? this.fastlink : this.settings).picker = null;
           this.render();
         },
         "folder-select": () => {
-          const current = this.settings.picker.path.at(-1);
-          this.settings.draft.library.rootId = current?.id || "0";
-          this.settings.draft.library.rootName = current?.name || "\u5168\u90E8\u6587\u4EF6";
-          this.settings.picker = null;
+          const store = this.fastlink.picker ? this.fastlink : this.settings;
+          const picker = store.picker;
+          const current = picker.path.at(-1);
+          if (picker.target === "fastlinkSeed") {
+            this.fastlink.filterDraft ||= structuredClone(this.config.fastlinkTools || {});
+            this.fastlink.filterDraft.seedFolderId = current?.id || "";
+            this.fastlink.filterDraft.seedFolderName = current?.name || "";
+          } else {
+            this.settings.draft.library.rootId = current?.id || "0";
+            this.settings.draft.library.rootName = current?.name || "\u5168\u90E8\u6587\u4EF6";
+          }
+          store.picker = null;
           this.render();
         },
         "category-tab": (control) => {

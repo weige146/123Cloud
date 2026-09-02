@@ -18,6 +18,7 @@ const slice = (fromMarker, toMarker) => {
 };
 const code = [
   slice("// src/core/utils.js", "// src/api.js"),
+  slice("// src/core/recognition-maps.js", "// src/config.js"),
   slice("// src/core/category-yaml.js", "// src/core/empty-folders.js")
 ].join("\n");
 const driver = `;
