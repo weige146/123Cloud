@@ -17858,11 +17858,15 @@ ${end.comment}` : end.comment;
         const records = readTableSelectionRecords();
         seedReady = Array.isArray(records) && records.length === 1 && Number(records[0].type ?? records[0].Type ?? 0) !== 1 && isSeedLikeName(records[0].name || records[0].FileName || "");
       }
+      const seedButton = this.toolbar.querySelector('[data-command="fastlinkImport"]');
       for (const button of this.toolbar.querySelectorAll("[data-requires-selection]")) {
         if ("disabled" in button) button.disabled = !this.selection.hasSelection;
         button.setAttribute("aria-disabled", this.selection.hasSelection ? "false" : "true");
+        // 没有勾选时直接把整颗按钮隐藏掉（样式 .c123-helper-toolbar > [data-command][hidden]{display:none !important}），
+        // 避免删除/清空后页面里残留置灰的「重命名/整理/秒传/转存秒传」。
+        // 注意：种子按钮（fastlinkImport）由下方专属逻辑按 seedReady 进一步覆盖 hidden 状态。
+        if (button !== seedButton) button.hidden = !this.selection.hasSelection;
       }
-      const seedButton = this.toolbar.querySelector('[data-command="fastlinkImport"]');
       if (seedButton) {
         // 只在校验通过时（恰好勾选了 1 个秒传种子文件 .123fastlink.json / .txt）
         // 才显示「转存秒传」按钮；选中文件夹、普通文件、多选或未选中时直接隐藏。
