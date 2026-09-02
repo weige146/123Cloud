@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.2.3
-// @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
+// @version      1.3.0
+// @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @author       local
 // @license      MIT
 // @match        *://*.123pan.com/*
@@ -1006,6 +1006,167 @@
       const info = body.Info || body.info || body;
       return String(info.FileId ?? info.fileId ?? body.FileId ?? body.fileId ?? "");
     }
+    async uploadTextFile(fileName, text2, parentFileId, signal) {
+      const name = String(fileName || "").trim();
+      if (!name) throw new Error("\u7F3A\u5C11\u4E0A\u4F20\u6587\u4EF6\u540D");
+      const content = String(text2 ?? "");
+      const size = stringByteSize(content);
+      if (size > FASTLINK_MAX_TEXT_FILE_SIZE) throw new Error(`\u6587\u672C\u5185\u5BB9\u8D85\u8FC7 ${formatBytes(FASTLINK_MAX_TEXT_FILE_SIZE)} \u4E0A\u9650\uFF1A${name}`);
+      const etag = md5Hex(content);
+      const data = await this.request("POST", "/b/api/file/upload_request", {
+        signal,
+        body: {
+          driveId: 0,
+          etag,
+          fileName: name,
+          parentFileId: Number(parentFileId || 0),
+          size,
+          type: 0,
+          duplicate: 1,
+          event: "homeUploadFile",
+          operateType: 1,
+          RequestSource: null
+        }
+      });
+      const upload = data?.data || {};
+      if (upload.Reuse || upload.reuse) return { id: String(upload.FileId ?? upload.fileId ?? ""), etag, size, reused: true };
+      if (!upload.Bucket || !upload.Key || !upload.UploadId) throw new Error("\u4E0A\u4F20\u8BF7\u6C42\u672A\u8FD4\u56DE\u5B58\u50A8\u53C2\u6570\uFF0C\u65E0\u6CD5\u7EE7\u7EED\u4E0A\u4F20");
+      const authData = await this.request("POST", "/b/api/file/s3_upload_object/auth", {
+        signal,
+        body: {
+          bucket: upload.Bucket,
+          key: upload.Key,
+          partNumberEnd: "1",
+          partNumberStart: "1",
+          uploadId: upload.UploadId,
+          StorageNode: upload.StorageNode
+        }
+      });
+      const presignedUrl = authData?.data?.presignedUrls?.["1"];
+      if (!presignedUrl) throw new Error("\u672A\u83B7\u53D6\u5230 S3 \u4E0A\u4F20\u51ED\u8BC1");
+      await this.uploadToPresignedUrl(presignedUrl, content, signal);
+      await this.request("POST", "/b/api/file/upload_complete/v2", {
+        signal,
+        body: {
+          fileId: upload.FileId,
+          bucket: upload.Bucket,
+          fileSize: String(size),
+          key: upload.Key,
+          isMultipart: false,
+          uploadId: upload.UploadId,
+          StorageNode: upload.StorageNode
+        }
+      });
+      return { id: String(upload.FileId ?? ""), etag, size, reused: false };
+    }
+    async uploadToPresignedUrl(presignedUrl, text2, signal) {
+      const blob = new Blob([text2], { type: "text/plain;charset=utf-8" });
+      const put = (headers) => fetch(presignedUrl, { method: "PUT", signal, ...(headers ? { headers } : {}), body: blob });
+      let response = await put({ "Content-Type": "text/plain;charset=utf-8" });
+      if (!response.ok && (response.status === 403 || response.status === 400)) response = await put(null);
+      if (!response.ok) throw new Error(`S3 \u4E0A\u4F20\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
+    }
+    assertDownloadedText(text) {
+      const trimmed = String(text ?? "").trim();
+      if (!trimmed.startsWith("{")) return trimmed;
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed.files) && (parsed.code !== void 0 || parsed.message || parsed.Message)) {
+          throw new Error(`\u4E0B\u8F7D\u76F4\u94FE\u8FD4\u56DE\u7684\u662F\u63A5\u53E3\u9519\u8BEF\u800C\u975E\u6587\u4EF6\u5185\u5BB9\uFF1A${parsed.message || parsed.Message || "code " + parsed.code}`);
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("\u4E0B\u8F7D\u76F4\u94FE")) throw error;
+      }
+      return trimmed;
+    }
+    async readFileText(file, signal) {
+      let record = file;
+      const fileId = Number(record?.id || record?.fileId || 0);
+      if (!fileId) throw new Error("\u7F3A\u5C11\u6709\u6548\u6587\u4EF6 ID\uFF0C\u65E0\u6CD5\u8BFB\u53D6\u5185\u5BB9");
+      if (!record.etag || !record.s3KeyFlag) {
+        const details = await this.fileInfos([fileId], signal);
+        const found = details.find((item) => String(item.id) === String(fileId));
+        if (!found) throw new Error("\u672A\u67E5\u8BE2\u5230\u6587\u4EF6\u4FE1\u606F\uFF0C\u65E0\u6CD5\u8BFB\u53D6\u5185\u5BB9");
+        record = { ...record, ...found, id: String(fileId) };
+      }
+      const size = Number(record.size || 0);
+      if (size > FASTLINK_MAX_TEXT_FILE_SIZE) throw new Error(`\u6587\u4EF6\u8D85\u8FC7 ${formatBytes(FASTLINK_MAX_TEXT_FILE_SIZE)} \u4E0A\u9650\uFF0C\u4E0D\u662F\u6709\u6548\u7684\u79D2\u4F20\u6587\u4EF6\uFF1A${record.name || ""}`);
+      const urls = await this.readTextDownloadUrls(record, signal);
+      const errors = [];
+      for (const url of urls) {
+        try {
+          return { name: record.name || "", text: await this.fetchTextContent(url, signal) };
+        } catch (error) {
+          if (error?.name === "AbortError" && signal?.aborted) throw error;
+          errors.push(error?.message || String(error));
+        }
+      }
+      throw new Error(`\u8BFB\u53D6\u6587\u4EF6\u5185\u5BB9\u5931\u8D25\uFF1A${errors.join("\uFF1B")}`);
+    }
+    async readTextDownloadUrls(record, signal) {
+      const body = {
+        driveId: 0,
+        etag: String(record.etag || ""),
+        fileId: Number(record.id || record.fileId || 0),
+        s3keyFlag: String(record.s3KeyFlag || ""),
+        type: Number(record.type || 0),
+        fileName: String(record.name || ""),
+        size: String(Number(record.size || 0))
+      };
+      const data = await this.request("POST", "/b/api/v2/file/download_info", { signal, body });
+      const info = data?.data || {};
+      const downloadPath = String(info.downloadPath || "");
+      const urls = [];
+      if (/^https?:\/\//i.test(downloadPath)) {
+        urls.push(downloadPath);
+      } else if (downloadPath) {
+        const list = Array.isArray(info.dispatchList) ? info.dispatchList : [];
+        for (const item of list) {
+          const prefix = String(item?.prefix || item?.Prefix || "").replace(/\/+$/, "");
+          if (prefix) urls.push(`${prefix}/${downloadPath.replace(/^\/+/, "")}`);
+        }
+      }
+      const fallback = findDownloadUrl(data);
+      if (fallback) urls.push(decodeDownloadV2Url(fallback));
+      if (!urls.length) throw new Error("\u4E0B\u8F7D\u4FE1\u606F\u672A\u8FD4\u56DE\u53EF\u7528\u76F4\u94FE");
+      return urls;
+    }
+    async fetchTextContent(url, signal) {
+      const controller = new AbortController();
+      const abortParent = () => controller.abort(signal?.reason);
+      if (signal) signal.addEventListener("abort", abortParent, { once: true });
+      const timeout = setTimeout(() => controller.abort(), 3e4);
+      try {
+        try {
+          const response = await fetch(url, { signal: controller.signal });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return this.assertDownloadedText(await response.text());
+        } catch (error) {
+          if (error?.name === "AbortError") throw error;
+          if (typeof GM_xmlhttpRequest !== "function") throw error;
+          return await new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+              method: "GET",
+              url,
+              timeout: 3e4,
+              onload: (result) => {
+                try {
+                  if (result.status >= 200 && result.status < 300) resolve(this.assertDownloadedText(String(result.responseText || "")));
+                  else reject(new Error(`HTTP ${result.status}`));
+                } catch (error2) {
+                  reject(error2);
+                }
+              },
+              onerror: () => reject(new Error("\u4E0B\u8F7D\u76F4\u94FE\u8BF7\u6C42\u5931\u8D25")),
+              ontimeout: () => reject(new Error("\u4E0B\u8F7D\u76F4\u94FE\u8BF7\u6C42\u8D85\u65F6"))
+            });
+          });
+        }
+      } finally {
+        clearTimeout(timeout);
+        if (signal) signal.removeEventListener("abort", abortParent);
+      }
+    }
     async ensurePath(rootId, parts, cache = /* @__PURE__ */ new Map(), signal) {
       let current = String(rootId || "0");
       let path = current;
@@ -1575,6 +1736,8 @@
       debugMode: false,
       useFolderNameForJson: true,
       appendDateToJson: false,
+      seedFolderId: "",
+      secondaryUseJson: true,
       filterOnShareEnabled: false,
       filterOnTransferEnabled: false,
       filters: [
@@ -1699,6 +1862,9 @@
       name: String(item?.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B"),
       enabled: item?.enabled === true
     })).filter((item) => item.ext);
+    const seedFolderId = String(config.fastlinkTools.seedFolderId ?? "").trim();
+    config.fastlinkTools.seedFolderId = /^\d{8}$/.test(seedFolderId) ? seedFolderId : "";
+    config.fastlinkTools.secondaryUseJson = config.fastlinkTools.secondaryUseJson !== false;
     delete config.appearance.hideOfficialPromotions;
     config.schemaVersion = 10;
     delete config.metadata;
@@ -2932,7 +3098,18 @@
     async selectedItems(signal, frozenSnapshot = null) {
       const snapshot = frozenSnapshot || this.readSelection();
       if (!snapshot.hasSelection) return [];
-      if (!snapshot.selectAll && typeof this.api?.fileInfos === "function") {
+      if (!snapshot.selectAll) {
+        const records = Array.isArray(snapshot.records) ? snapshot.records : frozenSnapshot ? [] : readTableSelectionRecords() || [];
+        if (records.length) {
+          const byRecordId = new Map(records.map((record) => normalizeFile(record)).filter(Boolean).map((file) => [String(file.id), file]));
+          const mapped = [...snapshot.selectedIds].map((id) => byRecordId.get(String(id))).filter(Boolean);
+          if (mapped.length === snapshot.selectedIds.size) return mapped;
+          if (typeof this.api?.fileInfos !== "function") {
+            const pageContext = readFilePageContext();
+            const files = await this.currentDirectoryFiles(signal, pageContext.global ? "0" : snapshot.currentDir, pageContext);
+            return files.filter((file) => snapshot.selectedIds.has(String(file.id)));
+          }
+        }
         const selectedIds = [...snapshot.selectedIds];
         const files2 = signal === void 0 ? await this.api.fileInfos(selectedIds) : await this.api.fileInfos(selectedIds, signal);
         const byId = new Map(files2.map((file) => [String(file.id), file]));
@@ -4930,9 +5107,215 @@
     }
   }
 
+  // src/core/table-selection.js
+  var TABLE_FIBER_HOSTS = [".ant-table-wrapper", ".file-table-list-wrapper", "[class*='table-list-wrapper']", "[class*='table-module']", "[class*='ant-table']"];
+  var tableSelectionCache = { host: null };
+  function reactFiberKey(element) {
+    for (const key of Object.keys(element || {})) {
+      if (key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")) return key;
+    }
+    return "";
+  }
+  function reactContainerKey(element) {
+    for (const key of Object.keys(element || {})) {
+      if (key.startsWith("__reactContainer$")) return key;
+    }
+    return "";
+  }
+  function isTableFiber(fiber) {
+    const props = fiber?.memoizedProps;
+    return Boolean(props && Array.isArray(props.dataSource) && props.rowSelection && Array.isArray(props.columns));
+  }
+  function tableFiberFromElement(element) {
+    const key = reactFiberKey(element);
+    if (!key) return null;
+    let fiber = element[key];
+    while (fiber) {
+      if (isTableFiber(fiber)) return fiber;
+      fiber = fiber.return;
+    }
+    return null;
+  }
+  function findTableFiberFromRoots() {
+    const hosts = [document.getElementById("app"), document.getElementById("root"), document.getElementById("__next")].filter(Boolean);
+    for (const host of hosts) {
+      const key = reactContainerKey(host);
+      if (!key) continue;
+      const queue = [host[key]];
+      const visited = new Set();
+      for (let scanned = 0; queue.length && scanned < 4000; scanned += 1) {
+        const fiber = queue.shift();
+        if (!fiber || visited.has(fiber)) continue;
+        visited.add(fiber);
+        if (isTableFiber(fiber)) return fiber;
+        if (fiber.child) queue.push(fiber.child);
+        if (fiber.sibling) queue.push(fiber.sibling);
+      }
+    }
+    return null;
+  }
+  function findTableFiber() {
+    if (tableSelectionCache.host?.isConnected) {
+      const cached = tableFiberFromElement(tableSelectionCache.host);
+      if (cached) return cached;
+    }
+    for (const selector of TABLE_FIBER_HOSTS) {
+      for (const element of document.querySelectorAll(selector)) {
+        if (!element.isConnected) continue;
+        const fiber = tableFiberFromElement(element);
+        if (fiber) {
+          tableSelectionCache.host = element;
+          return fiber;
+        }
+      }
+    }
+    const fiber = findTableFiberFromRoots();
+    if (fiber) tableSelectionCache.host = null;
+    return fiber;
+  }
+  function tableRowKeyOf(record, rowKey) {
+    if (rowKey && record && record[rowKey] !== void 0) return record[rowKey];
+    return record?.FileId ?? record?.fileId ?? record?.id ?? record?.key;
+  }
+  function readTableSelectionRecords() {
+    try {
+      const fiber = findTableFiber();
+      if (!fiber) return null;
+      const props = fiber.memoizedProps;
+      const selectedRowKeys = props.rowSelection?.selectedRowKeys;
+      if (!Array.isArray(selectedRowKeys) || !selectedRowKeys.length) return null;
+      const selected = new Set(selectedRowKeys.map((key) => String(key)));
+      const records = (props.dataSource || []).filter((record) => selected.has(String(tableRowKeyOf(record, props.rowKey))));
+      return records.length ? records.map((record) => ({ ...record })) : null;
+    } catch {
+      return null;
+    }
+  }
+
   // src/core/fastlink.js
-  var FASTLINK_VERSION = "3.2.0-tdr.4";
+  var FASTLINK_VERSION = "3.2.2-tdr.5";
   var BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  var FASTLINK_MAX_TEXT_FILE_SIZE = 3145728;
+  function stringByteSize(value) {
+    return new TextEncoder().encode(String(value ?? "")).length;
+  }
+  function md5Rotate(value, count) {
+    return (value << count) | (value >>> (32 - count));
+  }
+  function md5Cmn(q, a, b, x, s, t) {
+    a = ((a + q) | 0) + ((x + t) | 0) | 0;
+    return ((md5Rotate(a, s) + b) | 0);
+  }
+  function md5Ff(a, b, c, d, x, s, t) {
+    return md5Cmn((b & c | ~b & d), a, b, x, s, t);
+  }
+  function md5Gg(a, b, c, d, x, s, t) {
+    return md5Cmn((b & d | c & ~d), a, b, x, s, t);
+  }
+  function md5Hh(a, b, c, d, x, s, t) {
+    return md5Cmn((b ^ c ^ d), a, b, x, s, t);
+  }
+  function md5Ii(a, b, c, d, x, s, t) {
+    return md5Cmn((c ^ (b | ~d)), a, b, x, s, t);
+  }
+  function md5Cycle(words, bitLength) {
+    words[bitLength >> 5] |= 128 << bitLength % 32;
+    words[(bitLength + 64 >>> 9 << 4) + 14] = bitLength;
+    let a = 1732584193;
+    let b = -271733879;
+    let c = -1732584194;
+    let d = 271733878;
+    for (let index = 0; index < words.length; index += 16) {
+      const [olda, oldb, oldc, oldd] = [a, b, c, d];
+      a = md5Ff(a, b, c, d, words[index], 7, -680876936);
+      d = md5Ff(d, a, b, c, words[index + 1], 12, -389564586);
+      c = md5Ff(c, d, a, b, words[index + 2], 17, 606105819);
+      b = md5Ff(b, c, d, a, words[index + 3], 22, -1044525330);
+      a = md5Ff(a, b, c, d, words[index + 4], 7, -176418897);
+      d = md5Ff(d, a, b, c, words[index + 5], 12, 1200080426);
+      c = md5Ff(c, d, a, b, words[index + 6], 17, -1473231341);
+      b = md5Ff(b, c, d, a, words[index + 7], 22, -45705983);
+      a = md5Ff(a, b, c, d, words[index + 8], 7, 1770035416);
+      d = md5Ff(d, a, b, c, words[index + 9], 12, -1958414417);
+      c = md5Ff(c, d, a, b, words[index + 10], 17, -42063);
+      b = md5Ff(b, c, d, a, words[index + 11], 22, -1990404162);
+      a = md5Ff(a, b, c, d, words[index + 12], 7, 1804603682);
+      d = md5Ff(d, a, b, c, words[index + 13], 12, -40341101);
+      c = md5Ff(c, d, a, b, words[index + 14], 17, -1502002290);
+      b = md5Ff(b, c, d, a, words[index + 15], 22, 1236535329);
+      a = md5Gg(a, b, c, d, words[index + 1], 5, -165796510);
+      d = md5Gg(d, a, b, c, words[index + 6], 9, -1069501632);
+      c = md5Gg(c, d, a, b, words[index + 11], 14, 643717713);
+      b = md5Gg(b, c, d, a, words[index], 20, -373897302);
+      a = md5Gg(a, b, c, d, words[index + 5], 5, -701558691);
+      d = md5Gg(d, a, b, c, words[index + 10], 9, 38016083);
+      c = md5Gg(c, d, a, b, words[index + 15], 14, -660478335);
+      b = md5Gg(b, c, d, a, words[index + 4], 20, -405537848);
+      a = md5Gg(a, b, c, d, words[index + 9], 5, 568446438);
+      d = md5Gg(d, a, b, c, words[index + 14], 9, -1019803690);
+      c = md5Gg(c, d, a, b, words[index + 3], 14, -187363961);
+      b = md5Gg(b, c, d, a, words[index + 8], 20, 1163531501);
+      a = md5Gg(a, b, c, d, words[index + 13], 5, -1444681467);
+      d = md5Gg(d, a, b, c, words[index + 2], 9, -51403784);
+      c = md5Gg(c, d, a, b, words[index + 7], 14, 1735328473);
+      b = md5Gg(b, c, d, a, words[index + 12], 20, -1926607734);
+      a = md5Hh(a, b, c, d, words[index + 5], 4, -378558);
+      d = md5Hh(d, a, b, c, words[index + 8], 11, -2022574463);
+      c = md5Hh(c, d, a, b, words[index + 11], 16, 1839030562);
+      b = md5Hh(b, c, d, a, words[index + 14], 23, -35309556);
+      a = md5Hh(a, b, c, d, words[index + 1], 4, -1530992060);
+      d = md5Hh(d, a, b, c, words[index + 4], 11, 1272893353);
+      c = md5Hh(c, d, a, b, words[index + 7], 16, -155497632);
+      b = md5Hh(b, c, d, a, words[index + 10], 23, -1094730640);
+      a = md5Hh(a, b, c, d, words[index + 13], 4, 681279174);
+      d = md5Hh(d, a, b, c, words[index], 11, -358537222);
+      c = md5Hh(c, d, a, b, words[index + 3], 16, -722521979);
+      b = md5Hh(b, c, d, a, words[index + 6], 23, 76029189);
+      a = md5Hh(a, b, c, d, words[index + 9], 4, -640364487);
+      d = md5Hh(d, a, b, c, words[index + 12], 11, -421815835);
+      c = md5Hh(c, d, a, b, words[index + 15], 16, 530742520);
+      b = md5Hh(b, c, d, a, words[index + 2], 23, -995338651);
+      a = md5Ii(a, b, c, d, words[index], 6, -198630844);
+      d = md5Ii(d, a, b, c, words[index + 7], 10, 1126891415);
+      c = md5Ii(c, d, a, b, words[index + 14], 15, -1416354905);
+      b = md5Ii(b, c, d, a, words[index + 5], 21, -57434055);
+      a = md5Ii(a, b, c, d, words[index + 12], 6, 1700485571);
+      d = md5Ii(d, a, b, c, words[index + 3], 10, -1894986606);
+      c = md5Ii(c, d, a, b, words[index + 10], 15, -1051523);
+      b = md5Ii(b, c, d, a, words[index + 1], 21, -2054922799);
+      a = md5Ii(a, b, c, d, words[index + 8], 6, 1873313359);
+      d = md5Ii(d, a, b, c, words[index + 15], 10, -30611744);
+      c = md5Ii(c, d, a, b, words[index + 6], 15, -1560198380);
+      b = md5Ii(b, c, d, a, words[index + 13], 21, 1309151649);
+      a = md5Ii(a, b, c, d, words[index + 4], 6, -145523070);
+      d = md5Ii(d, a, b, c, words[index + 11], 10, -1120210379);
+      c = md5Ii(c, d, a, b, words[index + 2], 15, 718787259);
+      b = md5Ii(b, c, d, a, words[index + 9], 21, -343485551);
+      a = a + olda | 0;
+      b = b + oldb | 0;
+      c = c + oldc | 0;
+      d = d + oldd | 0;
+    }
+    return [a, b, c, d];
+  }
+  function md5Hex(value) {
+    const bytes = new TextEncoder().encode(String(value ?? ""));
+    const bitLength = bytes.length * 8;
+    const blockCount = ((bytes.length + 8) >> 6) + 1;
+    const words = new Array(blockCount * 16).fill(0);
+    for (let index = 0; index < bytes.length; index += 1) {
+      words[index >> 2] |= bytes[index] << (index % 4) * 8;
+    }
+    const digest = md5Cycle(words, bitLength);
+    let output = "";
+    for (const word of digest) {
+      for (let offset = 0; offset < 4; offset += 1) {
+        output += "0123456789abcdef"[(word >> (offset * 8 + 4)) & 15];
+        output += "0123456789abcdef"[(word >> (offset * 8)) & 15];
+      }
+    }
+    return output;
+  }
   var FASTLINK_TEXT_PREFIX = "123FLCPV2$";
   var FASTLINK_PREFIXES = {
     "123FLCPV2$": { commonPath: true, usesBase62: true },
@@ -5325,6 +5708,72 @@
     const safeName = cleanPathPart(options.name || sharedFolderName || input.shareKey || "123FastLink_PublicShare") || "123FastLink_PublicShare";
     const date = options.appendDate ? `_${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10).replace(/-/g, "")}` : "";
     return { item: { name: safeName }, fileCount: files.length, filename: `${safeName}${date}.123fastlink.json`, text: buildFastlinkJson(files), link: buildFastlinkText(files), shareKey: input.shareKey, sharePwd: input.sharePwd };
+  }
+  function normalizeSeedFolderId(value) {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "";
+    if (!/^\d{8}$/.test(raw)) throw new Error("\u79CD\u5B50\u6587\u4EF6\u5939 ID \u65E0\u6548\uFF1A\u5E94\u4E3A 8 \u4F4D\u6570\u5B57\uFF0C\u6216\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55");
+    return raw;
+  }
+  function buildSecondarySeedName(items, options = {}) {
+    const useJson = options.useJson !== false;
+    const date = options.appendDate ? `_${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10).replace(/-/g, "")}` : "";
+    const folderName = options.useFolderName === false || (items?.length || 0) !== 1 ? "123FastLink_Export" : cleanPathPart(items[0]?.name) || "123FastLink_Export";
+    return { fileName: `${folderName}${date}.123fastlink.${useJson ? "json" : "txt"}`, useJson };
+  }
+  async function generateSecondaryFastlink(api, items, options = {}) {
+    if (!Array.isArray(items) || !items.length) throw new Error("\u8BF7\u5148\u9009\u62E9\u8981\u751F\u6210\u4E8C\u7EA7\u79D2\u4F20\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
+    options.onProgress?.(0, 2, "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
+    const files = await collectFastlinkFiles(api, items, {
+      signal: options.signal,
+      filterEnabled: options.filterEnabled,
+      filterExtensions: options.filterExtensions,
+      onProgress: (done) => options.onProgress?.(0, 2, `\u5DF2\u626B\u63CF ${done} \u4E2A\u6587\u4EF6`)
+    });
+    const { fileName, useJson } = buildSecondarySeedName(items, options);
+    const content = useJson ? buildFastlinkJson(files) : buildFastlinkText(files);
+    const parentId = normalizeSeedFolderId(options.seedFolderId) || String(options.currentDir || "0");
+    options.onProgress?.(1, 2, `\u4E0A\u4F20\u79CD\u5B50\u6587\u4EF6\uFF1A${fileName}`);
+    const seed = await api.uploadTextFile(fileName, content, parentId, options.signal);
+    const link = buildFastlinkText([{ name: fileName, fileName, etag: seed.etag, size: seed.size, path: fileName }]);
+    options.onProgress?.(2, 2, "\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210");
+    return { item: { name: fileName }, fileCount: files.length, filename: fileName, text: content, link, seedFile: { id: seed.id, name: fileName, etag: seed.etag, size: seed.size } };
+  }
+  async function saveSecondaryFastlink(api, value, rootId, options = {}) {
+    const parsed = typeof value === "string" ? parseFastlink(value) : value;
+    if (!parsed?.files?.length) throw new Error("\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55");
+    if (parsed.files.length !== 1) throw new Error("\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u683C\u5F0F\u9519\u8BEF\uFF1A\u5E94\u53EA\u5305\u542B 1 \u4E2A\u79CD\u5B50\u6587\u4EF6");
+    const seed = parsed.files[0];
+    const parentId = normalizeSeedFolderId(options.seedFolderId) || String(rootId || "0");
+    options.onProgress?.(0, 2, `\u8F6C\u5B58\u79CD\u5B50\u6587\u4EF6\uFF1A${seed.fileName}`);
+    const seedId = await api.reuseFile(seed, parentId, options.signal);
+    options.onProgress?.(1, 2, "\u8BFB\u53D6\u79CD\u5B50\u5185\u5BB9");
+    const { text: seedText } = await api.readFileText({ id: seedId, name: seed.fileName, etag: seed.etag, size: seed.size }, options.signal);
+    options.onProgress?.(1, 2, "\u8F6C\u5B58\u79D2\u4F20\u5185\u5BB9");
+    return importFastlink(api, seedText, rootId, options);
+  }
+  async function saveFastlinkFromCloudFile(api, item, rootId, options = {}) {
+    if (!item || Number(item.type) === 1) throw new Error("\u8BF7\u5728\u6587\u4EF6\u5217\u8868\u52FE\u9009\u4E00\u4E2A\u79D2\u4F20\u6587\u4EF6\uFF08\u800C\u975E\u6587\u4EF6\u5939\uFF09");
+    options.onProgress?.(0, 1, `\u8BFB\u53D6\u6587\u4EF6\u5185\u5BB9\uFF1A${item.name}`);
+    const { text } = await api.readFileText(item, options.signal);
+    options.onProgress?.(1, 1, "\u8F6C\u5B58\u79D2\u4F20\u5185\u5BB9");
+    try {
+      return await importFastlink(api, text, rootId, options);
+    } catch (error) {
+      const message = String(error?.message || "");
+      if (/\u89E3\u6790\u5931\u8D25|\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55|\u65E0\u6548/.test(message)) {
+        throw new Error(`${message}\uFF08\u5B9E\u9645\u8BFB\u5230\u7684\u5F00\u5934\uFF1A${String(text).trim().slice(0, 60) || "\u7A7A\u5185\u5BB9"}\uFF09`);
+      }
+      throw error;
+    }
+  }
+  async function saveFastlinkLinkFile(api, artifact, parentId, options = {}) {
+    if (!artifact?.text && !artifact?.link) throw new Error("\u6CA1\u6709\u53EF\u4FDD\u5B58\u7684\u79D2\u4F20\u5185\u5BB9");
+    const base = cleanPathPart(String(artifact.filename || artifact.item?.name || "123FastLink_Export").replace(/\.123fastlink(?:\.(?:json|txt))?$/i, "")) || "123FastLink_Export";
+    const content = artifact.link || artifact.text;
+    const fileName = `${base}.123fastlink.${artifact.link ? "txt" : "json"}`;
+    const seed = await api.uploadTextFile(fileName, content, parentId, options.signal);
+    return { ...seed, fileName };
   }
 
   // src/public-share-cleanup.js
@@ -15680,13 +16129,15 @@ ${end.comment}` : end.comment;
     <button class="button ghost compact" data-action="cancel-task">\u505C\u6B62\u540E\u7EED\u64CD\u4F5C</button>
   </div>`;
   }
+  var FASTLINK_TASK_LABELS = { export: "\u751F\u6210\u79D2\u4F20", secondaryExport: "\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5", import: "\u5BFC\u5165\u79D2\u4F20", secondaryImport: "\u8F6C\u5B58\u4E8C\u7EA7\u94FE\u63A5", cloudImport: "\u8F6C\u5B58\u79D2\u4F20\u6587\u4EF6" };
+  var FASTLINK_IMPORT_TASK_KINDS = ["import", "secondaryImport", "cloudImport"];
   function renderBackgroundTask(ui) {
     const task = ui.backgroundTask;
     if (!task?.minimized) return "";
     const progress = ui.state.progress;
     const running = task.status === "running" || task.status === "cancelling";
     const percent = Math.max(0, Math.min(100, Math.round(Number(progress?.done || 0) / Math.max(1, Number(progress?.total || 1)) * 100)));
-    const label = task.kind === "export" ? "\u751F\u6210\u79D2\u4F20" : "\u5BFC\u5165\u79D2\u4F20";
+    const label = FASTLINK_TASK_LABELS[task.kind] || "\u79D2\u4F20\u4EFB\u52A1";
     if (running) {
       const message = task.status === "cancelling" ? "\u6B63\u5728\u53D6\u6D88\u4EFB\u52A1" : progress?.message || "\u6B63\u5728\u5904\u7406";
       return `<section class="background-task" role="status" aria-live="polite"><div class="background-task-copy"><span>${icon("loading", 16, "spin")}</span><div><strong>${label}</strong><small>${escapeHtml(message)} ${percent}%</small></div></div><div class="background-task-actions"><button class="icon-button" data-action="background-task-open" title="\u6062\u590D\u4EFB\u52A1\u7A97\u53E3" aria-label="\u6062\u590D\u4EFB\u52A1\u7A97\u53E3">${icon("chevronDown", 15)}</button><button class="icon-button danger" data-action="background-task-cancel" title="\u53D6\u6D88\u4EFB\u52A1" aria-label="\u53D6\u6D88\u4EFB\u52A1">${icon("close", 15)}</button></div></section>`;
@@ -15694,7 +16145,7 @@ ${end.comment}` : end.comment;
     const failed = task.status === "failed" || task.status === "cancelled";
     const partial = task.status === "partial";
     const status = task.status === "cancelled" ? "\u5DF2\u53D6\u6D88" : task.status === "failed" ? "\u5904\u7406\u5931\u8D25" : partial ? "\u90E8\u5206\u5B8C\u6210" : "\u5DF2\u5B8C\u6210";
-    const detail = failed ? task.error || "\u4EFB\u52A1\u672A\u5B8C\u6210" : task.kind === "export" ? `\u5DF2\u751F\u6210 ${Number(task.result?.length || 0)} \u4E2A\u79D2\u4F20\u6587\u4EF6` : `\u6210\u529F ${Number(task.result?.ok || 0)} \u9879${Number(task.result?.fail || 0) ? `\uFF0C\u5931\u8D25 ${Number(task.result.fail)} \u9879` : ""}`;
+    const detail = failed ? task.error || "\u4EFB\u52A1\u672A\u5B8C\u6210" : task.kind === "secondaryExport" ? `\u5DF2\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\uFF08\u542B ${Number(task.result?.fileCount || 0)} \u4E2A\u6587\u4EF6\uFF09` : FASTLINK_IMPORT_TASK_KINDS.includes(task.kind) ? `\u6210\u529F ${Number(task.result?.ok || 0)} \u9879${Number(task.result?.fail || 0) ? `\uFF0C\u5931\u8D25 ${Number(task.result.fail)} \u9879` : ""}` : `\u5DF2\u751F\u6210 ${Number(task.result?.length || 0)} \u4E2A\u79D2\u4F20\u6587\u4EF6`;
     const actionLabel = failed ? "\u8FD4\u56DE\u79D2\u4F20" : "\u67E5\u770B\u7ED3\u679C";
     return `<section class="background-task ${failed ? "danger" : partial ? "warning" : "success"}" role="status" aria-live="polite"><div class="background-task-copy"><span>${icon(failed || partial ? "alert" : "check", 16)}</span><div><strong>${label}${status}</strong><small>${escapeHtml(detail)}</small></div></div><div class="background-task-actions"><button class="button compact" data-action="background-task-open">${actionLabel}</button><button class="icon-button" data-action="background-task-dismiss" title="\u5173\u95ED\u63D0\u793A" aria-label="\u5173\u95ED\u63D0\u793A">${icon("close", 15)}</button></div></section>`;
   }
@@ -15800,13 +16251,15 @@ ${end.comment}` : end.comment;
     const batchPane = `${notice("\u6BCF\u884C\u4E00\u4E2A\u5206\u4EAB\u94FE\u63A5\u3001Key \u6216\u5E26\u63D0\u53D6\u7801\u7684\u6587\u672C\uFF1B\u6BCF\u4E2A\u5206\u4EAB\u4F1A\u72EC\u7ACB\u4E0B\u8F7D\u4E00\u4E2A\u6807\u51C6 JSON\u3002", "", "share")}<div class="editor-surface"><textarea id="fastlink-public-batch" placeholder="https://www.123865.com/s/xxxx?pwd=ABCD&#10;xxxx \u63D0\u53D6\u7801:ABCD">${escapeHtml(state.publicBatch || "")}</textarea></div>`;
     const splitPane = `${notice("\u652F\u6301\u9879\u76EE JSON\u3001123FLCPV2 \u94FE\u63A5\u548C\u65E7\u7248 V1/V2 \u6587\u672C\u3002\u6309\u76EE\u5F55\u5C42\u7EA7\u4F1A\u4E3A\u6BCF\u4E2A\u76EE\u5F55\u7EC4\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\uFF0C\u6309\u6570\u91CF\u4F1A\u6309\u6761\u76EE\u5207\u5206\u3002", "", "download")}<div class="button-row"><button class="button" data-action="fastlink-split-file-open">${icon("folderOpen", 15)}\u9009\u62E9 JSON</button><span>${escapeHtml(state.splitFileName || "\u4E5F\u53EF\u4EE5\u76F4\u63A5\u7C98\u8D34")}</span><input id="fastlink-split-file" type="file" accept=".json,.txt,.123fastlink" hidden></div><div class="editor-surface"><textarea id="fastlink-split-input" placeholder="\u7C98\u8D34 JSON \u6216\u79D2\u4F20\u94FE\u63A5">${escapeHtml(state.splitInput || "")}</textarea></div><div class="inline-fields"><label class="field"><span>\u62C6\u5206\u65B9\u5F0F</span><select id="fastlink-split-method"><option value="folder" ${state.splitMethod === "folder" ? "selected" : ""}>\u6309\u76EE\u5F55\u5C42\u7EA7</option><option value="count" ${state.splitMethod === "count" ? "selected" : ""}>\u6309\u6587\u4EF6\u6570\u91CF</option></select></label><label class="field"><span>${state.splitMethod === "count" ? "\u6BCF\u4EFD\u6587\u4EF6\u6570" : "\u76EE\u5F55\u5C42\u6570"}</span><input id="fastlink-split-amount" type="number" min="1" value="${Math.max(1, Number(state.splitAmount) || 1)}"></label></div>`;
     const convertPane = `${notice("\u5728 .123share \u4E0E\u9879\u76EE\u6807\u51C6 JSON \u4E4B\u95F4\u4E92\u8F6C\u3002\u8F6C\u6362\u53EA\u5728\u672C\u5730\u5B8C\u6210\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u6587\u4EF6\u3002", "", "settings")}<div class="button-row"><button class="button" data-action="fastlink-convert-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u6587\u4EF6</button><span>${escapeHtml(state.convertFileName || "\u652F\u6301 .123share / .json")}</span><input id="fastlink-convert-file" type="file" accept=".123share,.json" hidden></div><div class="editor-surface"><textarea id="fastlink-convert-input" placeholder="\u4E5F\u53EF\u4EE5\u7C98\u8D34\u6587\u4EF6\u5185\u5BB9">${escapeHtml(state.convertInput || "")}</textarea></div>${state.converted ? notice(`\u5DF2\u8F6C\u6362\u4E3A ${state.converted === "json" ? "JSON" : ".123share"} \u5E76\u5F00\u59CB\u4E0B\u8F7D\u3002`, "success", "check") : ""}`;
-    const filterPane = `${notice("\u542F\u7528\u540E\uFF0C\u751F\u6210\u6216\u8F6C\u5B58\u65F6\u4F1A\u8DF3\u8FC7\u5BF9\u5E94\u6269\u5C55\u540D\u3002\u8BBE\u7F6E\u4FDD\u5B58\u5728\u9879\u76EE\u914D\u7F6E\u4E2D\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-filter="share" ${settings.filterOnShareEnabled ? "checked" : ""}>\u751F\u6210\u65F6\u542F\u7528\u8FC7\u6EE4</label><label class="check-line"><input type="checkbox" data-fastlink-filter="transfer" ${settings.filterOnTransferEnabled ? "checked" : ""}>\u8F6C\u5B58\u65F6\u542F\u7528\u8FC7\u6EE4</label></div><div class="filter-actions"><button class="button compact" data-action="fastlink-filter-all">\u5168\u9009</button><button class="button compact" data-action="fastlink-filter-none">\u5168\u4E0D\u9009</button><button class="button compact" data-action="fastlink-filter-reset">\u6062\u590D\u9ED8\u8BA4</button></div><div class="fastlink-filter-list">${filters.map((item, index) => `<label class="check-line"><input type="checkbox" data-fastlink-filter="extension" data-index="${index}" ${item.enabled ? "checked" : ""}><span>.${escapeHtml(item.ext)}</span><small>${escapeHtml(item.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B")}</small></label>`).join("")}</div>`;
-    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
-    const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"]];
+    const secondaryPane = `${notice("\u4E8C\u7EA7\u79D2\u4F20\uFF1A\u6574\u5305\u5185\u5BB9\u5B58\u4E3A\u4E91\u76D8\u79CD\u5B50\u6587\u4EF6\uFF0C\u5BF9\u5916\u53EA\u5206\u4EAB\u4E00\u6761\u77ED\u94FE\u63A5\uFF0C\u5BF9\u65B9\u8F6C\u5B58\u65F6\u81EA\u52A8\u8FD8\u539F\u5168\u90E8\u6587\u4EF6\u3002\u79CD\u5B50\u9ED8\u8BA4\u5B58\u5F53\u524D\u76EE\u5F55\uFF08\u53EF\u5728\u79D2\u4F20\u8BBE\u7F6E\u56FA\u5B9A\u6587\u4EF6\u5939\uFF09\uFF0C\u8BF7\u52FF\u5220\u9664\u3002", "", "link")}<div class="button-row"><button class="button" data-action="fastlink-secondary-save-link">${icon("download", 15)}\u628A\u5DF2\u751F\u6210\u94FE\u63A5\u4FDD\u5B58\u5230\u4E91\u76D8</button><button class="button" data-action="fastlink-secondary-from-file">${icon("folderOpen", 15)}\u4ECE\u52FE\u9009\u7684\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58</button><button class="button" data-action="fastlink-secondary-import">${icon("import", 15)}\u4ECE\u94FE\u63A5\u8F6C\u5B58</button></div><div class="editor-surface secondary-editor"><textarea id="fastlink-secondary-input" placeholder="\u7C98\u8D34\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\uFF08\u5F62\u5982 123FLCPV2$%xxx#size#\u540D\u79F0.json\uFF09\uFF0C\u70B9\u201C\u4ECE\u94FE\u63A5\u8F6C\u5B58\u201D\u8FD8\u539F\u5168\u90E8\u6587\u4EF6">${escapeHtml(state.secondaryInput || "")}</textarea></div>`;
+    const filterPane =`${notice("\u542F\u7528\u540E\uFF0C\u751F\u6210\u6216\u8F6C\u5B58\u65F6\u4F1A\u8DF3\u8FC7\u5BF9\u5E94\u6269\u5C55\u540D\u3002\u8BBE\u7F6E\u4FDD\u5B58\u5728\u9879\u76EE\u914D\u7F6E\u4E2D\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-filter="share" ${settings.filterOnShareEnabled ? "checked" : ""}>\u751F\u6210\u65F6\u542F\u7528\u8FC7\u6EE4</label><label class="check-line"><input type="checkbox" data-fastlink-filter="transfer" ${settings.filterOnTransferEnabled ? "checked" : ""}>\u8F6C\u5B58\u65F6\u542F\u7528\u8FC7\u6EE4</label></div><div class="filter-actions"><button class="button compact" data-action="fastlink-filter-all">\u5168\u9009</button><button class="button compact" data-action="fastlink-filter-none">\u5168\u4E0D\u9009</button><button class="button compact" data-action="fastlink-filter-reset">\u6062\u590D\u9ED8\u8BA4</button></div><div class="fastlink-filter-list">${filters.map((item, index) => `<label class="check-line"><input type="checkbox" data-fastlink-filter="extension" data-index="${index}" ${item.enabled ? "checked" : ""}><span>.${escapeHtml(item.ext)}</span><small>${escapeHtml(item.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B")}</small></label>`).join("")}</div>`;
+    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939 ID\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C8 \u4F4D\u6570\u5B57\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><input type="number" inputmode="numeric" data-fastlink-setting="seedFolderId" value="${escapeHtml(String(settings.seedFolderId ?? ""))}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
+    const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["secondary", "\u4E8C\u7EA7\u79D2\u4F20", "link"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"]];
     const nav = `<div class="fastlink-tool-grid">${tools.map(([key, label, iconName]) => `<button class="button tool-button ${tool === key ? "active" : ""}" data-action="fastlink-tool" data-tool="${key}">${icon(iconName, 14)}${label}</button>`).join("")}</div>`;
-    let pane = tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : settingsPane;
-    const body = `${nav}<div class="mode-toolbar"><div class="segmented"><button data-action="fastlink-mode" data-mode="import" class="${tool === "import" ? "active" : ""}">${icon("import", 15)}\u5BFC\u5165</button><button data-action="fastlink-mode" data-mode="export" class="${tool === "export" ? "active" : ""}">${icon("download", 15)}\u5BFC\u51FA</button></div></div><div class="fastlink-pane">${pane}</div>${state.artifacts.length && !["export", "import"].includes(tool) ? generatedLinks : ""}`;
-    const action = tool === "export" ? `<button class="button primary" data-action="fastlink-export" ${state.items.length ? "" : "disabled"}>${icon("download", 15)}\u5BFC\u51FA ${state.items.length || ""}</button>` : tool === "import" ? `<button class="button primary" data-action="fastlink-import" ${String(state.input || "").trim() ? "" : "disabled"}>${icon("import", 15)}\u5F00\u59CB\u8F6C\u5B58</button>` : tool === "public" ? `<button class="button primary" data-action="fastlink-public-generate">${icon("download", 15)}\u751F\u6210 JSON \u6587\u4EF6</button>` : tool === "batch" ? `<button class="button primary" data-action="fastlink-public-batch">${icon("share", 15)}\u6279\u91CF\u751F\u6210</button>` : tool === "split" ? `<button class="button primary" data-action="fastlink-split">${icon("download", 15)}\u5F00\u59CB\u62C6\u5206</button>` : tool === "convert" ? `<button class="button primary" data-action="fastlink-convert">${icon("settings", 15)}\u5F00\u59CB\u8F6C\u6362</button>` : tool === "filters" || tool === "settings" ? `<button class="button primary" data-action="fastlink-settings-save">\u4FDD\u5B58\u8BBE\u7F6E</button>` : "";
+    let pane = tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "secondary" ? secondaryPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : settingsPane;
+    const modeToolbar = `<div class="mode-toolbar"><div class="segmented"><button data-action="fastlink-mode" data-mode="import" class="${tool === "import" ? "active" : ""}">${icon("import", 15)}\u5BFC\u5165</button><button data-action="fastlink-mode" data-mode="export" class="${tool === "export" ? "active" : ""}">${icon("download", 15)}\u5BFC\u51FA</button></div></div>`;
+    const body = `${nav}${["export", "import"].includes(tool) ? modeToolbar : ""}<div class="fastlink-pane">${pane}</div>${state.artifacts.length && !["export", "import"].includes(tool) ? generatedLinks : ""}`;
+    const action = tool === "export" ? `<button class="button primary" data-action="fastlink-export" ${state.items.length ? "" : "disabled"}>${icon("download", 15)}\u5BFC\u51FA ${state.items.length || ""}</button>` : tool === "import" ? `<button class="button primary" data-action="fastlink-import" ${String(state.input || "").trim() ? "" : "disabled"}>${icon("import", 15)}\u5F00\u59CB\u8F6C\u5B58</button>` : tool === "secondary" ? `<button class="button primary" data-action="fastlink-secondary-generate" ${state.items.length ? "" : "disabled"}>${icon("link", 15)}\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5</button>` : tool === "public" ? `<button class="button primary" data-action="fastlink-public-generate">${icon("download", 15)}\u751F\u6210 JSON \u6587\u4EF6</button>` : tool === "batch" ? `<button class="button primary" data-action="fastlink-public-batch">${icon("share", 15)}\u6279\u91CF\u751F\u6210</button>` : tool === "split" ? `<button class="button primary" data-action="fastlink-split">${icon("download", 15)}\u5F00\u59CB\u62C6\u5206</button>` : tool === "convert" ? `<button class="button primary" data-action="fastlink-convert">${icon("settings", 15)}\u5F00\u59CB\u8F6C\u6362</button>` : tool === "filters" || tool === "settings" ? `<button class="button primary" data-action="fastlink-settings-save">\u4FDD\u5B58\u8BBE\u7F6E</button>` : "";
     return dialogFrame(ui, {
       title: "\u79D2\u4F20",
       subtitle: tool === "export" ? `${state.items.length} \u4E2A\u9876\u5C42\u9879\u76EE` : tool === "import" ? "\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55" : "\u79D2\u4F20\u5DE5\u5177\u7BB1",
@@ -16831,8 +17284,8 @@ ${end.comment}` : end.comment;
   /* —— 秒传工作台 —— */
   .fastlink-window { width:min(980px,calc(100vw - 48px)); height:min(780px,calc(100vh - 48px)); }
   .fastlink-content { display:flex; flex-direction:column; min-height:0; overflow:hidden; padding:0; }
-  .fastlink-tool-grid { position:relative; flex:0 0 auto; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; margin:16px 18px 0; padding:6px; background:var(--glass-soft); border:1px solid var(--glass-border); border-radius:var(--radius-sm); box-shadow:var(--shadow-sm); }
-  .fastlink-tool-grid .tool-button { min-width:0; min-height:42px; justify-content:flex-start; gap:8px; padding:8px 10px; line-height:1.3; white-space:normal; text-align:left; border-color:transparent; border-radius:var(--radius-xs); background:transparent; box-shadow:none; }
+  .fastlink-tool-grid { position:relative; flex:0 0 auto; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; margin:10px 18px 0; padding:5px; background:var(--glass-soft); border:1px solid var(--glass-border); border-radius:var(--radius-sm); box-shadow:var(--shadow-sm); }
+  .fastlink-tool-grid .tool-button { min-width:0; min-height:34px; justify-content:flex-start; gap:8px; padding:6px 10px; line-height:1.25; white-space:normal; text-align:left; border-color:transparent; border-radius:var(--radius-xs); background:transparent; box-shadow:none; }
   .fastlink-tool-grid .tool-button:hover:not(:disabled) { border-color:var(--glass-border); background:var(--glass); color:var(--text); box-shadow:var(--shadow-sm); }
   .fastlink-tool-grid .tool-button.active { color:var(--accent-strong); border-color:color-mix(in srgb,var(--accent) 35%,var(--glass-border)); background:var(--accent-soft); box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 4px 12px -8px var(--accent-glow); }
   .fastlink-tool-grid .tool-button.active svg { color:var(--accent); }
@@ -16847,6 +17300,8 @@ ${end.comment}` : end.comment;
   .fastlink-pane > .field:last-child { margin-bottom:14px; }
   .fastlink-pane .editor-surface { display:flex; min-height:0; margin:0 0 14px; padding:12px; }
   .fastlink-pane .editor-surface textarea { min-height:clamp(210px,32vh,360px); line-height:1.6; letter-spacing:0; }
+  .fastlink-pane .editor-surface.secondary-editor { padding:10px 12px; }
+  .fastlink-pane .editor-surface.secondary-editor textarea { min-height:72px; max-height:120px; }
   .fastlink-pane .inline-fields { margin:0 0 14px; gap:12px; }
   .fastlink-pane .check-grid { margin:0 0 14px; gap:9px; }
   .fastlink-pane .check-grid .check-line,
@@ -16867,7 +17322,7 @@ ${end.comment}` : end.comment;
   .fastlink-debug-card span { color:var(--muted); font-size:11px; }
   .fastlink-debug-card pre { max-height:180px; overflow:auto; margin:0; padding:9px; border-radius:var(--radius-xs); background:var(--surface-2); color:var(--muted); font:10px/1.45 var(--font-mono); border:1px solid var(--glass-border); }
   .fastlink-results { position:relative; display:grid; gap:10px; margin:12px 0 0; padding:1px; }
-  .fastlink-content > .fastlink-results { flex:0 0 auto; max-height:230px; overflow:auto; margin:0 18px 16px; padding:8px 1px 1px; background:var(--content-bg); z-index:2; }
+  .fastlink-content > .fastlink-results { flex:0 0 auto; max-height:150px; overflow:auto; margin:0 18px 14px; padding:8px 1px 1px; background:var(--content-bg); z-index:2; }
   .fastlink-result-card { position:relative; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; padding:13px; background:var(--glass); backdrop-filter:blur(var(--blur-sm)); -webkit-backdrop-filter:blur(var(--blur-sm)); border:1px solid var(--glass-border); border-radius:var(--radius-sm); box-shadow:var(--shadow-sm); transition:border-color var(--dur-fast) ease,box-shadow var(--dur-fast) ease,transform var(--dur-fast) var(--ease-out); }
   .fastlink-result-card:hover { border-color:color-mix(in srgb,var(--accent) 35%,var(--glass-border)); box-shadow:var(--shadow-glow); transform:translateY(-1px); }
   .fastlink-result-card > div { min-width:0; display:flex; align-items:baseline; gap:9px; line-height:1.35; }
@@ -17141,11 +17596,13 @@ ${end.comment}` : end.comment;
     return String(value || "123FastLink_Export").replace(/[\\/:*?"<>|]+/g, " ").trim() || "123FastLink_Export";
   }
   function frozenSelection(snapshot) {
+    const records = readTableSelectionRecords();
     return {
       ...snapshot,
       currentDir: String(snapshot.currentDir || "0"),
       selectedIds: new Set(snapshot.selectedIds || []),
-      unselectedIds: new Set(snapshot.unselectedIds || [])
+      unselectedIds: new Set(snapshot.unselectedIds || []),
+      records: records || null
     };
   }
   function organizeConfigured(config) {
@@ -17693,7 +18150,7 @@ ${end.comment}` : end.comment;
     }
     completeFastlinkTask(task, result2) {
       if (this.backgroundTask !== task) return false;
-      task.status = task.kind === "import" && Number(result2?.fail || 0) > 0 ? "partial" : "success";
+      task.status = FASTLINK_IMPORT_TASK_KINDS.includes(task.kind) && Number(result2?.fail || 0) > 0 ? "partial" : "success";
       task.result = result2;
       task.error = "";
       if (!task.minimized) {
@@ -17740,12 +18197,14 @@ ${end.comment}` : end.comment;
         return;
       }
       this.backgroundTask = null;
-      if (task.kind === "import" && task.result) {
-        this.setResult("\u79D2\u4F20\u5BFC\u5165\u7ED3\u679C", task.result);
+      if (FASTLINK_IMPORT_TASK_KINDS.includes(task.kind) && task.result) {
+        const resultTitle = task.kind === "secondaryImport" ? "\u4E8C\u7EA7\u79D2\u4F20\u8F6C\u5B58\u7ED3\u679C" : task.kind === "cloudImport" ? "\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58\u7ED3\u679C" : "\u79D2\u4F20\u5BFC\u5165\u7ED3\u679C";
+        this.setResult(resultTitle, task.result);
         return;
       }
-      this.fastlink.tool = task.kind;
-      this.fastlink.mode = task.kind;
+      const toolByKind = { export: "export", import: "import", secondaryExport: "secondary", secondaryImport: "secondary", cloudImport: "secondary" };
+      this.fastlink.tool = toolByKind[task.kind] || task.kind;
+      if (["export", "import"].includes(this.fastlink.tool)) this.fastlink.mode = this.fastlink.tool;
       this.state.view = "fastlink";
       this.render();
     }
@@ -18127,6 +18586,8 @@ ${end.comment}` : end.comment;
         tool: items.length ? "export" : "import",
         input: "",
         importFileName: "",
+        secondaryInput: "",
+        secondaryLink: "",
         artifacts: [],
         fileCount: 0,
         publicInput: "",
@@ -18179,6 +18640,89 @@ ${end.comment}` : end.comment;
       this.bridge.refresh();
       if (this.completeFastlinkTask(outcome.task, result2)) return;
       this.setResult("\u79D2\u4F20\u5BFC\u5165\u7ED3\u679C", result2);
+    }
+    fastlinkSeedOptions() {
+      const settings = this.config.fastlinkTools || {};
+      return { seedFolderId: settings.seedFolderId, currentDir: this.fastlink.currentDir };
+    }
+    async generateSecondaryFastlink() {
+      if (!this.fastlink.items.length) throw new Error("\u8BF7\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u8981\u5BFC\u51FA\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
+      const settings = this.config.fastlinkTools || {};
+      const outcome = await this.runFastlinkTask("secondaryExport", async (signal) => {
+        this.setProgress(0, 2, "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
+        return generateSecondaryFastlink(this.api, this.fastlink.items, {
+          signal,
+          ...this.fastlinkSeedOptions(),
+          useJson: settings.secondaryUseJson !== false,
+          ...this.fastlinkExportOptions(),
+          onProgress: (done, total, message) => this.setProgress(done, total, message)
+        });
+      });
+      if (outcome.error) return;
+      const artifact = outcome.result;
+      this.fastlink.artifacts = [artifact];
+      this.fastlink.fileCount = artifact.fileCount;
+      this.fastlink.secondaryLink = artifact.link;
+      if (this.completeFastlinkTask(outcome.task, artifact)) return;
+      this.toast("\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210\uFF0C\u53EF\u590D\u5236\u6216\u76F4\u63A5\u5206\u4EAB", "success");
+      this.render();
+    }
+    async restoreSecondaryFastlink() {
+      const text2 = String(this.fastlink.secondaryInput || "").trim();
+      if (!text2) throw new Error("\u8BF7\u5148\u7C98\u8D34\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5");
+      const settings = this.config.fastlinkTools || {};
+      const outcome = await this.runFastlinkTask("secondaryImport", async (signal) => {
+        this.setProgress(0, 2, "\u89E3\u6790\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5");
+        return saveSecondaryFastlink(this.api, text2, this.fastlink.currentDir, {
+          signal,
+          seedFolderId: settings.seedFolderId,
+          concurrency: this.config.requests.writeConcurrency,
+          ...this.fastlinkTransferOptions(),
+          onProgress: (done, total, name) => this.setProgress(done, total, name)
+        });
+      });
+      if (outcome.error) return;
+      const result2 = outcome.result;
+      this.bridge.refresh();
+      if (this.completeFastlinkTask(outcome.task, result2)) return;
+      this.setResult("\u4E8C\u7EA7\u79D2\u4F20\u8F6C\u5B58\u7ED3\u679C", result2);
+    }
+    async restoreFastlinkFromCloudFile() {
+      const snapshot = frozenSelection(this.bridge.readSelection());
+      const items = await this.bridge.selectedItems(void 0, snapshot);
+      if (items.length !== 1) throw new Error("\u8BF7\u5728\u6587\u4EF6\u5217\u8868\u52FE\u9009 1 \u4E2A\u79D2\u4F20\u6587\u4EF6\uFF08\u5185\u5BB9\u4E3A\u94FE\u63A5\u6216 JSON \u7684\u6587\u672C\u6587\u4EF6\uFF09");
+      const item = items[0];
+      if (Number(item.type) === 1) throw new Error("\u8BF7\u52FE\u9009\u6587\u4EF6\u800C\u4E0D\u662F\u6587\u4EF6\u5939");
+      const outcome = await this.runFastlinkTask("cloudImport", async (signal) => {
+        this.setProgress(0, 1, `\u8BFB\u53D6\u6587\u4EF6\u5185\u5BB9\uFF1A${item.name}`);
+        return saveFastlinkFromCloudFile(this.api, item, this.fastlink.currentDir, {
+          signal,
+          concurrency: this.config.requests.writeConcurrency,
+          ...this.fastlinkTransferOptions(),
+          onProgress: (done, total, name) => this.setProgress(done, total, name)
+        });
+      });
+      if (outcome.error) return;
+      const result2 = outcome.result;
+      this.bridge.refresh();
+      if (this.completeFastlinkTask(outcome.task, result2)) return;
+      this.setResult("\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58\u7ED3\u679C", result2);
+    }
+    async saveFastlinkLinkFile() {
+      const artifacts = this.fastlink.artifacts || [];
+      if (!artifacts.length) throw new Error("\u6CA1\u6709\u53EF\u4FDD\u5B58\u7684\u94FE\u63A5\uFF1A\u8BF7\u5148\u5728\u300C\u751F\u6210\u79D2\u4F20\u300D\u9875\u70B9\u5BFC\u51FA\uFF08\u5173\u95ED\u5DE5\u5177\u7BB1\u4F1A\u6E05\u7A7A\u5BFC\u51FA\u7ED3\u679C\uFF0C\u91CD\u5F00\u540E\u9700\u91CD\u65B0\u5BFC\u51FA\u4E00\u6B21\uFF09\uFF0C\u6216\u76F4\u63A5\u70B9\u9875\u811A\u300C\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\u300D");
+      const { seedFolderId, currentDir } = this.fastlinkSeedOptions();
+      const parentId = normalizeSeedFolderId(seedFolderId) || currentDir;
+      const saved = await this.runTask(async (signal) => {
+        const results = [];
+        for (let index = 0; index < artifacts.length; index += 1) {
+          this.setProgress(index, artifacts.length, `\u4FDD\u5B58\u94FE\u63A5\u6587\u4EF6\uFF1A${artifacts[index].filename || artifacts[index].item?.name || ""}`);
+          results.push(await saveFastlinkLinkFile(this.api, artifacts[index], parentId, { signal }));
+        }
+        return results;
+      });
+      this.toast(`\u5DF2\u628A ${saved.length} \u4E2A\u94FE\u63A5\u6587\u4EF6\u4FDD\u5B58\u5230\u4E91\u76D8`, "success");
+      this.render();
     }
     fastlinkOptions() {
       const settings = this.config.fastlinkTools || {};
@@ -18782,6 +19326,10 @@ ${end.comment}` : end.comment;
         "fastlink-public-batch": () => this.generateFastlinkBatch(),
         "fastlink-split": () => this.splitFastlinkFile(),
         "fastlink-convert": () => this.convertFastlinkFile(),
+        "fastlink-secondary-generate": () => this.generateSecondaryFastlink(),
+        "fastlink-secondary-import": () => this.restoreSecondaryFastlink(),
+        "fastlink-secondary-from-file": () => this.restoreFastlinkFromCloudFile(),
+        "fastlink-secondary-save-link": () => this.saveFastlinkLinkFile(),
         "fastlink-api-test": async () => {
           const result2 = await this.api.listPage(this.fastlink.currentDir, 1, { limit: 1 });
           this.toast(`API \u6B63\u5E38\uFF1A\u5F53\u524D\u76EE\u5F55\u5171 ${result2.total} \u9879`, "success");
@@ -19447,6 +19995,10 @@ ${end.comment}` : end.comment;
       }
       if (target.id === "fastlink-convert-input") {
         this.fastlink.convertInput = target.value;
+        return;
+      }
+      if (target.id === "fastlink-secondary-input") {
+        this.fastlink.secondaryInput = target.value;
         return;
       }
       if (target.id === "category-yaml-text" && this.settings) {

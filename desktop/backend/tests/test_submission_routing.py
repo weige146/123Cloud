@@ -248,6 +248,20 @@ class TelegramFastlinkRoutingTests(unittest.TestCase):
         self.assertEqual(links[0]["provider"], "123fastlink")
         self.assertIn("123FLCPV2$", links[0]["cleanUrl"])
 
+    def test_secondary_fastlink_text_generates_submission_drafts(self):
+        """二级秒传链接（123FLCPV2$% 开头、单条种子文件记录）与普通秒传走同一投稿分流。"""
+        submit = AsyncMock(return_value={"draftCount": 1, "sentCount": 1})
+        secondary = "123FLCPV2$%GivR7wk9FQT4UwfLoCF0#972#乐园侵触死亡之岛 (2023) {tmdb-222928}.123fastlink.json"
+        with patch.object(main, "submit_submission_links", submit):
+            handled = asyncio.run(main.handle_transfer_telegram_update(
+                self.update({"text": secondary}), "telegram-token", self.config
+            ))
+        self.assertTrue(handled)
+        submit.assert_awaited_once()
+        links = submit.await_args.args[1]
+        self.assertEqual(links[0]["provider"], "123fastlink")
+        self.assertIn("123FLCPV2$%", links[0]["cleanUrl"])
+
     def test_project_standard_json_converts_to_fastlink_link(self):
         content = (
             '{"scriptVersion":"3.2.0-tdr.4","exportVersion":"1.0","usesBase62EtagsInExport":true,'
