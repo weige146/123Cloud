@@ -307,3 +307,8 @@ export interface TransferOfflineTask {
   size?: number;
   message?: string;
 }
+
+export interface AccountCooldown {
+  name: string;
+  remainingMinutes: number;
+}

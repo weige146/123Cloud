@@ -436,7 +436,11 @@ class Pan115TransferClient:
             or raw.get("state") is False
             or (raw.get("errno") is not None and raw.get("errno") != 0)
         ):
-            raise ValueError(raw.get("error") or raw.get("message") or f"115 app downurl {response.status_code}")
+            errno = raw.get("errno")
+            message = raw.get("error") or raw.get("message") or f"115 app downurl {response.status_code}"
+            if errno is not None and str(errno) != "0":
+                message = f"[errno {errno}] {message}"
+            raise ValueError(message)
 
         data = raw.get("data")
         if isinstance(data, str):
@@ -586,6 +590,12 @@ _PAN115_TRANSIENT_ERROR_RE = re.compile(
 )
 # 网页页面（登录页/验证页）：对该账号应冷却停用，换其他账号
 _PAN115_PAGE_ERROR_RE = re.compile(r"返回了网页页面|需要验证|登录页", re.IGNORECASE)
+# 分享本身已失效（取消/不存在/过期）：换号、冷却账号都无意义，与账号健康无关；
+# 例如 [errno 4100010] 分享已取消，可能混在多接口拼接的复合报错里
+_PAN115_SHARE_GONE_ERROR_RE = re.compile(
+    r"\[errno\s*4100010\]|分享已取消|分享已被取消|分享不存在|分享已过期",
+    re.IGNORECASE,
+)
 
 
 def _is_transient_share_list_error(error: Exception) -> bool:
@@ -596,8 +606,11 @@ def _is_transient_share_list_error(error: Exception) -> bool:
 
 
 def classify_pan115_account_error(error: Exception) -> str:
-    """分类 115 账号错误：expired（Cookie 失效/账号不可用）/ transient（限流风控）/ other。"""
+    """分类 115 账号错误：expired（Cookie 失效/账号不可用）/ transient（限流风控）/ share_gone（分享失效）/ other。"""
     message = str(error)
+    if _PAN115_SHARE_GONE_ERROR_RE.search(message):
+        # 分享取消/不存在时复合报错里可能同时出现"返回了网页页面"，须先判分享失效，避免误冷却账号
+        return "share_gone"
     if _PAN115_EXPIRED_ERROR_RE.search(message) or _PAN115_PAGE_ERROR_RE.search(message):
         return "expired"
     if _PAN115_TRANSIENT_ERROR_RE.search(message):

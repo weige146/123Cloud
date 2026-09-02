@@ -725,6 +725,42 @@ class TransferServiceTests(unittest.TestCase):
         # 配置更长时以配置为准
         self.assertEqual(_offline_wait_deadline_ms(20 * 1024 * 1024 * 1024, 5 * 60 * 60_000), 5 * 60 * 60_000)
 
+    def test_account_cooldown_snapshot_and_clear(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                service = TransferService(SessionStore(Path(directory)))
+
+                self.assertEqual(service.account_cooldown_snapshot(), [])
+                self.assertEqual(service.clear_account_cooldowns(), [])
+
+                account = {"name": "翁臣岩", "cookie": "UID=1; CID=2; SEID=3"}
+                self.assertTrue(await service._mark_account_cooling(None, account, "[errno 990001] 需要登录"))
+                # 冷却期内重复标记只算一次（通知去重）
+                self.assertFalse(await service._mark_account_cooling(None, account, "再次失败"))
+
+                snapshot = service.account_cooldown_snapshot()
+                self.assertEqual(len(snapshot), 1)
+                self.assertEqual(snapshot[0]["name"], "翁臣岩")
+                self.assertGreaterEqual(snapshot[0]["remainingMinutes"], 1)
+                self.assertTrue(service._is_account_cooling(account))
+
+                self.assertEqual(service.clear_account_cooldowns(), ["翁臣岩"])
+                self.assertFalse(service._is_account_cooling(account))
+                self.assertEqual(service.account_cooldown_snapshot(), [])
+                await service.close()
+
+        asyncio.run(run())
+
+    def test_account_cooldown_snapshot_prunes_expired_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = TransferService(SessionStore(Path(directory)))
+            service._account_health[service._account_fingerprint("UID=1")] = {
+                "name": "过期账号",
+                "coolUntilMs": 0,
+            }
+            self.assertEqual(service.account_cooldown_snapshot(), [])
+            self.assertEqual(service._account_health, {})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 import { api } from "./client";
 import type {
   AdminStatus,
+  AccountCooldown,
   Pan115Device,
   Pan115HelperStatus,
   SubmissionConfig,
@@ -106,4 +107,6 @@ export const transferApi = {
   offline: () => api.get<{ ok: boolean; tasks: TransferOfflineTask[]; canDelete: boolean }>("/api/transfer/offline"),
   deleteOffline: (taskId: number | string) => api.delete<{ ok: boolean }>(`/api/transfer/offline/${encodeURIComponent(String(taskId))}`),
   deleteCompletedOffline: () => api.delete<{ ok: boolean; deleted: number; message?: string }>("/api/transfer/offline/completed"),
+  accountCooldowns: () => api.get<{ ok: boolean; accounts: AccountCooldown[]; cooldownMinutes: number }>("/api/transfer/account-cooldowns"),
+  clearAccountCooldowns: () => api.delete<{ ok: boolean; cleared: number; accounts: string[] }>("/api/transfer/account-cooldowns"),
 };

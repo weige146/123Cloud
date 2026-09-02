@@ -7,7 +7,7 @@ import SegmentedTabs from "@/components/SegmentedTabs.vue";
 import GlassCard from "@/components/GlassCard.vue";
 import FormGrid from "@/components/FormGrid.vue";
 import { transferApi, pan115HelperApi, pan115CookieApi } from "@/api";
-import type { Pan115Device, TransferConfig, TransferOfflineTask, TransferTask, TransferTaskFile } from "@/api/types";
+import type { AccountCooldown, Pan115Device, TransferConfig, TransferOfflineTask, TransferTask, TransferTaskFile } from "@/api/types";
 import { formatBytes } from "@/utils/format";
 import { useGlobalState } from "@/composables/useGlobalState";
 import { useResponsive } from "@/composables/useResponsive";
@@ -78,6 +78,7 @@ const submitting = ref(false);
 const localSubmitting = ref(false);
 const actingTaskId = ref("");
 const offlineLoading = ref(false);
+const coolingAccounts = ref<AccountCooldown[]>([]);
 
 const timeZones = [
   { title: "北京时间", value: "Asia/Shanghai" },
@@ -98,6 +99,16 @@ const taskStats = computed(() => {
   const success = transferTasks.value.filter((task) => task.status === "success").length;
   return { total, running, queued, failed, success };
 });
+
+const coolingText = computed(() => {
+  if (!coolingAccounts.value.length) return "";
+  const minutes = Math.min(...coolingAccounts.value.map((item) => item.remainingMinutes));
+  return `${coolingAccounts.value.length} 个账号冷却中 · 剩 ${minutes} 分钟`;
+});
+
+const coolingNames = computed(() =>
+  coolingAccounts.value.map((item) => `${item.name}（剩 ${item.remainingMinutes} 分钟）`).join("\n")
+);
 
 function applyTransferConfig(config: Partial<TransferConfig>) {
   Object.assign(transferForm, { ...defaultTransferConfig, ...config });
@@ -146,12 +157,14 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
 async function loadTransfer() {
   transferLoading.value = true;
   try {
-    const [config, list] = await Promise.all([
+    const [config, list, cooldowns] = await Promise.all([
       transferApi.getConfig(),
       transferApi.tasks(),
+      transferApi.accountCooldowns().catch(() => ({ accounts: [], cooldownMinutes: 30 })),
     ]);
     applyTransferConfig(config);
     transferTasks.value = list;
+    coolingAccounts.value = cooldowns.accounts;
     syncSelectedTransferTask();
   } catch (error) {
     notifyError(`115 搬运加载失败：${error instanceof Error ? error.message : String(error)}`);
@@ -276,6 +289,30 @@ async function clearCompleted() {
   }
   notifySuccess(`已清理完成任务：${done.length} 个`);
   await loadTransferTasks();
+}
+
+async function loadCooldowns() {
+  try {
+    coolingAccounts.value = (await transferApi.accountCooldowns()).accounts;
+  } catch {
+    coolingAccounts.value = [];
+  }
+}
+
+async function clearAccountCooldowns() {
+  if (!coolingAccounts.value.length) {
+    notifySuccess("当前没有账号被停用");
+    return;
+  }
+  if (!(await confirm(`解除被停用 115 账号的冷却限制（${coolingNames.value.replace(/\n/g, "、")}）？`, "清除账号停用限制"))) return;
+  try {
+    const data = await transferApi.clearAccountCooldowns();
+    notifySuccess(data.cleared ? `已解除停用：${data.accounts.join("、")}` : "当前没有账号被停用");
+  } catch (error) {
+    notifyError(`清除失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    await loadCooldowns();
+  }
 }
 
 function toggleCompleted() {
@@ -755,6 +792,10 @@ onUnmounted(() => {
           <v-icon size="14">mdi-format-list-checks</v-icon>
           搬运 {{ taskStats.total }}
         </span>
+        <span v-if="coolingAccounts.length" class="chip-status" data-tone="warning" :title="coolingNames">
+          <v-icon size="14">mdi-snowflake</v-icon>
+          {{ coolingText }}
+        </span>
       </template>
     </PageHero>
 
@@ -787,6 +828,7 @@ onUnmounted(() => {
               <v-list-item prepend-icon="mdi-progress-download" title="查看离线进度" @click="showOfflineTasks" />
               <v-list-item :prepend-icon="showCompleted ? 'mdi-eye-off-outline' : 'mdi-eye-outline'" :title="showCompleted ? '隐藏完成任务' : '显示完成任务'" @click="toggleCompleted" />
               <v-list-item prepend-icon="mdi-broom" title="清理完成任务" @click="clearCompleted" />
+              <v-list-item prepend-icon="mdi-snowflake-off" title="清除账号停用限制" @click="clearAccountCooldowns" />
             </v-list>
           </v-menu>
         </div>

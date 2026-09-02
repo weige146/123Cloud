@@ -34,6 +34,21 @@ class ClassifyPan115AccountErrorTests(unittest.TestCase):
 
         self.assertTrue(_is_transient_share_list_error(ValueError(message)))
 
+    def test_share_gone_errors_take_priority_over_page_and_expired(self):
+        cases = [
+            "[errno 4100010] 分享已取消",
+            "分享不存在",
+            "该分享已过期",
+            # 真实场景：分享取消后三个取直链接口报错拼接，混入"返回了网页页面"字样，
+            # 曾被误判为 Cookie 失效导致整个账号池被冷却 30 分钟
+            (
+                "115 app downurl 200；115 取直链 返回了网页页面（HTTP 404），"
+                "可能是 115 Cookie 失效、需要验证或接口临时风控；[errno 4100010] 分享已取消"
+            ),
+        ]
+        for message in cases:
+            self.assertEqual(classify_pan115_account_error(ValueError(message)), "share_gone", message)
+
     def test_other_errors(self):
         self.assertEqual(classify_pan115_account_error(ValueError("文件不存在")), "other")
 

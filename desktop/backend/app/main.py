@@ -66,7 +66,7 @@ from .submission import (
     telegram_message_text,
     telegram_user_allowed,
 )
-from .transfer_service import TransferService
+from .transfer_service import PAN115_ACCOUNT_COOLDOWN_MS, TransferService
 
 
 def _resolve_admin_web_dir() -> Path:
@@ -1442,6 +1442,21 @@ async def create_local_transfer_task(request: TransferLocalTaskRequest) -> Dict[
 async def kick_transfer_queue() -> Dict[str, Any]:
     transfer_service.kick()
     return {"ok": True}
+
+
+@app.get("/api/transfer/account-cooldowns")
+async def read_transfer_account_cooldowns() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "accounts": transfer_service.account_cooldown_snapshot(),
+        "cooldownMinutes": round(PAN115_ACCOUNT_COOLDOWN_MS / 60000),
+    }
+
+
+@app.delete("/api/transfer/account-cooldowns")
+async def clear_transfer_account_cooldowns() -> Dict[str, Any]:
+    names = transfer_service.clear_account_cooldowns()
+    return {"ok": True, "cleared": len(names), "accounts": names}
 
 
 @app.post("/api/transfer/tasks/{task_id}/requeue")

@@ -506,6 +506,30 @@ class TransferService:
                 logger.warning("115 Cookie 失效通知失败", extra={"error": str(error)})
         return True
 
+    def account_cooldown_snapshot(self) -> List[Dict[str, Any]]:
+        """冷却中的账号列表（含剩余分钟数）；顺带清掉已过期的条目。"""
+        now_ms = time.monotonic() * 1000
+        items: List[Dict[str, Any]] = []
+        for fingerprint, health in list(self._account_health.items()):
+            remaining_ms = float(health.get("coolUntilMs", 0)) - now_ms
+            if remaining_ms <= 0:
+                self._account_health.pop(fingerprint, None)
+                continue
+            items.append({
+                "name": health.get("name") or "未命名账号",
+                "remainingMinutes": max(1, round(remaining_ms / 60000)),
+            })
+        items.sort(key=lambda item: item["name"])
+        return items
+
+    def clear_account_cooldowns(self) -> List[str]:
+        """手动解除所有账号的冷却停用，返回被解除的账号名。"""
+        if not self._account_health:
+            return []
+        names = [health.get("name") or "未命名账号" for health in self._account_health.values()]
+        self._account_health.clear()
+        return sorted(names)
+
     def _download_url_candidates(self, primary: Optional[Dict[str, str]], allow_rotation: bool) -> List[Dict[str, str]]:
         """取直链候选账号：主账号优先，其余活账号按池顺序兜底（仅分享任务允许换号）。"""
         candidates: List[Dict[str, str]] = []
@@ -770,7 +794,11 @@ class TransferService:
             except Exception as error:
                 message = str(error)
                 errors.append(f"{account['name']}：{message}")
-                if classify_pan115_account_error(error) == "expired":
+                classification = classify_pan115_account_error(error)
+                if classification == "share_gone":
+                    # 分享取消/不存在对任何账号都一样，继续换号只会白跑并误伤账号池
+                    raise RuntimeError(f"分享已取消或不存在，停止解析：{message}") from error
+                if classification == "expired":
                     await self._mark_account_cooling(task, account, message)
                 if len(candidates) > 1:
                     _add_task_log(task, "warn", f"115 分享解析失败：{account['name']}（{message}）")
@@ -895,7 +923,7 @@ class TransferService:
                     if classification == "expired":
                         await self._mark_account_cooling(task, candidate, last_error)
                     elif classification != "transient":
-                        # 未知错误换号意义不大，直接失败便于排查
+                        # 未知错误或分享已失效，换号意义不大，直接失败便于排查
                         raise
                     elif index + 1 < len(candidates):
                         _add_task_log(task, "warn", f"115 取直链持续受限，换号重试：{candidate.get('name') or '?'}")
