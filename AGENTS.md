@@ -26,6 +26,16 @@ npm ci && npm run dist:mac
 
 Windows 包无法在 macOS 上交叉构建（PyInstaller 限制），由 CI 在 Windows runner 上构建。
 
+## 油猴脚本版本号规则（只递增，不回退）
+
+- 脚本文件：`油猴脚本/123-helper.user.js`，版本号写在头部 `// @version`。
+- 发布地址：https://greasyfork.org/zh-CN/scripts/592236-123-%E5%8A%A9%E6%89%8B
+- **铁律：本地开发版本号只准在「Greasy Fork 已发布版本」基础上递增，且一次只 +1 个补丁号（x.y.z → x.y.z+1）。**
+  - 例：线上现在是 `1.2.4`，本次开发/发布就是 `1.2.5`；再下一次 `1.2.6`。
+  - 禁止跳号（`1.2.4 → 1.3.0`）、禁止回退、禁止与线上版本持平。
+- 每次改动脚本准备发布前，先打开上面的 Greasy Fork 页面确认「版本」字段的当前线上值（以页面元信息的"版本：x.y.z"为准，不要相信页面正文/文档里手写的版本号，那里可能过时），再据此 +1 写回 `@version`。
+- 当前线上版本：`1.2.4`（更新于 2026-09-02），因此下一版为 **`1.2.5`**。
+
 ## 架构备忘
 
 - `desktop/backend/app/main.py` — FastAPI 路由层；投稿/搬运的统一分流入口是 `route_submission_text`（油猴脚本 `POST /api/submission/submit` 与后台提交共用）。
