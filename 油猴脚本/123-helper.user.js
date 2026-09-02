@@ -2934,6 +2934,15 @@
         if (!id) continue;
         visibleRows.set(id, Boolean(visibleRows.get(id)) || rowSelected(row));
       }
+      // 删除/移除/移动后，123 的"已选择 N 项"计数常常滞后于真实 DOM：
+      // 行已经没了，但宿主工具栏的计数文本还在显示原值，
+      // 仅靠 hostCount 兜底会漏掉这种"行没了、计数还停在旧值"的情况。
+      // 主动剔除 selectedIds / unselectedIds 中已不在当前可见行里的 id，避免后续
+      // snapshot().hasSelection 被陈旧 id 误判为 true、导致工具栏按钮在删除后残留显示。
+      if (!this.selectAll) {
+        for (const id of [...this.selectedIds]) if (!visibleRows.has(id)) this.selectedIds.delete(id);
+        for (const id of [...this.unselectedIds]) if (!visibleRows.has(id)) this.unselectedIds.delete(id);
+      }
       for (const [id, selected] of visibleRows) {
         if (this.selectAll) {
           if (selected) this.unselectedIds.delete(id);
