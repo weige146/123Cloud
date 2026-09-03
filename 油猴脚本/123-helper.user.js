@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.2.6
+// @version      1.2.7
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @author       local
 // @license      MIT
@@ -1514,7 +1514,7 @@
     { key: "dolbyVision", label: "\u675C\u6BD4\u89C6\u754C", hint: "\u7EDF\u4E00 DoVi\u3001Dolby Vision \u7B49\u5199\u6CD5\u3002" },
     { key: "dynamicRange", label: "\u52A8\u6001\u8303\u56F4", hint: "\u7EDF\u4E00 HDR\u3001HLG\u3001SDR \u7B49\u5199\u6CD5\u3002" },
     { key: "videoCodec", label: "\u89C6\u9891\u7F16\u7801", hint: "\u7EDF\u4E00 H.264\u3001H.265 \u7B49\u7F16\u7801\u5199\u6CD5\u3002" },
-    { key: "audioCodec", label: "\u97F3\u9891\u7F16\u7801", hint: "\u7EDF\u4E00\u97F3\u9891\u7F16\u7801\u540D\u79F0\uFF1B\u58F0\u9053\u548C Atmos \u4FE1\u606F\u4F1A\u7EE7\u7EED\u4FDD\u7559\u3002" },
+    { key: "audioCodec", label: "\u97F3\u9891\u7F16\u7801", hint: "\u7EDF\u4E00\u97F3\u9891\u7F16\u7801\u540D\u79F0\uFF1B\u58F0\u9053\u548C Atmos \u4FE1\u606F\u4F1A\u7EE7\u7EED\u4FDD\u7559\u3002\u9047\u5230\u65B0\u7F16\u7801\u65F6\uFF0C\u5728\u522B\u540D\u91CC\u52A0\u4E0A\u5B83\uFF08\u5982 XXEA\uFF09\u5E76\u586B\u597D\u8F93\u51FA\u5199\u6CD5\uFF0C\u65E0\u9700\u66F4\u65B0\u811A\u672C\u5373\u53EF\u8BC6\u522B\u3002" },
     { key: "highQuality", label: "\u9AD8\u89C4\u683C", hint: "\u7EDF\u4E00\u9AD8\u89C4\u683C\u6807\u8BB0\u3002" },
     { key: "originalEdition", label: "\u5730\u533A\u7248 / \u7248\u672C", hint: "\u7EDF\u4E00\u5730\u533A\u7801\u548C\u7248\u672C\u6807\u8BB0\u3002" },
     { key: "specialKind", label: "\u7279\u522B\u7BC7\u5173\u952E\u8BCD", hint: "\u6587\u4EF6\u540D\u51FA\u73B0\u8FD9\u4E9B\u8BCD\u5C31\u6309\u5BF9\u5E94\u7C7B\u578B\u53C2\u4E0E\u7279\u522B\u7BC7\u914D\u5BF9\uFF1B\u53EF\u7ED9\u5DF2\u6709\u7C7B\u578B\u52A0\u8BCD\uFF0C\u4E5F\u53EF\u4EE5\u81EA\u5B9A\u4E49\u65B0\u7C7B\u578B\u540D\uFF08\u5982\u300C\u52A8\u8111\u5427\u300D\uFF09\u3002" }
@@ -13548,6 +13548,33 @@ ${end.comment}` : end.comment;
     }
     return null;
   }
+  var DEFAULT_AUDIO_TOKEN_SOURCE = "TrueHD(?:[.\\s-]*(?:Dolby[.\\s-]*)?Atmos)?(?:[.\\s-]*\\d\\.\\d)?|DDP(?:[.\\s-]?\\d\\.\\d(?:[.\\s-]?(?:Atmos|JOC))?)?|DD\\+(?:[.\\s-]?\\d\\.\\d(?:[.\\s-]?(?:Atmos|JOC))?)?|DD[.\\s-]?\\d\\.\\d(?:[.\\s-]?(?:Atmos|JOC))?|DTS[- .]?HD(?:[- .]?MA|[- .]?HRA)?(?:[.\\s-]?\\d\\.\\d)?|DTS[- .]?X(?:[.\\s-]?\\d\\.\\d)?|DTS(?:[.\\s-]?\\d\\.\\d)?|AAC(?:[.\\s-]?\\d\\.\\d)?|FLAC(?:[.\\s-]?\\d\\.\\d)?|LPCM(?:[.\\s-]?\\d\\.\\d)?|PCM(?:[.\\s-]?\\d\\.\\d)?|AC3(?:[.\\s-]?\\d\\.\\d)?|EAC3(?:[.\\s-]?\\d\\.\\d)?|Opus(?:[.\\s-]?\\d\\.\\d)?|AV3A(?:[.\\s-]?\\d\\.\\d)?";
+  function escapeAudioToken(token) {
+    return token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  // 音频编码提取白名单是硬编码闸门：新编码（如当年的 AV3A）不在其中就提不出来，
+  // 设置里配的别名也无效。这里把「音频编码」组的用户别名并入提取与截断正则，
+  // 以后新编码在设置里加一条别名即可生效，不用再改代码。
+  function audioAliasTokens(mappings) {
+    const tokens = new Set();
+    for (const item of normalizeFixedMappings(mappings)) {
+      if (item.field !== "audioCodec") continue;
+      for (const alias of item.aliases) {
+        if (/^[A-Za-z0-9][A-Za-z0-9+.-]*$/.test(alias)) tokens.add(alias);
+      }
+    }
+    return [...tokens];
+  }
+  function audioAliasTokenSource(mappings) {
+    return audioAliasTokens(mappings).map((token) => `${escapeAudioToken(token)}(?:[.\\s-]?\\d\\.\\d)?`).join("|");
+  }
+  function audioAliasWordSource(mappings) {
+    return audioAliasTokens(mappings).map(escapeAudioToken).join("|");
+  }
+  function buildAudioMatchRegex(mappings) {
+    const aliasSource = audioAliasTokenSource(mappings);
+    return new RegExp(`(\\b(?:${DEFAULT_AUDIO_TOKEN_SOURCE})\\b${aliasSource ? `|\\b(?:${aliasSource})(?![A-Za-z0-9])` : ""})`, "i");
+  }
   var CHINESE_NUMBER_PATTERN = "0-9\u96F6\u3007\u4E00\u4E8C\u4E24\u5169\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D\u5341\u767E\u5343\u4E07\u842C\u58F9\u8D30\u8CB3\u53C1\u53C3\u8086\u4F0D\u9646\u9678\u67D2\u634C\u7396\u62FE\u4F70\u4EDF\u5EFF\u5345\u534C";
   var CHINESE_SEASON_PATTERN = `(?:\u7B2C\\s*)?[${CHINESE_NUMBER_PATTERN}]+\\s*\u5B63`;
   var VARIETY_TITLE_SUFFIX = /(?:\s+|[._·-]+)(?:加更(?:篇|版)?|独家加更|超前(?:营业|聚会|企划)|(?:舞台|歌曲|完整)?纯享(?:典藏版)?|舞台全记录|突袭休息室|会员(?:彩蛋|版|加长|专享)|直播(?:回放)?|番外(?:篇|微综)?|幕后(?:纪录|特辑)?|花絮|先导(?:片|篇)?|预告|片花)(?=$|[\s._·-])/i;
@@ -13584,7 +13611,7 @@ ${end.comment}` : end.comment;
     const named = text2.match(new RegExp(`(?:\u7B2C\\s*)?([${CHINESE_NUMBER_PATTERN}]+)\\s*\u5B63`));
     return named ? chineseInteger2(named[1]) : null;
   }
-  function inferTitle(value) {
+  function inferTitle(value, mappings) {
     const [rawStem] = splitExtension(String(value || ""));
     const bracketTitle = titleFromBrackets(rawStem);
     let stem = bracketTitle || rawStem;
@@ -13592,7 +13619,8 @@ ${end.comment}` : end.comment;
     stem = stem.replace(/[_.]+/g, " ");
     const year = stem.match(YEAR);
     if (year?.index >= 2) stem = stem.slice(0, year.index);
-    const token = stem.match(new RegExp(`\\b(?:S\\d{1,3}(?:E\\d{1,5})?|Season\\s*\\d+|EP?\\d{1,5}|Complete|4320p|2160p|1440p|1080p|720p|WEB[- ]?DL|WEBRip|Blu[- ]?Ray|REMUX|HDTV|H[ .]?26[45]|HEVC|AVC|DDP?|AAC|FLAC|AV3A|HDR10\\+?|DoVi|DV)\\b|${CHINESE_SEASON_PATTERN}`, "i"));
+    const aliasSource = audioAliasWordSource(mappings);
+    const token = stem.match(new RegExp(`\\b(?:S\\d{1,3}(?:E\\d{1,5})?|Season\\s*\\d+|EP?\\d{1,5}|Complete|4320p|2160p|1440p|1080p|720p|WEB[- ]?DL|WEBRip|Blu[- ]?Ray|REMUX|HDTV|H[ .]?26[45]|HEVC|AVC|DDP?|AAC|FLAC|AV3A|HDR10\\+?|DoVi|DV${aliasSource ? `|${aliasSource}` : ""})\\b|${CHINESE_SEASON_PATTERN}`, "i"));
     if (token?.index >= 2) stem = stem.slice(0, token.index);
     const chineseLead = stem.match(/^([\u3400-\u9fff][\u3400-\u9fff\s·]{1,70}?)(?=\s+[A-Za-z])/);
     if (chineseLead) stem = chineseLead[1];
@@ -13860,10 +13888,10 @@ ${end.comment}` : end.comment;
     const explicit = videos.filter(hasExplicitSeasonEpisode).length;
     return explicit >= Math.max(1, Math.ceil(videos.length * 0.5));
   }
-  function episodicTitle(filenames) {
+  function episodicTitle(filenames, mappings) {
     const counts = /* @__PURE__ */ new Map();
     for (const filename of filenames.filter((name) => isVideoFile(name) && hasExplicitSeasonEpisode(name))) {
-      const title = inferTitle(filename);
+      const title = inferTitle(filename, mappings);
       if (!title) continue;
       const key = title.replace(/[\s._-]+/g, "").toLocaleLowerCase();
       const current = counts.get(key) || { title, count: 0 };
@@ -13883,7 +13911,7 @@ ${end.comment}` : end.comment;
     const dolbyVision = mapped("dolbyVision");
     const dynamicRange = mapped("dynamicRange");
     const videoCodec = mapped("videoCodec");
-    const audioMatch = text2.match(/\b(TrueHD(?:[.\s-]*(?:Dolby[.\s-]*)?Atmos)?(?:[.\s-]*\d\.\d)?|DDP(?:[.\s-]?\d\.\d(?:[.\s-]?(?:Atmos|JOC))?)?|DD\+(?:[.\s-]?\d\.\d(?:[.\s-]?(?:Atmos|JOC))?)?|DD[.\s-]?\d\.\d(?:[.\s-]?(?:Atmos|JOC))?|DTS[- .]?HD(?:[- .]?MA|[- .]?HRA)?(?:[.\s-]?\d\.\d)?|DTS[- .]?X(?:[.\s-]?\d\.\d)?|DTS(?:[.\s-]?\d\.\d)?|AAC(?:[.\s-]?\d\.\d)?|FLAC(?:[.\s-]?\d\.\d)?|LPCM(?:[.\s-]?\d\.\d)?|PCM(?:[.\s-]?\d\.\d)?|AC3(?:[.\s-]?\d\.\d)?|EAC3(?:[.\s-]?\d\.\d)?|Opus(?:[.\s-]?\d\.\d)?|AV3A(?:[.\s-]?\d\.\d)?)\b/i);
+    const audioMatch = text2.match(buildAudioMatchRegex(configuredMappings));
     let audioRaw = "";
     if (audioMatch) {
       audioRaw = audioMatch[1];
@@ -13914,21 +13942,22 @@ ${end.comment}` : end.comment;
   }
   function inferFields(titleHint, filenames = [], config = {}) {
     const customWords = config.recognition?.customWords || [];
+    const fixedMappings = config.recognition?.fixedMappings;
     const preparedTitle = prepareRecognitionText(titleHint, customWords).text;
     const preparedFiles = filenames.map((name) => prepareRecognitionText(name, customWords).text);
     const names = [preparedTitle, ...preparedFiles].filter(Boolean);
     const combined = names.join(" ");
     const videoNames = filenames.map((name, index) => ({ original: name, prepared: preparedFiles[index] })).filter((item) => isVideoFile(item.original)).map((item) => item.prepared);
     const hasEpisodes = episodicEvidence(videoNames);
-    const folderTitle = inferTitle(preparedTitle);
+    const folderTitle = inferTitle(preparedTitle, fixedMappings);
     const genericSeasonPattern = new RegExp(`^(?:Season\\s*\\d{1,3}|S\\d{1,3}|${CHINESE_SEASON_PATTERN})$`, "i");
     const genericSeasonFolder = genericSeasonPattern.test(folderTitle) || genericSeasonPattern.test(preparedTitle.replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim());
-    const fileTitle = inferTitle(filenames[0]);
+    const fileTitle = inferTitle(filenames[0], fixedMappings);
     const weakFileFallback = genericSeasonFolder && /^(?:\d{1,4}|S\d{1,3}(?:E\d{1,5})?|E(?:P)?\d{1,5})$/i.test(fileTitle);
-    const title = (genericSeasonFolder ? episodicTitle(videoNames) : folderTitle) || episodicTitle(videoNames) || (weakFileFallback ? "" : fileTitle) || "\u672A\u8BC6\u522B\u5A92\u4F53";
+    const title = (genericSeasonFolder ? episodicTitle(videoNames, fixedMappings) : folderTitle) || episodicTitle(videoNames, fixedMappings) || (weakFileFallback ? "" : fileTitle) || "\u672A\u8BC6\u522B\u5A92\u4F53";
     const episode = parseSeasonEpisode(combined, 1);
     const mediaType = hasEpisodes ? "tv" : inferMediaType(combined, filenames);
-    const technical = { ...inferTechnicalFields(combined, config.recognition?.fixedMappings), ...collectTechnicalFields(preparedFiles, config.recognition?.fixedMappings) };
+    const technical = { ...inferTechnicalFields(combined, fixedMappings), ...collectTechnicalFields(preparedFiles, fixedMappings) };
     return {
       title,
       namingTitle: title,
@@ -14879,7 +14908,8 @@ ${end.comment}` : end.comment;
   var GENERIC_WEAK_FOLDERS = /^(?:Transfer|Downloads?|下载|待整理|未分类|Movies?|电影|影片|Shows?|Series|剧集|电视剧|TV|综艺|动漫|动画|Documentaries|纪录片|Media|媒体|媒体库|Videos?|Resources?|资源|Folder|Dir|Directory|新建文件夹|文件夹)$/i;
   var PURE_SEASON_FOLDER = /^(?:Season\s*\d{1,3}|S\d{1,3}|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季)$/i;
   var SEASON_FOLDER_PREFIX = /^(?:Season\s*\d{1,3}|S\d{1,3}|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季)(?:\s+|$)/i;
-  var SEASON_TECHNICAL_SUFFIX_START = /^(?:4320p|8K|2160p|4K|UHD|1440p|1080p|1080i|720p|576p|540p|480p|360p|HQ|DV|DoVi|Dolby|HDR|HDR10\+?|HLG|SDR|EDR|WEB|WEB-DL|WEBRip|BluRay|Blu-Ray|BD|REMUX|HDTV|UHDTV|NF|Netflix|AMZN|Amazon|ATVP|DSNP|Disney|HMAX|MAX|HBO|IQ|WeTV|Bilibili|MGTV|YOUKU|ABMA|ADN|AT-X|Baha|FOD|FriDay|KKTV|FUNi|HIDI|UNXT|VIU|LINETV|Hami|MW|CPP|TVING|Wavve|YT|YouTube|HEVC|H265|H264|AVC|AV1|DDP?|DD\+|AAC|AV3A|FLAC|TrueHD|DTS|LPCM|PCM|AC3|EAC3|Opus|10bit|12bit|8bit|MAXPLUS|IMAX|REPACK|PROPER|RERIP|CC)$/i;
+  var SEASON_TECHNICAL_SUFFIX_SOURCE = "4320p|8K|2160p|4K|UHD|1440p|1080p|1080i|720p|576p|540p|480p|360p|HQ|DV|DoVi|Dolby|HDR|HDR10\\+?|HLG|SDR|EDR|WEB|WEB-DL|WEBRip|BluRay|Blu-Ray|BD|REMUX|HDTV|UHDTV|NF|Netflix|AMZN|Amazon|ATVP|DSNP|Disney|HMAX|MAX|HBO|IQ|WeTV|Bilibili|MGTV|YOUKU|ABMA|ADN|AT-X|Baha|FOD|FriDay|KKTV|FUNi|HIDI|UNXT|VIU|LINETV|Hami|MW|CPP|TVING|Wavve|YT|YouTube|HEVC|H265|H264|AVC|AV1|DDP?|DD\\+|AAC|AV3A|FLAC|TrueHD|DTS|LPCM|PCM|AC3|EAC3|Opus|10bit|12bit|8bit|MAXPLUS|IMAX|REPACK|PROPER|RERIP|CC";
+  var SEASON_TECHNICAL_SUFFIX_START = new RegExp(`^(?:${SEASON_TECHNICAL_SUFFIX_SOURCE})$`, "i");
   var WEAK_FILE_TITLE = /^(?:unknown|未识别媒体|season\s*\d{1,3}|s\d{1,3}(?:e\d{1,5})?|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季|e(?:p(?:isode)?)?\s*\d{0,5}|第?\s*\d{1,5}\s*[集期话話]?)$/i;
   function normalizedTitle(value) {
     return String(value || "").normalize("NFKC").replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim();
@@ -14890,21 +14920,23 @@ ${end.comment}` : end.comment;
     const parsed = parseSeasonEpisode(text2, 0);
     return Number.isInteger(parsed.season) && parsed.season > 0 ? parsed.season : null;
   }
-  function isGeneratedSeasonFolderTitle(name) {
+  function isGeneratedSeasonFolderTitle(name, mappings) {
     const text2 = normalizedTitle(name);
     const prefix = text2.match(SEASON_FOLDER_PREFIX);
     if (!prefix) return false;
     const suffix = text2.slice(prefix[0].length).trim();
     if (!suffix) return true;
     const firstToken = suffix.split(/\s+/).find(Boolean);
-    return SEASON_TECHNICAL_SUFFIX_START.test(firstToken || "");
+    const aliasSource = audioAliasWordSource(mappings);
+    if (!aliasSource) return SEASON_TECHNICAL_SUFFIX_START.test(firstToken || "");
+    return new RegExp(`^(?:${SEASON_TECHNICAL_SUFFIX_SOURCE}|${aliasSource})`, "i").test(firstToken || "");
   }
-  function isWeakOrganizeFolderTitle(name) {
+  function isWeakOrganizeFolderTitle(name, mappings) {
     const text2 = normalizedTitle(name);
     if (!text2) return true;
     if (GENERIC_WEAK_FOLDERS.test(text2)) return true;
     if (PURE_SEASON_FOLDER.test(text2)) return true;
-    if (isGeneratedSeasonFolderTitle(text2)) return true;
+    if (isGeneratedSeasonFolderTitle(text2, mappings)) return true;
     return /^\d{1,4}$/.test(text2);
   }
   function isWeakLooseTitle(title) {
@@ -14967,9 +14999,10 @@ ${end.comment}` : end.comment;
     const groups = [];
     const grouped = /* @__PURE__ */ new Map();
     const customWords = config.library?.recognition?.customWords || [];
+    const fixedMappings = config.library?.recognition?.fixedMappings;
     for (const file of loose) {
       const text2 = looseRecognitionText(file, customWords);
-      const title = inferTitle(text2);
+      const title = inferTitle(text2, fixedMappings);
       const unidentified = isWeakLooseTitle(title);
       const targetSeason = Number(file.targetSeason || 0);
       // 结尾集号（01 / 第01集 / E02…）不参与分组键，同一标题的各集归为一组。
@@ -15115,7 +15148,7 @@ ${end.comment}` : end.comment;
         const scanned = await scanFolder(api, item, options);
         if (!scanned.files.some((file) => isVideoFile(file.name))) continue;
         const targetSeason = targetSeasonFromFolder(item.name);
-        if (!isWeakOrganizeFolderTitle(item.name)) {
+        if (!isWeakOrganizeFolderTitle(item.name, config?.library?.recognition?.fixedMappings)) {
           const validation = await validateStrongFolderTitle(options.tmdb, item.name, config, options);
           if (!validation.available || validation.media) {
             groups.push({

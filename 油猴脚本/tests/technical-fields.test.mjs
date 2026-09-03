@@ -47,4 +47,17 @@ assert.equal(inferTitle(sample), "See You Later Maybe");
 assert.equal(inferTitle("SomeShow.AV3A.H.265-GROUP"), "SomeShow");
 console.log("ok 标题截断不受 AV3A 影响");
 
+// 4. 全新编码（不在默认白名单，如虚构的 XXEA）：未配置别名时提不出来；
+//    在「音频编码」组加别名后，提取、声道后缀、标题截断全部生效，无需改代码
+const customCodecMappings = [{ id: "custom-xxea", field: "audioCodec", aliases: ["XXEA"], output: "XXEA" }];
+assert.equal(inferTechnicalFields("Movie.2024.1080p.XXEA.2.0.H.265-GROUP").audioCodec, "");
+fields = inferTechnicalFields("Movie.2024.1080p.XXEA.2.0.H.265-GROUP", customCodecMappings);
+assert.equal(fields.audioCodec, "XXEA.2.0");
+console.log("ok 全新编码加别名后可提取（含声道后缀），未配置时不误提取");
+
+fields = inferTechnicalFields("Show.S01E01.XXEA.H.265-GROUP", customCodecMappings);
+assert.equal(fields.audioCodec, "XXEA");
+assert.equal(inferTitle("Movie.XXEA.2.0.H.265-GROUP", customCodecMappings), "Movie");
+console.log("ok 全新编码无声道写法识别 + 标题截断生效");
+
 console.log("technical-fields.test.mjs 全部通过");
