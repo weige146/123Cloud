@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.2.5
+// @version      1.2.6
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @author       local
 // @license      MIT
@@ -1604,6 +1604,7 @@
     entry("audio-lpcm", "audioCodec", ["LPCM"], "LPCM"),
     entry("audio-pcm", "audioCodec", ["PCM"], "LPCM"),
     entry("audio-opus", "audioCodec", ["Opus"], "Opus"),
+    entry("audio-av3a", "audioCodec", ["AV3A"], "AV3A"),
     entry("quality-hq", "highQuality", ["HQ"], "HQ"),
     entry("edition-cc", "originalEdition", ["Criterion Collection", "Criterion", "CC"], "CC"),
     entry("edition-directors-cut", "originalEdition", ["Director's Cut", "Directors Cut", "DC"], "Director's Cut"),
@@ -13220,7 +13221,7 @@ ${end.comment}` : end.comment;
     stem = stem.replace(/[_.]+/g, " ");
     const year = stem.match(YEAR);
     if (year?.index >= 2) stem = stem.slice(0, year.index);
-    const token = stem.match(new RegExp(`\\b(?:S\\d{1,3}(?:E\\d{1,5})?|Season\\s*\\d+|EP?\\d{1,5}|Complete|4320p|2160p|1440p|1080p|720p|WEB[- ]?DL|WEBRip|Blu[- ]?Ray|REMUX|HDTV|H[ .]?26[45]|HEVC|AVC|DDP?|AAC|FLAC|HDR10\\+?|DoVi|DV)\\b|${CHINESE_SEASON_PATTERN}`, "i"));
+    const token = stem.match(new RegExp(`\\b(?:S\\d{1,3}(?:E\\d{1,5})?|Season\\s*\\d+|EP?\\d{1,5}|Complete|4320p|2160p|1440p|1080p|720p|WEB[- ]?DL|WEBRip|Blu[- ]?Ray|REMUX|HDTV|H[ .]?26[45]|HEVC|AVC|DDP?|AAC|FLAC|AV3A|HDR10\\+?|DoVi|DV)\\b|${CHINESE_SEASON_PATTERN}`, "i"));
     if (token?.index >= 2) stem = stem.slice(0, token.index);
     const chineseLead = stem.match(/^([\u3400-\u9fff][\u3400-\u9fff\s·]{1,70}?)(?=\s+[A-Za-z])/);
     if (chineseLead) stem = chineseLead[1];
@@ -13511,7 +13512,7 @@ ${end.comment}` : end.comment;
     const dolbyVision = mapped("dolbyVision");
     const dynamicRange = mapped("dynamicRange");
     const videoCodec = mapped("videoCodec");
-    const audioMatch = text2.match(/\b(TrueHD(?:[.\s-]*(?:Dolby[.\s-]*)?Atmos)?(?:[.\s-]*\d\.\d)?|DDP(?:[.\s-]?\d\.\d(?:[.\s-]?(?:Atmos|JOC))?)?|DD\+(?:[.\s-]?\d\.\d(?:[.\s-]?(?:Atmos|JOC))?)?|DD[.\s-]?\d\.\d(?:[.\s-]?(?:Atmos|JOC))?|DTS[- .]?HD(?:[- .]?MA|[- .]?HRA)?(?:[.\s-]?\d\.\d)?|DTS[- .]?X(?:[.\s-]?\d\.\d)?|DTS(?:[.\s-]?\d\.\d)?|AAC(?:[.\s-]?\d\.\d)?|FLAC(?:[.\s-]?\d\.\d)?|LPCM(?:[.\s-]?\d\.\d)?|PCM(?:[.\s-]?\d\.\d)?|AC3(?:[.\s-]?\d\.\d)?|EAC3(?:[.\s-]?\d\.\d)?|Opus(?:[.\s-]?\d\.\d)?)\b/i);
+    const audioMatch = text2.match(/\b(TrueHD(?:[.\s-]*(?:Dolby[.\s-]*)?Atmos)?(?:[.\s-]*\d\.\d)?|DDP(?:[.\s-]?\d\.\d(?:[.\s-]?(?:Atmos|JOC))?)?|DD\+(?:[.\s-]?\d\.\d(?:[.\s-]?(?:Atmos|JOC))?)?|DD[.\s-]?\d\.\d(?:[.\s-]?(?:Atmos|JOC))?|DTS[- .]?HD(?:[- .]?MA|[- .]?HRA)?(?:[.\s-]?\d\.\d)?|DTS[- .]?X(?:[.\s-]?\d\.\d)?|DTS(?:[.\s-]?\d\.\d)?|AAC(?:[.\s-]?\d\.\d)?|FLAC(?:[.\s-]?\d\.\d)?|LPCM(?:[.\s-]?\d\.\d)?|PCM(?:[.\s-]?\d\.\d)?|AC3(?:[.\s-]?\d\.\d)?|EAC3(?:[.\s-]?\d\.\d)?|Opus(?:[.\s-]?\d\.\d)?|AV3A(?:[.\s-]?\d\.\d)?)\b/i);
     let audioRaw = "";
     if (audioMatch) {
       audioRaw = audioMatch[1];
@@ -14507,7 +14508,7 @@ ${end.comment}` : end.comment;
   var GENERIC_WEAK_FOLDERS = /^(?:Transfer|Downloads?|下载|待整理|未分类|Movies?|电影|影片|Shows?|Series|剧集|电视剧|TV|综艺|动漫|动画|Documentaries|纪录片|Media|媒体|媒体库|Videos?|Resources?|资源|Folder|Dir|Directory|新建文件夹|文件夹)$/i;
   var PURE_SEASON_FOLDER = /^(?:Season\s*\d{1,3}|S\d{1,3}|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季)$/i;
   var SEASON_FOLDER_PREFIX = /^(?:Season\s*\d{1,3}|S\d{1,3}|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季)(?:\s+|$)/i;
-  var SEASON_TECHNICAL_SUFFIX_START = /^(?:4320p|8K|2160p|4K|UHD|1440p|1080p|1080i|720p|576p|540p|480p|360p|HQ|DV|DoVi|Dolby|HDR|HDR10\+?|HLG|SDR|EDR|WEB|WEB-DL|WEBRip|BluRay|Blu-Ray|BD|REMUX|HDTV|UHDTV|NF|Netflix|AMZN|Amazon|ATVP|DSNP|Disney|HMAX|MAX|HBO|IQ|WeTV|Bilibili|MGTV|YOUKU|ABMA|ADN|AT-X|Baha|FOD|FriDay|KKTV|FUNi|HIDI|UNXT|VIU|LINETV|Hami|MW|CPP|TVING|Wavve|YT|YouTube|HEVC|H265|H264|AVC|AV1|DDP?|DD\+|AAC|FLAC|TrueHD|DTS|LPCM|PCM|AC3|EAC3|Opus|10bit|12bit|8bit|MAXPLUS|IMAX|REPACK|PROPER|RERIP|CC)$/i;
+  var SEASON_TECHNICAL_SUFFIX_START = /^(?:4320p|8K|2160p|4K|UHD|1440p|1080p|1080i|720p|576p|540p|480p|360p|HQ|DV|DoVi|Dolby|HDR|HDR10\+?|HLG|SDR|EDR|WEB|WEB-DL|WEBRip|BluRay|Blu-Ray|BD|REMUX|HDTV|UHDTV|NF|Netflix|AMZN|Amazon|ATVP|DSNP|Disney|HMAX|MAX|HBO|IQ|WeTV|Bilibili|MGTV|YOUKU|ABMA|ADN|AT-X|Baha|FOD|FriDay|KKTV|FUNi|HIDI|UNXT|VIU|LINETV|Hami|MW|CPP|TVING|Wavve|YT|YouTube|HEVC|H265|H264|AVC|AV1|DDP?|DD\+|AAC|AV3A|FLAC|TrueHD|DTS|LPCM|PCM|AC3|EAC3|Opus|10bit|12bit|8bit|MAXPLUS|IMAX|REPACK|PROPER|RERIP|CC)$/i;
   var WEAK_FILE_TITLE = /^(?:unknown|未识别媒体|season\s*\d{1,3}|s\d{1,3}(?:e\d{1,5})?|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季|e(?:p(?:isode)?)?\s*\d{0,5}|第?\s*\d{1,5}\s*[集期话話]?)$/i;
   function normalizedTitle(value) {
     return String(value || "").normalize("NFKC").replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim();
