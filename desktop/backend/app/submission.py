@@ -1423,7 +1423,7 @@ def collect_audio_codec(files: Iterable[Any]) -> str:
 def extract_audio_codec(value: str) -> str:
     family = (
         r"TrueHD|DDP|DD\+?|DTS(?:[- .]?(?:HD(?:[- .]?(?:MA|HRA))?|X))?"
-        r"|EAC3|AC3|AAC|FLAC|LPCM|PCM|Opus|Atmos"
+        r"|EAC3|AC3|AAC|FLAC|LPCM|PCM|Opus|AV3A|Atmos"
     )
     match = re.search(
         rf"(?<![A-Za-z0-9])(?P<family>{family})"
@@ -1440,7 +1440,7 @@ def extract_audio_codec(value: str) -> str:
         "DTS": "DTS", "DTSHD": "DTS-HD", "DTSHDMA": "DTS-HD.MA",
         "DTSHDHRA": "DTS-HD.HRA", "DTSX": "DTS-X", "EAC3": "EAC3",
         "AC3": "AC3", "AAC": "AAC", "FLAC": "FLAC", "LPCM": "LPCM",
-        "PCM": "PCM", "OPUS": "Opus", "ATMOS": "Atmos",
+        "PCM": "PCM", "OPUS": "Opus", "ATMOS": "Atmos", "AV3A": "AV3A",
     }
     codec = labels.get(key, match.group("family"))
     details = match.group("details") or ""
@@ -1550,7 +1550,7 @@ _KNOWN_NON_GROUP_TERMS = {
     # Video codecs
     "HEVC", "H265", "H264", "AVC", "AV1", "X264", "X265", "VP9", "MPEG", "MPEG2",
     # Audio codecs
-    "AAC", "AC3", "DDP", "DDP5", "DD", "DTS", "FLAC", "TRUEHD", "ATMOS", "EAC3", "OPUS", "MP3", "LPCM",
+    "AAC", "AC3", "DDP", "DDP5", "DD", "DTS", "FLAC", "TRUEHD", "ATMOS", "EAC3", "OPUS", "MP3", "LPCM", "AV3A",
     # HDR / video formats
     "DV", "HDR", "HDR10", "HDR10+", "HLG", "SDR", "DOVI",
     # Resolution / frame rate
@@ -1574,7 +1574,7 @@ def _is_known_media_term(value: str) -> bool:
     if upper in _KNOWN_NON_GROUP_TERMS or compact in _KNOWN_NON_GROUP_TERMS:
         return True
     # Match patterns like DDP5.1, AAC2.0, DD+5.1, etc.
-    if re.match(r"^(?:AAC|DDP?|DD\+?|AC3|DTS|FLAC|TRUEHD)\d*\.?\d*$", upper):
+    if re.match(r"^(?:AAC|DDP?|DD\+?|AC3|DTS|FLAC|TRUEHD|AV3A)\d*\.?\d*$", upper):
         return True
     if re.fullmatch(r"S\d{1,3}(?:\s*[-~]\s*S\d{1,3})?", upper):
         return True
@@ -1654,7 +1654,7 @@ def is_release_group_suffix(value: str) -> bool:
     if not re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9._@-]{1,40}", text):
         return False
     return not _is_known_media_term(text) and not re.fullmatch(
-        r"(?:DL|WEB|WEBRIP|REMUX|BLURAY|HDTV|BDRIP|HDRIP|NF|AMZN|DSNP|ATVP|VIU|HULU|MAX|HMAX|AAC\d?(?:\.\d)?|DDP\d?(?:\.\d)?|DD\d?(?:\.\d)?|AC3|FLAC|TRUEHD|DTS|AVC|HEVC|AV1|H264|H265|X264|X265|bit|bits?|\d+bit|\d+bits?|\d{3,4}p|\d{3,4}i|S\d{1,2}E\d{1,4}|19\d{2}|20\d{2})",
+        r"(?:DL|WEB|WEBRIP|REMUX|BLURAY|HDTV|BDRIP|HDRIP|NF|AMZN|DSNP|ATVP|VIU|HULU|MAX|HMAX|AAC\d?(?:\.\d)?|DDP\d?(?:\.\d)?|DD\d?(?:\.\d)?|AC3|FLAC|TRUEHD|AV3A|DTS|AVC|HEVC|AV1|H264|H265|X264|X265|bit|bits?|\d+bit|\d+bits?|\d{3,4}p|\d{3,4}i|S\d{1,2}E\d{1,4}|19\d{2}|20\d{2})",
         text,
         re.I,
     )

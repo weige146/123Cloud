@@ -1011,6 +1011,10 @@ class RecognitionCollisionTests(unittest.TestCase):
                 {"audioCodec": "TrueHD7.1 Atmos"},
             ),
             (
+                "Movie.2026.2160p.WEB-DL.AV3A.2.0.H.265-HiveWeb.mkv",
+                {"audioCodec": "AV3A2.0"},
+            ),
+            (
                 "Movie.2026.1080p.WEB-DL.Atmos-HiveWeb.mkv",
                 {"audioCodec": "Atmos"},
             ),
