@@ -1029,7 +1029,17 @@
         }
       });
       const upload = data?.data || {};
-      if (upload.Reuse || upload.reuse) return { id: String(upload.FileId ?? upload.fileId ?? ""), etag, size, reused: true };
+      if (upload.Reuse || upload.reuse) {
+        const id = String(upload.FileId ?? upload.fileId ?? "");
+        // 服务端按内容秒传时，复用的是旧文件本体，可能还躺在以前上传的目录（比如根目录的旧种子）。
+        // 查一下实际位置，不在请求的目录就挪过去，保证「种子文件保存文件夹」设置生效。
+        try {
+          const [info] = id ? await this.fileInfos([id], signal) : [];
+          if (info && info.parentId && info.parentId !== String(Number(parentFileId || 0))) await this.move([id], parentFileId, signal);
+        } catch {
+        }
+        return { id, etag, size, reused: true };
+      }
       if (!upload.Bucket || !upload.Key || !upload.UploadId) throw new Error("\u4E0A\u4F20\u8BF7\u6C42\u672A\u8FD4\u56DE\u5B58\u50A8\u53C2\u6570\uFF0C\u65E0\u6CD5\u7EE7\u7EED\u4E0A\u4F20");
       const authData = await this.request("POST", "/b/api/file/s3_upload_object/auth", {
         signal,
@@ -5675,13 +5685,51 @@
     if (converted123Share) return converted123Share;
     return parseFastlinkText(text2);
   }
+  function fastlinkImportFileKey(file) {
+    return `${String(file.path || file.fileName || "")}|${String(file.etag || "").toLowerCase()}`;
+  }
+  function fastlinkImportContentHash(rootId, files) {
+    return md5Hex(`${String(rootId || "0")}#${JSON.stringify(files.map((file) => [file.path, String(file.etag || "").toLowerCase(), Number(file.size) || 0]))}`);
+  }
+  // 导入断点：按「目标目录 + 内容指纹」记录已成功秒传的文件；重跑同一内容时自动跳过，
+  // 失败项不在 done 里，重跑只会重试失败的部分。全部成功后清除。
   async function importFastlink(api, value, rootId, options = {}) {
     const parsed = typeof value === "string" ? parseFastlink(value) : value;
     const filtered = filterFastlinkFiles(parsed.files, { filterEnabled: options.filterEnabled, filterExtensions: options.filterExtensions });
     if (!filtered.length) throw new Error("\u8FC7\u6EE4\u540E\u6CA1\u6709\u53EF\u5BFC\u5165\u7684\u6587\u4EF6");
     const commonParts = parsed.commonPath ? importedPathParts(parsed.commonPath.replace(/\/$/, ""), "\u516C\u5171\u8DEF\u5F84") : [];
+    let progress = null;
+    let todo = filtered;
+    let skipped = 0;
+    if (options.importProgress) {
+      const contentHash = fastlinkImportContentHash(rootId, filtered);
+      const existing = readFastlinkImportCheckpoint();
+      progress = existing && existing.contentHash === contentHash ? existing : { kind: "import", version: 1, savedAt: Date.now(), contentHash, rootId: String(rootId || "0"), total: filtered.length, done: {} };
+      const doneKeys = new Set(Object.keys(progress.done || {}));
+      todo = filtered.filter((file) => !doneKeys.has(fastlinkImportFileKey(file)));
+      skipped = filtered.length - todo.length;
+    }
+    if (skipped) options.onProgress?.(0, Math.max(todo.length, 1), `\u8DF3\u8FC7\u4E0A\u6B21\u5DF2\u5BFC\u5165\u7684 ${skipped} \u9879\uFF0C\u7EE7\u7EED\u5BFC\u5165\u5269\u4F59 ${todo.length} \u9879`);
+    if (!todo.length) {
+      const details = filtered.map((file) => ({ ...file, name: [...commonParts, file.path].filter(Boolean).join("/"), status: "skipped", message: "\u4E0A\u6B21\u5DF2\u5BFC\u5165" }));
+      return { ...batchResult(details, [rootId]), skipped };
+    }
+    let progressDirty = false;
+    let progressSavedAt = 0;
+    const markProgress = (file) => {
+      if (!progress) return;
+      progress.done[fastlinkImportFileKey(file)] = 1;
+      progressDirty = true;
+      const now = Date.now();
+      if (now - progressSavedAt >= 1500) {
+        progressSavedAt = now;
+        progress.savedAt = now;
+        checkpointStorageSet(FASTLINK_IMPORT_CHECKPOINT_KEY, progress);
+        progressDirty = false;
+      }
+    };
     const cache = /* @__PURE__ */ new Map();
-    const prepared = await mapLimit(filtered, Math.max(1, Math.min(4, options.concurrency || 3)), async (file) => {
+    const prepared = await mapLimit(todo, Math.max(1, Math.min(4, options.concurrency || 3)), async (file) => {
       const parts = importedPathParts(file.path);
       const parentId = await api.ensurePath(rootId, [...commonParts, ...parts.slice(0, -1)], cache, options.signal);
       return { ...file, parentId };
@@ -5690,6 +5738,7 @@
     const details = await mapLimit(prepared, Math.max(1, Math.min(5, options.concurrency || 3)), async (file) => {
       try {
         await api.reuseFile(file, file.parentId, options.signal);
+        markProgress(file);
         return { ...file, name: [...commonParts, file.path].filter(Boolean).join("/"), status: "success" };
       } catch (error) {
         return { ...file, name: [...commonParts, file.path].filter(Boolean).join("/"), status: "failed", message: error.message };
@@ -5698,45 +5747,269 @@
         options.onProgress?.(done, prepared.length, file.path);
       }
     }, { signal: options.signal });
-    return batchResult(details, [rootId]);
+    if (progress) {
+      const failed = details.filter((item) => item.status === "failed").length;
+      if (failed) {
+        if (progressDirty) checkpointStorageSet(FASTLINK_IMPORT_CHECKPOINT_KEY, { ...progress, savedAt: Date.now() });
+      } else {
+        checkpointStorageRemove(FASTLINK_IMPORT_CHECKPOINT_KEY);
+      }
+    }
+    return { ...batchResult(details, [rootId]), skipped };
+  }
+  var FASTLINK_SCAN_CHECKPOINT_KEY = "Cloud123.Helper.FastlinkScanProgress";
+  var FASTLINK_IMPORT_CHECKPOINT_KEY = "Cloud123.Helper.FastlinkImportProgress";
+  var FASTLINK_CHECKPOINT_TTL = 7 * 24 * 60 * 60 * 1000;
+  function checkpointStorageGet(key) {
+    try {
+      if (typeof GM_getValue === "function") return GM_getValue(key, null);
+      return JSON.parse(localStorage.getItem(key) || "null");
+    } catch {
+      return null;
+    }
+  }
+  function checkpointStorageSet(key, value) {
+    try {
+      if (typeof GM_setValue === "function") GM_setValue(key, value);
+      else localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+    }
+  }
+  function checkpointStorageRemove(key) {
+    try {
+      if (typeof GM_deleteValue === "function") GM_deleteValue(key);
+      else if (typeof GM_setValue === "function") GM_setValue(key, null);
+      else localStorage.removeItem(key);
+    } catch {
+    }
+  }
+  function freshFastlinkFileEntry(item, fileName, path, root = 0) {
+    return { id: String(item?.id ?? ""), name: String(item?.name ?? fileName), fileName, path, etag: String(item?.etag ?? ""), size: Number(item?.size) || 0, s3KeyFlag: String(item?.s3KeyFlag ?? ""), root: Number(root) || 0 };
+  }
+  function fastlinkScanIdentity(items, options = {}) {
+    return {
+      rootIds: (items || []).map((item) => String(item?.id || "")).filter(Boolean),
+      filtersKey: JSON.stringify([options.filterEnabled === true, [...(options.filterExtensions || [])].map((item) => String(item).toLowerCase()).sort()])
+    };
+  }
+  function fastlinkScanIdentityMatches(state, identity) {
+    return !!state && state.kind === "scan" && JSON.stringify([state.rootIds || [], state.filtersKey || ""]) === JSON.stringify([identity.rootIds, identity.filtersKey]);
+  }
+  function readFastlinkScanCheckpoint() {
+    const state = checkpointStorageGet(FASTLINK_SCAN_CHECKPOINT_KEY);
+    if (!state || state.kind !== "scan" || !Array.isArray(state.files) || !state.files.length) return null;
+    if (!Number(state.savedAt) || Date.now() - Number(state.savedAt) > FASTLINK_CHECKPOINT_TTL) return null;
+    return state;
+  }
+  function writeFastlinkScanCheckpoint(state) {
+    checkpointStorageSet(FASTLINK_SCAN_CHECKPOINT_KEY, { ...state, kind: "scan", version: 1, savedAt: Date.now() });
+  }
+  function clearFastlinkScanCheckpoint() {
+    checkpointStorageRemove(FASTLINK_SCAN_CHECKPOINT_KEY);
+  }
+  function readFastlinkImportCheckpoint() {
+    const state = checkpointStorageGet(FASTLINK_IMPORT_CHECKPOINT_KEY);
+    if (!state || state.kind !== "import" || !state.contentHash || !state.done || typeof state.done !== "object") return null;
+    if (!Number(state.savedAt) || Date.now() - Number(state.savedAt) > FASTLINK_CHECKPOINT_TTL) return null;
+    return state;
+  }
+  function fastlinkCheckpointController(state, resumed, write, clearStorage) {
+    return {
+      state,
+      resumed,
+      lastSavedAt: 0,
+      lastSavedCount: 0,
+      save(force = false) {
+        if (!this.state) return;
+        const now = Date.now();
+        if (!force && now - this.lastSavedAt < 1500 && Math.abs(this.state.files.length - this.lastSavedCount) < 300) return;
+        this.lastSavedAt = now;
+        this.lastSavedCount = this.state.files.length;
+        write(this.state);
+      },
+      clear() {
+        this.state = null;
+        clearStorage();
+      }
+    };
+  }
+  // 扫描断点：files 已收集的文件（带 root 归属），completedFolders 已扫完的目录，
+  // pending 是还没扫的目录栈；中断后同选择 + 同过滤条件即可续扫，目录 ID 在 123 云盘内稳定。
+  function createFastlinkScanCheckpoint(items, options = {}) {
+    const identity = fastlinkScanIdentity(items, options);
+    const existing = readFastlinkScanCheckpoint();
+    const resumed = fastlinkScanIdentityMatches(existing, identity);
+    if (existing && !resumed) clearFastlinkScanCheckpoint();
+    const state = resumed ? existing : {
+      rootIds: identity.rootIds,
+      rootNames: (items || []).map((item) => String(item?.name || "")),
+      filtersKey: identity.filtersKey,
+      files: [],
+      completedFolders: [],
+      pending: (items || []).map((item, index) => Number(item?.type) === 1
+        ? { root: index, type: "folder", id: String(item?.id || ""), name: String(item?.name || ""), prefix: "" }
+        : { root: index, type: "file", entry: freshFastlinkFileEntry(item, String(item?.name || ""), cleanFastlinkPath(String(item?.name || "")), index) })
+    };
+    return { identity, ...fastlinkCheckpointController(state, resumed, writeFastlinkScanCheckpoint, clearFastlinkScanCheckpoint) };
+  }
+  // 分享扫描断点：单个分享（或批量里的当前行）的扫描进度；批量元数据放在 state.batch（原始行 + 已完成行数）。
+  var FASTLINK_SHARE_CHECKPOINT_KEY = "Cloud123.Helper.FastlinkShareProgress";
+  function readFastlinkShareCheckpoint() {
+    const state = checkpointStorageGet(FASTLINK_SHARE_CHECKPOINT_KEY);
+    if (!state || state.kind !== "share" || !Array.isArray(state.files) || !state.files.length) return null;
+    if (!Number(state.savedAt) || Date.now() - Number(state.savedAt) > FASTLINK_CHECKPOINT_TTL) return null;
+    return state;
+  }
+  function writeFastlinkShareCheckpoint(state) {
+    checkpointStorageSet(FASTLINK_SHARE_CHECKPOINT_KEY, { ...state, kind: "share", version: 1, savedAt: Date.now() });
+  }
+  function clearFastlinkShareCheckpoint() {
+    checkpointStorageRemove(FASTLINK_SHARE_CHECKPOINT_KEY);
+  }
+  function fastlinkShareFiltersKey(options = {}) {
+    return JSON.stringify([options.filterEnabled === true, [...(options.filterExtensions || [])].map((item) => String(item).toLowerCase()).sort(), String(options.parentId || "0")]);
+  }
+  function fastlinkSameLines(left, right) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((item, index) => String(item) === String(right[index]));
+  }
+  function createFastlinkShareCheckpoint(input, options = {}, batchContext = null) {
+    const shareKey = String(input?.shareKey || "");
+    const filtersKey = fastlinkShareFiltersKey(options);
+    const parentId = String(options.parentId || "0");
+    const existing = readFastlinkShareCheckpoint();
+    let resumed = false;
+    if (existing) {
+      if (batchContext) resumed = !!existing.batch && fastlinkSameLines(existing.batch.lines, batchContext.lines) && Number(existing.batch.done) === Number(batchContext.done) && existing.shareKey === shareKey && existing.filtersKey === filtersKey;
+      else resumed = !existing.batch && existing.shareKey === shareKey && existing.filtersKey === filtersKey && existing.parentId === parentId;
+    }
+    if (existing && !resumed) clearFastlinkShareCheckpoint();
+    const state = resumed ? existing : {
+      shareKey,
+      sharePwd: String(input?.sharePwd || ""),
+      filtersKey,
+      parentId,
+      files: [],
+      completedFolders: [],
+      pending: [{ id: parentId, path: "" }]
+    };
+    if (batchContext) state.batch = { lines: [...batchContext.lines], done: Number(batchContext.done) || 0 };
+    else delete state.batch;
+    return fastlinkCheckpointController(state, resumed, writeFastlinkShareCheckpoint, clearFastlinkShareCheckpoint);
+  }
+  function fastlinkArtifactName(name, options = {}) {
+    const date = options.appendDate ? `_${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10).replace(/-/g, "")}` : "";
+    const folderName = options.useFolderName === false ? "123FastLink_Export" : cleanPathPart(name) || "123FastLink_Export";
+    return `${folderName}${date}.123fastlink.json`;
   }
   async function exportFastlinkItems(api, items, options = {}) {
     const artifacts = [];
+    const checkpoint = options.checkpoint || null;
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index];
       const files = await collectFastlinkFiles(api, [item], {
         signal: options.signal,
         filterEnabled: options.filterEnabled,
         filterExtensions: options.filterExtensions,
-        onProgress: (done) => options.onProgress?.(index, items.length, `${item.name}\uFF1A\u5DF2\u626B\u63CF ${done} \u4E2A\u6587\u4EF6`)
+        onProgress: (done) => options.onProgress?.(index, items.length, `${item.name}\uFF1A\u5DF2\u626B\u63CF ${done} \u4E2A\u6587\u4EF6`),
+        checkpoint,
+        checkpointRoots: [index]
       });
       if (!files.length) throw new Error(`\u6240\u9009\u9879\u76EE\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u6587\u4EF6\uFF1A${item.name}`);
-      const date = options.appendDate ? `_${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10).replace(/-/g, "")}` : "";
-      const folderName = options.useFolderName === false ? "123FastLink_Export" : cleanPathPart(item.name) || "123FastLink_Export";
       artifacts.push({
         item,
-        filename: `${folderName}${date}.123fastlink.json`,
+        filename: fastlinkArtifactName(item.name, options),
         text: buildFastlinkJson(files),
         link: buildFastlinkText(files),
         fileCount: files.length
       });
       options.onProgress?.(index + 1, items.length, `${item.name}\uFF1A\u5BFC\u51FA\u5B8C\u6210`);
     }
+    checkpoint?.clear();
     return artifacts;
   }
   async function collectFastlinkFiles(api, items, options = {}) {
-    const files = [];
-    async function scan(item, prefix, depth) {
-      if (options.signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
-      if (Number(item.type) === 1) {
-        const children = await api.listAll(item.id, { signal: options.signal });
-        for (const child of children) await scan(child, `${prefix}${item.name}/`, depth + 1);
-        return;
-      }
-      files.push({ ...item, fileName: item.name, path: cleanFastlinkPath(`${prefix}${item.name}`) });
-      options.onProgress?.(files.length, 0, item.name);
+    const checkpoint = options.checkpoint;
+    const rootIndexes = (options.checkpointRoots || [0]).map((value) => Number(value));
+    const rootSet = new Set(rootIndexes);
+    let files = [];
+    let allFiles = files;
+    let othersPending = [];
+    let stack = [];
+    let completedFolders = new Set();
+    let seenIds = new Set();
+    if (checkpoint?.state) {
+      const state = checkpoint.state;
+      allFiles = Array.isArray(state.files) ? state.files : [];
+      files = allFiles.filter((file) => rootSet.has(Number(file.root)));
+      completedFolders = new Set(state.completedFolders || []);
+      seenIds = new Set(allFiles.map((file) => String(file.id)));
+      for (const entry of state.pending || []) (rootSet.has(Number(entry?.root)) ? stack : othersPending).push(entry);
+    } else {
+      stack = (items || []).map((item, index) => {
+        const root = Number.isSafeInteger(rootIndexes[index]) ? rootIndexes[index] : 0;
+        return Number(item?.type) === 1
+          ? { root, type: "folder", id: String(item?.id || ""), name: String(item?.name || ""), prefix: "" }
+          : { root, type: "file", entry: freshFastlinkFileEntry(item, String(item?.name || ""), cleanFastlinkPath(String(item?.name || "")), root) };
+      });
     }
-    for (const item of items) await scan(item, "", 0);
+    const persist = (force = false) => {
+      if (!checkpoint?.state) return;
+      checkpoint.state.files = allFiles;
+      checkpoint.state.completedFolders = [...completedFolders];
+      checkpoint.state.pending = [...othersPending, ...stack];
+      checkpoint.save(force);
+    };
+    const pushFile = (entry) => {
+      const key = String(entry.id || "");
+      if (seenIds.has(key)) return;
+      seenIds.add(key);
+      allFiles.push(entry);
+      if (files !== allFiles) files.push(entry);
+      options.onProgress?.(files.length, 0, entry.fileName);
+    };
+    while (stack.length) {
+      if (options.signal?.aborted) {
+        persist(true);
+        throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
+      }
+      const entry = stack[stack.length - 1];
+      if (entry.type === "file") {
+        stack.pop();
+        pushFile(entry.entry);
+        continue;
+      }
+      if (completedFolders.has(entry.id)) {
+        stack.pop();
+        continue;
+      }
+      // 上次中断在这个目录时可能已收了一部分文件，重扫前先剔除本目录前缀下的旧记录
+      const ownPrefix = `${entry.prefix}${entry.name}`;
+      const stale = files.filter((file) => file.path === ownPrefix || file.path.startsWith(`${ownPrefix}/`));
+      if (stale.length) {
+        const removed = new Set(stale);
+        for (const file of stale) seenIds.delete(String(file.id || ""));
+        allFiles = allFiles.filter((file) => !removed.has(file));
+        files = files.filter((file) => !removed.has(file));
+        if (checkpoint?.state) checkpoint.state.files = allFiles;
+      }
+      let children;
+      try {
+        children = await api.listAll(entry.id, { signal: options.signal });
+      } catch (error) {
+        persist(true);
+        throw error;
+      }
+      // 先弹出已完成的目录再压入子目录（收集子项是同步的，中断只可能发生在 listAll 期间）
+      stack.pop();
+      const childFolders = [];
+      for (const child of [...(children || [])].reverse()) {
+        if (Number(child.type) === 1) childFolders.push({ root: entry.root, type: "folder", id: String(child.id || ""), name: String(child.name || ""), prefix: `${ownPrefix}/` });
+        else pushFile(freshFastlinkFileEntry(child, String(child.name || ""), cleanFastlinkPath(`${ownPrefix}/${child.name}`), entry.root));
+      }
+      stack.push(...childFolders);
+      completedFolders.add(entry.id);
+      persist(false);
+    }
     const missing = files.filter((file) => !file.etag);
     if (missing.length) {
       const details = await api.fileInfos(missing.map((file) => file.id), options.signal);
@@ -5748,32 +6021,128 @@
     if (incomplete) throw new Error(`\u6587\u4EF6\u7F3A\u5C11\u79D2\u4F20 Etag\uFF1A${incomplete.path}`);
     return filtered;
   }
-  async function collectPublicShareFiles(api, value, options = {}) {
-    const { shareKey, sharePwd } = typeof value === "string" ? parsePublicShareInput(value) : value;
-    const output = [];
-    async function walk(parentId, prefix, depth) {
-      const entries = await api.listSharedDirectoryContents(parentId, shareKey, sharePwd, { signal: options.signal, limit: options.limit });
-      for (const entry2 of entries || []) {
-        const name = cleanPathPart(entry2.name || entry2.fileName || "\u672A\u77E5\u6587\u4EF6");
-        const path = [prefix, name].filter(Boolean).join("/");
-        if (Number(entry2.type) === 1) await walk(entry2.id || entry2.fileId, path, depth + 1);
-        else if (entry2.etag && Number.isSafeInteger(Number(entry2.size))) output.push({ ...entry2, fileName: name, path });
-        options.onProgress?.(output.length, 0, path);
+  // 中断抢救：把断点里已扫描到的文件直接整理成可用的秒传产物（缺 Etag 的剔除而不是报错）。
+  async function buildFastlinkSalvage(api, state, options = {}) {
+    const collected = (state?.files || []).filter((file) => file?.path && Number.isSafeInteger(Number(file.size)) && Number(file.size) >= 0);
+    if (!collected.length) throw new Error("\u6CA1\u6709\u5DF2\u626B\u63CF\u7684\u6587\u4EF6\u53EF\u4EE5\u5BFC\u51FA");
+    const missing = collected.filter((file) => !file.etag);
+    if (missing.length && typeof api?.fileInfos === "function") {
+      try {
+        const details = await api.fileInfos(missing.map((file) => Number(file.id)).filter((value) => value > 0), options.signal);
+        const map2 = new Map(details.map((file) => [file.id, file]));
+        for (const file of missing) Object.assign(file, map2.get(Number(file.id)) || {});
+      } catch {
       }
     }
-    await walk(String(options.parentId || "0"), "", 0);
+    const groups = /* @__PURE__ */ new Map();
+    for (const file of collected) {
+      if (!file.etag) continue;
+      const rootIndex = Number.isSafeInteger(Number(file.root)) ? Number(file.root) : 0;
+      if (!groups.has(rootIndex)) groups.set(rootIndex, []);
+      groups.get(rootIndex).push(file);
+    }
+    if (!groups.size) throw new Error("\u5DF2\u626B\u63CF\u7684\u6587\u4EF6\u7F3A\u5C11\u79D2\u4F20 Etag\uFF0C\u65E0\u6CD5\u5BFC\u51FA");
+    const rootNames = Array.isArray(state?.rootNames) ? state.rootNames : [];
+    return [...groups.entries()].map(([rootIndex, groupFiles]) => {
+      const name = rootNames[rootIndex] || `Part_${rootIndex + 1}`;
+      return { item: { name }, filename: fastlinkArtifactName(name, options), text: buildFastlinkJson(groupFiles), link: buildFastlinkText(groupFiles), fileCount: groupFiles.length };
+    });
+  }
+  async function collectPublicShareFiles(api, value, options = {}) {
+    const { shareKey, sharePwd } = typeof value === "string" ? parsePublicShareInput(value) : value;
+    const checkpoint = options.checkpoint || null;
+    let output = [];
+    let allFiles = output;
+    let stack = [];
+    let completedFolders = new Set();
+    let seenIds = new Set();
+    if (checkpoint?.state) {
+      allFiles = Array.isArray(checkpoint.state.files) ? checkpoint.state.files : [];
+      output = allFiles;
+      completedFolders = new Set(checkpoint.state.completedFolders || []);
+      seenIds = new Set(allFiles.map((file) => String(file.id)));
+      stack = [...(checkpoint.state.pending || [])];
+      checkpoint.state.pending = [];
+    } else {
+      stack = [{ id: String(options.parentId || "0"), path: "" }];
+    }
+    const persist = (force = false) => {
+      if (!checkpoint?.state) return;
+      checkpoint.state.files = allFiles;
+      checkpoint.state.completedFolders = [...completedFolders];
+      checkpoint.state.pending = [...stack];
+      checkpoint.save(force);
+    };
+    const pushFile = (entry) => {
+      const key = String(entry.id || "");
+      if (seenIds.has(key)) return;
+      seenIds.add(key);
+      allFiles.push(entry);
+      if (output !== allFiles) output.push(entry);
+      options.onProgress?.(output.length, 0, entry.path);
+    };
+    while (stack.length) {
+      if (options.signal?.aborted) {
+        persist(true);
+        throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
+      }
+      const entry = stack[stack.length - 1];
+      if (completedFolders.has(entry.id)) {
+        stack.pop();
+        continue;
+      }
+      // 上次中断在这个目录时可能已收了一部分文件，重扫前先剔除本目录前缀下的旧记录
+      if (entry.path) {
+        const stale = output.filter((file) => file.path === entry.path || file.path.startsWith(`${entry.path}/`));
+        if (stale.length) {
+          const removed = new Set(stale);
+          for (const file of stale) seenIds.delete(String(file.id || ""));
+          allFiles = allFiles.filter((file) => !removed.has(file));
+          output = output.filter((file) => !removed.has(file));
+          if (checkpoint?.state) checkpoint.state.files = allFiles;
+        }
+      }
+      let entries;
+      try {
+        entries = await api.listSharedDirectoryContents(entry.id, shareKey, sharePwd, { signal: options.signal, limit: options.limit });
+      } catch (error) {
+        persist(true);
+        throw error;
+      }
+      stack.pop();
+      const childFolders = [];
+      for (const entry2 of [...(entries || [])].reverse()) {
+        const name = cleanPathPart(entry2.name || entry2.fileName || "\u672A\u77E5\u6587\u4EF6");
+        const path = [entry.path, name].filter(Boolean).join("/");
+        if (Number(entry2.type) === 1) childFolders.push({ id: String(entry2.id || entry2.fileId || ""), path });
+        else if (entry2.etag && Number.isSafeInteger(Number(entry2.size))) pushFile({ id: String(entry2.id || entry2.fileId || path), fileName: name, path, etag: String(entry2.etag || ""), size: Number(entry2.size), s3KeyFlag: String(entry2.s3KeyFlag || "") });
+        else options.onProgress?.(output.length, 0, path);
+      }
+      stack.push(...childFolders);
+      completedFolders.add(entry.id);
+      persist(false);
+    }
     return filterFastlinkFiles(output, options);
   }
-  async function exportPublicShare(api, value, options = {}) {
-    const input = typeof value === "string" ? parsePublicShareInput(value) : value;
-    const files = await collectPublicShareFiles(api, input, options);
-    if (!files.length) throw new Error("\u5206\u4EAB\u4E2D\u6CA1\u6709\u53EF\u751F\u6210\u79D2\u4F20\u7684\u6587\u4EF6");
+  function buildFastlinkPublicArtifact(files, input, options = {}) {
     const roots = new Set(files.map((file) => cleanFastlinkPath(file.path).split("/")[0]).filter(Boolean));
     const hasSharedFolderRoot = files.every((file) => cleanFastlinkPath(file.path).includes("/"));
     const sharedFolderName = options.useFolderName !== false && hasSharedFolderRoot && roots.size === 1 ? [...roots][0] : "";
     const safeName = cleanPathPart(options.name || sharedFolderName || input.shareKey || "123FastLink_PublicShare") || "123FastLink_PublicShare";
     const date = options.appendDate ? `_${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10).replace(/-/g, "")}` : "";
     return { item: { name: safeName }, fileCount: files.length, filename: `${safeName}${date}.123fastlink.json`, text: buildFastlinkJson(files), link: buildFastlinkText(files), shareKey: input.shareKey, sharePwd: input.sharePwd };
+  }
+  async function exportPublicShare(api, value, options = {}) {
+    const input = typeof value === "string" ? parsePublicShareInput(value) : value;
+    const checkpoint = options.checkpoint || null;
+    const files = await collectPublicShareFiles(api, input, options);
+    if (!files.length) {
+      checkpoint?.clear();
+      throw new Error("\u5206\u4EAB\u4E2D\u6CA1\u6709\u53EF\u751F\u6210\u79D2\u4F20\u7684\u6587\u4EF6");
+    }
+    const artifact = buildFastlinkPublicArtifact(files, input, options);
+    checkpoint?.clear();
+    return artifact;
   }
   function normalizeSeedFolderId(value) {
     const raw = String(value ?? "").trim();
@@ -5794,7 +6163,9 @@
       signal: options.signal,
       filterEnabled: options.filterEnabled,
       filterExtensions: options.filterExtensions,
-      onProgress: (done) => options.onProgress?.(0, 2, `\u5DF2\u626B\u63CF ${done} \u4E2A\u6587\u4EF6`)
+      onProgress: (done) => options.onProgress?.(0, 2, `\u5DF2\u626B\u63CF ${done} \u4E2A\u6587\u4EF6`),
+      checkpoint: options.checkpoint || null,
+      checkpointRoots: items.map((item, index) => index)
     });
     const { fileName, useJson } = buildSecondarySeedName(items, options);
     const content = useJson ? buildFastlinkJson(files) : buildFastlinkText(files);
@@ -16367,12 +16738,16 @@ ${end.comment}` : end.comment;
     const splitPane = `${notice("\u652F\u6301\u9879\u76EE JSON\u3001123FLCPV2 \u94FE\u63A5\u548C\u65E7\u7248 V1/V2 \u6587\u672C\u3002\u6309\u76EE\u5F55\u5C42\u7EA7\u4F1A\u4E3A\u6BCF\u4E2A\u76EE\u5F55\u7EC4\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\uFF0C\u6309\u6570\u91CF\u4F1A\u6309\u6761\u76EE\u5207\u5206\u3002", "", "download")}<div class="button-row"><button class="button" data-action="fastlink-split-file-open">${icon("folderOpen", 15)}\u9009\u62E9 JSON</button><span>${escapeHtml(state.splitFileName || "\u4E5F\u53EF\u4EE5\u76F4\u63A5\u7C98\u8D34")}</span><input id="fastlink-split-file" type="file" accept=".json,.txt,.123fastlink" hidden></div><div class="editor-surface"><textarea id="fastlink-split-input" placeholder="\u7C98\u8D34 JSON \u6216\u79D2\u4F20\u94FE\u63A5">${escapeHtml(state.splitInput || "")}</textarea></div><div class="inline-fields"><label class="field"><span>\u62C6\u5206\u65B9\u5F0F</span><select id="fastlink-split-method"><option value="folder" ${state.splitMethod === "folder" ? "selected" : ""}>\u6309\u76EE\u5F55\u5C42\u7EA7</option><option value="count" ${state.splitMethod === "count" ? "selected" : ""}>\u6309\u6587\u4EF6\u6570\u91CF</option></select></label><label class="field"><span>${state.splitMethod === "count" ? "\u6BCF\u4EFD\u6587\u4EF6\u6570" : "\u76EE\u5F55\u5C42\u6570"}</span><input id="fastlink-split-amount" type="number" min="1" value="${Math.max(1, Number(state.splitAmount) || 1)}"></label></div>`;
     const convertPane = `${notice("\u5728 .123share \u4E0E\u9879\u76EE\u6807\u51C6 JSON \u4E4B\u95F4\u4E92\u8F6C\u3002\u8F6C\u6362\u53EA\u5728\u672C\u5730\u5B8C\u6210\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u6587\u4EF6\u3002", "", "settings")}<div class="button-row"><button class="button" data-action="fastlink-convert-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u6587\u4EF6</button><span>${escapeHtml(state.convertFileName || "\u652F\u6301 .123share / .json")}</span><input id="fastlink-convert-file" type="file" accept=".123share,.json" hidden></div><div class="editor-surface"><textarea id="fastlink-convert-input" placeholder="\u4E5F\u53EF\u4EE5\u7C98\u8D34\u6587\u4EF6\u5185\u5BB9">${escapeHtml(state.convertInput || "")}</textarea></div>${state.converted ? notice(`\u5DF2\u8F6C\u6362\u4E3A ${state.converted === "json" ? "JSON" : ".123share"} \u5E76\u5F00\u59CB\u4E0B\u8F7D\u3002`, "success", "check") : ""}`;
     const filterPane =`${notice("\u542F\u7528\u540E\uFF0C\u751F\u6210\u6216\u8F6C\u5B58\u65F6\u4F1A\u8DF3\u8FC7\u5BF9\u5E94\u6269\u5C55\u540D\u3002\u8BBE\u7F6E\u4FDD\u5B58\u5728\u9879\u76EE\u914D\u7F6E\u4E2D\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-filter="share" ${settings.filterOnShareEnabled ? "checked" : ""}>\u751F\u6210\u65F6\u542F\u7528\u8FC7\u6EE4</label><label class="check-line"><input type="checkbox" data-fastlink-filter="transfer" ${settings.filterOnTransferEnabled ? "checked" : ""}>\u8F6C\u5B58\u65F6\u542F\u7528\u8FC7\u6EE4</label></div><div class="filter-actions"><button class="button compact" data-action="fastlink-filter-all">\u5168\u9009</button><button class="button compact" data-action="fastlink-filter-none">\u5168\u4E0D\u9009</button><button class="button compact" data-action="fastlink-filter-reset">\u6062\u590D\u9ED8\u8BA4</button></div><div class="fastlink-filter-list">${filters.map((item, index) => `<label class="check-line"><input type="checkbox" data-fastlink-filter="extension" data-index="${index}" ${item.enabled ? "checked" : ""}><span>.${escapeHtml(item.ext)}</span><small>${escapeHtml(item.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B")}</small></label>`).join("")}</div>`;
-    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? `${settings.seedFolderName || ""}\uFF08${settings.seedFolderId}\uFF09` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
+    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? settings.seedFolderName ? `${settings.seedFolderName}\uFF08${settings.seedFolderId}\uFF09` : `ID ${settings.seedFolderId}` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
     const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"]];
     const nav = `<div class="fastlink-tool-grid">${tools.map(([key, label, iconName]) => `<button class="button tool-button ${tool === key ? "active" : ""}" data-action="fastlink-tool" data-tool="${key}">${icon(iconName, 14)}${label}</button>`).join("")}</div>`;
     let pane = state.picker ? renderFolderPicker(ui, state.picker) : tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : settingsPane;
     const modeToolbar = `<div class="mode-toolbar"><div class="segmented"><button data-action="fastlink-mode" data-mode="import" class="${tool === "import" ? "active" : ""}">${icon("import", 15)}\u5BFC\u5165</button><button data-action="fastlink-mode" data-mode="export" class="${tool === "export" ? "active" : ""}">${icon("download", 15)}\u5BFC\u51FA</button></div></div>`;
-    const body = `${nav}${["export", "import"].includes(tool) ? modeToolbar : ""}<div class="fastlink-pane">${pane}</div>${state.artifacts.length && !["export", "import"].includes(tool) ? generatedLinks : ""}`;
+    const scanProgress = readFastlinkScanCheckpoint();
+    const shareProgress = readFastlinkShareCheckpoint();
+    const scanSalvageCard = scanProgress ? `${notice(`\u4E0A\u6B21\u79D2\u4F20\u626B\u63CF\u672A\u5B8C\u6210\uFF0C\u5DF2\u4FDD\u5B58 ${scanProgress.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6${state.salvage && state.salvage.flow !== "public" && state.salvage.flow !== "publicBatch" ? `\uFF08${escapeHtml(state.salvage.reason)}\uFF09` : ""}\uFF1B\u5BF9\u540C\u6837\u7684\u9009\u62E9\u518D\u6B21\u5BFC\u51FA\u4F1A\u81EA\u52A8\u7EED\u63A5\u3002`, "warning", "alert")}<div class="button-row"><button class="button compact" data-action="fastlink-resume-scan">\u7EE7\u7EED\u626B\u63CF</button><button class="button compact" data-action="fastlink-salvage-export">\u5BFC\u51FA\u5DF2\u626B\u63CF\u90E8\u5206</button><button class="button compact" data-action="fastlink-salvage-discard">\u653E\u5F03\u8FDB\u5EA6</button></div>` : "";
+    const shareSalvageCard = shareProgress ? `${notice(`\u4E0A\u6B21\u5206\u4EAB\u626B\u63CF\u672A\u5B8C\u6210\uFF0C\u5DF2\u4FDD\u5B58 ${shareProgress.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6${shareProgress.batch ? `\uFF08\u6279\u91CF\u89E3\u6790\uFF1A\u5DF2\u5B8C\u6210 ${Number(shareProgress.batch.done) || 0}/${shareProgress.batch.lines.length} \u884C\uFF09` : ""}${state.salvage && (state.salvage.flow === "public" || state.salvage.flow === "publicBatch") ? `\uFF08${escapeHtml(state.salvage.reason)}\uFF09` : ""}\uFF1B\u540C\u6837\u5185\u5BB9\u518D\u6B21\u751F\u6210\u4F1A\u81EA\u52A8\u7EED\u63A5\u3002`, "warning", "alert")}<div class="button-row"><button class="button compact" data-action="fastlink-share-resume">\u7EE7\u7EED\u626B\u63CF</button><button class="button compact" data-action="fastlink-share-salvage-export">\u5BFC\u51FA\u5DF2\u626B\u63CF\u90E8\u5206</button><button class="button compact" data-action="fastlink-share-salvage-discard">\u653E\u5F03\u8FDB\u5EA6</button></div>` : "";
+    const body = `${scanSalvageCard}${shareSalvageCard}${nav}${["export", "import"].includes(tool) ? modeToolbar : ""}<div class="fastlink-pane">${pane}</div>${state.artifacts.length && !["export", "import"].includes(tool) ? generatedLinks : ""}`;
     const action = tool === "export" ? `<button class="button primary" data-action="fastlink-export" ${state.items.length ? "" : "disabled"}>${icon("download", 15)}\u5BFC\u51FA ${state.items.length || ""}</button>` : tool === "import" ? `<button class="button primary" data-action="fastlink-import" ${String(state.input || "").trim() ? "" : "disabled"}>${icon("import", 15)}\u5F00\u59CB\u8F6C\u5B58</button>` : tool === "public" ? `<button class="button primary" data-action="fastlink-public-generate">${icon("download", 15)}\u751F\u6210 JSON \u6587\u4EF6</button>` : tool === "batch" ? `<button class="button primary" data-action="fastlink-public-batch">${icon("share", 15)}\u6279\u91CF\u751F\u6210</button>` : tool === "split" ? `<button class="button primary" data-action="fastlink-split">${icon("download", 15)}\u5F00\u59CB\u62C6\u5206</button>` : tool === "convert" ? `<button class="button primary" data-action="fastlink-convert">${icon("settings", 15)}\u5F00\u59CB\u8F6C\u6362</button>` : tool === "filters" || tool === "settings" ? `<button class="button primary" data-action="fastlink-settings-save">\u4FDD\u5B58\u8BBE\u7F6E</button>` : "";
     return dialogFrame(ui, {
       title: "\u79D2\u4F20",
@@ -18776,21 +19151,94 @@ ${end.comment}` : end.comment;
     }
     async generateFastlink() {
       if (!this.fastlink.items.length) throw new Error("\u8BF7\u5148\u9009\u62E9\u8981\u5BFC\u51FA\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
-      const outcome = await this.runFastlinkTask("export", async (signal) => {
-        this.setProgress(0, this.fastlink.items.length, "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
-        return exportFastlinkItems(this.api, this.fastlink.items, {
-          signal,
-          ...this.fastlinkExportOptions(),
-          onProgress: (done, total, message) => this.setProgress(done, total, message)
+      const checkpoint = createFastlinkScanCheckpoint(this.fastlink.items, this.fastlinkExportOptions());
+      if (checkpoint.resumed) this.toast(`\u7EED\u63A5\u4E0A\u6B21\u626B\u63CF\uFF1A\u5DF2\u6709 ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6`, "info");
+      this.fastlink.salvage = null;
+      try {
+        const outcome = await this.runFastlinkTask("export", async (signal) => {
+          this.setProgress(0, this.fastlink.items.length, checkpoint.resumed ? `\u7EED\u63A5\u626B\u63CF\uFF08\u5DF2\u626B ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\uFF09` : "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
+          return exportFastlinkItems(this.api, this.fastlink.items, {
+            signal,
+            ...this.fastlinkExportOptions(),
+            checkpoint,
+            onProgress: (done, total, message) => this.setProgress(done, total, message)
+          });
         });
-      });
-      if (outcome.error) return;
-      const artifacts = outcome.result;
+        if (outcome.error) {
+          this.offerFastlinkSalvage("export", outcome.error);
+          return;
+        }
+        const artifacts = outcome.result;
+        this.fastlink.artifacts = artifacts;
+        this.fastlink.fileCount = artifacts.reduce((sum, artifact) => sum + artifact.fileCount, 0);
+        for (const artifact of artifacts) downloadText(filenameSafe(artifact.filename), artifact.text);
+        this.toast(`\u5DF2\u6309 ${artifacts.length} \u4E2A\u9876\u5C42\u9879\u76EE\u5206\u522B\u5BFC\u51FA`, "success");
+        if (this.completeFastlinkTask(outcome.task, artifacts)) return;
+        this.render();
+      } catch (error) {
+        if (this.offerFastlinkSalvage("export", error)) return;
+        throw error;
+      }
+    }
+    offerFastlinkSalvage(flow, error) {
+      const shareFlow = flow === "public" || flow === "publicBatch";
+      const state = shareFlow ? readFastlinkShareCheckpoint() : readFastlinkScanCheckpoint();
+      if (!state?.files?.length) return false;
+      this.fastlink.salvage = {
+        flow,
+        fileCount: state.files.length,
+        reason: error?.name === "AbortError" ? "\u626B\u63CF\u5DF2\u53D6\u6D88" : String(error?.message || "\u626B\u63CF\u4E2D\u65AD")
+      };
+      this.render();
+      return true;
+    }
+    resumeFastlinkShareScan() {
+      const state = readFastlinkShareCheckpoint();
+      if (!state?.shareKey) throw new Error("\u6CA1\u6709\u53EF\u7EED\u63A5\u7684\u5206\u4EAB\u626B\u63CF\u8FDB\u5EA6");
+      this.fastlink.salvage = null;
+      if (Array.isArray(state.batch?.lines) && state.batch.lines.length) return this.generateFastlinkBatch([...state.batch.lines]);
+      return this.generateFastlinkFromPublic({ shareKey: state.shareKey, sharePwd: state.sharePwd || "" });
+    }
+    async exportSalvagedShareScan() {
+      const state = readFastlinkShareCheckpoint();
+      const files = (state?.files || []).filter((file) => file?.path && file?.etag && Number.isSafeInteger(Number(file.size)) && Number(file.size) >= 0);
+      if (!files.length) throw new Error("\u6CA1\u6709\u5DF2\u626B\u63CF\u7684\u5206\u4EAB\u6587\u4EF6\u53EF\u4EE5\u5BFC\u51FA");
+      const artifact = buildFastlinkPublicArtifact(files, { shareKey: state.shareKey, sharePwd: state.sharePwd || "" }, this.fastlinkExportOptions());
+      downloadText(filenameSafe(artifact.filename), artifact.text);
+      clearFastlinkShareCheckpoint();
+      this.fastlink.salvage = null;
+      this.fastlink.artifacts = [artifact];
+      this.fastlink.fileCount = artifact.fileCount;
+      this.toast(`\u5DF2\u5BFC\u51FA\u5DF2\u626B\u63CF\u7684 ${artifact.fileCount} \u4E2A\u6587\u4EF6`, "success");
+      this.render();
+    }
+    discardFastlinkShareScanProgress() {
+      clearFastlinkShareCheckpoint();
+      this.fastlink.salvage = null;
+      this.toast("\u5DF2\u653E\u5F03\u4E0A\u6B21\u626B\u63CF\u8FDB\u5EA6", "info");
+      this.render();
+    }
+    resumeFastlinkScan() {
+      const flow = this.fastlink.salvage?.flow;
+      this.fastlink.salvage = null;
+      return flow === "secondaryExport" ? this.generateSecondaryFastlink() : this.generateFastlink();
+    }
+    async exportSalvagedScan() {
+      const state = readFastlinkScanCheckpoint();
+      if (!state?.files?.length) throw new Error("\u6CA1\u6709\u53EF\u62A2\u6551\u7684\u626B\u63CF\u8FDB\u5EA6");
+      const artifacts = await this.runTask((signal) => buildFastlinkSalvage(this.api, state, { signal, ...this.fastlinkExportOptions() }));
+      for (const artifact of artifacts) downloadText(filenameSafe(artifact.filename), artifact.text);
+      clearFastlinkScanCheckpoint();
+      this.fastlink.salvage = null;
       this.fastlink.artifacts = artifacts;
       this.fastlink.fileCount = artifacts.reduce((sum, artifact) => sum + artifact.fileCount, 0);
-      for (const artifact of artifacts) downloadText(filenameSafe(artifact.filename), artifact.text);
-      this.toast(`\u5DF2\u6309 ${artifacts.length} \u4E2A\u9876\u5C42\u9879\u76EE\u5206\u522B\u5BFC\u51FA`, "success");
-      if (this.completeFastlinkTask(outcome.task, artifacts)) return;
+      this.toast(`\u5DF2\u5BFC\u51FA\u5DF2\u626B\u63CF\u7684 ${this.fastlink.fileCount} \u4E2A\u6587\u4EF6\uFF08${artifacts.length} \u4E2A\u9879\u76EE\uFF09`, "success");
+      this.render();
+    }
+    discardFastlinkScanProgress() {
+      clearFastlinkScanCheckpoint();
+      this.fastlink.salvage = null;
+      this.toast("\u5DF2\u653E\u5F03\u4E0A\u6B21\u626B\u63CF\u8FDB\u5EA6", "info");
       this.render();
     }
     async restoreFastlink() {
@@ -18801,12 +19249,14 @@ ${end.comment}` : end.comment;
           signal,
           seedFolderId: (this.config.fastlinkTools || {}).seedFolderId,
           concurrency: this.config.requests.writeConcurrency,
+          importProgress: true,
           ...this.fastlinkTransferOptions(),
           onProgress: (done, total, name) => this.setProgress(done, total, `\u5BFC\u5165\u79D2\u4F20\uFF1A${name}`)
         });
       });
       if (outcome.error) return;
       const result2 = outcome.result;
+      if (Number(result2?.skipped) > 0) this.toast(`\u5DF2\u8DF3\u8FC7\u4E0A\u6B21\u6210\u529F\u5BFC\u5165\u7684 ${result2.skipped} \u9879`, "info");
       this.bridge.refresh();
       if (this.completeFastlinkTask(outcome.task, result2)) return;
       this.setResult("\u79D2\u4F20\u5BFC\u5165\u7ED3\u679C", result2);
@@ -18818,23 +19268,35 @@ ${end.comment}` : end.comment;
     async generateSecondaryFastlink() {
       if (!this.fastlink.items.length) throw new Error("\u8BF7\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u8981\u5BFC\u51FA\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
       const settings = this.config.fastlinkTools || {};
-      const outcome = await this.runFastlinkTask("secondaryExport", async (signal) => {
-        this.setProgress(0, 2, "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
-        return generateSecondaryFastlink(this.api, this.fastlink.items, {
-          signal,
-          ...this.fastlinkSeedOptions(),
-          useJson: settings.secondaryUseJson !== false,
-          ...this.fastlinkExportOptions(),
-          onProgress: (done, total, message) => this.setProgress(done, total, message)
+      const checkpoint = createFastlinkScanCheckpoint(this.fastlink.items, this.fastlinkExportOptions());
+      if (checkpoint.resumed) this.toast(`\u7EED\u63A5\u4E0A\u6B21\u626B\u63CF\uFF1A\u5DF2\u6709 ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6`, "info");
+      this.fastlink.salvage = null;
+      try {
+        const outcome = await this.runFastlinkTask("secondaryExport", async (signal) => {
+          this.setProgress(0, 2, checkpoint.resumed ? `\u7EED\u63A5\u626B\u63CF\uFF08\u5DF2\u626B ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\uFF09` : "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
+          return generateSecondaryFastlink(this.api, this.fastlink.items, {
+            signal,
+            ...this.fastlinkSeedOptions(),
+            useJson: settings.secondaryUseJson !== false,
+            ...this.fastlinkExportOptions(),
+            checkpoint,
+            onProgress: (done, total, message) => this.setProgress(done, total, message)
+          });
         });
-      });
-      if (outcome.error) return;
-      const artifact = outcome.result;
-      this.fastlink.artifacts = [artifact];
-      this.fastlink.fileCount = artifact.fileCount;
-      if (this.completeFastlinkTask(outcome.task, artifact)) return;
-      this.toast("\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210\uFF0C\u53EF\u590D\u5236\u6216\u76F4\u63A5\u5206\u4EAB", "success");
-      this.render();
+        if (outcome.error) {
+          this.offerFastlinkSalvage("secondaryExport", outcome.error);
+          return;
+        }
+        const artifact = outcome.result;
+        this.fastlink.artifacts = [artifact];
+        this.fastlink.fileCount = artifact.fileCount;
+        if (this.completeFastlinkTask(outcome.task, artifact)) return;
+        this.toast("\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210\uFF0C\u53EF\u590D\u5236\u6216\u76F4\u63A5\u5206\u4EAB", "success");
+        this.render();
+      } catch (error) {
+        if (this.offerFastlinkSalvage("secondaryExport", error)) return;
+        throw error;
+      }
     }
     async restoreFastlinkFromCloudFile() {
       const snapshot = frozenSelection(this.bridge.readSelection());
@@ -18847,12 +19309,14 @@ ${end.comment}` : end.comment;
         return saveFastlinkFromCloudFile(this.api, item, this.fastlink.currentDir, {
           signal,
           concurrency: this.config.requests.writeConcurrency,
+          importProgress: true,
           ...this.fastlinkTransferOptions(),
           onProgress: (done, total, name) => this.setProgress(done, total, name)
         });
       });
       if (outcome.error) return;
       const result2 = outcome.result;
+      if (Number(result2?.skipped) > 0) this.toast(`\u5DF2\u8DF3\u8FC7\u4E0A\u6B21\u6210\u529F\u5BFC\u5165\u7684 ${result2.skipped} \u9879`, "info");
       this.bridge.refresh();
       if (this.completeFastlinkTask(outcome.task, result2)) return;
       this.setResult("\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58\u7ED3\u679C", result2);
@@ -18894,36 +19358,73 @@ ${end.comment}` : end.comment;
         filterExtensions: filters.filter((item) => item.enabled).map((item) => item.ext)
       };
     }
-    async generateFastlinkFromPublic() {
-      const input = parsePublicShareInput(this.fastlink.publicInput, this.fastlink.publicPassword);
-      const artifact = await this.runTask(async (signal) => exportPublicShare(this.api, input, {
-        signal,
-        ...this.fastlinkExportOptions(),
-        onProgress: (done, total, message) => this.setProgress(done, total, `\u89E3\u6790\u5206\u4EAB\uFF1A${message}`)
-      }));
-      this.fastlink.artifacts = [artifact];
-      this.fastlink.fileCount = artifact.fileCount;
-      downloadText(filenameSafe(artifact.filename), artifact.text);
-      this.toast(`\u5DF2\u751F\u6210 ${artifact.filename}`, "success");
-      this.render();
+    async generateFastlinkFromPublic(inputOverride = null) {
+      const input = inputOverride || parsePublicShareInput(this.fastlink.publicInput, this.fastlink.publicPassword);
+      const checkpoint = createFastlinkShareCheckpoint(input, this.fastlinkExportOptions());
+      if (checkpoint.resumed) this.toast(`\u7EED\u63A5\u4E0A\u6B21\u5206\u4EAB\u626B\u63CF\uFF1A\u5DF2\u6709 ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6`, "info");
+      this.fastlink.salvage = null;
+      try {
+        const artifact = await this.runTask(async (signal) => exportPublicShare(this.api, input, {
+          signal,
+          ...this.fastlinkExportOptions(),
+          checkpoint,
+          onProgress: (done, total, message) => this.setProgress(done, total, `\u89E3\u6790\u5206\u4EAB\uFF1A${message}`)
+        }));
+        this.fastlink.artifacts = [artifact];
+        this.fastlink.fileCount = artifact.fileCount;
+        downloadText(filenameSafe(artifact.filename), artifact.text);
+        this.toast(`\u5DF2\u751F\u6210 ${artifact.filename}`, "success");
+        this.render();
+      } catch (error) {
+        if (this.offerFastlinkSalvage("public", error)) return;
+        throw error;
+      }
     }
     async openFastlinkFolderPicker(target, title) {
       this.fastlink.filterDraft ||= structuredClone(this.config.fastlinkTools || {});
       this.fastlink.picker = { parentId: "0", path: [], folders: [], loading: true, target, title };
       await this.loadFolderPicker("0", this.fastlink);
     }
-    async generateFastlinkBatch() {
-      const lines = String(this.fastlink.publicBatch || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    async generateFastlinkBatch(linesOverride = null) {
+      const stored = readFastlinkShareCheckpoint();
+      const storedLines = stored?.batch?.lines;
+      const inputLines = String(this.fastlink.publicBatch || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      let lines;
+      let startIndex = 0;
+      let resumedBatch = false;
+      if (linesOverride) {
+        lines = linesOverride;
+        if (storedLines && fastlinkSameLines(storedLines, lines)) {
+          startIndex = Math.min(Number(stored.batch.done) || 0, lines.length);
+          resumedBatch = startIndex > 0 && startIndex < lines.length;
+        } else if (stored) clearFastlinkShareCheckpoint();
+      } else if (storedLines && storedLines.length && (!inputLines.length || fastlinkSameLines(storedLines, inputLines))) {
+        lines = storedLines;
+        startIndex = Math.min(Number(stored.batch.done) || 0, lines.length);
+        resumedBatch = startIndex > 0 && startIndex < lines.length;
+      } else {
+        lines = inputLines;
+        if (stored) clearFastlinkShareCheckpoint();
+      }
       if (!lines.length) throw new Error("\u8BF7\u5148\u8F93\u5165\u5206\u4EAB\u94FE\u63A5\uFF0C\u6BCF\u884C\u4E00\u4E2A");
+      if (resumedBatch) this.toast(`\u7EED\u63A5\u6279\u91CF\u89E3\u6790\uFF1A\u4ECE\u7B2C ${startIndex + 1}/${lines.length} \u884C\u7EE7\u7EED`, "info");
       const artifacts = [];
-      for (let index = 0; index < lines.length; index += 1) {
-        const artifact = await this.runTask(async (signal) => exportPublicShare(this.api, parsePublicShareInput(lines[index]), {
-          signal,
-          ...this.fastlinkExportOptions(),
-          onProgress: (done, total, message) => this.setProgress(done, total, `\u6279\u91CF\u89E3\u6790 ${index + 1}/${lines.length}\uFF1A${message}`)
-        }));
-        artifacts.push(artifact);
-        downloadText(filenameSafe(artifact.filename), artifact.text);
+      for (let index = startIndex; index < lines.length; index += 1) {
+        const input = parsePublicShareInput(lines[index]);
+        const checkpoint = createFastlinkShareCheckpoint(input, this.fastlinkExportOptions(), { lines, done: index });
+        try {
+          const artifact = await this.runTask(async (signal) => exportPublicShare(this.api, input, {
+            signal,
+            ...this.fastlinkExportOptions(),
+            checkpoint,
+            onProgress: (done, total, message) => this.setProgress(done, total, `\u6279\u91CF\u89E3\u6790 ${index + 1}/${lines.length}\uFF1A${message}`)
+          }));
+          artifacts.push(artifact);
+          downloadText(filenameSafe(artifact.filename), artifact.text);
+        } catch (error) {
+          if (this.offerFastlinkSalvage("publicBatch", error)) return;
+          throw error;
+        }
       }
       this.fastlink.artifacts = artifacts;
       this.fastlink.fileCount = artifacts.reduce((sum, item) => sum + item.fileCount, 0);
@@ -19491,6 +19992,12 @@ ${end.comment}` : end.comment;
         "fastlink-secondary-generate": () => this.generateSecondaryFastlink(),
         "fastlink-secondary-from-file": () => this.restoreFastlinkFromCloudFile(),
         "fastlink-secondary-save-link": () => this.saveFastlinkLinkFile(),
+        "fastlink-resume-scan": () => this.resumeFastlinkScan(),
+        "fastlink-salvage-export": () => this.exportSalvagedScan(),
+        "fastlink-salvage-discard": () => this.discardFastlinkScanProgress(),
+        "fastlink-share-resume": () => this.resumeFastlinkShareScan(),
+        "fastlink-share-salvage-export": () => this.exportSalvagedShareScan(),
+        "fastlink-share-salvage-discard": () => this.discardFastlinkShareScanProgress(),
         "fastlink-api-test": async () => {
           const result2 = await this.api.listPage(this.fastlink.currentDir, 1, { limit: 1 });
           this.toast(`API \u6B63\u5E38\uFF1A\u5F53\u524D\u76EE\u5F55\u5171 ${result2.total} \u9879`, "success");
