@@ -19,8 +19,8 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.staticfiles import StaticFiles as _StarletteStaticFiles
 
 # 统一日志：控制台 + 落盘轮转 + 内存环形缓冲（GET /api/logs 读取）
 # 必须在导入业务模块前初始化，保证第三方库降噪与应用日志格式一致
@@ -74,6 +74,63 @@ from .submission import (
     telegram_user_allowed,
 )
 from .transfer_service import PAN115_ACCOUNT_COOLDOWN_MS, TransferService
+
+
+# --- Admin SPA static files ------------------------------------------------
+
+# Content types we pin ourselves instead of trusting mimetypes.
+#
+# On Windows, Python's mimetypes seeds itself from HKEY_CLASSES_ROOT, so a
+# machine where some editor reassociated .js with a text/plain "Content Type"
+# makes StaticFiles answer /admin/assets/*.js as text/plain. Chromium then
+# refuses <script type="module"> and the window stays blank/black — it only
+# reproduces on affected machines, never in development.
+_SPA_FORCED_CONTENT_TYPES = {
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".cjs": "text/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".map": "application/json",
+    ".svg": "image/svg+xml",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+}
+
+
+class _StrictStaticFiles(_StarletteStaticFiles):
+    """StaticFiles pinning the content types the SPA shell cannot load without.
+
+    Starlette's FileResponse infers content-type from mimetypes, which has two
+    ways to end up wrong for our assets:
+
+      * On Windows, mimetypes seeds itself from HKEY_CLASSES_ROOT, so a machine
+        where some editor reassociated .js with a text/plain "Content Type"
+        serves the SPA entry chunk as text/plain.
+      * FileResponse falls back to text/plain whenever guess_type() returns
+        None, which happens inside a PyInstaller bundle because the mimetypes
+        data files are not shipped.
+
+    Either way Chromium rejects <script type="module"> and the window stays
+    blank. It never reproduces in development, only on affected machines.
+
+    Extensions outside _SPA_FORCED_CONTENT_TYPES keep Starlette's guess.
+    """
+
+    # Signature is forwarded loosely so a Starlette upgrade that reshuffles
+    # file_response()'s parameters cannot silently break the SPA.
+    def file_response(self, full_path, *args, **kwargs):
+        response = super().file_response(full_path, *args, **kwargs)
+        ext = os.path.splitext(str(full_path))[1].lower()
+        forced = _SPA_FORCED_CONTENT_TYPES.get(ext)
+        if forced:
+            # Preserve any "; charset=..." suffix Starlette already computed.
+            current = response.headers.get("content-type", "")
+            suffix = current[current.index(";"):] if ";" in current else ""
+            response.media_type = forced
+            response.headers["content-type"] = forced + suffix
+        return response
 
 
 def _resolve_admin_web_dir() -> Path:
@@ -1769,7 +1826,7 @@ def clamp_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
 
 
 if ADMIN_WEB_DIR.exists():
-    app.mount("/admin/assets", StaticFiles(directory=str(ADMIN_WEB_DIR / "assets")), name="admin-assets")
+    app.mount("/admin/assets", _StrictStaticFiles(directory=str(ADMIN_WEB_DIR / "assets")), name="admin-assets")
 
     def admin_index_response() -> FileResponse:
         # The HTML shell keeps the Vite asset manifest.  Telegram's in-app
