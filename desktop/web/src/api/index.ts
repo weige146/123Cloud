@@ -29,13 +29,20 @@ export interface MyChannelConfigUpdate {
   routing: Routing;
 }
 
-// ====== Admin / 123 网盘账号 ======
+// ====== Admin / 123 网盘账号（OAuth 授权登录） ======
 export const adminApi = {
   status: () => api.get<AdminStatus>("/api/admin/status"),
-  login: (user: string, password: string, remember: boolean) =>
-    api.post<{ ok: boolean; user: string; loginUuid: string; reused: boolean; updatedAt: string }>(
-      "/api/123/login",
-      { user, password, remember }
+  oauthStart: () =>
+    api.post<{ ok: boolean; authorizeUrl: string; redirectUri: string; nonce: string }>("/api/123/oauth/start", {}),
+  oauthFinish: (nonce: string, callbackUrl: string) =>
+    api.post<{ ok: boolean; authenticated: boolean; user: string; updatedAt: string; loginExpired?: boolean }>(
+      "/api/123/oauth/finish",
+      { nonce, callbackUrl }
+    ),
+  oauthImport: (refreshToken: string) =>
+    api.post<{ ok: boolean; authenticated: boolean; user: string; updatedAt: string; loginExpired?: boolean }>(
+      "/api/123/oauth/import",
+      { refreshToken }
     ),
   logout: () => api.post<{ ok: boolean }>("/api/123/logout"),
 };
@@ -101,6 +108,7 @@ export const transferApi = {
   tasks: (limit = 100) => api.get<TransferTask[]>(`/api/transfer/tasks?limit=${limit}`),
   submit: (text: string) => api.post<{ ok: boolean; tasks: TransferTask[] }>("/api/transfer/tasks", { text }),
   submitLocal: (path115: string) => api.post<{ ok: boolean; task: TransferTask }>("/api/transfer/local-tasks", { path115 }),
+  submit123to115: (sourceDirId: string) => api.post<{ ok: boolean; task: TransferTask }>("/api/transfer/123to115-tasks", { sourceDirId }),
   kick: () => api.post<{ ok: boolean }>("/api/transfer/kick", {}),
   requeue: (taskId: string) => api.post<{ ok: boolean; task: TransferTask }>(`/api/transfer/tasks/${encodeURIComponent(taskId)}/requeue`, {}),
   deleteTask: (taskId: string) => api.delete<{ ok: boolean }>(`/api/transfer/tasks/${encodeURIComponent(taskId)}`),

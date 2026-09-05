@@ -987,6 +987,10 @@ class TransferPipeline:
                     reused_file_id = await self.pan123.sha1_reuse(target_dir_id, file["name"], file["sha1"], file.get("size", 0))
                     if reused_file_id:
                         self.dir_cache.invalidate_dir(target_dir_id)
+                        created_file = await self.dir_cache.find_same_file(self.pan123, target_dir_id, file["name"], file.get("size", 0))
+                        if created_file:
+                            # 回查 123 侧 etag 记入学习表，供 123→115 反向搬运秒传使用
+                            await service._remember_transfer_hash(file, created_file)
                         file["status"] = "success"
                         file["method"] = "sha1_reuse"
                         file["pan123FileId"] = reused_file_id

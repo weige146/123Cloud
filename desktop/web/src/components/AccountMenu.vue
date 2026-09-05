@@ -77,12 +77,12 @@ function navigate(path: string) {
         </button>
         <button type="button" @click="navigate('/admin/settings')">
           <span class="account-item-icon"><v-icon :icon="expired ? 'mdi-alert' : 'mdi-link-variant'" size="20" /></span>
-          <span><strong>绑定 123 网盘</strong><small>{{ expired ? "登录已过期，请重新登录" : authenticated ? "管理已绑定账号" : "前往设置页绑定" }}</small></span>
+          <span><strong>授权 123 网盘</strong><small>{{ expired ? "授权已失效，请重新授权" : authenticated ? "管理已授权账号" : "前往设置页授权登录" }}</small></span>
           <v-icon icon="mdi-chevron-right" size="18" />
         </button>
         <button type="button" :disabled="loading" @click="emit('refresh'); open = false">
           <span class="account-item-icon"><v-icon icon="mdi-refresh" size="20" /></span>
-          <span><strong>刷新状态</strong><small>同步最新服务与登录状态</small></span>
+          <span><strong>刷新状态</strong><small>同步最新服务与授权状态</small></span>
           <v-progress-circular v-if="loading" indeterminate size="17" width="2" />
           <v-icon v-else icon="mdi-chevron-right" size="18" />
         </button>

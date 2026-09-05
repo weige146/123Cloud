@@ -170,26 +170,58 @@ class SessionStoreTests(unittest.TestCase):
                 ["post-101"],
             )
 
-    def test_session_store_matches_same_user_and_password(self):
+    def test_session_roundtrip_and_merge_keeps_existing_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
-            session = store.build_session("user@example.com", "secret", "token", "uuid")
-            store.write_session(session)
+            store.write_session({"refreshToken": "rt", "user": "demo"})
             loaded = store.read_session()
             self.assertIsNotNone(loaded)
             assert loaded is not None
-            self.assertTrue(store.credentials_match(loaded, "user@example.com", "secret"))
-            self.assertFalse(store.credentials_match(loaded, "user@example.com", "wrong"))
-            self.assertFalse(store.credentials_match(loaded, "other@example.com", "secret"))
+            self.assertEqual(loaded["refreshToken"], "rt")
+
+            merged = store.merge_session({"profile": {"uid": 1}, "accessToken": "at"})
+            self.assertEqual(merged["refreshToken"], "rt")
+            self.assertEqual(merged["profile"]["uid"], 1)
+            self.assertIn("updatedAt", merged)
+            self.assertEqual(store.read_session()["refreshToken"], "rt")
+
+            store.clear_session()
+            self.assertIsNone(store.read_session())
+
+    def test_transfer_hashes_reset_once_for_token_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # 模拟旧版数据库：学习表里已有数据，且没有重置标记
+            import sqlite3
+
+            connection = sqlite3.connect(root / "cloud123.db")
+            connection.execute(
+                "CREATE TABLE transfer_hashes (sha1 TEXT NOT NULL, size INTEGER NOT NULL, "
+                "etag TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, "
+                "PRIMARY KEY(sha1, size))"
+            )
+            connection.execute("INSERT INTO transfer_hashes VALUES(?, ?, ?, ?, ?)", ("a" * 40, 1, "", "old.mkv", "x"))
+            connection.commit()
+            connection.close()
+
+            store = SessionStore(root)
+
+            # 旧数据已被一次性清空，新数据正常写入
+            self.assertIsNone(store.get_transfer_hash("a" * 40, 1))
+            store.save_transfer_hash("b" * 40, 2, "e" * 32, "new.mkv")
+            self.assertIsNotNone(store.get_transfer_hash("b" * 40, 2))
+
+            # 重新打开实例不再重置
+            reopened = SessionStore(root)
+            self.assertIsNotNone(reopened.get_transfer_hash("b" * 40, 2))
 
     def test_admin_config_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
-            store.write_config({"transfer": {"enabled": True, "pan123ClientId": "cid"}})
-            saved = store.write_config({"transfer": {"enabled": False, "pan123ClientId": "cid", "pan123ClientSecret": "secret"}})
-            self.assertEqual(saved["transfer"]["pan123ClientId"], "cid")
-            self.assertEqual(saved["transfer"]["pan123ClientSecret"], "secret")
-            self.assertEqual(store.read_config()["transfer"]["pan123ClientId"], "cid")
+            store.write_config({"transfer": {"enabled": True, "pan115TargetCid": "55"}})
+            saved = store.write_config({"transfer": {"enabled": False, "pan115TargetCid": "66"}})
+            self.assertEqual(saved["transfer"]["pan115TargetCid"], "66")
+            self.assertEqual(store.read_config()["transfer"]["pan115TargetCid"], "66")
 
     def test_legacy_openapi_credentials_migrated_into_transfer(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -205,31 +237,33 @@ class SessionStoreTests(unittest.TestCase):
 
             migrated = SessionStore(root)
 
+            # token 模式下旧密钥字段全部作废并清除，不再迁移到搬运配置
             config = migrated.read_value("admin_config")
             assert isinstance(config, dict)
             self.assertNotIn("gatewayName", config)
             self.assertNotIn("pan123ClientMode", config)
             self.assertNotIn("pan123OpenApiClientId", config)
             self.assertNotIn("pan123OpenApiClientSecret", config)
-            self.assertEqual(config.get("transfer", {}).get("pan123ClientId"), "legacy-cid")
-            self.assertEqual(config.get("transfer", {}).get("pan123ClientSecret"), "legacy-secret")
+            self.assertNotIn("pan123ClientId", config.get("transfer", {}))
+            self.assertNotIn("pan123ClientSecret", config.get("transfer", {}))
             self.assertTrue(config.get("transfer", {}).get("enabled"))
 
-    def test_legacy_openapi_migration_keeps_existing_transfer_credentials(self):
+    def test_legacy_openapi_migration_strips_transfer_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store = SessionStore(root)
             store.write_value("admin_config", {
                 "pan123OpenApiClientId": "legacy-cid",
-                "transfer": {"pan123ClientId": "new-cid", "pan123ClientSecret": "new-secret"},
+                "transfer": {"enabled": True, "pan123ClientId": "new-cid", "pan123ClientSecret": "new-secret"},
             })
 
             migrated = SessionStore(root)
 
             config = migrated.read_value("admin_config")
             assert isinstance(config, dict)
-            self.assertEqual(config.get("transfer", {}).get("pan123ClientId"), "new-cid")
-            self.assertEqual(config.get("transfer", {}).get("pan123ClientSecret"), "new-secret")
+            self.assertNotIn("pan123ClientId", config.get("transfer", {}))
+            self.assertNotIn("pan123ClientSecret", config.get("transfer", {}))
+            self.assertTrue(config.get("transfer", {}).get("enabled"))
 
     def test_legacy_json_is_migrated_and_deleted(self):
         with tempfile.TemporaryDirectory() as directory:

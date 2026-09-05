@@ -28,7 +28,7 @@ else:
 class SubmissionRoutingTests(unittest.TestCase):
     def setUp(self) -> None:
         main.store.write_config({"transfer": {"enabled": True, "localPath115": "/云下载"}})
-        main.store.write_session({"token": "token", "loginUuid": "uuid", "profile": {"uid": 100}})
+        main.store.write_session({"refreshToken": "rt", "profile": {"uid": 100}, "user": "demo"})
 
     def route(self, text: str, **kwargs):
         return asyncio.run(main.route_submission_text(text, "油猴投稿", **kwargs))
@@ -123,7 +123,7 @@ class SubmissionRoutingTests(unittest.TestCase):
             result = self.route("https://www.123pan.com/s/demo")
 
         enqueue.assert_not_awaited()
-        self.assertTrue(any("未登录" in item for item in result["failures"]))
+        self.assertTrue(any("尚未授权登录" in item for item in result["failures"]))
 
     def test_115_share_link_queues_transfer(self):
         enqueue = AsyncMock(return_value=[{"id": "task-1"}])

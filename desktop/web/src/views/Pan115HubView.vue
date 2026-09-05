@@ -40,12 +40,12 @@ let syncingRoute = false;
 // ============ Transfer state (搬运) ============
 const defaultTransferConfig: TransferConfig = {
   enabled: false,
-  pan123ClientId: "",
-  pan123ClientSecret: "",
   pan115Cookie: "",
   pan115Cookies: [],
   targetDirId: "0",
   localPath115: "",
+  pan115TargetCid: "0",
+  pan123OauthApi: "",
   excludeSuffix: "",
   excludeCid: "",
   delete115AfterSuccess: false,
@@ -72,6 +72,8 @@ const transferDetailOpen = ref(false);
 const selectedTransferTask = ref<TransferTask | null>(null);
 const showCompleted = ref(localStorage.getItem("transferShowCompleted") === "1");
 const submitText = ref("");
+const sourceDirId123 = ref("");
+const transfer123to115Submitting = ref(false);
 const transferLoading = ref(false);
 const transferSaving = ref(false);
 const submitting = ref(false);
@@ -120,12 +122,12 @@ function collectTransferConfig(): TransferConfig {
   const cookies = cookieLines(transferForm.pan115Cookie);
   return {
     ...transferForm,
-    pan123ClientId: transferForm.pan123ClientId.trim(),
-    pan123ClientSecret: transferForm.pan123ClientSecret.trim(),
     pan115Cookie: cookies.join("\n"),
     pan115Cookies: cookies,
     targetDirId: transferForm.targetDirId.trim() || "0",
     localPath115: transferForm.localPath115.trim(),
+    pan115TargetCid: transferForm.pan115TargetCid.trim() || "0",
+    pan123OauthApi: transferForm.pan123OauthApi.trim(),
     excludeSuffix: transferForm.excludeSuffix.trim(),
     excludeCid: transferForm.excludeCid.trim(),
     delete115AfterSuccess: transferForm.delete115AfterSuccess === true,
@@ -233,6 +235,27 @@ async function submitLocalTransfer() {
     notifyError(`本地盘入队失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
     localSubmitting.value = false;
+  }
+}
+
+async function submit123to115Transfer() {
+  // 默认从 115→123 的落地目录往回搬；输入框可自由指定其他源目录
+  const sourceDirId = sourceDirId123.value.trim() || transferForm.targetDirId.trim() || "0";
+  if (!/^\d+$/.test(sourceDirId)) {
+    notifyError("123 源目录 ID 必须是数字（根目录填 0）");
+    return;
+  }
+  transfer123to115Submitting.value = true;
+  try {
+    const data = await transferApi.submit123to115(sourceDirId);
+    notifySuccess(`已提交 123→115 搬运：${data.task.title || sourceDirId}`);
+    sourceDirId123.value = "";
+    await loadTransferTasks();
+    createTransferDialog.value = false;
+  } catch (error) {
+    notifyError(`123→115 入队失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    transfer123to115Submitting.value = false;
   }
 }
 
@@ -378,7 +401,7 @@ function offlineStatusText(status?: string | number | null) {
 }
 
 function taskTitle(task: TransferTask) {
-  const prefix = task.kind === "pan123_share_copy" ? "123 分享转存 · " : "";
+  const prefix = task.kind === "pan123_share_copy" ? "123 分享转存 · " : task.kind === "pan123to115" ? "123→115 · " : "";
   return `${prefix}${task.title || task.shareCode || task.shareUrl || "115 分享"}`;
 }
 
@@ -387,6 +410,11 @@ function taskSubtitle(task: TransferTask) {
   if (task.kind === "pan123_share_copy") {
     const remote = task.remoteTaskId ? ` · 远端任务 ${task.remoteTaskId}` : "";
     return `${shareUrl} · 目标目录 ${task.targetDirId || "0"}${remote}`;
+  }
+  if (task.kind === "pan123to115") {
+    const source = task.shareUrl || "";
+    if (source && !source.startsWith("123://")) return `${source} → 115 目录 CID ${task.targetDirId || "0"}`;
+    return `123 目录 ID ${task.sourceDirId || task.sourceText || "0"} → 115 目录 CID ${task.targetDirId || "0"}`;
   }
   if (shareUrl.startsWith("115://local")) return task.sourceText || shareUrl;
   return shareUrl;
@@ -953,6 +981,24 @@ onUnmounted(() => {
                 <v-btn variant="outlined" :loading="localSubmitting" @click="submitLocalTransfer">提交本地盘搬运</v-btn>
               </div>
             </section>
+
+            <section class="hub-form-section">
+              <div class="hub-form-section-title">
+                <v-icon icon="mdi-swap-horizontal" size="18" />
+                <div><strong>123 → 115</strong><span>把 123 网盘目录搬到 115 助手账号：能秒传的秒传，其余走 115 离线下载。</span></div>
+              </div>
+              <v-text-field
+                v-model="sourceDirId123"
+                label="123 源目录 ID"
+                :placeholder="`留空默认用 115→123 落地目录（${transferForm.targetDirId || '0'}），可填其他目录 ID`"
+                variant="outlined"
+                density="compact"
+              />
+              <div class="hub-status-line">115 目标目录 CID：{{ transferForm.pan115TargetCid || "0" }}（在搬运设置中修改）· 目标账号为 115 助手 Cookie</div>
+              <div class="hub-form-actions">
+                <v-btn color="primary" :loading="transfer123to115Submitting" @click="submit123to115Transfer">提交 123→115 搬运</v-btn>
+              </div>
+            </section>
           </v-card-text>
         </v-card>
       </v-dialog>
@@ -983,8 +1029,8 @@ onUnmounted(() => {
                 <v-switch v-model="transferForm.enabled" label="启用 115 搬运" color="primary" hide-details />
                 <v-text-field v-model="transferForm.targetDirId" label="123 目标目录 ID" variant="outlined" density="compact" />
                 <v-text-field v-model="transferForm.localPath115" label="115 本地盘目录路径 / CID" variant="outlined" density="compact" />
-                <v-text-field v-model="transferForm.pan123ClientId" label="123 OpenAPI ClientID" variant="outlined" density="compact" />
-                <v-text-field v-model="transferForm.pan123ClientSecret" label="123 OpenAPI ClientSecret" type="password" variant="outlined" density="compact" />
+                <v-text-field v-model="transferForm.pan115TargetCid" label="115 目标目录 CID（123→115）" variant="outlined" density="compact" />
+                <v-text-field v-model="transferForm.pan123OauthApi" label="123 授权服务地址（可选，默认社区官方）" variant="outlined" density="compact" />
                 <v-text-field v-model.number="transferForm.concurrency" label="并发任务数 1-5" type="number" variant="outlined" density="compact" />
                 <v-text-field v-model="transferForm.excludeSuffix" label="排除后缀" variant="outlined" density="compact" />
                 <v-text-field v-model="transferForm.excludeCid" label="排除 115 目录 CID" variant="outlined" density="compact" />
@@ -1018,6 +1064,7 @@ onUnmounted(() => {
                 <v-text-field v-model.number="transferForm.progressNotifyIntervalMs" label="进度通知间隔 ms" type="number" variant="outlined" density="compact" />
               </FormGrid>
             </section>
+
           </div>
           <footer class="hub-drawer-actions">
             <v-btn variant="text" :loading="transferLoading" @click="loadTransfer">重新读取</v-btn>

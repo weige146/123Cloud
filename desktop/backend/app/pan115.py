@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import time
@@ -9,6 +10,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import httpx
+
+from .pan115_cipher import build_upload_request, decode_upload_response
 
 
 USER_AGENT = "Mozilla/5.0 115disk/31.4.2 115Browser/31.4.2 115wangpan_android/34.0.0"
@@ -23,6 +26,15 @@ OPEN_OFFLINE_ADD_URL = "https://proapi.115.com/open/offline/add_task_urls"
 RECYCLE_CLEAN_URL = "https://webapi.115.com/rb/clean"
 USER_INFO_URL = "https://my.115.com/?ct=ajax&ac=get_user_aq"
 
+LOCAL_FILES_URL = "https://webapi.115.com/files"
+LOCAL_MKDIR_URL = "https://webapi.115.com/files/add"
+UPLOAD_INIT_URL = "https://uplb.115.com/4.0/initupload.php"
+UPLOAD_KEY_URL = "https://proapi.115.com/android/2.0/user/upload_key"
+UPLOAD_INFO_URL = "https://proapi.115.com/app/uploadinfo"
+FILE_UPDATE_URL = "https://proapi.115.com/open/ufile/update"
+# initupload 的 UA 与 appversion 必须配套（token 签名含 appversion，服务端会校验）
+UPLOAD_UA = "Mozilla/5.0 115disk/36.2.28 115Browser/36.2.28 115wangpan_android/36.2.28"
+UPLOAD_APP_VERSION = "36.2.28"
 SHARE_RE = re.compile(r"https?://(?:www\.)?(?:115cdn\.com|115\.com)/s/[^\s<>\"']+", re.I)
 CODE_RE = re.compile(r"(?:提取码|访问码|密码|password|receive[_\s-]?code|code|pwd)[=：:\s]*([A-Za-z0-9]{4,8})", re.I)
 MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[A-Za-z0-9]{32,40}[^\s<>\"']*", re.I)
@@ -247,6 +259,7 @@ class Pan115Client:
         self.timeout = timeout_seconds
         self._last_request_at = 0.0
         self._cached_user_id = ""
+        self._upload_credentials: Dict[str, str] = {}
 
     async def inspect_and_flatten(self, link: Pan115ShareLink) -> Dict[str, Any]:
         if not self.cookie.strip():
@@ -386,6 +399,280 @@ class Pan115Client:
         if not sign or not sign_time:
             raise Pan115Error("115 离线签名响应缺少 sign/time")
         return {"sign": sign, "time": sign_time}
+
+    # ------------------------------------------------------------------
+    # 本地盘操作（123 → 115 搬运使用）
+    # ------------------------------------------------------------------
+    async def list_local_dir(self, dir_id: str, limit: int, offset: int) -> Dict[str, Any]:
+        return await self.request_json(
+            LOCAL_FILES_URL,
+            "115 本地盘列表",
+            params={
+                "aid": "1",
+                "cid": str(dir_id or "0"),
+                "limit": str(limit),
+                "offset": str(offset),
+                "show_dir": "1",
+                "count_folders": "1",
+                "record_open_time": "1",
+                "format": "json",
+            },
+        )
+
+    async def list_local_entries(self, dir_id: str) -> List[Dict[str, Any]]:
+        """翻页列出目录下全部条目，规范化为 {fid,name,size,isDir,sha,pickCode}。"""
+        entries: List[Dict[str, Any]] = []
+        offset = 0
+        while True:
+            payload = await self.list_local_dir(dir_id, 1000, offset)
+            items = local_list_items(payload)
+            if not items:
+                break
+            for item in items:
+                name = str(item.get("n") or item.get("fn") or item.get("file_name") or item.get("name") or "").strip()
+                if not name:
+                    continue
+                is_dir = local_item_is_dir(item)
+                # 115 files 列表：目录条目的 ID 在 cid（没有 fid），文件条目在 fid
+                if is_dir:
+                    fid = str(item.get("cid") or item.get("category_id") or item.get("fid") or item.get("file_id") or item.get("id") or "").strip()
+                else:
+                    fid = str(item.get("fid") or item.get("file_id") or item.get("id") or "").strip()
+                if not fid:
+                    continue
+                entries.append({
+                    "fid": fid,
+                    "name": name,
+                    "size": 0 if is_dir else int_number(item.get("s") or item.get("fs") or item.get("file_size") or item.get("size"), 0),
+                    "isDir": is_dir,
+                    "sha": str(item.get("sha") or item.get("sha1") or item.get("file_sha1") or "").strip().lower(),
+                    "pickCode": str(item.get("pc") or item.get("pick_code") or item.get("pickcode") or "").strip(),
+                })
+            offset += len(items)
+            if len(items) < 1000:
+                break
+            count = local_list_count(payload, 0)
+            if count and offset >= count:
+                break
+        return entries
+
+    async def ensure_local_dir(self, parent_cid: str, name: str) -> str:
+        """在 parent_cid 下找同名目录，找不到就创建，返回目录 cid。"""
+        for entry in await self.list_local_entries(parent_cid):
+            if entry.get("isDir") and entry.get("name") == name:
+                return str(entry.get("fid") or "")
+        return await self.mkdir_local_dir(parent_cid, name)
+
+    async def mkdir_local_dir(self, parent_cid: str, name: str) -> str:
+        """直接创建目录（不做同名检查，重复创建由调用方先用列表判断）。
+
+        注意 webapi files/add 的目录名字段是 cname（不是 file_name）。
+        响应里目录 ID 的位置随端点/版本漂移（顶层 cid、data.file_id、
+        data.category_id……），解析不到时回查父目录列表按名字定位，仍找不到
+        才报错并附带响应片段，便于继续排查。
+        """
+        try:
+            payload = await self.post_form(
+                LOCAL_MKDIR_URL,
+                "115 新建目录",
+                {"pid": str(parent_cid or "0"), "cname": name},
+            )
+        except Pan115Error as error:
+            # errno 20004：同名目录已存在——回查父目录按名字定位（并发/重复创建时自愈）
+            if "20004" in str(error) or "已存在" in str(error):
+                for entry in await self.list_local_entries(parent_cid):
+                    if entry.get("isDir") and entry.get("name") == name:
+                        return str(entry.get("fid") or "")
+            raise
+        raw_data = payload.get("data")
+        data = as_record(raw_data)
+        if isinstance(raw_data, list) and raw_data:
+            data = as_record(raw_data[0])
+        cid = str(
+            payload.get("cid")
+            or data.get("file_id") or data.get("fileID") or data.get("fid")
+            or data.get("category_id") or data.get("cid") or data.get("id")
+            or (raw_data if isinstance(raw_data, int) else None)
+            or payload.get("file_id") or payload.get("id")
+            or ""
+        ).strip()
+        if cid and cid != "0":
+            return cid
+        # 响应里没有可识别的 ID：回查父目录，按名字找刚建的目录
+        try:
+            for entry in await self.list_local_entries(parent_cid):
+                if entry.get("isDir") and entry.get("name") == name:
+                    return str(entry.get("fid") or "")
+        except Exception:
+            pass
+        try:
+            snippet = json.dumps(payload, ensure_ascii=False)[:200]
+        except Exception:
+            snippet = str(payload)[:200]
+        raise Pan115Error(f"115 新建目录未返回目录 ID：{name}（响应片段：{snippet}）")
+
+    async def rename_local_file(self, file_id: str, new_name: str) -> None:
+        await self.post_form(
+            FILE_UPDATE_URL,
+            "115 重命名文件",
+            {"file_id": str(file_id), "file_name": new_name},
+        )
+
+    async def upload_init_fast(
+        self,
+        file_name: str,
+        sha1: str,
+        size: int,
+        target_pid: str,
+        fetch_range_bytes=None,
+    ) -> Dict[str, Any]:
+        """115 秒传：uplb 4.0/initupload.php（Cookie + userid/userkey 认证）。
+
+        注意不要用 proapi 的 /open/upload/init——它要求 Bearer access_token，
+        纯 Cookie 会报"access_token 格式错误"。initupload 的请求体与响应都是
+        AES 加密 + LZ4 压缩（签名协议见 pan115_cipher），响应 status==2 即秒传
+        成功；status==7 时服务器下发 sign_check（HTTP Range 形式的字节范围）做
+        二次验证，取到片段算 SHA1 作为 sign_val 重发；其余状态视为 115 服务器
+        上没有该文件。偶发 HTTP 401 重试即可（p115client 注明的已知怪癖）。
+        """
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", str(sha1 or "")):
+            raise Pan115Error("115 秒传需要 40 位 SHA1")
+        creds = await self._get_upload_credentials()
+        base_payload = {
+            "fileid": str(sha1).upper(),
+            "filename": str(file_name or "file"),
+            "filesize": str(max(0, int(size or 0))),
+            "target": f"U_1_{str(target_pid or '0')}",
+            "topupload": "true",
+            "userid": creds["userid"],
+            "userkey": creds["userkey"],
+            "sign_key": "",
+            "sign_val": "",
+            "appversion": UPLOAD_APP_VERSION,
+        }
+        payload = dict(base_payload)
+        challenged = False
+        for _ in range(4):
+            request = build_upload_request(payload)
+            status_code, payload_json = await self._post_upload_init(request)
+            if status_code == 401:
+                continue
+            if status_code >= 300 or payload_json is None:
+                raise Pan115Error(f"115 秒传接口 HTTP {status_code}")
+            if payload_json.get("state") is False:
+                raise Pan115Error(pan115_message(payload_json) or "115 秒传接口返回失败")
+            data = as_record(payload_json.get("data"))
+            status = int_number(data.get("status"), int_number(payload_json.get("status"), 0))
+            if status == 2:
+                return {
+                    "reuse": True,
+                    "fileId": str(data.get("file_id") or data.get("fileid") or data.get("pickcode") or ""),
+                }
+            if status != 7 or challenged:
+                return {"reuse": False, "fileId": "", "status": status}
+            sign_key = str(data.get("sign_key") or payload_json.get("sign_key") or "").strip()
+            sign_check = str(data.get("sign_check") or payload_json.get("sign_check") or "").strip()
+            if not sign_key or not sign_check:
+                return {"reuse": False, "fileId": "", "status": status}
+            if fetch_range_bytes is None:
+                raise Pan115Error("115 要求秒传二次验证，但缺少文件内容读取通道")
+            content = await fetch_range_bytes(sign_check)
+            if content is None:
+                return {"reuse": False, "fileId": "", "status": status}
+            sign_val = content if isinstance(content, str) else hashlib.sha1(content).hexdigest().upper()
+            payload = {**base_payload, "sign_key": sign_key, "sign_val": sign_val.upper()}
+            challenged = True
+        return {"reuse": False, "fileId": ""}
+
+    async def _post_upload_init(self, request: Dict[str, Any]) -> tuple:
+        """POST initupload 并解密响应；返回 (http_status, 解密 JSON 或 None)。"""
+        await self._throttle()
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            response = await client.post(
+                UPLOAD_INIT_URL,
+                params=request["params"],
+                content=request["data"],
+                headers={
+                    "accept": "*/*",
+                    "content-type": "application/x-www-form-urlencoded",
+                    "cookie": self.cookie,
+                    "user-agent": UPLOAD_UA,
+                },
+            )
+        if response.status_code != 200:
+            return response.status_code, None
+        content = response.content
+        text = content.decode("utf-8", "replace").strip()
+        # 依次尝试：明文 JSON / AES+LZ4 / 仅 AES / 仅 LZ4 / 项目内 RSA 方案
+        if text.startswith("{"):
+            try:
+                return response.status_code, json.loads(text)
+            except Exception:
+                pass
+        try:
+            return response.status_code, decode_upload_response(content)
+        except Exception:
+            pass
+        try:
+            from .pan115_cipher import aes_cbc_decrypt as _dec, lz4_decompress as _lz4, AES_KEY as _K, AES_IV as _IV
+            aligned = content[:len(content) & -16]
+            plain = _dec(aligned, _K, _IV)
+            try:
+                return response.status_code, json.loads(_lz4(plain))
+            except Exception:
+                pass
+            return response.status_code, json.loads(plain)
+        except Exception:
+            pass
+        try:
+            from .pan115_cipher import lz4_decompress as _lz4_only
+            return response.status_code, json.loads(_lz4_only(content))
+        except Exception:
+            pass
+        try:
+            from urllib.parse import unquote
+            return response.status_code, json.loads(pan115_rsa_decrypt(unquote(text)))
+        except Exception:
+            pass
+        raise Pan115Error(
+            f"115 秒传响应无法解析（{len(content)} 字节，hex：{content.hex()[:480]}，片段：{text[:120]!r}）"
+        )
+
+        return {"reuse": False, "fileId": ""}
+
+    async def _get_upload_credentials(self) -> Dict[str, str]:
+        """获取秒传必需的 userid + userkey（Cookie 认证，进程内缓存）。
+
+        优先 android/2.0/user/upload_key（p115client 的标准取法），
+        失败再试 app/uploadinfo；都不给 userkey 时报错并附带响应片段。
+        """
+        if self._upload_credentials:
+            return self._upload_credentials
+        errors: List[str] = []
+        for url, label in (
+            (UPLOAD_KEY_URL, "115 上传凭据"),
+            (UPLOAD_INFO_URL, "115 上传信息"),
+        ):
+            try:
+                payload = await self.request_json(url, label)
+            except Pan115Error as error:
+                errors.append(f"{label}：{error}")
+                continue
+            data = as_record(payload.get("data"))
+            if isinstance(payload.get("data"), list) and payload["data"]:
+                data = as_record(payload["data"][0])
+            userkey = str(data.get("userkey") or data.get("userKey") or payload.get("userkey") or "").strip()
+            if not userkey:
+                errors.append(f"{label}：响应缺少 userkey（键：{sorted(set(data) | set(payload))[:12]}）")
+                continue
+            user_id = str(data.get("user_id") or data.get("userId") or "").strip()
+            if not user_id:
+                user_id = await self.get_user_id()
+            # Cookie 的 UID 形如 9999966_R2_1787280212，上传接口只要下划线前的数字段
+            user_id = user_id.split("_", 1)[0].strip()
+            self._upload_credentials = {"userid": user_id, "userkey": userkey}
+            return self._upload_credentials
+        raise Pan115Error("；".join(errors) or "115 上传凭据获取失败")
 
     async def get_user_id(self) -> str:
         if self._cached_user_id:
@@ -832,6 +1119,42 @@ def is_private_download_url(value: str) -> bool:
         )
     except Exception:
         return True
+
+
+def local_list_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """解析 115 本地盘列表（webapi.115.com/files）响应里的条目列表。"""
+    data = payload.get("data")
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        for key in ("list", "data", "items", "files"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    for key in ("list", "items", "files"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def local_list_count(payload: Dict[str, Any], fallback: int) -> int:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    for value in (payload.get("count"), payload.get("file_count"), data.get("count"), data.get("file_count"), data.get("total")):
+        number = int_number(value, -1)
+        if number >= 0:
+            return number
+    return fallback
+
+
+def local_item_is_dir(item: Dict[str, Any]) -> bool:
+    """115 列表条目里 fc==0 表示目录；无 fc 时按是否有 sha/大小兜底判断。"""
+    if item.get("fc") is not None:
+        return int_number(item.get("fc"), 1) == 0
+    for key in ("sha", "sha1", "file_sha1"):
+        if item.get(key) is not None:
+            return not str(item.get(key) or "").strip()
+    return not any(item.get(key) for key in ("fid", "file_id", "s", "fs", "file_size", "size"))
 
 
 def as_record(value: Any) -> Dict[str, Any]:

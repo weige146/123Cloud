@@ -30,7 +30,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
 setup_logging(DATA_DIR)
 
-from .pan115 import empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
+from .pan115 import CODE_RE as PAN123_CODE_RE, empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
 from .pan115_cookie import (
     PAN115_QR_DEVICES,
     confirm_pan115_qr_login,
@@ -40,7 +40,14 @@ from .pan115_cookie import (
     pan115_qr_sessions,
     pan115_status_text,
 )
-from .pan123 import Pan123Client, Pan123Error, parse_pan123_share_url
+from .pan123 import (
+    Pan123Client,
+    Pan123Error,
+    Pan123OauthBroker,
+    decode_oplist_callback_fragment,
+    pan123_open_token_expires_at,
+    parse_pan123_share_url,
+)
 from .pan115_transfer import extract_115_links
 from .session_store import SessionStore, positive_user_ids
 from .submission import (
@@ -96,7 +103,9 @@ telegram_callback_polling_task: Optional[asyncio.Task[None]] = None
 PAN123_COPY_PASSWORD_PENDING_PREFIX = "telegram_pan123_copy_password:"
 PAN123_COPY_PASSWORD_TTL_SECONDS = 600
 TELEGRAM_BOT_COMMANDS = [
-    {"command": "start", "description": "启动本地盘搬运"},
+    {"command": "start", "description": "启动 115 本地盘搬运"},
+    {"command": "123dir", "description": "123 网盘目录搬运到 115"},
+    {"command": "123share", "description": "123 分享链接搬运到 115"},
     {"command": "recycle", "description": "删除回收站"},
 ]
 
@@ -257,6 +266,53 @@ async def handle_transfer_telegram_update(update: Dict[str, Any], bot_token: str
                 await delete_telegram_messages(bot_token, chat_id, [source_message_id, telegram_message_id(sent)])
             except Exception as error:
                 await send_telegram_text(bot_token, chat_id, f"115 回收站清理失败：{error}")
+            return True
+        if command == "/123dir":
+            transfer_config = normalize_transfer_config(store.read_config())
+            # 默认从 115→123 的落地目录往回搬
+            dir_id = payload.strip() or str(transfer_config.get("targetDirId") or "0").strip() or "0"
+            try:
+                task = await transfer_service.enqueue_pan123to115(
+                    dir_id,
+                    "telegram",
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    message_id=source_message_id,
+                )
+                sent = await send_telegram_text(
+                    bot_token, chat_id,
+                    f"📥 123→115 搬运已加入队列：{task.get('title') or dir_id}\n115 目标目录 CID：{task.get('targetDirId') or '0'}",
+                )
+                await delete_telegram_messages(bot_token, chat_id, [source_message_id, telegram_message_id(sent)])
+            except Exception as error:
+                await send_telegram_text(bot_token, chat_id, f"123→115 搬运入队失败：{error}")
+            return True
+        if command == "/123share":
+            parts = payload.strip().split(maxsplit=1)
+            share_url = parts[0] if parts else ""
+            share_pwd = parts[1].strip() if len(parts) > 1 else ""
+            if not share_url:
+                await send_telegram_text(bot_token, chat_id, "用法：/123share 分享链接 [提取码]（提取码在链接里时可省略）")
+                return True
+            code_match = PAN123_CODE_RE.search(share_pwd) or PAN123_CODE_RE.search(share_url)
+            if code_match:
+                share_pwd = code_match.group(1)
+            try:
+                task = await transfer_service.enqueue_pan123_share_to_115(
+                    share_url,
+                    share_pwd,
+                    "telegram",
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    message_id=source_message_id,
+                )
+                sent = await send_telegram_text(
+                    bot_token, chat_id,
+                    f"📥 123 分享→115 搬运已加入队列：{task.get('title') or share_url}\n115 目标目录 CID：{task.get('targetDirId') or '0'}",
+                )
+                await delete_telegram_messages(bot_token, chat_id, [source_message_id, telegram_message_id(sent)])
+            except Exception as error:
+                await send_telegram_text(bot_token, chat_id, f"123 分享→115 搬运入队失败：{error}")
             return True
         if command != "/start":
             return False
@@ -496,23 +552,12 @@ async def handle_admin_pan123_share_links(
     submitter: Dict[str, Any],
     links: List[Dict[str, Any]],
 ) -> bool:
-    session = store.read_session()
-    if not session or not session.get("token"):
-        await send_telegram_text(bot_token, chat_id, "后端未登录 123 云盘，无法判断分享者 UID 或执行转存。请先重新登录。")
-        return True
-    profile = session.get("profile") if isinstance(session.get("profile"), dict) else {}
-    current_uid = safe_int(profile.get("uid"))
+    current_uid = await current_pan123_uid()
     if not current_uid:
-        try:
-            profile = await pan123.get_user_info(session)
-            session["profile"] = profile
-            store.write_session(session)
-            current_uid = safe_int(profile.get("uid"))
-        except Exception as error:
-            await send_telegram_text(bot_token, chat_id, f"获取当前 123 账号 UID 失败：{error}。请重新登录后再试。")
-            return True
-    if not current_uid:
-        await send_telegram_text(bot_token, chat_id, "当前 123 登录会话没有 UID，请重新登录后再试。")
+        await send_telegram_text(
+            bot_token, chat_id,
+            "123 云盘尚未授权登录（或账号资料获取失败），无法判断分享者 UID 或执行转存。请先到设置页完成 123 账号授权。",
+        )
         return True
 
     submission_links: List[Dict[str, Any]] = []
@@ -631,8 +676,10 @@ def pan123_copy_password_key(user_id: int) -> str:
 def telegram_pan115_help_text() -> str:
     return "\n".join([
         "115 搬运机器人使用说明：",
-        "/start 启动本地盘搬运（后台配置的默认 115 本地盘目录）",
+        "/start 启动 115 本地盘搬运（后台配置的默认 115 本地盘目录）",
         "/start 路径或CID 搬运指定的 115 本地盘目录",
+        "/123dir 目录ID 把 123 网盘目录搬运到 115（根目录填 0）",
+        "/123share 分享链接 [提取码] 把 123 分享链接搬运到 115",
         "/recycle 删除回收站（清空 115 回收站）",
         "",
         "直接发送 115 分享链接和提取码：搬运到 123 云盘",
@@ -701,15 +748,25 @@ async def send_telegram_transfer_queued_messages(tasks: List[Dict[str, Any]]) ->
     track_chat_id = chat_ids[0]
     refs: List[Dict[str, Any]] = []
     for task in tasks:
-        is_pan123_copy = str(task.get("kind") or "") == "pan123_share_copy"
+        kind = str(task.get("kind") or "")
+        is_pan123_copy = kind == "pan123_share_copy"
+        is_pan123to115 = kind == "pan123to115"
         is_local = str(task.get("shareCode") or "").lower().startswith("local:")
         title = str(
             task.get("title")
             or (task.get("sourceText") if is_local else task.get("shareUrl"))
             or "115 任务"
         )
-        label = "123 分享转存" if is_pan123_copy else ("115 本地盘搬运" if is_local else "115 分享搬运")
+        label = (
+            "123 分享转存" if is_pan123_copy
+            else ("123→115 搬运" if is_pan123to115 else ("115 本地盘搬运" if is_local else "115 分享搬运"))
+        )
         detail = f"\n目标目录 ID：{task.get('targetDirId') or '0'}" if is_pan123_copy else ""
+        if is_pan123to115:
+            if str(task.get("shareUrl") or "").startswith("123://"):
+                detail = f"\n123 源目录 ID：{task.get('sourceDirId') or task.get('sourceText') or '0'}\n115 目标目录 CID：{task.get('targetDirId') or '0'}"
+            else:
+                detail = f"\n分享链接：{task.get('shareUrl') or ''}\n115 目标目录 CID：{task.get('targetDirId') or '0'}"
         text = f"📥 {label}已加入队列：{title}{detail}\n任务 ID：{str(task.get('id') or '')[:8]}"
         for chat_id in chat_ids:
             with contextlib.suppress(Exception):
@@ -722,7 +779,7 @@ async def send_telegram_transfer_queued_messages(tasks: List[Dict[str, Any]]) ->
 
 async def send_telegram_transfer_status_message(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     kind = str(task.get("kind") or "")
-    if kind not in {"pan123_share_copy", "pan115_share"}:
+    if kind not in {"pan123_share_copy", "pan115_share", "pan123to115"}:
         return None
     status = str(task.get("status") or "")
     if status not in {"success", "failed", "partial"}:
@@ -732,10 +789,14 @@ async def send_telegram_transfer_status_message(task: Dict[str, Any]) -> Optiona
     if not bot_token or not chat_ids:
         return None
     is_pan123_copy = kind == "pan123_share_copy"
+    is_pan123to115 = kind == "pan123to115"
     is_local = str(task.get("shareCode") or "").lower().startswith("local:")
     if is_pan123_copy:
         title = str(task.get("title") or task.get("shareUrl") or "123 分享")
         label = "123 分享转存"
+    elif is_pan123to115:
+        title = str(task.get("title") or task.get("shareUrl") or "123 目录")
+        label = "123→115 搬运"
     else:
         title = str(task.get("title") or task.get("shareUrl") or ("115 本地盘" if is_local else "115 分享"))
         label = "115 本地盘搬运" if is_local else "115 分享搬运"
@@ -826,19 +887,7 @@ async def route_submission_text(
 
     submission_links: List[Dict[str, Any]] = []
     if links:
-        session = store.read_session()
-        current_uid = 0
-        if session and session.get("token"):
-            profile = session.get("profile") if isinstance(session.get("profile"), dict) else {}
-            current_uid = safe_int(profile.get("uid"))
-            if not current_uid:
-                try:
-                    profile = await pan123.get_user_info(session)
-                    session["profile"] = profile
-                    store.write_session(session)
-                    current_uid = safe_int(profile.get("uid"))
-                except Exception as error:
-                    logger.warning(f"获取 123 账号 UID 失败：{error}")
+        current_uid = await current_pan123_uid()
         for link in links:
             provider = str(link.get("provider") or "")
             if provider != "123pan":
@@ -847,7 +896,7 @@ async def route_submission_text(
             share_url = str(link.get("cleanUrl") or link.get("url") or "")
             try:
                 if not current_uid:
-                    raise RuntimeError("后端未登录 123 云盘，无法判断分享归属；请先登录")
+                    raise RuntimeError("123 云盘尚未授权登录，无法判断分享归属；请先到设置页完成授权")
                 parsed_share = parse_pan123_share_url(share_url)
                 canonical_share_url = f"{parsed_share['origin']}/s/{parsed_share['shareKey']}"
                 info = await pan123.get_share_info(canonical_share_url)
@@ -975,26 +1024,26 @@ def safe_zoneinfo(value: str) -> ZoneInfo:
         return ZoneInfo("Asia/Shanghai")
 
 
-class LoginRequest(BaseModel):
-    user: str = Field(..., min_length=1)
-    password: str = Field(..., min_length=1)
-    remember: bool = True
-
-
-class LoginResponse(BaseModel):
+class Pan123OauthStartResponse(BaseModel):
     ok: bool
-    user: str
-    loginUuid: str
-    reused: bool = False
-    updatedAt: str
-    profile: Optional[Dict[str, Any]] = None
+    authorizeUrl: str
+    redirectUri: str
+    nonce: str
+
+
+class Pan123OauthFinishRequest(BaseModel):
+    nonce: str = ""
+    callbackUrl: str = ""
+
+
+class Pan123OauthImportRequest(BaseModel):
+    refreshToken: str = Field(..., min_length=1)
 
 
 class SessionResponse(BaseModel):
     backend: bool = True
     authenticated: bool
     user: str = ""
-    loginUuid: str = ""
     updatedAt: str = ""
     profile: Optional[Dict[str, Any]] = None
     loginExpired: bool = False
@@ -1035,12 +1084,12 @@ class TextActionRequest(BaseModel):
 
 class TransferConfigRequest(BaseModel):
     enabled: bool = False
-    pan123ClientId: str = ""
-    pan123ClientSecret: str = ""
     pan115Cookie: str = ""
     pan115Cookies: List[str] = Field(default_factory=list)
     targetDirId: str = "0"
     localPath115: str = ""
+    pan115TargetCid: str = "0"
+    pan123OauthApi: str = ""
     excludeSuffix: str = ""
     excludeCid: str = ""
     delete115AfterSuccess: bool = False
@@ -1059,6 +1108,11 @@ class TransferConfigRequest(BaseModel):
 
 class TransferLocalTaskRequest(BaseModel):
     path115: str = ""
+    targetUserId: Optional[int] = None
+
+
+class Transfer123to115TaskRequest(BaseModel):
+    sourceDirId: str = "0"
     targetUserId: Optional[int] = None
 
 
@@ -1097,64 +1151,124 @@ async def admin_status() -> Dict[str, Any]:
             "pan115HelperConfigured": bool(helper_config.get("enabled")),
             "transferConfigured": bool(transfer_config.get("enabled")),
         },
-        "pan123": await session_payload(session, refresh_profile=True),
+        "pan123": await session_payload(refresh_profile=True),
     }
 
 
 @app.get("/api/123/session", response_model=SessionResponse)
 async def read_pan123_session() -> SessionResponse:
-    session = store.read_session()
-    payload = await session_payload(session, refresh_profile=True)
+    payload = await session_payload(refresh_profile=True)
     return SessionResponse(**payload)
 
 
-@app.post("/api/123/login", response_model=LoginResponse)
-async def login_pan123(request: LoginRequest) -> LoginResponse:
-    user = request.user.strip()
-    password = request.password
-    if not user or not password:
-        raise HTTPException(status_code=400, detail="请输入账号和密码")
+PAN123_OAUTH_PENDING_KEY = "pan123_oauth_pending"
+PAN123_OAUTH_PENDING_TTL_SECONDS = 1800
 
-    existing = store.read_session()
-    if existing and existing.get("token") and store.credentials_match(existing, user, password):
-        profile = existing.get("profile")
-        if not isinstance(profile, dict) or not profile:
-            profile = await load_profile(existing, user)
-            existing["profile"] = profile
-            store.write_session(existing)
-        return LoginResponse(
-            ok=True,
-            user=str(existing.get("user") or user),
-            loginUuid=str(existing.get("loginUuid") or ""),
-            reused=True,
-            updatedAt=str(existing.get("updatedAt") or ""),
-            profile=profile,
-        )
 
-    login_uuid = str(existing.get("loginUuid") or "") if existing else ""
-    if not login_uuid:
-        login_uuid = uuid.uuid4().hex + uuid.uuid4().hex
+def _pan123_oauth_broker() -> Pan123OauthBroker:
+    config = store.read_config()
+    transfer_config = config.get("transfer") if isinstance(config.get("transfer"), dict) else {}
+    base_url = str(transfer_config.get("pan123OauthApi") or "").strip()
+    return Pan123OauthBroker(base_url=base_url) if base_url else Pan123OauthBroker()
+
+
+@app.post("/api/123/oauth/start", response_model=Pan123OauthStartResponse)
+async def start_pan123_oauth() -> Pan123OauthStartResponse:
+    """生成 123 官方授权页地址；桌面端弹窗打开，授权后回调地址回传 /oauth/finish。"""
     try:
-        auth = await pan123.login(user, password, request.remember, login_uuid)
+        info = await _pan123_oauth_broker().authorize_url()
     except Pan123Error as error:
-        raise HTTPException(status_code=401, detail=str(error))
-
-    profile = await load_profile({"token": auth["token"], "loginUuid": auth["loginUuid"], "user": user}, user)
-    session = store.build_session(user, password, auth["token"], auth["loginUuid"], profile=profile)
-    store.write_session(session)
-    return LoginResponse(
+        raise HTTPException(status_code=502, detail=str(error))
+    nonce = uuid.uuid4().hex
+    store.write_value(PAN123_OAUTH_PENDING_KEY, {
+        "nonce": nonce,
+        "expiresAt": time.time() + PAN123_OAUTH_PENDING_TTL_SECONDS,
+    })
+    return Pan123OauthStartResponse(
         ok=True,
-        user=user,
-        loginUuid=str(session.get("loginUuid") or ""),
-        reused=False,
-        updatedAt=str(session.get("updatedAt") or ""),
-        profile=profile,
+        authorizeUrl=str(info.get("authorizeUrl") or ""),
+        redirectUri=str(info.get("redirectUri") or ""),
+        nonce=nonce,
     )
+
+
+async def _finish_pan123_authorization(refresh_token: str, access_token: str, expires_in: Optional[int]) -> Dict[str, Any]:
+    """持久化 token 并抓取账号资料（昵称/UID），返回会话负载。"""
+    store.merge_session({
+        "refreshToken": refresh_token,
+        "accessToken": access_token,
+        "expiresAt": pan123_open_token_expires_at(access_token, {"expiresIn": expires_in} if expires_in else None),
+        "loginExpired": False,
+    })
+    nickname = ""
+    profile: Dict[str, Any] = {}
+    try:
+        client = await transfer_service.create_status_pan123_client()
+        profile = await client.get_open_user_info()
+        nickname = str(profile.get("nickname") or "")
+    except Exception as error:
+        logger.warning(f"123 授权成功但获取账号资料失败：{error}")
+    store.merge_session({
+        "user": nickname or "123 账号",
+        "profile": profile or None,
+    })
+    store.delete_value(PAN123_OAUTH_PENDING_KEY)
+    return await session_payload(refresh_profile=True)
+
+
+@app.post("/api/123/oauth/finish", response_model=SessionResponse)
+async def finish_pan123_oauth(request: Pan123OauthFinishRequest) -> SessionResponse:
+    """接收授权弹窗/浏览器回传的回调地址，换取并保存 token。"""
+    pending = store.read_value(PAN123_OAUTH_PENDING_KEY)
+    if not isinstance(pending, dict) or float(pending.get("expiresAt") or 0) < time.time():
+        raise HTTPException(status_code=400, detail="授权会话已过期，请重新点击「授权登录」")
+    if str(request.nonce or "") != str(pending.get("nonce") or ""):
+        raise HTTPException(status_code=400, detail="授权校验失败（nonce 不匹配），请重新发起授权")
+
+    callback_url = str(request.callbackUrl or "").strip()
+    parsed = urlparse(callback_url)
+    query = parse_qs(parsed.query)
+    code = str((query.get("code") or [""])[0]).strip()
+    try:
+        if code:
+            tokens = await _pan123_oauth_broker().exchange_code(code)
+            payload = await _finish_pan123_authorization(
+                str(tokens.get("refreshToken") or ""),
+                str(tokens.get("accessToken") or ""),
+                tokens.get("expiresIn"),
+            )
+        else:
+            # 回调已经过中转站 302，直接解析 /#<base64> 里的 token 数据
+            data = decode_oplist_callback_fragment(callback_url)
+            refresh_token = str(data.get("refresh_token") or "")
+            access_token = str(data.get("access_token") or "")
+            if not refresh_token:
+                raise Pan123Error("回调内容里没有找到 token；请粘贴包含 code= 的完整回调地址")
+            payload = await _finish_pan123_authorization(refresh_token, access_token, None)
+    except Pan123Error as error:
+        raise HTTPException(status_code=502, detail=str(error))
+    return SessionResponse(**payload)
+
+
+@app.post("/api/123/oauth/import", response_model=SessionResponse)
+async def import_pan123_refresh_token(request: Pan123OauthImportRequest) -> SessionResponse:
+    """手动导入刷新令牌（浏览器模式下从 token 工具页复制）。"""
+    try:
+        result = await _pan123_oauth_broker().refresh(request.refreshToken.strip())
+        payload = await _finish_pan123_authorization(
+            str(result.get("refreshToken") or request.refreshToken.strip()),
+            str(result.get("accessToken") or ""),
+            result.get("expiresIn"),
+        )
+    except Pan123Error as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return SessionResponse(**payload)
 
 
 @app.post("/api/123/logout")
 async def logout_pan123() -> Dict[str, bool]:
     store.clear_session()
+    store.delete_value(PAN123_OAUTH_PENDING_KEY)
     return {"ok": True}
 
 
@@ -1438,6 +1552,18 @@ async def create_local_transfer_task(request: TransferLocalTaskRequest) -> Dict[
     return {"ok": True, "task": task}
 
 
+@app.post("/api/transfer/123to115-tasks")
+async def create_pan123to115_transfer_task(request: Transfer123to115TaskRequest) -> Dict[str, Any]:
+    try:
+        config = normalize_transfer_config(store.read_config())
+        # 默认从 115→123 的落地目录往回搬；新建任务可自由指定源目录 ID
+        source_dir_id = str(request.sourceDirId or config.get("targetDirId") or "0").strip() or "0"
+        task = await transfer_service.enqueue_pan123to115(source_dir_id, "admin-123to115")
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, "task": task}
+
+
 @app.post("/api/transfer/kick")
 async def kick_transfer_queue() -> Dict[str, Any]:
     transfer_service.kick()
@@ -1506,57 +1632,62 @@ PROFILE_TTL_SECONDS = 12 * 3600
 
 def _looks_like_login_expired(message: str) -> bool:
     lowered = message.lower()
-    return "expired" in lowered or "过期" in message or "请登录" in message or "unauthorized" in lowered
+    return (
+        "expired" in lowered
+        or "过期" in message
+        or "失效" in message
+        or "请登录" in message
+        or "授权" in message
+        or "unauthorized" in lowered
+    )
 
 
-async def session_payload(session: Optional[Dict[str, Any]], refresh_profile: bool = False) -> Dict[str, Any]:
-    if not session or not session.get("token"):
-        return {"backend": True, "authenticated": False, "user": "", "loginUuid": "", "updatedAt": "", "profile": None, "loginExpired": False}
+async def session_payload(refresh_profile: bool = False) -> Dict[str, Any]:
+    """123 授权会话状态：refresh token 在即视为已授权，资料用 OpenAPI 抓取并缓存。"""
+    session = store.read_session()
+    if not session or not session.get("refreshToken"):
+        return {"backend": True, "authenticated": False, "user": "", "updatedAt": "", "profile": None, "loginExpired": False}
     profile = session.get("profile")
-    login_expired = False
-    if not isinstance(profile, dict) or not profile:
-        profile = await load_profile(session, str(session.get("user") or ""))
-        login_expired = _looks_like_login_expired(str(profile.get("fetchError") or ""))
-        session = dict(session)
-        session["profile"] = profile
-        store.write_session(session)
-    elif refresh_profile:
-        # 缓存的 profile 里头像是登录时的 CDN 签名链接，过期就成死链；到期自动重取
-        fetched_at = profile.get("fetchedAt") if isinstance(profile.get("fetchedAt"), (int, float)) else 0.0
-        if time.time() - float(fetched_at) > PROFILE_TTL_SECONDS:
-            fresh = await load_profile(session, str(session.get("user") or ""))
-            if fresh.get("uid") or fresh.get("headImage"):
-                fresh["fetchedAt"] = time.time()
-                profile = fresh
-                session = dict(session)
-                session["profile"] = profile
-                store.write_session(session)
-            else:
-                # 刷新失败（多为登录 token 过期）：保留旧缓存，但把状态暴露给前端提示重新登录
-                login_expired = _looks_like_login_expired(str(fresh.get("fetchError") or ""))
+    login_expired = bool(session.get("loginExpired"))
+    fetched_at = profile.get("fetchedAt") if isinstance(profile, dict) and isinstance(profile.get("fetchedAt"), (int, float)) else 0.0
+    if not isinstance(profile, dict) or not profile or (refresh_profile and time.time() - float(fetched_at) > PROFILE_TTL_SECONDS):
+        fresh = await load_open_profile()
+        if fresh.get("uid"):
+            fresh["fetchedAt"] = time.time()
+            profile = fresh
+            login_expired = False
+            store.merge_session({"profile": profile, "loginExpired": False})
+        elif not isinstance(profile, dict) or not profile:
+            profile = fresh
+            login_expired = True
+            store.merge_session({"profile": None, "loginExpired": True})
+        else:
+            # 刷新失败（多为授权失效）：保留旧缓存，把状态暴露给前端提示重新授权
+            login_expired = _looks_like_login_expired(str(fresh.get("fetchError") or ""))
+            store.merge_session({"loginExpired": login_expired})
     return {
         "backend": True,
         "authenticated": True,
         "user": str(session.get("user") or ""),
-        "loginUuid": str(session.get("loginUuid") or ""),
         "updatedAt": str(session.get("updatedAt") or ""),
         "profile": profile if isinstance(profile, dict) else None,
         "loginExpired": login_expired,
     }
 
 
-async def load_profile(session: Dict[str, Any], fallback_user: str) -> Dict[str, Any]:
+async def load_open_profile() -> Dict[str, Any]:
+    """用 OpenAPI 抓取账号资料；失败时返回带 fetchError 的占位（由上层判定登录过期）。"""
     try:
-        profile = await pan123.get_user_info(session)
-        # 123 官方接口返回的头像等 CDN 链接会轮换过期，记录抓取时间供缓存 TTL 判断
+        client = await transfer_service.create_status_pan123_client()
+        profile = await client.get_open_user_info()
         profile["fetchedAt"] = time.time()
         return profile
     except Exception as error:
         return {
             "uid": None,
-            "nickname": fallback_user or str(session.get("user") or ""),
+            "nickname": "",
             "headImage": "",
-            "passport": fallback_user or str(session.get("user") or ""),
+            "passport": "",
             "mail": "",
             "spaceUsed": None,
             "spacePermanent": None,
@@ -1570,6 +1701,25 @@ async def load_profile(session: Dict[str, Any], fallback_user: str) -> Dict[str,
         }
 
 
+async def current_pan123_uid() -> int:
+    """当前授权账号的 123 UID（分享归属判断用）；未授权或资料抓取失败返回 0。"""
+    session = store.read_session()
+    if not session or not session.get("refreshToken"):
+        return 0
+    profile = session.get("profile") if isinstance(session.get("profile"), dict) else {}
+    uid = safe_int(profile.get("uid"))
+    if uid:
+        return uid
+    try:
+        client = await transfer_service.create_status_pan123_client()
+        fresh = await client.get_open_user_info()
+        store.merge_session({"profile": fresh, "loginExpired": False})
+        return safe_int(fresh.get("uid"))
+    except Exception as error:
+        logger.warning(f"获取 123 账号 UID 失败：{error}")
+        return 0
+
+
 def normalize_transfer_config(config: Dict[str, Any]) -> Dict[str, Any]:
     raw = config.get("transfer") if isinstance(config.get("transfer"), dict) else config
     pan115_cookies = raw.get("pan115Cookies") if isinstance(raw.get("pan115Cookies"), list) else []
@@ -1579,12 +1729,12 @@ def normalize_transfer_config(config: Dict[str, Any]) -> Dict[str, Any]:
         pan115_cookies = [line.strip() for line in re.split(r"\n\s*\n|[\r\n]+", pan115_cookie) if line.strip()]
     return {
         "enabled": bool(raw.get("enabled")),
-        "pan123ClientId": str(raw.get("pan123ClientId") or "").strip(),
-        "pan123ClientSecret": str(raw.get("pan123ClientSecret") or "").strip(),
         "pan115Cookie": "\n".join(pan115_cookies) if pan115_cookies else pan115_cookie,
         "pan115Cookies": pan115_cookies,
         "targetDirId": str(raw.get("targetDirId") or "0").strip() or "0",
         "localPath115": str(raw.get("localPath115") or raw.get("path115") or raw.get("path_115") or "").strip(),
+        "pan115TargetCid": str(raw.get("pan115TargetCid") or "0").strip() or "0",
+        "pan123OauthApi": str(raw.get("pan123OauthApi") or "").strip(),
         "excludeSuffix": str(raw.get("excludeSuffix") or raw.get("exclude_suffix") or "").strip(),
         "excludeCid": str(raw.get("excludeCid") or raw.get("exclude_cid") or "").strip(),
         "delete115AfterSuccess": bool(raw.get("delete115AfterSuccess") or raw.get("delete_115")),

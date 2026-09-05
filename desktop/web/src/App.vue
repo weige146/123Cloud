@@ -75,12 +75,12 @@ const currentTitle = computed(() => String(route.meta?.title || "123Cloud"));
 const pan = computed(() => state.status?.pan123);
 const profile = computed(() => pan.value?.profile);
 const panName = computed(() => displayName(profile.value || null, pan.value?.user || ""));
-// 登录 token 过期后 profile 无法刷新，头像等缓存链接会失效，需要用户重新登录
+// 授权失效后 profile 无法刷新，头像等缓存链接会失效，需要用户重新授权
 const panLoginExpired = computed(() => pan.value?.loginExpired === true);
 const panMeta = computed(() => {
-  if (panLoginExpired.value) return "登录已过期，请重新登录 123 账号";
+  if (panLoginExpired.value) return "授权已失效，请到设置页重新授权 123 账号";
   const currentProfile = profile.value;
-  if (!currentProfile) return pan.value?.authenticated ? "账号已连接" : "未登录 123 云盘";
+  if (!currentProfile) return pan.value?.authenticated ? "账号已连接" : "未授权 123 云盘";
   const parts: string[] = [];
   if (currentProfile.vip) parts.push("VIP");
   const used = formatBytes(currentProfile.spaceUsed);
@@ -240,7 +240,7 @@ watch(isPublicPage, (isPublic) => {
             />
             <span class="side-rail__account" :class="{ 'login-expired': panLoginExpired }" :title="panMeta">
               <strong>{{ panName }}</strong>
-              <small>{{ panLoginExpired ? "登录已过期" : pan?.authenticated ? "已连接" : "未登录" }}</small>
+              <small>{{ panLoginExpired ? "授权已失效" : pan?.authenticated ? "已连接" : "未授权" }}</small>
             </span>
             <span class="side-rail__spacer" />
             <ThemeSettingsMenu button-class="rail-icon-button" />

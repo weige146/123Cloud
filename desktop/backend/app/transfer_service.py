@@ -26,8 +26,15 @@ from .pan115_transfer import (
     PAN123_OFFLINE_USER_AGENT,
     Pan115TransferClient,
 )
-from .pan123 import Pan123Client, Pan123OpenAPIClient, Pan123OpenTokenStore
-from .session_store import SessionStore, pan123_open_token_key
+from .pan123 import (
+    PAN123_OAUTH_BROKER_URL,
+    Pan123Client,
+    Pan123OauthBroker,
+    Pan123OpenAPIClient,
+    SyncPan123OauthStore,
+    parse_pan123_share_url,
+)
+from .session_store import SessionStore
 # 管线与工具函数统一定义在 transfer_pipeline，这里引用并向上层保持兼容导出
 from .transfer_pipeline import (  # noqa: F401
     TaskCancelled,
@@ -58,6 +65,7 @@ from .transfer_pipeline import (  # noqa: F401
     _transfer_cookie_pool,
     _utc_now_iso,
 )
+from .transfer_pipeline_123to115 import TransferPipeline123to115
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +93,9 @@ PAN115_DOWNLOAD_MAX_ATTEMPTS = int(os.environ.get("TRANSFER_115_DOWNLOAD_MAX_ATT
 PAN115_DOWNLOAD_RETRY_BASE_MS = int(os.environ.get("TRANSFER_115_DOWNLOAD_RETRY_BASE_MS", "8000"))
 PAN115_DOWNLOAD_USER_AGENT = "Mozilla/5.0 115disk/31.4.2 115Browser/31.4.2 115wangpan_android/34.0.0"
 FILE_CONCURRENCY_MAX = int(os.environ.get("TRANSFER_FILE_CONCURRENCY_MAX", "5"))
-PAN123_SHARE_COPY_MIN_INTERVAL_MS = int(os.environ.get("PAN123_SHARE_COPY_MIN_INTERVAL_MS", "10000"))
-PAN123_SHARE_COPY_MAX_ATTEMPTS = int(os.environ.get("PAN123_SHARE_COPY_MAX_ATTEMPTS", "4"))
-PAN123_SHARE_COPY_RETRY_BASE_MS = int(os.environ.get("PAN123_SHARE_COPY_RETRY_BASE_MS", "10000"))
+# 分享秒传逐文件间隔与单任务文件数上限（防限流、防误搬超大分享）
+PAN123_SHARE_STAGE_INTERVAL_MS = int(os.environ.get("PAN123_SHARE_STAGE_INTERVAL_MS", "300"))
+MAX_SHARE_COPY_FILES = 20000
 # 失效 115 账号的全局冷却时长；期间其他任务不再选用该账号
 PAN115_ACCOUNT_COOLDOWN_MS = _normalize_non_negative_ms(
     os.environ.get("TRANSFER_115_ACCOUNT_COOLDOWN_MS"), 30 * 60_000
@@ -122,13 +130,13 @@ class TransferService:
         self._pan115_download_queue: Optional[asyncio.Future[Any]] = None
         self._last_pan115_download_at = 0.0
         self._cached_transfer_config: Optional[Dict[str, Any]] = None
-        # 相同凭证复用同一 Pan123OpenAPIClient 实例，共享内存 token
+        # 相同授权配置复用同一 Pan123OpenAPIClient 实例，共享内存 token
         self._pan123_open_client: Optional[Pan123OpenAPIClient] = None
         self._pan123_open_client_key: str = ""
         self._pan123_open_client_lock: Optional[asyncio.Lock] = None
-        self._pan123_web_client = Pan123Client()
+        # 123 分享公开接口（列分享详情/目录，无需登录态）
+        self._pan123_share_client = Pan123Client()
         self._active_pan123_share_copy_task_id: Optional[str] = None
-        self._last_pan123_share_copy_submit_at = 0.0
         # 任务级管线（解析/规划/秒传/离线各阶段的缓存挂在管线上）
         self._pipelines: Dict[str, TransferPipeline] = {}
         # 115 账号健康状态：cookie 指纹 -> {"name", "coolUntilMs"}；失效账号冷却期内跳过
@@ -172,7 +180,7 @@ class TransferService:
             self._pan123_open_client_key = ""
             if client is not None:
                 await client.close()
-        await self._pan123_web_client.close()
+        await self._pan123_share_client.close()
 
     async def requeue_task(self, task_id: str) -> Dict[str, Any]:
         task = self._store.get_transfer_task(task_id)
@@ -386,6 +394,154 @@ class TransferService:
         self.kick()
         return task
 
+    async def enqueue_pan123to115(
+        self,
+        source_dir_id: str,
+        source: str,
+        chat_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """创建 123 → 115 搬运任务。
+
+        123 侧使用已授权账号的 OpenAPI 接口（设置页授权登录后自动刷新 token）；
+        115 侧固定用"115 助手"的账号 Cookie。
+        不受晚高峰暂停窗口限制（该窗口只针对 123 离线通道）。
+        """
+        config = self._store.read_config()
+        transfer_config = config.get("transfer", {}) if isinstance(config.get("transfer"), dict) else {}
+        self._remember_config(transfer_config)
+        if not transfer_config.get("enabled"):
+            raise RuntimeError("115 搬运未启用，请先在后台开启")
+
+        normalized_dir = str(source_dir_id or "").strip() or "0"
+        if not re.fullmatch(r"\d+", normalized_dir):
+            raise RuntimeError("123 源目录 ID 必须是数字（根目录填 0）")
+        session = self._store.read_session()
+        if not session or not session.get("refreshToken"):
+            raise RuntimeError("123 云盘尚未授权登录，请先到设置页完成 123 账号授权")
+        submission = self._store.read_submission_config()
+        helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+        try:
+            select_115_account(helper)
+        except Exception as error:
+            raise RuntimeError(
+                "123→115 搬运需要 115 助手账号作为目标账号，请先在后台“115 助手”配置 Cookie"
+            ) from error
+
+        now = _utc_now_iso()
+        task = {
+            "id": str(uuid4()),
+            "kind": "pan123to115",
+            "source": source,
+            "sourceText": normalized_dir,
+            "chatId": chat_id,
+            "userId": user_id,
+            "messageId": message_id,
+            "shareUrl": f"123://dir?id={normalized_dir}",
+            "shareCode": f"123dir:{normalized_dir}",
+            "receiveCode": "",
+            "title": f"123 目录 {normalized_dir}",
+            "sourceDirId": normalized_dir,
+            "targetDirId": str(transfer_config.get("pan115TargetCid") or "0").strip() or "0",
+            "status": "queued",
+            "totalFiles": 0,
+            "doneFiles": 0,
+            "files": [],
+            "logs": [{"time": now, "level": "info", "message": "123→115 搬运任务已入队"}],
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        duplicate = await self._find_active_duplicate(task)
+        if duplicate:
+            raise RuntimeError(
+                f"该 123 目录已有未完成搬运任务（{_transfer_status_label(duplicate.get('status'))}），请勿重复提交"
+            )
+        self._store.save_transfer_task(task)
+        await self._notify_queued_tasks([task])
+        self.kick()
+        return task
+
+    async def enqueue_pan123_share_to_115(
+        self,
+        share_url: str,
+        share_password: str,
+        source: str,
+        chat_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """创建 123 分享链接 → 115 搬运任务。
+
+        执行时把分享内容用 OpenAPI 秒传（MD5）中转到本机网盘的临时目录，
+        再走 123→115 的 OpenAPI 秒传管线；115 侧固定用"115 助手"账号 Cookie。
+        """
+        config = self._store.read_config()
+        transfer_config = config.get("transfer", {}) if isinstance(config.get("transfer"), dict) else {}
+        self._remember_config(transfer_config)
+        if not transfer_config.get("enabled"):
+            raise RuntimeError("115 搬运未启用，请先在后台开启")
+
+        session = self._store.read_session()
+        if not session or not session.get("refreshToken"):
+            raise RuntimeError("123 云盘尚未授权登录，请先到设置页完成 123 账号授权")
+
+        parsed = parse_pan123_share_url(share_url)
+        clean_url = f"{parsed['origin']}/s/{parsed['shareKey']}"
+        password = str(share_password or parsed.get("password") or "").strip()
+        if password:
+            from urllib.parse import quote
+
+            clean_url += f"?password={quote(password)}"
+        submission = self._store.read_submission_config()
+        helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+        try:
+            select_115_account(helper)
+        except Exception as error:
+            raise RuntimeError(
+                "123→115 搬运需要 115 助手账号作为目标账号，请先在后台“115 助手”配置 Cookie"
+            ) from error
+
+        title = parsed["shareKey"]
+        try:
+            share_info = await self._pan123_share_client.get_share_info(share_url)
+            if share_info.get("shareName"):
+                title = str(share_info["shareName"])
+        except Exception:
+            pass
+
+        now = _utc_now_iso()
+        task = {
+            "id": str(uuid4()),
+            "kind": "pan123to115",
+            "source": source,
+            "sourceText": share_url,
+            "chatId": chat_id,
+            "userId": user_id,
+            "messageId": message_id,
+            "shareUrl": clean_url,
+            "shareCode": parsed["shareKey"],
+            "receiveCode": password,
+            "title": f"123 分享 {title}",
+            "targetDirId": str(transfer_config.get("pan115TargetCid") or "0").strip() or "0",
+            "status": "queued",
+            "totalFiles": 0,
+            "doneFiles": 0,
+            "files": [],
+            "logs": [{"time": now, "level": "info", "message": "123 分享→115 搬运任务已入队"}],
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        duplicate = await self._find_active_duplicate(task)
+        if duplicate:
+            raise RuntimeError(
+                f"该 123 分享已有未完成搬运任务（{_transfer_status_label(duplicate.get('status'))}），请勿重复提交"
+            )
+        self._store.save_transfer_task(task)
+        await self._notify_queued_tasks([task])
+        self.kick()
+        return task
+
     async def _find_active_duplicate(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """查找相同 shareCode 的活跃（未完成的）任务，防止重复提交。"""
         existing_tasks = self._store.list_transfer_tasks(100)
@@ -560,7 +716,8 @@ class TransferService:
             if paused:
                 if pan123_copy_busy:
                     return
-                task = self._store.next_queued_transfer_task("pan123_share_copy")
+                # 暂停窗口针对的是 123 离线通道；123→115 不用 123 离线，继续调度
+                task = self._store.next_queued_transfer_task("pan123_share_copy") or self._store.next_queued_transfer_task("pan123to115")
             else:
                 task = self._store.next_queued_transfer_task(
                     exclude_kind="pan123_share_copy" if pan123_copy_busy else ""
@@ -612,7 +769,10 @@ class TransferService:
             await self._run_pan123_share_copy(task, transfer_config)
             return
 
-        pipeline = TransferPipeline(self, task, transfer_config)
+        if str(task.get("kind") or "") == "pan123to115":
+            pipeline = TransferPipeline123to115(self, task, transfer_config)
+        else:
+            pipeline = TransferPipeline(self, task, transfer_config)
         self._pipelines[task["id"]] = pipeline
         try:
             await pipeline.run()
@@ -635,142 +795,115 @@ class TransferService:
         await self._discard_finished_task_record(task)
 
     async def _run_pan123_share_copy(self, task: Dict[str, Any], transfer_config: Dict[str, Any]) -> None:
-        session = self._store.read_session()
-        if not session or not session.get("token"):
-            raise RuntimeError("后端未登录 123 云盘，无法转存")
-        _add_task_log(task, "info", f"开始转存 123 分享：{task.get('title') or task.get('shareUrl')}")
+        """123 分享转存到自己网盘（OpenAPI 秒传通道）。
+
+        OpenAPI 没有"转存他人分享"接口，这里用分享目录自带的文件 MD5（Etag）
+        走 /upload/v2/file/create 秒传：内容本就在 123 服务器上，正常全部命中，
+        服务端秒建文件、不占带宽。目录结构按分享原样重建。
+        """
+        client = await self._create_pan123_client()
+        _add_task_log(task, "info", f"开始转存 123 分享：{task.get('title') or task.get('shareUrl')}（OpenAPI 秒传通道）")
         if not await self._save_transfer_task(task):
             return
 
-        remote_task_id = int(task.get("remoteTaskId") or 0)
-        if remote_task_id <= 0:
-            items = await self._pan123_web_client.list_share_root_items(
-                str(task.get("shareUrl") or ""),
-                str(task.get("receiveCode") or ""),
-            )
-            task["files"] = [
-                {
-                    "id": str(item.get("FileId") or item.get("fileId") or item.get("id") or ""),
-                    "name": str(item.get("FileName") or item.get("filename") or item.get("name") or ""),
-                    "size": int(item.get("Size") or item.get("BaseSize") or item.get("size") or 0),
-                    "status": "pending",
-                }
-                for item in items
-                if str(item.get("FileId") or item.get("fileId") or item.get("id") or "").strip()
-            ]
-            task["totalFiles"] = len(task["files"])
-            if not task["files"]:
+        share_url = str(task.get("shareUrl") or "")
+        share_password = str(task.get("receiveCode") or "")
+        target_dir_id = str(task.get("targetDirId") or "0").strip() or "0"
+        files = task.get("files") or []
+        if not files:
+            root_items = await self._pan123_share_client.list_share_root_items(share_url, share_password)
+            if not root_items:
                 raise RuntimeError("123 分享根目录中没有可转存的文件")
-            _add_task_log(task, "info", f"分享里有 {len(task['files'])} 个文件，提交 123 官方转存")
-            remote_task_id = await self._submit_pan123_share_copy_with_retry(
-                task,
-                session,
-                items,
-                transfer_config,
+            task["files"] = []
+            await self._stage_share_items(task, client, share_url, share_password, root_items, target_dir_id, [])
+
+        success = len([f for f in task.get("files", []) if f.get("status") == "success"])
+        failed = len([f for f in task.get("files", []) if f.get("status") == "failed"])
+        total = int(task.get("totalFiles") or 0)
+        task["status"] = "failed" if failed and failed == total else ("partial" if failed else "success")
+        task["finishedAt"] = _utc_now_iso()
+        if failed:
+            failed_names = [f.get("name") or "?" for f in task.get("files", []) if f.get("status") == "failed"]
+            preview = "、".join(str(name) for name in failed_names[:5]) + ("…" if len(failed_names) > 5 else "")
+            _add_task_log(
+                task, "warn",
+                f"转存结束：成功 {success}，失败 {failed}。无法秒传的文件：{preview}"
+                f"（123 服务器上没有相同 MD5 内容，OpenAPI 秒传无法建立）",
             )
-            task["remoteTaskId"] = remote_task_id
-            _add_task_log(task, "info", f"123 转存已提交，远端任务 ID：{remote_task_id}，开始等待转存完成")
-            if not await self._save_transfer_task(task):
-                return
         else:
-            _add_task_log(task, "info", f"继续查询已有 123 转存任务：{remote_task_id}")
+            _add_task_log(task, "info", f"转存全部完成：成功 {success} 个")
+        if not await self._save_transfer_task(task):
+            return
+        await self._notify_task(task)
 
-        max_polls = max(1, int(transfer_config.get("offlineMaxPolls") or DEFAULT_MAX_POLLS))
-        poll_ms = max(2000, int(transfer_config.get("offlinePollMs") or DEFAULT_POLL_MS))
-        for attempt in range(max_polls):
-            try:
-                status = await self._pan123_web_client.get_share_copy_task(
-                    session,
-                    str(task.get("shareUrl") or ""),
-                    remote_task_id,
-                )
-            except Exception as error:
-                if not _is_transient_pan123_share_copy_error(error) or attempt + 1 >= max_polls:
-                    raise
-                wait_ms = max(poll_ms, _pan123_share_copy_retry_base_ms(transfer_config))
-                _add_unique_task_log(task, "warn", f"123 转存状态查询频繁，{wait_ms // 1000} 秒后重试")
-                if not await self._save_transfer_task(task):
-                    return
-                await _delay(wait_ms)
-                continue
-            error_code = int(status.get("errorCode") or 0)
-            remote_status = int(status.get("status") or 0)
-            reason = str(status.get("reason") or "").strip()
-            task["remoteStatus"] = remote_status
-            task["remoteProgress"] = str(status.get("progress") or "")
-            if remote_status == 2:
-                for file in task.get("files") or []:
-                    if isinstance(file, dict):
-                        file["status"] = "success"
-                        file["method"] = "123_copy"
-                        file["finishedAt"] = _utc_now_iso()
-                task["doneFiles"] = task.get("totalFiles") or len(task.get("files") or [])
-                task["status"] = "success"
-                task["finishedAt"] = _utc_now_iso()
-                _add_task_log(task, "info", "123 分享转存完成")
-                if not await self._save_transfer_task(task):
-                    return
-                await self._notify_task(task)
-                return
-            status_error: Optional[RuntimeError] = None
-            if error_code:
-                status_error = RuntimeError(reason or f"123 转存失败（错误码 {error_code}）")
-            elif reason:
-                status_error = RuntimeError(reason)
-            elif remote_status not in {0, 1}:
-                status_error = RuntimeError(f"123 转存失败（状态 {remote_status}）")
-            if status_error:
-                if _is_transient_pan123_share_copy_error(status_error) and attempt + 1 < max_polls:
-                    wait_ms = max(poll_ms, _pan123_share_copy_retry_base_ms(transfer_config))
-                    _add_unique_task_log(task, "warn", f"123 转存状态返回操作频繁，{wait_ms // 1000} 秒后重试")
-                    if not await self._save_transfer_task(task):
-                        return
-                    await _delay(wait_ms)
-                    continue
-                raise status_error
-            if attempt + 1 < max_polls:
-                await _delay(poll_ms)
-        raise RuntimeError(f"123 转存状态查询超时（远端任务 {remote_task_id}）")
-
-    async def _submit_pan123_share_copy_with_retry(
+    async def _stage_share_items(
         self,
         task: Dict[str, Any],
-        session: Dict[str, Any],
+        client: Pan123OpenAPIClient,
+        share_url: str,
+        share_password: str,
         items: List[Dict[str, Any]],
-        transfer_config: Dict[str, Any],
-    ) -> int:
-        min_interval_ms = _pan123_share_copy_min_interval_ms(transfer_config)
-        max_attempts = _pan123_share_copy_max_attempts(transfer_config)
-        retry_base_ms = _pan123_share_copy_retry_base_ms(transfer_config)
-        for attempt in range(1, max_attempts + 1):
-            loop = asyncio.get_running_loop()
-            elapsed_ms = max(0, int((loop.time() - self._last_pan123_share_copy_submit_at) * 1000))
-            wait_ms = max(0, min_interval_ms - elapsed_ms) if self._last_pan123_share_copy_submit_at else 0
-            if wait_ms:
-                _add_unique_task_log(task, "info", f"为避免 123 限流，等待 {max(1, math.ceil(wait_ms / 1000))} 秒后提交")
-                await _delay(wait_ms)
-            self._last_pan123_share_copy_submit_at = loop.time()
+        target_dir_id: str,
+        path: List[str],
+    ) -> None:
+        """递归把分享内容按原目录结构秒传到目标目录（文件夹重建，文件 md5 秒传）。"""
+        for item in items:
+            if len(task.get("files") or []) >= MAX_SHARE_COPY_FILES:
+                return
+            name = str(item.get("FileName") or item.get("filename") or item.get("name") or "").strip()
+            if not name:
+                continue
+            entry = {
+                "id": "",
+                "name": name,
+                "size": int(item.get("Size") or item.get("BaseSize") or item.get("size") or 0),
+                "path": list(path),
+                "status": "pending",
+            }
+            task.setdefault("files", []).append(entry)
+            task["totalFiles"] = len(task["files"])
+            if int(item.get("Type") or item.get("type") or 0) == 1:
+                try:
+                    dir_id = await client.create_folder(target_dir_id, name)
+                except Exception as error:
+                    entry["status"] = "failed"
+                    entry["method"] = "123_api_reuse"
+                    entry["error"] = f"创建目录失败：{error}"
+                    entry["finishedAt"] = _utc_now_iso()
+                    _add_task_log(task, "warn", f"创建目录失败：{'/'.join([*path, name])}（{error}）")
+                    continue
+                entry["id"] = str(dir_id)
+                entry["status"] = "success"
+                entry["method"] = "123_folder"
+                entry["finishedAt"] = _utc_now_iso()
+                child_items = await self._pan123_share_client.list_share_items(share_url, share_password, str(item.get("FileId") or item.get("fileId") or ""))
+                await self._stage_share_items(task, client, share_url, share_password, child_items, str(dir_id), [*path, name])
+                continue
+            etag = str(item.get("Etag") or item.get("etag") or "").strip()
             try:
-                return await self._pan123_web_client.create_share_copy_task(
-                    session,
-                    str(task.get("shareUrl") or ""),
-                    str(task.get("receiveCode") or ""),
-                    str(task.get("targetDirId") or "0"),
-                    items,
-                )
+                reused_id = await client.md5_reuse(target_dir_id, name, etag, int(entry["size"] or 0))
             except Exception as error:
-                if not _is_transient_pan123_share_copy_error(error) or attempt >= max_attempts:
-                    raise
-                retry_ms = max(min_interval_ms, retry_base_ms * attempt)
-                _add_task_log(
-                    task,
-                    "warn",
-                    f"123 返回操作频繁，第 {attempt}/{max_attempts} 次提交失败，{max(1, math.ceil(retry_ms / 1000))} 秒后重试",
-                )
-                if not await self._save_transfer_task(task):
-                    raise RuntimeError("123 转存任务已取消")
-                await _delay(retry_ms)
-        raise RuntimeError("123 转存提交重试失败")
+                entry["status"] = "failed"
+                entry["method"] = "123_api_reuse"
+                entry["error"] = str(error)
+                entry["finishedAt"] = _utc_now_iso()
+                _add_task_log(task, "warn", f"秒传失败：{'/'.join([*path, name])}（{error}）")
+            else:
+                if reused_id:
+                    entry["id"] = str(reused_id)
+                    entry["status"] = "success"
+                    entry["method"] = "123_api_reuse"
+                    entry["finishedAt"] = _utc_now_iso()
+                else:
+                    entry["status"] = "failed"
+                    entry["method"] = "123_api_reuse"
+                    entry["error"] = "123 服务器上没有相同内容（MD5），无法秒传"
+                    entry["finishedAt"] = _utc_now_iso()
+                    _add_task_log(task, "warn", f"秒传失败：{'/'.join([*path, name])}（MD5 未命中）")
+            task["doneFiles"] = len([f for f in task["files"] if _is_done_file(f)])
+            if not await self._save_transfer_task(task):
+                raise TaskCancelled()
+            await _delay(PAN123_SHARE_STAGE_INTERVAL_MS)
 
     async def _inspect_pan115_share(
         self,
@@ -829,32 +962,36 @@ class TransferService:
             raise RuntimeError(f"{account['name']}：{error}") from error
 
     async def _create_pan123_client(self) -> Pan123OpenAPIClient:
+        """构建/复用 123 OpenAPI 客户端（token 来自设置页的 OAuth 授权，自动刷新）。"""
         config = self._store.read_config()
         transfer_config = config.get("transfer") if isinstance(config.get("transfer"), dict) else {}
-        client_id = str(transfer_config.get("pan123ClientId") or "").strip()
-        client_secret = str(transfer_config.get("pan123ClientSecret") or "").strip()
-        if not client_id or not client_secret:
-            raise RuntimeError("请先配置 123 OpenAPI ClientID 和 ClientSecret")
-        token_key = pan123_open_token_key(client_id, client_secret)
-        if self._pan123_open_client is not None and self._pan123_open_client_key == token_key:
+        broker_base = str(transfer_config.get("pan123OauthApi") or "").strip() or PAN123_OAUTH_BROKER_URL
+        if self._pan123_open_client is not None and self._pan123_open_client_key == broker_base:
             return self._pan123_open_client
         if self._pan123_open_client_lock is None:
             self._pan123_open_client_lock = asyncio.Lock()
         async with self._pan123_open_client_lock:
-            if self._pan123_open_client is not None and self._pan123_open_client_key == token_key:
+            if self._pan123_open_client is not None and self._pan123_open_client_key == broker_base:
                 return self._pan123_open_client
             previous_client = self._pan123_open_client
             self._pan123_open_client = None
             self._pan123_open_client_key = ""
             if previous_client is not None:
                 await previous_client.close()
-            token_store = _Pan123OpenTokenStoreAdapter(self._store, token_key)
-            self._pan123_open_client = Pan123OpenAPIClient(
-                client_id,
-                client_secret,
-                token_store=token_store,
+            oauth_store = SyncPan123OauthStore(
+                self._store.read_session,
+                self._store.merge_session,
+                self._store.clear_session,
             )
-            self._pan123_open_client_key = token_key
+            client = Pan123OpenAPIClient(
+                broker=Pan123OauthBroker(base_url=broker_base),
+                oauth_store=oauth_store,
+            )
+            await client.load_authorization()
+            if not client.authorized:
+                raise RuntimeError("123 云盘尚未授权登录，请先到设置页完成 123 账号授权")
+            self._pan123_open_client = client
+            self._pan123_open_client_key = broker_base
             return self._pan123_open_client
 
     async def _get_transfer_config(self) -> Dict[str, Any]:
@@ -1237,26 +1374,6 @@ class TransferService:
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
-class _Pan123OpenTokenStoreAdapter(Pan123OpenTokenStore):
-    """将 SessionStore 的 pan123_open_token 三个方法适配为 Pan123OpenAPIClient 的 token_store。
-
-    SessionStore 的同步方法包装为 async，保持 Pan123OpenAPIClient 与 SessionStore 解耦。
-    """
-
-    def __init__(self, store: SessionStore, token_key: str):
-        self._store = store
-        self._token_key = token_key
-
-    async def load(self) -> Optional[Dict[str, Any]]:
-        return self._store.get_pan123_open_token(self._token_key)
-
-    async def save(self, access_token: str, expires_at: float) -> None:
-        self._store.save_pan123_open_token(self._token_key, access_token, expires_at)
-
-    async def clear(self) -> None:
-        self._store.delete_pan123_open_token(self._token_key)
-
-
 def _utc_now_iso_service() -> str:
     return _utc_now_iso()
 
@@ -1330,26 +1447,6 @@ def _is_final_transfer_status(status: Optional[str]) -> bool:
 
 def _is_transient_115_download_error(message: str) -> bool:
     return bool(re.search(r"操作频繁|请稍后|频繁|too\s*many|rate|429|context\.Background|局域网直链|直链预检|错误页", str(message or ""), re.I))
-
-
-def _is_transient_pan123_share_copy_error(error: Exception) -> bool:
-    message = str(error or "")
-    code = int(getattr(error, "code", 0) or 0)
-    return code in {429, 42902, 42903} or bool(
-        re.search(r"操作频繁|请勿频繁|请稍后|访问频繁|请求过快|too\s*many|rate\s*limit|\b429\b", message, re.I)
-    )
-
-
-def _pan123_share_copy_min_interval_ms(config: Dict[str, Any]) -> int:
-    return max(0, int(config.get("pan123ShareCopyMinIntervalMs") or PAN123_SHARE_COPY_MIN_INTERVAL_MS))
-
-
-def _pan123_share_copy_max_attempts(config: Dict[str, Any]) -> int:
-    return max(1, min(10, int(config.get("pan123ShareCopyMaxAttempts") or PAN123_SHARE_COPY_MAX_ATTEMPTS)))
-
-
-def _pan123_share_copy_retry_base_ms(config: Dict[str, Any]) -> int:
-    return max(1000, int(config.get("pan123ShareCopyRetryBaseMs") or PAN123_SHARE_COPY_RETRY_BASE_MS))
 
 
 def _transfer_runtime_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:

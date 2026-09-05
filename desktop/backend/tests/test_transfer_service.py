@@ -44,108 +44,80 @@ class TransferServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_pan123_share_copy_submit_retries_rate_limit(self):
+    def test_pan123_share_copy_stages_share_via_md5_reuse(self):
         async def run() -> None:
             with tempfile.TemporaryDirectory() as directory:
                 service = TransferService(SessionStore(Path(directory)))
-                service._pan123_web_client.create_share_copy_task = AsyncMock(  # type: ignore[method-assign]
-                    side_effect=[Pan123Error("请勿频繁操作，请稍后再试", code=429), 12345]
+                open_client = AsyncMock()
+                open_client.create_folder = AsyncMock(side_effect=["555"])
+                open_client.md5_reuse = AsyncMock(side_effect=[999, 0])
+                service._create_pan123_client = AsyncMock(return_value=open_client)  # type: ignore[method-assign]
+                service._pan123_share_client.list_share_root_items = AsyncMock(  # type: ignore[method-assign]
+                    return_value=[{"FileId": 11, "FileName": "剧集", "Type": 1, "Size": 0}]
+                )
+                service._pan123_share_client.list_share_items = AsyncMock(  # type: ignore[method-assign]
+                    return_value=[
+                        {"FileId": 12, "FileName": "a.mkv", "Type": 0, "Size": 100, "Etag": "a" * 32},
+                        {"FileId": 13, "FileName": "b.mkv", "Type": 0, "Size": 200, "Etag": "b" * 32},
+                    ]
                 )
                 service._save_transfer_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
+                service._notify_task = AsyncMock()  # type: ignore[method-assign]
                 task = {
                     "id": "copy-1",
+                    "kind": "pan123_share_copy",
+                    "status": "running",
                     "shareUrl": "https://www.123pan.com/s/demo",
                     "receiveCode": "",
                     "targetDirId": "456",
+                    "files": [],
+                    "totalFiles": 0,
+                    "doneFiles": 0,
                     "logs": [],
                 }
                 with patch("app.transfer_service._delay", new=AsyncMock()) as delay:
-                    task_id = await service._submit_pan123_share_copy_with_retry(
-                        task,
-                        {"token": "token", "loginUuid": "uuid"},
-                        [{"FileId": 1, "FileName": "Demo", "Type": 1}],
-                        {
-                            "pan123ShareCopyMinIntervalMs": 1,
-                            "pan123ShareCopyMaxAttempts": 2,
-                            "pan123ShareCopyRetryBaseMs": 1,
-                        },
-                    )
+                    await service._run_pan123_share_copy(task, {})
 
-                self.assertEqual(task_id, 12345)
-                self.assertEqual(service._pan123_web_client.create_share_copy_task.await_count, 2)  # type: ignore[attr-defined]
+                # 目录复刻：分享里的「剧集」文件夹被建到目标目录 456 下，文件秒传进 555
+                open_client.create_folder.assert_awaited_once_with("456", "剧集")
+                self.assertEqual(open_client.md5_reuse.await_args_list[0].args, ("555", "a.mkv", "a" * 32, 100))
+                self.assertEqual(task["status"], "partial")
+                self.assertEqual(task["files"][0]["status"], "success")
+                self.assertEqual(task["files"][0]["method"], "123_folder")
+                self.assertEqual(task["files"][1]["status"], "success")
+                self.assertEqual(task["files"][1]["id"], "999")
+                self.assertEqual(task["files"][2]["status"], "failed")
+                self.assertIn("MD5", task["files"][2]["error"])
                 self.assertGreaterEqual(delay.await_count, 1)
-                self.assertTrue(any("操作频繁" in log["message"] for log in task["logs"]))
                 await service.close()
 
         asyncio.run(run())
 
-    def test_pan123_share_copy_status_retries_rate_limit_result(self):
+    def test_pan123_share_copy_finalizes_existing_files_without_relisting(self):
         async def run() -> None:
             with tempfile.TemporaryDirectory() as directory:
-                store = SessionStore(Path(directory))
-                store.write_session({"token": "token", "loginUuid": "uuid"})
-                service = TransferService(store)
-                service._pan123_web_client.get_share_copy_task = AsyncMock(  # type: ignore[method-assign]
-                    side_effect=[
-                        {"status": 1, "errorCode": 429, "reason": "请勿频繁操作，请稍后再试", "progress": ""},
-                        {"status": 2, "errorCode": 0, "reason": "", "progress": ""},
-                    ]
-                )
+                service = TransferService(SessionStore(Path(directory)))
+                service._create_pan123_client = AsyncMock()  # type: ignore[method-assign]
+                service._pan123_share_client.list_share_root_items = AsyncMock()  # type: ignore[method-assign]
+                service._save_transfer_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
                 service._notify_task = AsyncMock()  # type: ignore[method-assign]
                 task = {
                     "id": "copy-1",
                     "kind": "pan123_share_copy",
                     "status": "running",
                     "shareUrl": "https://www.123pan.com/s/demo",
-                    "remoteTaskId": 99,
+                    "receiveCode": "",
                     "targetDirId": "123",
-                    "files": [{"id": "1", "name": "Folder", "status": "pending"}],
+                    "files": [{"id": "1", "name": "a.mkv", "status": "success", "size": 1}],
                     "totalFiles": 1,
-                    "logs": [],
-                }
-                with patch("app.transfer_service._delay", new=AsyncMock()) as delay:
-                    await service._run_pan123_share_copy(
-                        task,
-                        {"offlineMaxPolls": 3, "offlinePollMs": 2000, "pan123ShareCopyRetryBaseMs": 1000},
-                    )
-
-                self.assertEqual(task["status"], "success")
-                self.assertEqual(service._pan123_web_client.get_share_copy_task.await_count, 2)  # type: ignore[attr-defined]
-                delay.assert_awaited_once()
-                await service.close()
-
-        asyncio.run(run())
-
-    def test_pan123_share_copy_resumes_remote_task_without_resubmitting(self):
-        async def run() -> None:
-            with tempfile.TemporaryDirectory() as directory:
-                store = SessionStore(Path(directory))
-                store.write_session({"token": "token", "loginUuid": "uuid"})
-                service = TransferService(store)
-                service._pan123_web_client.list_share_root_items = AsyncMock()  # type: ignore[method-assign]
-                service._pan123_web_client.create_share_copy_task = AsyncMock()  # type: ignore[method-assign]
-                service._pan123_web_client.get_share_copy_task = AsyncMock(  # type: ignore[method-assign]
-                    return_value={"status": 2, "errorCode": 0, "reason": "", "progress": ""}
-                )
-                service._notify_task = AsyncMock()  # type: ignore[method-assign]
-                task = {
-                    "id": "copy-1",
-                    "kind": "pan123_share_copy",
-                    "status": "running",
-                    "shareUrl": "https://www.123pan.com/s/demo",
-                    "remoteTaskId": 99,
-                    "targetDirId": "123",
-                    "files": [{"id": "1", "name": "Folder", "status": "pending"}],
-                    "totalFiles": 1,
+                    "doneFiles": 1,
                     "logs": [],
                 }
 
-                await service._run_pan123_share_copy(task, {"offlineMaxPolls": 2, "offlinePollMs": 2000})
+                await service._run_pan123_share_copy(task, {})
 
-                service._pan123_web_client.list_share_root_items.assert_not_awaited()  # type: ignore[attr-defined]
-                service._pan123_web_client.create_share_copy_task.assert_not_awaited()  # type: ignore[attr-defined]
+                service._pan123_share_client.list_share_root_items.assert_not_awaited()  # type: ignore[attr-defined]
                 self.assertEqual(task["status"], "success")
-                self.assertEqual(task["doneFiles"], 1)
                 await service.close()
 
         asyncio.run(run())

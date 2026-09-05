@@ -21,10 +21,9 @@ export interface Pan123Session {
   backend: boolean;
   authenticated: boolean;
   user: string;
-  loginUuid: string;
   updatedAt: string;
   profile: Pan123Profile | null;
-  /** 登录 token 已过期：profile 无法刷新，需重新登录（头像等缓存链接会失效） */
+  /** 授权已失效：refresh token 被 123 拒绝，需重新授权（头像等缓存链接会失效） */
   loginExpired?: boolean;
 }
 
@@ -223,12 +222,13 @@ export interface Pan115HelperStatus {
 
 export interface TransferConfig {
   enabled: boolean;
-  pan123ClientId: string;
-  pan123ClientSecret: string;
   pan115Cookie: string;
   pan115Cookies: string[];
   targetDirId: string;
   localPath115: string;
+  pan115TargetCid: string;
+  /** 123 OAuth 授权中转服务地址（留空用社区官方 https://api.oplist.org） */
+  pan123OauthApi: string;
   excludeSuffix: string;
   excludeCid: string;
   delete115AfterSuccess: boolean;
@@ -259,6 +259,7 @@ export interface TransferTaskFile {
   status?: string;
   method?: string | null;
   pan123FileId?: string | number | null;
+  pan115FileId?: string | null;
   offlineTaskId?: string | number | null;
   offlineStatus?: string | number | null;
   offlineStatusText?: string;
@@ -285,6 +286,7 @@ export interface TransferTask {
   title?: string;
   remoteTaskId?: string | number | null;
   targetDirId?: string;
+  sourceDirId?: string;
   shareOwnerUserId?: string | number | null;
   status: "queued" | "running" | "success" | "partial" | "failed" | string;
   totalFiles?: number;

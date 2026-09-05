@@ -305,6 +305,61 @@ function registerIpc() {
     const result = await shell.openPath(dataDir);
     return result || "";
   });
+  // 123 OAuth 授权弹窗：加载 123 官方授权页（账号密码在官方页输入），
+  // 监听到跳回授权中转站回调地址（含 ?code= 或 #token）即截获并回传渲染层。
+  let pan123OauthWindow = null;
+  ipcMain.handle("app:openPan123Oauth", (_event, payload) => {
+    const authorizeUrl = String((payload && payload.authorizeUrl) || "");
+    const redirectUri = String((payload && payload.redirectUri) || "https://api.oplist.org/123cloud/callback");
+    if (!/^https:\/\//i.test(authorizeUrl)) return Promise.resolve({ error: "授权地址无效" });
+    if (pan123OauthWindow && !pan123OauthWindow.isDestroyed()) {
+      try { pan123OauthWindow.destroy(); } catch (_) {}
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      pan123OauthWindow = new BrowserWindow({
+        width: 960,
+        height: 740,
+        title: "123 云盘授权登录",
+        autoHideMenuBar: true,
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+          spellcheck: false,
+          partition: "persist:pan123oauth",
+        },
+      });
+      const contents = pan123OauthWindow.webContents;
+      const intercept = (event, url) => {
+        if (typeof url !== "string" || !url.startsWith(redirectUri)) return;
+        event.preventDefault();
+        done({ callbackUrl: url });
+        try { pan123OauthWindow.destroy(); } catch (_) {}
+      };
+      contents.on("will-navigate", intercept);
+      contents.on("will-redirect", intercept);
+      // 兜底：回调若被 302 到带 #token 的最终页面，直接从地址栏截获
+      const captureFragment = (_event, url) => {
+        if (settled || typeof url !== "string") return;
+        if (url.startsWith(redirectUri) || (url.startsWith("https://api.oplist.org") && url.includes("#"))) {
+          done({ callbackUrl: url });
+          try { pan123OauthWindow.destroy(); } catch (_) {}
+        }
+      };
+      contents.on("did-navigate", captureFragment);
+      contents.on("did-navigate-in-page", captureFragment);
+      pan123OauthWindow.on("closed", () => {
+        pan123OauthWindow = null;
+        done({ cancelled: true });
+      });
+      pan123OauthWindow.loadURL(authorizeUrl);
+    });
+  });
   // 端口等需要重启生效的配置保存后调用：停后端 → relaunch → 退出
   ipcMain.handle("app:relaunchApp", async () => {
     try {

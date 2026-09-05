@@ -27,9 +27,10 @@ const { state, notifySuccess, notifyError, confirm, loadStatus } = useGlobalStat
 const desktopInfo = ref<DesktopInfo | null>(null);
 const backendVersion = computed(() => (state.status ? "已连接" : "未连接"));
 
-// ===== 123 网盘绑定 =====
+// ===== 123 网盘授权（OAuth，账号密码在 123 官方授权页输入） =====
 const pan123 = computed(() => state.status?.pan123);
 const pan123Authenticated = computed(() => Boolean(pan123.value?.authenticated));
+const pan123LoginExpired = computed(() => Boolean(pan123.value?.loginExpired));
 const pan123Profile = computed(() => pan123.value?.profile || null);
 const pan123Name = computed(() => displayName(pan123Profile.value || null, pan123.value?.user || ""));
 const pan123Space = computed(() => {
@@ -41,33 +42,93 @@ const pan123Space = computed(() => {
   return used || (total ? `总容量 ${total}` : "");
 });
 
-const bindForm = ref({ user: "", password: "" });
-const showBindPassword = ref(false);
-const binding = ref(false);
+const authorizing = ref(false);
 const unbinding = ref(false);
+const browserAuthOpen = ref(false);
+const authorizeUrl = ref("");
+const authorizeNonce = ref("");
+const callbackInput = ref("");
+const finishing = ref(false);
 
-async function bindPan123() {
-  const user = bindForm.value.user.trim();
-  const password = bindForm.value.password;
-  if (!user || !password) {
-    notifyError("请输入 123 云盘账号和密码");
+interface OauthPopupResult {
+  callbackUrl?: string;
+  cancelled?: boolean;
+  error?: string;
+}
+
+function desktopBridge() {
+  return (window as unknown as {
+    cloud123?: {
+      openPan123Oauth?: (payload: { authorizeUrl: string; redirectUri: string }) => Promise<OauthPopupResult>;
+      getInfo?: () => Promise<DesktopInfo>;
+      openDataDir?: () => Promise<string>;
+      getPortConfig?: () => Promise<{ port: number | null }>;
+      setPortConfig?: (payload: { port: number | null }) => Promise<{ port: number | null }>;
+      relaunchApp?: () => Promise<boolean>;
+    };
+  }).cloud123;
+}
+
+async function authorizePan123() {
+  authorizing.value = true;
+  try {
+    const start = await adminApi.oauthStart();
+    const bridge = desktopBridge();
+    if (bridge?.openPan123Oauth) {
+      // 桌面端：弹窗打开 123 官方授权页（账号密码在官方页输入），自动截获回调
+      const result = await bridge.openPan123Oauth({ authorizeUrl: start.authorizeUrl, redirectUri: start.redirectUri });
+      if (result?.cancelled) {
+        notifyError("授权窗口已关闭，未完成授权");
+        return;
+      }
+      if (!result?.callbackUrl) {
+        notifyError(result?.error || "授权未完成，请重试");
+        return;
+      }
+      await adminApi.oauthFinish(start.nonce, result.callbackUrl);
+      notifySuccess("123 网盘授权成功");
+      await loadStatus();
+    } else {
+      // 浏览器模式：新标签打开授权页，授权后把回调地址/刷新令牌粘贴回来
+      authorizeUrl.value = start.authorizeUrl;
+      authorizeNonce.value = start.nonce;
+      callbackInput.value = "";
+      browserAuthOpen.value = true;
+    }
+  } catch (error) {
+    notifyError(`发起授权失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    authorizing.value = false;
+  }
+}
+
+async function finishBrowserAuth() {
+  const value = callbackInput.value.trim();
+  if (!value) {
+    notifyError("请粘贴授权后的完整回调地址，或直接粘贴刷新令牌");
     return;
   }
-  binding.value = true;
+  finishing.value = true;
   try {
-    await adminApi.login(user, password, true);
-    bindForm.value = { user: "", password: "" };
-    notifySuccess("123 网盘绑定成功");
+    if (value.toLowerCase().startsWith("http")) {
+      await adminApi.oauthFinish(authorizeNonce.value, value);
+    } else {
+      await adminApi.oauthImport(value);
+    }
+    browserAuthOpen.value = false;
+    authorizeUrl.value = "";
+    callbackInput.value = "";
+    notifySuccess("123 网盘授权成功");
     await loadStatus();
   } catch (error) {
-    notifyError(`绑定失败：${error instanceof Error ? error.message : String(error)}`);
+    notifyError(`授权失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
-    binding.value = false;
+    finishing.value = false;
   }
 }
 
 async function unbindPan123() {
-  const ok = await confirm("解除绑定后，投稿归属判断与他人分享的自动转存将不可用，确定解除吗？", "解除绑定 123 网盘");
+  const ok = await confirm("解除绑定后，投稿归属判断与他人分享的自动转存、123 相关搬运将不可用，确定解除吗？", "解除绑定 123 网盘");
   if (!ok) return;
   unbinding.value = true;
   try {
@@ -130,15 +191,7 @@ async function openDataDir() {
 }
 
 function desktopApi() {
-  return (window as unknown as {
-    cloud123?: {
-      getInfo?: () => Promise<DesktopInfo>;
-      openDataDir?: () => Promise<string>;
-      getPortConfig?: () => Promise<{ port: number | null }>;
-      setPortConfig?: (payload: { port: number | null }) => Promise<{ port: number | null }>;
-      relaunchApp?: () => Promise<boolean>;
-    };
-  }).cloud123;
+  return desktopBridge();
 }
 
 async function savePortConfig() {
@@ -204,7 +257,7 @@ onMounted(async () => {
         </div>
       </GlassCard>
 
-      <GlassCard title="123 网盘" desc="投稿归属判断与他人分享自动转存都需要绑定 123 云盘账号，配置一次即可。" icon="mdi-link-variant" :hover="false">
+      <GlassCard title="123 网盘" desc="授权登录后自动获取并刷新 OpenAPI token，转存搬运、投稿归属判断都走官方接口。" icon="mdi-link-variant" :hover="false">
         <div v-if="pan123Authenticated" class="pan-bind">
           <div class="pan-bind-info">
             <span class="pan-bind-avatar">
@@ -215,46 +268,46 @@ onMounted(async () => {
               <strong>{{ pan123Name }}</strong>
               <small>{{ pan123Space || "账号已连接" }}</small>
             </span>
-            <span class="pan-bind-badge">已绑定</span>
+            <span v-if="pan123LoginExpired" class="pan-bind-badge expired">授权已失效</span>
+            <span v-else class="pan-bind-badge">已授权</span>
           </div>
-          <v-btn variant="tonal" color="error" size="small" prepend-icon="mdi-link-variant-off" :loading="unbinding" @click="unbindPan123">
-            解除绑定
-          </v-btn>
+          <div class="pan-bind-actions">
+            <v-btn variant="tonal" color="primary" size="small" prepend-icon="mdi-refresh" :loading="authorizing" @click="authorizePan123">
+              {{ pan123LoginExpired ? "重新授权" : "重新授权" }}
+            </v-btn>
+            <v-btn variant="tonal" color="error" size="small" prepend-icon="mdi-link-variant-off" :loading="unbinding" @click="unbindPan123">
+              解除绑定
+            </v-btn>
+          </div>
         </div>
 
-        <form v-else class="pan-bind-form" @submit.prevent="bindPan123">
-          <FormField label="账号">
-            <v-text-field
-              v-model="bindForm.user"
-              placeholder="123 云盘账号"
-              prepend-inner-icon="mdi-account-outline"
-              variant="outlined"
-              density="comfortable"
-              hide-details
-              autocomplete="username"
-            />
-          </FormField>
-          <FormField label="密码">
-            <v-text-field
-              v-model="bindForm.password"
-              :type="showBindPassword ? 'text' : 'password'"
-              placeholder="123 云盘密码"
-              prepend-inner-icon="mdi-lock-outline"
-              :append-inner-icon="showBindPassword ? 'mdi-eye-off-outline' : 'mdi-eye-outline'"
-              variant="outlined"
-              density="comfortable"
-              hide-details
-              autocomplete="current-password"
-              @click:append-inner="showBindPassword = !showBindPassword"
-            />
-          </FormField>
-          <v-btn color="primary" type="submit" :loading="binding" prepend-icon="mdi-link-variant">
-            绑定 123 网盘
+        <div v-else class="pan-bind-form">
+          <v-btn color="primary" :loading="authorizing" prepend-icon="mdi-shield-check-outline" @click="authorizePan123">
+            授权登录 123 网盘
           </v-btn>
           <p class="muted" style="font-size: 11.5px; margin: 2px 0 0">
-            凭据只保存在本机，用于判断投稿是否属于你，以及自动转存他人分享的 115 资源。
+            点击后会打开 123 云盘官方授权页，在官方页面输入账号密码并同意授权即可；本应用只保存授权后的
+            token，不经手你的密码，也无需申请开放平台密钥。
           </p>
-        </form>
+
+          <template v-if="browserAuthOpen">
+            <v-divider class="my-2" />
+            <p class="muted" style="font-size: 12px; margin: 0">
+              浏览器模式：在新标签打开
+              <a :href="authorizeUrl" target="_blank" rel="noopener">123 官方授权页</a>
+              ，完成授权后把跳转回来的完整地址（或工具页显示的刷新令牌）粘贴到下面。
+            </p>
+            <v-text-field
+              v-model="callbackInput"
+              label="回调地址 / 刷新令牌"
+              placeholder="https://api.oplist.org/123cloud/callback?code=… 或刷新令牌"
+              variant="outlined"
+              density="comfortable"
+              hide-details
+            />
+            <v-btn color="primary" :loading="finishing" prepend-icon="mdi-check" @click="finishBrowserAuth">完成授权</v-btn>
+          </template>
+        </div>
       </GlassCard>
 
       <GlassCard title="服务端口" desc="后端默认只监听本机并自动选择空闲端口。" icon="mdi-lan" :hover="false">
@@ -468,7 +521,13 @@ onMounted(async () => {
   border-radius: var(--radius-pill);
   padding: 3px 10px;
 }
+.pan-bind-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .pan-bind-form { display: flex; flex-direction: column; gap: 12px; }
+.pan-bind-badge.expired {
+  color: var(--warning, #f39c12);
+  background: rgba(243, 156, 18, 0.12);
+  border-color: rgba(243, 156, 18, 0.35);
+}
 
 .port-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .port-toggle { background: var(--surface-subtle); border-radius: var(--radius-pill); }

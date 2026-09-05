@@ -2,30 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
-import random
 import re
 import time
-import uuid
 import weakref
-import zlib
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import parse_qs, urlencode, urlparse
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Iterable, List, Optional
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
 
-LOGIN_URL = "https://login.123pan.com/api/user/sign_in"
-API_BASE = "https://api.123278.com"
 OPEN_API_BASE = "https://open-api.123pan.com"
-PAN_DEVICE_NAME = "Windows 版网页登录"
 PAN_LOGIN_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 123XiaoZhuShou/1.0"
 )
-PAN_SHARE_APP_VERSION = "139"
+# OAuth 授权换 token 的社区中转服务（OpenList APIPages，源码 AGPLv3 开源）。
+# 用户在 123 官方授权页输入账号密码完成授权，本服务代持 clientSecret 负责
+# code 换 token 与后续 refresh_token 刷新，本程序全程不需要自己的开放平台密钥。
+PAN123_OAUTH_BROKER_URL = "https://api.oplist.org"
+PAN123_OAUTH_DRIVER = "123cloud"
 PAN_SHARE_HOST_SUFFIXES = (
     ".share.123pan.cn",
     ".share.123pan.com",
@@ -139,68 +136,14 @@ class _HttpClientPool:
 
 
 class Pan123Client:
+    """123 分享公开接口客户端（列分享详情/分享目录，无需登录态）。"""
+
     def __init__(self, timeout_seconds: float = 20.0):
         self.timeout = timeout_seconds
         self._http = _HttpClientPool(self.timeout)
 
     async def close(self) -> None:
         await self._http.close()
-
-    async def login(self, user: str, password: str, remember: bool, login_uuid: Optional[str] = None) -> Dict[str, str]:
-        login_uuid = login_uuid or uuid.uuid4().hex + uuid.uuid4().hex
-        payload: Dict[str, Any]
-        if "@" in user:
-            payload = {"mail": user, "password": password, "type": 2, "deviceName": PAN_DEVICE_NAME}
-        else:
-            payload = {"passport": user, "password": password, "remember": bool(remember), "deviceName": PAN_DEVICE_NAME}
-
-        client = self._http.write()
-        response = await client.post(
-                LOGIN_URL,
-                json=payload,
-                headers={
-                    "Content-Type": "application/json;charset=UTF-8",
-                    "Origin": API_BASE,
-                    "Referer": API_BASE + "/",
-                    "User-Agent": PAN_LOGIN_USER_AGENT,
-                    "platform": "web",
-                    "app-version": "3",
-                    "loginuuid": login_uuid,
-                },
-        )
-        data = safe_json(response)
-        if response.status_code >= 400:
-            raise Pan123Error(str(data.get("message") or "123 登录接口请求失败"))
-        body = data.get("data") if isinstance(data.get("data"), dict) else {}
-        token = str(body.get("token") or "")
-        if data.get("code") == 200 and token:
-            return {
-                "token": token,
-                "loginUuid": normalize_login_uuid(body, login_uuid),
-            }
-        raise Pan123Error(str(data.get("message") or "登录失败"))
-
-    async def get_user_info(self, session: Dict[str, Any]) -> Dict[str, Any]:
-        token = str(session.get("token") or "")
-        login_uuid = str(session.get("loginUuid") or "")
-        if not token:
-            raise Pan123Error("后端未登录 123 云盘")
-
-        path = "/b/api/user/info"
-        query = signed_query(path)
-        client = self._http.read()
-        response = await client.get(
-            API_BASE + path,
-            params=query,
-            headers=auth_headers(token, login_uuid, has_body=False),
-        )
-        data = safe_json(response)
-        code = data.get("code")
-        if response.status_code >= 400 or code not in (0, 200, "0", None):
-            raise Pan123Error(str(data.get("message") or "123 用户信息请求失败"))
-        body = data.get("data") if isinstance(data.get("data"), dict) else {}
-        raw = first_record(body, ("userInfo", "user", "info")) or body
-        return normalize_user_info(raw, fallback_user=str(session.get("user") or ""))
 
     async def get_share_info(self, share_url: str) -> Dict[str, Any]:
         parsed = parse_pan123_share_url(share_url)
@@ -226,6 +169,10 @@ class Pan123Client:
         }
 
     async def list_share_root_items(self, share_url: str, share_password: str = "") -> List[Dict[str, Any]]:
+        return await self.list_share_items(share_url, share_password, "0")
+
+    async def list_share_items(self, share_url: str, share_password: str, parent_file_id: str) -> List[Dict[str, Any]]:
+        """列出分享中某个目录（ParentFileId）下的全部条目，自动翻页。"""
         parsed = parse_pan123_share_url(share_url)
         items: List[Dict[str, Any]] = []
         page = 1
@@ -238,7 +185,7 @@ class Pan123Client:
                 "orderBy": "file_name",
                 "orderDirection": "asc",
                 "shareKey": parsed["shareKey"],
-                "ParentFileId": "0",
+                "ParentFileId": str(parent_file_id or "0"),
                 "Page": str(page),
                 "event": "homeListFile",
                 "operateType": "1",
@@ -255,9 +202,10 @@ class Pan123Client:
             if response.status_code >= 400 or code not in (0, 200, None):
                 raise Pan123Error(str(data.get("message") or "123 分享文件列表获取失败"), code=code or response.status_code)
             page_items = first_record_list(body, ("InfoList", "infoList", "fileList", "FileList", "list", "items"))
-            items.extend(page_items)
+            normalized = [item for item in (normalize_file(entry) for entry in page_items) if item is not None]
+            items.extend(normalized)
             response_next = str(body.get("Next") or body.get("next") or body.get("LastFileId") or body.get("lastFileId") or "").strip()
-            last_file_id = str((page_items[-1] if page_items else {}).get("FileId") or (page_items[-1] if page_items else {}).get("fileId") or "")
+            last_file_id = str((normalized[-1] if normalized else {}).get("FileId") or (normalized[-1] if normalized else {}).get("fileId") or "")
             if response_next in {"0", "-1"}:
                 response_next = ""
             next_candidate = response_next or (last_file_id if len(page_items) >= 100 else "-1")
@@ -267,180 +215,248 @@ class Pan123Client:
             page += 1
         return items
 
-    async def create_share_copy_task(
-        self,
-        session: Dict[str, Any],
-        share_url: str,
-        share_password: str,
-        target_dir_id: str,
-        items: List[Dict[str, Any]],
-    ) -> int:
-        parsed = parse_pan123_share_url(share_url)
-        path = "/b/api/restful/goapi/v1/file/copy/save"
-        file_list = [share_copy_file(item, target_dir_id) for item in items]
-        file_list = [item for item in file_list if item]
-        if not file_list:
-            raise Pan123Error("123 分享根目录中没有可转存的文件")
-        data = await self._request_share_copy_api(
-            session,
-            parsed["origin"],
-            path,
-            "POST",
-            {
-                "fileList": file_list,
-                "shareKey": parsed["shareKey"],
-                "sharePwd": str(share_password or ""),
-                "currentLevel": 0,
-                "superAdmin": None,
-            },
-            referer=share_url,
-        )
-        body = data.get("data") if isinstance(data.get("data"), dict) else {}
-        task_id = number_value(body.get("taskID"), body.get("taskId")) or 0
-        if task_id <= 0:
-            raise Pan123Error("123 转存接口未返回任务 ID")
-        return task_id
 
-    async def get_share_copy_task(self, session: Dict[str, Any], share_url: str, task_id: int) -> Dict[str, Any]:
-        parsed = parse_pan123_share_url(share_url)
-        path = "/b/api/restful/goapi/v1/file/copy/save/get"
-        data = await self._request_share_copy_api(
-            session,
-            parsed["origin"],
-            path,
-            "GET",
-            {"taskID": str(task_id)},
-            referer=share_url,
-        )
-        body = data.get("data") if isinstance(data.get("data"), dict) else {}
-        return {
-            "taskId": number_value(body.get("taskID"), body.get("taskId")) or int(task_id),
-            "status": number_value(body.get("status")) or 0,
-            "errorCode": number_value(body.get("errorCode")) or 0,
-            "reason": str(body.get("reason") or ""),
-            "progress": str(body.get("progress") or ""),
-        }
-
-    async def _request_share_copy_api(
-        self,
-        session: Dict[str, Any],
-        origin: str,
-        path: str,
-        method: str,
-        payload: Dict[str, Any],
-        referer: str,
-    ) -> Dict[str, Any]:
-        token = str(session.get("token") or "")
-        login_uuid = str(session.get("loginUuid") or "")
-        if not token:
-            raise Pan123Error("后端未登录 123 云盘")
-        request_method = method.upper()
-        query = dict(payload) if request_method == "GET" else {}
-        signed_path = path
-        if request_method == "GET" and query:
-            signed_path = f"{path}?{urlencode(query)}"
-        query.update(signed_query(signed_path, app_version=PAN_SHARE_APP_VERSION))
-        headers = auth_headers(token, login_uuid, has_body=request_method != "GET", app_version=PAN_SHARE_APP_VERSION)
-        headers["referer"] = referer
-        client = self._http.read() if request_method == "GET" else self._http.write()
-        response = await client.request(
-            request_method,
-            f"{origin}{path}",
-            params=query,
-            json=payload if request_method != "GET" else None,
-            headers=headers,
-        )
-        data = safe_json(response)
-        code = number_value(data.get("code"))
-        if response.status_code >= 400 or code not in (0, 200, None):
-            raise Pan123Error(str(data.get("message") or "123 转存接口请求失败"), code=code or response.status_code)
-        return data
-
-    async def _request_web_api(
-        self,
-        session: Dict[str, Any],
-        path: str,
-        method: str,
-        payload: Optional[Dict[str, Any]] = None,
-        allowed_codes: Iterable[int] = (),
-    ) -> Dict[str, Any]:
-        token = str(session.get("token") or "")
-        login_uuid = str(session.get("loginUuid") or "")
-        if not token:
-            raise Pan123Error("后端未登录 123 云盘")
-        client = self._http.read() if method.upper() == "GET" else self._http.write()
-        request_method = method.upper()
-        params: Dict[str, Any] = signed_query(path)
-        request_kwargs: Dict[str, Any] = {}
-        if request_method == "GET":
-            params.update(payload or {})
-        else:
-            request_kwargs["json"] = payload or {}
-        response = await client.request(
-            request_method,
-            API_BASE + path,
-            params=params,
-            headers=auth_headers(token, login_uuid, has_body=request_method != "GET"),
-            **request_kwargs,
-        )
-        data = safe_json(response)
-        code = number_value(data.get("code"))
-        accepted = {int(value) for value in allowed_codes}
-        if response.status_code >= 400 or (code not in (0, 200, None) and code not in accepted):
-            raise Pan123Error(
-                str(data.get("message") or f"123 接口请求失败（HTTP {response.status_code}）"),
-                code=code or response.status_code,
-                data=data.get("data") if isinstance(data.get("data"), dict) else {},
-            )
-        return data
-
-class Pan123OpenTokenStore:
-    """Pan123OpenAPIClient 的 token 持久化适配器接口。
-
-    适配 SessionStore 的 get/save/delete_pan123_open_token 三个方法，
-    使 Pan123OpenAPIClient 不直接依赖 SessionStore。
-    """
+class Pan123OauthStore:
+    """Pan123OpenAPIClient 的授权数据持久化接口（refresh/access token + 账号资料）。"""
 
     async def load(self) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
 
-    async def save(self, access_token: str, expires_at: float) -> None:
+    async def save(self, data: Dict[str, Any]) -> None:
         raise NotImplementedError
 
     async def clear(self) -> None:
         raise NotImplementedError
 
 
-class Pan123OpenAPIClient:
-    """Small 123 OpenAPI client kept ready for the gateway mode switch.
+class SyncPan123OauthStore(Pan123OauthStore):
+    """把同步的 kv 读写函数适配成异步接口（避免 pan123 依赖 session_store）。"""
 
-    Web login remains the default because 123 OpenAPI copy cannot cover folders
-    consistently; folder copy continues to use the Web API path.
+    def __init__(self, load: Callable[[], Optional[Dict[str, Any]]], save: Callable[[Dict[str, Any]], None], clear: Callable[[], None]):
+        self._load = load
+        self._save = save
+        self._clear = clear
+
+    async def load(self) -> Optional[Dict[str, Any]]:
+        return self._load()
+
+    async def save(self, data: Dict[str, Any]) -> None:
+        self._save(data)
+
+    async def clear(self) -> None:
+        self._clear()
+
+
+class Pan123OauthBroker:
+    """123 OpenAPI OAuth 授权的社区中转客户端（OpenList APIPages 协议）。
+
+    - authorize_url：向中转站拿 123 官方授权页跳转地址（授权页输入账号密码）
+    - exchange_code：授权回调的 code 交给中转站换取 access/refresh token
+    - refresh：用 refresh_token 换新 access_token（clientSecret 由中转站保管）
+    """
+
+    def __init__(self, base_url: str = PAN123_OAUTH_BROKER_URL, timeout_seconds: float = 25.0):
+        self.base_url = str(base_url or PAN123_OAUTH_BROKER_URL).strip().rstrip("/")
+        self.timeout = timeout_seconds
+        self._http = _HttpClientPool(self.timeout)
+
+    async def close(self) -> None:
+        await self._http.close()
+
+    def _driver_root(self) -> str:
+        return f"{self.base_url}/{PAN123_OAUTH_DRIVER}"
+
+    async def authorize_url(self) -> Dict[str, str]:
+        client = self._http.read()
+        response = await client.get(
+            f"{self._driver_root()}/requests",
+            params={"server_use": "true", "driver_txt": f"{PAN123_OAUTH_DRIVER}_oa"},
+            headers=_broker_headers(),
+        )
+        payload = safe_json(response)
+        authorize_url = string_value(payload.get("text"))
+        if response.status_code >= 400 or not authorize_url.startswith("http"):
+            raise Pan123Error(
+                str(payload.get("text") or payload.get("message") or f"获取 123 授权地址失败（HTTP {response.status_code}）")
+            )
+        parsed = urlparse(authorize_url)
+        query = parse_qs(parsed.query)
+        redirect_uri = string_value(*query.get("redirect_uri", []))
+        if not redirect_uri:
+            raise Pan123Error("123 授权地址缺少回调回调参数（redirect_uri）")
+        return {"authorizeUrl": authorize_url, "redirectUri": redirect_uri}
+
+    async def exchange_code(self, code: str) -> Dict[str, Any]:
+        client = self._http.read()
+        response = await client.get(
+            f"{self._driver_root()}/callback",
+            params={"code": str(code or "").strip()},
+            headers=_broker_headers(),
+            follow_redirects=False,
+        )
+        location = response.headers.get("location", "")
+        if response.status_code in (301, 302, 303, 307, 308) and "#" in location:
+            data = decode_oplist_callback_fragment(location)
+        else:
+            payload = safe_json(response)
+            message = string_value(payload.get("text") or payload.get("message"))
+            raise Pan123Error(message or f"123 授权码换取 token 失败（HTTP {response.status_code}）")
+        access_token = string_value(data.get("access_token"))
+        refresh_token = string_value(data.get("refresh_token"))
+        if data.get("message_err"):
+            raise Pan123Error(str(data["message_err"]))
+        if not access_token or not refresh_token:
+            raise Pan123Error("123 授权回调未返回完整的 token 信息")
+        return {
+            "accessToken": access_token,
+            "refreshToken": refresh_token,
+            "expiresIn": number_value(data.get("expires_in")),
+        }
+
+    async def refresh(self, refresh_token: str) -> Dict[str, Any]:
+        token = str(refresh_token or "").strip()
+        if not token:
+            raise Pan123Error("缺少 123 刷新令牌（refresh token）")
+        client = self._http.read()
+        response = await client.get(
+            f"{self._driver_root()}/renewapi",
+            params={"refresh_ui": token},
+            headers=_broker_headers(),
+        )
+        payload = safe_json(response)
+        access_token = string_value(payload.get("access_token"))
+        if response.status_code >= 400 or not access_token:
+            message = string_value(payload.get("text") or payload.get("message"))
+            if _looks_like_invalid_refresh_grant(message) or not message:
+                raise Pan123Error("123 授权已失效，请到设置里重新授权登录（刷新令牌无效）")
+            raise Pan123Error(message)
+        return {
+            "accessToken": access_token,
+            "refreshToken": string_value(payload.get("refresh_token")) or token,
+            "expiresIn": number_value(payload.get("expires_in")),
+        }
+
+
+def _broker_headers() -> Dict[str, str]:
+    return {
+        "accept": "application/json, text/plain, */*",
+        "user-agent": PAN_LOGIN_USER_AGENT,
+        "referer": f"{PAN123_OAUTH_BROKER_URL}/",
+    }
+
+
+def _looks_like_invalid_refresh_grant(message: str) -> bool:
+    return bool(re.search(
+        r"invalid|expired|revoked|refresh\s*token|授权|刷新令牌|失效|过期",
+        str(message or ""),
+        re.I,
+    ))
+
+
+def decode_oplist_callback_fragment(location: str) -> Dict[str, Any]:
+    """解析中转站回调 302 Location 里 /#<base64(json)> 携带的 token 数据。"""
+    fragment = str(location or "").split("#", 1)[-1]
+    fragment = fragment.strip()
+    if not fragment:
+        return {}
+    try:
+        padded = fragment + "=" * (-len(fragment) % 4)
+        decoded = base64.b64decode(padded).decode("utf-8")
+        data = json.loads(decoded)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+class Pan123OpenAPIClient:
+    """123 OpenAPI 客户端：access_token 由 OAuth 授权得来并自动刷新。
+
+    授权入口在设置页：用户在 123 官方授权页输入账号密码完成授权后，
+    refresh_token 持久化在本机，access_token 过期即用 refresh_token 静默换取。
     """
 
     clientKind = "openapi"
 
     def __init__(
         self,
-        client_id: str,
-        client_secret: str,
+        broker: Optional[Pan123OauthBroker] = None,
+        oauth_store: Optional[Pan123OauthStore] = None,
         timeout_seconds: float = 20.0,
-        token_store: Optional["Pan123OpenTokenStore"] = None,
     ):
-        self.client_id = client_id.strip()
-        self.client_secret = client_secret.strip()
+        self.broker = broker or Pan123OauthBroker(timeout_seconds=timeout_seconds)
+        self.oauth_store = oauth_store
         self.timeout = timeout_seconds
-        self.token_store = token_store
         self._http = _HttpClientPool(self.timeout)
         self._access_token = ""
         self._access_token_expires_at = 0.0
+        self._refresh_token = ""
+        self._store_loaded = False
         self._access_token_lock: Optional[asyncio.Lock] = None
-        # 进程重启后只懒加载一次外部 token_store
-        self._cached_token_load: Optional[asyncio.Future] = None
-        self._cached_token_loaded = False
 
     async def close(self) -> None:
         await self._http.close()
+        await self.broker.close()
+
+    # ------------------------------------------------------------------
+    # 授权数据
+    # ------------------------------------------------------------------
+    @property
+    def authorized(self) -> bool:
+        return bool(self._refresh_token)
+
+    async def load_authorization(self) -> Dict[str, Any]:
+        """从持久层读授权数据（refresh token + 缓存的 access token），进程启动后调用一次。"""
+        if self._store_loaded or self.oauth_store is None:
+            return self._snapshot()
+        self._store_loaded = True
+        stored = await self.oauth_store.load()
+        if isinstance(stored, dict):
+            self._refresh_token = str(stored.get("refreshToken") or "")
+            cached_token = str(stored.get("accessToken") or "")
+            cached_expires_at = float(stored.get("expiresAt") or 0)
+            if cached_token and cached_expires_at > time.time() + 60:
+                self._access_token = cached_token
+                self._access_token_expires_at = cached_expires_at
+        return self._snapshot()
+
+    def bind_tokens(self, access_token: str, refresh_token: str, expires_in: Optional[int] = None) -> None:
+        self._access_token = access_token
+        self._refresh_token = refresh_token
+        self._access_token_expires_at = pan123_open_token_expires_at(
+            access_token, {"expiresIn": expires_in} if expires_in else None
+        )
+        self._store_loaded = True
+
+    async def persist(self, clear: bool = False) -> None:
+        if self.oauth_store is None:
+            return
+        if clear:
+            self._refresh_token = ""
+            self._access_token = ""
+            self._access_token_expires_at = 0.0
+            await self.oauth_store.clear()
+            return
+        await self.oauth_store.save({
+            "refreshToken": self._refresh_token,
+            "accessToken": self._access_token,
+            "expiresAt": self._access_token_expires_at,
+            "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        })
+
+    def _snapshot(self) -> Dict[str, Any]:
+        return {
+            "refreshToken": self._refresh_token,
+            "accessToken": self._access_token,
+            "expiresAt": self._access_token_expires_at,
+        }
+
+    # ------------------------------------------------------------------
+    # OpenAPI 接口
+    # ------------------------------------------------------------------
+    async def get_open_user_info(self) -> Dict[str, Any]:
+        data = await self.request("GET", "/api/v1/user/info")
+        body = data.get("data") if isinstance(data.get("data"), dict) else {}
+        return normalize_open_user_info(body)
 
     async def list_files(self, parent_file_id: str) -> List[Dict[str, Any]]:
         files: List[Dict[str, Any]] = []
@@ -605,6 +621,15 @@ class Pan123OpenAPIClient:
         del task_ids
         raise Pan123Error("123 OpenAPI 未提供离线任务删除接口")
 
+    async def download_info(self, file_id: int) -> str:
+        """获取 123 文件下载直链（OpenAPI）。"""
+        data = await self.request("GET", "/api/v1/file/download_info", query={"fileId": str(int(file_id or 0))})
+        body = data.get("data") if isinstance(data.get("data"), dict) else {}
+        url = string_value(body.get("downloadUrl"), body.get("DownloadUrl"), body.get("url"), body.get("Url"))
+        if not url:
+            raise Pan123Error("123 OpenAPI 未返回下载直链")
+        return url
+
     async def request(
         self,
         method: str,
@@ -666,73 +691,31 @@ class Pan123OpenAPIClient:
     async def get_token(self) -> str:
         if self._access_token and self._access_token_expires_at > time.time() + 60:
             return self._access_token
-        # 进程重启后只懒加载一次外部 token_store
-        cached = await self._load_cached_token()
-        if cached:
-            return cached
+        await self.load_authorization()
+        if self._access_token and self._access_token_expires_at > time.time() + 60:
+            return self._access_token
         if self._access_token_lock is None:
             self._access_token_lock = asyncio.Lock()
         async with self._access_token_lock:
             if self._access_token and self._access_token_expires_at > time.time() + 60:
                 return self._access_token
-            if not self.client_id or not self.client_secret:
-                raise Pan123Error("请先配置 123 OpenAPI ClientID 和 ClientSecret")
-            client = self._http.write()
-            response = await client.post(
-                OPEN_API_BASE + "/api/v1/access_token",
-                json={"clientID": self.client_id, "clientSecret": self.client_secret},
-                headers={"platform": "open_platform", "Content-Type": "application/json"},
-            )
-            payload = safe_json(response)
-            code = payload.get("code")
-            if response.status_code >= 400 or code not in (0, 200, "0", None):
-                raise Pan123Error(str(payload.get("message") or f"123 OpenAPI Token {response.status_code}"))
-            body = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-            token = string_value(body.get("accessToken"), body.get("access_token"))
-            if not token:
-                raise Pan123Error("123 OpenAPI Token 响应缺少 accessToken")
-            self._access_token = token
-            self._access_token_expires_at = pan123_open_token_expires_at(token, body)
-            # 写盘复用，下次启动可直接命中
-            if self.token_store is not None:
-                try:
-                    await self.token_store.save(self._access_token, self._access_token_expires_at)
-                except Exception:
-                    pass
-            return token
+            await self._refresh_tokens()
+            return self._access_token
 
-    async def _load_cached_token(self) -> Optional[str]:
-        if self._cached_token_loaded or self.token_store is None:
-            return None
-        if self._cached_token_load is None:
-            self._cached_token_load = asyncio.get_event_loop().create_future()
-            try:
-                cached = await self.token_store.load()
-                if cached and cached.get("accessToken"):
-                    self._access_token = str(cached["accessToken"])
-                    stored_expires_at = float(cached["expiresAt"])
-                    jwt_expires_at = pan123_open_jwt_exp(self._access_token)
-                    self._access_token_expires_at = jwt_expires_at or stored_expires_at
-                    if self._access_token_expires_at <= time.time() + 60:
-                        self._access_token = ""
-                        self._access_token_expires_at = 0.0
-                        self._cached_token_load.set_result(None)
-                        return None
-                    if jwt_expires_at and abs(jwt_expires_at - stored_expires_at) >= 1:
-                        try:
-                            await self.token_store.save(self._access_token, self._access_token_expires_at)
-                        except Exception:
-                            pass
-                    self._cached_token_load.set_result(self._access_token)
-                    return self._access_token
-                self._cached_token_load.set_result(None)
-                return None
-            except Exception:
-                self._cached_token_load.set_result(None)
-                return None
-            finally:
-                self._cached_token_loaded = True
-        return await self._cached_token_load
+    async def _refresh_tokens(self) -> None:
+        """用 refresh_token 换新 access_token（中转站持有 clientSecret）。"""
+        if not self._refresh_token:
+            raise Pan123Error("123 云盘尚未完成授权登录，请先到设置里绑定 123 账号")
+        result = await self.broker.refresh(self._refresh_token)
+        self._access_token = str(result.get("accessToken") or "")
+        self._refresh_token = str(result.get("refreshToken") or self._refresh_token)
+        if not self._access_token:
+            raise Pan123Error("123 授权刷新未返回 accessToken")
+        self._access_token_expires_at = pan123_open_token_expires_at(
+            self._access_token, {"expiresIn": result.get("expiresIn")} if result.get("expiresIn") else None
+        )
+        # 新 token（以及可能轮换的 refresh_token）落盘，下次启动直接命中
+        await self.persist()
 
     async def _invalidate_token(self, token: str) -> None:
         # 迟到的旧响应不能清掉新 token
@@ -743,14 +726,9 @@ class Pan123OpenAPIClient:
         async with self._access_token_lock:
             if self._access_token != token:
                 return
+            # 只清内存里的 access_token；下次请求会自动用 refresh_token 换新
             self._access_token = ""
             self._access_token_expires_at = 0.0
-            self._cached_token_loaded = True  # 失效后不再懒加载
-            if self.token_store is not None:
-                try:
-                    await self.token_store.clear()
-                except Exception:
-                    pass
 
 
 def safe_json(response: httpx.Response) -> Dict[str, Any]:
@@ -761,46 +739,29 @@ def safe_json(response: httpx.Response) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def normalize_login_uuid(data: Dict[str, Any], fallback: str) -> str:
-    for key in ("loginuuid", "loginUuid", "loginUUID", "uuid", "login_uuid"):
-        value = data.get(key)
-        if value:
-            return str(value)
-    return fallback
-
-
-def auth_headers(token: str, login_uuid: str, has_body: bool, app_version: str = "3") -> Dict[str, str]:
-    headers = {
-        "accept": "*/*",
-        "accept-language": "zh-CN",
-        "app-version": str(app_version or "3"),
-        "authorization": "Bearer " + token,
-        "loginuuid": login_uuid,
-        "platform": "web",
-        "user-agent": "Mozilla/5.0",
+def normalize_open_user_info(value: Any) -> Dict[str, Any]:
+    """把 123 OpenAPI /api/v1/user/info 的响应对齐到网页版 profile 字段。"""
+    record = value if isinstance(value, dict) else {}
+    uid = number_value(record.get("uid"), record.get("UID"), record.get("userId"), record.get("userID"))
+    nickname = string_value(record.get("nickname"), record.get("Nickname"), record.get("username"), record.get("Nickname"))
+    passport = string_value(record.get("passport"), record.get("phone"), record.get("mail"), record.get("email"))
+    space_used = number_value(record.get("spaceUsed"), record.get("space_used"), record.get("usedSpace"))
+    space_total = number_value(record.get("spacePermanent"), record.get("space_total"), record.get("totalSpace"))
+    return {
+        "uid": uid,
+        "nickname": nickname or passport or (f"123-{uid}" if uid else "123 账号"),
+        "headImage": string_value(record.get("headImage"), record.get("avatar"), record.get("headImg")),
+        "passport": passport,
+        "mail": string_value(record.get("mail"), record.get("email")),
+        "spaceUsed": space_used,
+        "spacePermanent": space_total,
+        "spaceTemp": number_value(record.get("spaceTemp"), record.get("space_temp")),
+        "spaceTempExpr": string_value(record.get("spaceTempExpr")),
+        "vip": bool_value(record.get("vip"), record.get("isvip")),
+        "directTraffic": number_value(record.get("directTraffic")),
+        "isHideUID": None,
+        "httpsCount": None,
     }
-    if has_body:
-        headers["content-type"] = "application/json;charset=UTF-8"
-    return headers
-
-
-def signed_query(
-    path: str,
-    now_ms: Optional[int] = None,
-    random_value: Optional[int] = None,
-    app_version: str = "3",
-) -> Dict[str, str]:
-    now_ms = now_ms if now_ms is not None else int(datetime.now(timezone.utc).timestamp() * 1000)
-    random_value = random_value if random_value is not None else random.randint(0, 10_000_000)
-    cst = datetime.fromtimestamp(now_ms / 1000, timezone.utc).astimezone(timezone(timedelta(hours=8)))
-    ds = cst.strftime("%Y%m%d%H%M")
-    mapper = "adefghlmyijnopkqrstubcvwsz" if str(app_version) == PAN_SHARE_APP_VERSION else "adefghlimjnoopkqrstubcvwsz"
-    mapped = "".join(mapper[int(ch)] if ch.isdigit() else ch for ch in ds)
-    tsgn = str(crc32_text(mapped))
-    ts = timestamp_text(now_ms)
-    rnd = str(random_value)
-    dat = "|".join([ts, rnd, path, "web", str(app_version or "3"), tsgn])
-    return {tsgn: "{}-{}-{}".format(ts, rnd, crc32_text(dat))}
 
 
 def parse_pan123_share_url(value: str) -> Dict[str, str]:
@@ -825,7 +786,7 @@ def parse_pan123_share_url(value: str) -> Dict[str, str]:
     port = f":{parsed.port}" if parsed.port else ""
     origin = f"{parsed.scheme}://{hostname}{port}"
     query = parse_qs(parsed.query)
-    password = str((query.get("pwd") or [""])[0])
+    password = str((query.get("pwd") or query.get("password") or query.get("code") or [""])[0])
     return {"origin": origin, "shareKey": share_key, "password": password}
 
 
@@ -851,45 +812,22 @@ def first_record_list(record: Dict[str, Any], keys: tuple[str, ...]) -> List[Dic
     return []
 
 
-def share_copy_file(item: Dict[str, Any], target_dir_id: str) -> Optional[Dict[str, Any]]:
-    file_id = number_value(item.get("FileId"), item.get("fileId"), item.get("FileID"), item.get("id")) or 0
-    if file_id <= 0:
-        return None
-    return {
-        "fileID": file_id,
-        "size": number_value(item.get("Size"), item.get("BaseSize"), item.get("size")) or 0,
-        "etag": str(item.get("Etag") or item.get("etag") or ""),
-        "type": number_value(item.get("Type"), item.get("type")) or 0,
-        "parentFileID": number_value(target_dir_id) or 0,
-        "fileName": str(item.get("FileName") or item.get("filename") or item.get("name") or file_id),
-        "driveID": number_value(item.get("DriveId"), item.get("driveId"), item.get("driveID")) or 0,
-    }
-
-
-def timestamp_text(now_ms: int) -> str:
-    seconds = now_ms // 1000
-    millis = now_ms % 1000
-    if millis == 0:
-        return str(seconds)
-    return "{}.{}".format(seconds, str(millis).zfill(3).rstrip("0"))
-
-
-def crc32_text(value: str) -> int:
-    return zlib.crc32(value.encode("utf-8")) & 0xFFFFFFFF
-
-
 def normalize_file(value: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(value, dict):
         return None
-    file_id = number_value(value.get("FileId"), value.get("fileId"), value.get("fileID"), value.get("id"))
-    name = string_value(value.get("FileName"), value.get("fileName"), value.get("filename"), value.get("name"))
+    file_id = number_value(
+        value.get("FileId"), value.get("fileId"), value.get("fileID"), value.get("FileID"), value.get("id")
+    )
+    name = string_value(
+        value.get("FileName"), value.get("fileName"), value.get("filename"), value.get("Filename"), value.get("name")
+    )
     if file_id is None or not name:
         return None
     file_type = number_value(value.get("Type"), value.get("type"), value.get("file_type")) or 0
     parent_file_id = number_value(value.get("ParentFileId"), value.get("ParentFileID"), value.get("parentFileId"))
     update_at = string_value(value.get("UpdateAt"), value.get("updateAt"), value.get("updatedAt"), value.get("updated_at"))
     create_at = string_value(value.get("CreateAt"), value.get("createAt"), value.get("createdAt"), value.get("created_at"))
-    etag = string_value(value.get("Etag"), value.get("etag"))
+    etag = string_value(value.get("Etag"), value.get("etag"), value.get("md5"))
     size = number_value(value.get("Size"), value.get("size"), value.get("BaseSize"), value.get("baseSize"), value.get("LiveSize"), value.get("liveSize"))
     parent_name = string_value(value.get("ParentName"), value.get("parentName"), value.get("NewParentName"), value.get("newParentName"))
     new_parent_name = string_value(value.get("NewParentName"), value.get("newParentName"))
@@ -908,7 +846,8 @@ def normalize_file(value: Any) -> Optional[Dict[str, Any]]:
         "parentName": parent_name,
         "newParentName": new_parent_name,
         "absPath": abs_path,
-        "s3KeyFlag": string_value(value.get("S3KeyFlag"), value.get("s3KeyFlag")),
+        "s3KeyFlag": string_value(value.get("S3KeyFlag"), value.get("s3KeyFlag"), value.get("s3keyFlag")),
+        "driveId": number_value(value.get("DriveId"), value.get("driveId"), value.get("driveID")),
         "category": number_value(value.get("Category"), value.get("category")),
         "status": number_value(value.get("Status"), value.get("status")),
         "createAt": create_at,
@@ -920,40 +859,6 @@ def normalize_file(value: Any) -> Optional[Dict[str, Any]]:
 RELEASE_GROUP_EXT_RE = re.compile(r"(\.(?:mkv|mp4|avi|mov|wmv|flv|webm|m4v|mpeg|mpg|3gp|ts|m2ts|mts|ass|srt|ssa|zip|rar|7z))$", re.I)
 RELEASE_GROUP_BRACKET_RE = re.compile(r"\s*\[[\u4e00-\u9fa5A-Za-z0-9][\u4e00-\u9fa5A-Za-z0-9._@-]{1,49}\]\s*$")
 RELEASE_GROUP_SUFFIX_RE = re.compile(r"^[\u4e00-\u9fa5A-Za-z0-9][\u4e00-\u9fa5A-Za-z0-9._@]{1,49}$")
-
-
-def normalize_user_info(value: Any, fallback_user: str = "") -> Dict[str, Any]:
-    record = value if isinstance(value, dict) else {}
-    nickname = string_value(
-        record.get("nickname"),
-        record.get("Nickname"),
-        record.get("nickName"),
-        record.get("NickName"),
-        record.get("name"),
-    )
-    passport = string_value(record.get("passport"), record.get("Passport"), record.get("phone"), fallback_user)
-    mail = string_value(record.get("mail"), record.get("Mail"), record.get("email"))
-    return {
-        "uid": number_value(record.get("uid"), record.get("UID"), record.get("userId"), record.get("userID")),
-        "nickname": nickname or passport or mail or fallback_user,
-        "headImage": string_value(
-            record.get("headImage"),
-            record.get("HeadImage"),
-            record.get("headImg"),
-            record.get("HeadImg"),
-            record.get("avatar"),
-        ),
-        "passport": passport or fallback_user,
-        "mail": mail,
-        "spaceUsed": number_value(record.get("spaceUsed"), record.get("SpaceUsed")),
-        "spacePermanent": number_value(record.get("spacePermanent"), record.get("SpacePermanent")),
-        "spaceTemp": number_value(record.get("spaceTemp"), record.get("SpaceTemp")),
-        "spaceTempExpr": string_value(record.get("spaceTempExpr"), record.get("SpaceTempExpr")),
-        "vip": bool_value(record.get("vip"), record.get("Vip")),
-        "directTraffic": number_value(record.get("directTraffic"), record.get("DirectTraffic")),
-        "isHideUID": bool_value(record.get("isHideUID"), record.get("isHideUid"), record.get("hideUID")),
-        "httpsCount": number_value(record.get("httpsCount"), record.get("HttpsCount")),
-    }
 
 
 def string_value(*values: Any) -> str:
@@ -1093,14 +998,6 @@ def normalize_offline_status(value: Any, process: float) -> int:
     if "success" in raw or "complete" in raw or raw == "2" or process >= 100:
         return 2
     return 1
-
-
-def first_record(record: Dict[str, Any], keys: tuple[str, ...]) -> Optional[Dict[str, Any]]:
-    for key in keys:
-        value = record.get(key)
-        if isinstance(value, dict):
-            return value
-    return None
 
 
 def chunks(values: List[Any], size: int) -> Iterable[List[Any]]:

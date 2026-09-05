@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import base64
 import copy
-import hashlib
-import hmac
 import json
 import os
 import re
@@ -16,10 +13,10 @@ from typing import Any, Dict, List, Optional
 from .defaults import DEFAULT_SUBMISSION_CONFIG, DEFAULT_USER_CHANNELS, DEFAULT_USER_ROUTING
 
 
-PBKDF2_ITERATIONS = 180_000
 ADMIN_CONFIG_KEY = "admin_config"
 PAN123_SESSION_KEY = "pan123_session"
 SUBMISSION_CONFIG_KEY = "submission_config"
+TRANSFER_HASHES_RESET_KEY = "transfer_hashes_reset_v2"
 
 DEFAULT_ADMIN_CONFIG: Dict[str, Any] = {}
 
@@ -39,6 +36,7 @@ class SessionStore:
         self._ensure_initialized()
 
     def read_session(self) -> Optional[Dict[str, Any]]:
+        """123 授权会话（OAuth refresh token + 账号资料）。"""
         raw = self.read_value(PAN123_SESSION_KEY)
         return raw if isinstance(raw, dict) else None
 
@@ -746,67 +744,56 @@ class SessionStore:
             )
         return True
 
-    def get_pan123_open_token(self, token_key: str) -> Optional[Dict[str, Any]]:
-        self._ensure_initialized()
-        token_key = str(token_key or "").strip()
-        if not token_key:
+    def get_transfer_sha1_by_name(self, name: str, size: int) -> Optional[Dict[str, Any]]:
+        """按"文件名+大小"反查 SHA1（用于导入的 115 SHA1 数据）。"""
+        name = str(name or "").strip()
+        if not name:
             return None
+        self._ensure_initialized()
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM pan123_open_tokens WHERE token_key = ?", (token_key,)
+                "SELECT * FROM transfer_hashes WHERE name = ? AND size = ?", (name, int(size or 0))
             ).fetchone()
         if not row:
             return None
         return {
-            "accessToken": row["access_token"],
-            "expiresAt": float(row["expires_at"]),
+            "sha1": row["sha1"],
+            "size": row["size"],
+            "etag": row["etag"],
+            "name": row["name"],
             "updatedAt": row["updated_at"],
         }
 
-    def save_pan123_open_token(self, token_key: str, access_token: str, expires_at: float) -> None:
+    def get_transfer_sha1_by_etag(self, etag: str, size: int) -> Optional[Dict[str, Any]]:
+        """反查：123 文件的 etag（MD5）+ 大小 → 当初从 115 学到的 sha1。
+
+        供 123→115 搬运的秒传阶段使用；只对"曾经从 115 搬进 123"的文件有效。
+        """
+        etag = str(etag or "").strip().lower()
+        if not etag:
+            return None
         self._ensure_initialized()
-        token_key = str(token_key or "").strip()
-        if not token_key or not access_token:
-            return
-        now = utc_now_iso()
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO pan123_open_tokens(token_key, access_token, expires_at, updated_at)
-                VALUES(?, ?, ?, ?)
-                ON CONFLICT(token_key) DO UPDATE SET
-                  access_token = excluded.access_token,
-                  expires_at = excluded.expires_at,
-                  updated_at = excluded.updated_at
-                """,
-                (token_key, access_token, float(expires_at), now),
-            )
-
-    def delete_pan123_open_token(self, token_key: str) -> None:
-        self._ensure_initialized()
-        token_key = str(token_key or "").strip()
-        if not token_key:
-            return
-        with self._connect() as connection:
-            connection.execute("DELETE FROM pan123_open_tokens WHERE token_key = ?", (token_key,))
-
-    def credentials_match(self, session: Dict[str, Any], user: str, password: str) -> bool:
-        if str(session.get("user") or "") != user:
-            return False
-        encoded = str(session.get("passwordHash") or "")
-        if not encoded:
-            return False
-        return verify_password(password, encoded)
-
-    def build_session(self, user: str, password: str, token: str, login_uuid: str, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            row = connection.execute(
+                "SELECT * FROM transfer_hashes WHERE etag = ? AND size = ?", (etag, int(size or 0))
+            ).fetchone()
+        if not row:
+            return None
         return {
-            "token": token,
-            "user": user,
-            "loginUuid": login_uuid,
-            "passwordHash": hash_password(password),
-            "updatedAt": utc_now_iso(),
-            **({"profile": profile} if profile else {}),
+            "sha1": row["sha1"],
+            "size": row["size"],
+            "etag": row["etag"],
+            "name": row["name"],
+            "updatedAt": row["updated_at"],
         }
+
+    def merge_session(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        """合并写 123 授权会话：token 刷新与资料更新互不覆盖。"""
+        merged = dict(self.read_session() or {})
+        merged.update({key: value for key, value in dict(patch or {}).items() if value is not None})
+        merged["updatedAt"] = utc_now_iso()
+        self.write_session(merged)
+        return merged
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
@@ -891,6 +878,10 @@ class SessionStore:
                 self._ensure_column(connection, "transfer_tasks", "remote_task_id", "INTEGER")
                 self._ensure_column(connection, "transfer_tasks", "target_dir_id", "TEXT NOT NULL DEFAULT ''")
                 self._ensure_column(connection, "transfer_tasks", "share_owner_user_id", "INTEGER")
+                if not self._read_kv_value(TRANSFER_HASHES_RESET_KEY):
+                    # 一次性重置：切换 token 模式后旧学习数据作废，清空重建、重新积累
+                    connection.execute("DROP TABLE IF EXISTS transfer_hashes")
+                    self._write_kv_value(TRANSFER_HASHES_RESET_KEY, {"resetAt": utc_now_iso()})
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS transfer_hashes (
@@ -903,15 +894,12 @@ class SessionStore:
                     )
                     """
                 )
+                # 123→115 反向搬运按 (etag, size) / (name, size) 反查 sha1 用
                 connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS pan123_open_tokens (
-                      token_key TEXT PRIMARY KEY,
-                      access_token TEXT NOT NULL,
-                      expires_at REAL NOT NULL,
-                      updated_at TEXT NOT NULL
-                    )
-                    """
+                    "CREATE INDEX IF NOT EXISTS idx_transfer_hashes_etag ON transfer_hashes(etag, size)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_transfer_hashes_name ON transfer_hashes(name, size)"
                 )
                 connection.execute(
                     """
@@ -1082,25 +1070,22 @@ class SessionStore:
             pass
 
     def _migrate_legacy_admin_gateway(self) -> None:
-        """旧版把 123 OpenAPI 凭据存在网关配置顶层；现在统一收口到搬运配置。"""
+        """旧版把 123 OpenAPI 凭据存在网关配置顶层/搬运配置里；token 模式下这些密钥字段全部作废。"""
         raw = self._read_kv_value(ADMIN_CONFIG_KEY)
         if not isinstance(raw, dict):
             return
-        legacy_keys = ("gatewayName", "pan123ClientMode", "pan123OpenApiClientId", "pan123OpenApiClientSecret")
-        if not any(key in raw for key in legacy_keys):
+        legacy_top_keys = ("gatewayName", "pan123ClientMode", "pan123OpenApiClientId", "pan123OpenApiClientSecret")
+        transfer = raw.get("transfer") if isinstance(raw.get("transfer"), dict) else None
+        legacy_transfer_keys = ("pan123ClientId", "pan123ClientSecret")
+        if not any(key in raw for key in legacy_top_keys) and not (transfer and any(key in transfer for key in legacy_transfer_keys)):
             return
         next_config = dict(raw)
-        client_id = str(next_config.pop("pan123OpenApiClientId", "") or "").strip()
-        client_secret = str(next_config.pop("pan123OpenApiClientSecret", "") or "").strip()
-        next_config.pop("gatewayName", None)
-        next_config.pop("pan123ClientMode", None)
-        if client_id or client_secret:
-            transfer = next_config.get("transfer")
-            transfer = dict(transfer) if isinstance(transfer, dict) else {}
-            if client_id and not str(transfer.get("pan123ClientId") or "").strip():
-                transfer["pan123ClientId"] = client_id
-            if client_secret and not str(transfer.get("pan123ClientSecret") or "").strip():
-                transfer["pan123ClientSecret"] = client_secret
+        for key in legacy_top_keys:
+            next_config.pop(key, None)
+        if transfer is not None:
+            transfer = dict(transfer)
+            for key in legacy_transfer_keys:
+                transfer.pop(key, None)
             next_config["transfer"] = transfer
         self._write_kv_value(ADMIN_CONFIG_KEY, next_config)
 
@@ -1443,12 +1428,6 @@ def transfer_task_from_row(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
-def pan123_open_token_key(client_id: str, client_secret: str) -> str:
-    """按 clientId:clientSecret 生成稳定 key，用于 pan123_open_tokens 表主键。"""
-    raw = f"{str(client_id or '').strip()}:{str(client_secret or '').strip()}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
 def json_value(value: Any, fallback: Any) -> Any:
     try:
         return json.loads(str(value))
@@ -1463,29 +1442,5 @@ def optional_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def hash_password(password: str) -> str:
-    salt = os.urandom(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
-    return "pbkdf2_sha256${}${}${}".format(
-        PBKDF2_ITERATIONS,
-        base64.b64encode(salt).decode("ascii"),
-        base64.b64encode(digest).decode("ascii"),
-    )
-
-
-def verify_password(password: str, encoded: str) -> bool:
-    try:
-        scheme, iterations_text, salt_text, digest_text = encoded.split("$", 3)
-        if scheme != "pbkdf2_sha256":
-            return False
-        iterations = int(iterations_text)
-        salt = base64.b64decode(salt_text.encode("ascii"))
-        expected = base64.b64decode(digest_text.encode("ascii"))
-    except (ValueError, TypeError):
-        return False
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return hmac.compare_digest(digest, expected)
 
 
