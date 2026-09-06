@@ -7,7 +7,7 @@ import SegmentedTabs from "@/components/SegmentedTabs.vue";
 import GlassCard from "@/components/GlassCard.vue";
 import FormGrid from "@/components/FormGrid.vue";
 import { transferApi, pan115HelperApi, pan115CookieApi } from "@/api";
-import type { AccountCooldown, Pan115Device, TransferConfig, TransferOfflineTask, TransferTask, TransferTaskFile } from "@/api/types";
+import type { AccountCooldown, DirectLinkFile, Pan123BrowseItem, Pan123PanLinkFile, Pan115Device, TransferConfig, TransferOfflineTask, TransferTask, TransferTaskFile } from "@/api/types";
 import { formatBytes } from "@/utils/format";
 import { useGlobalState } from "@/composables/useGlobalState";
 import { useResponsive } from "@/composables/useResponsive";
@@ -464,6 +464,10 @@ const helperForm = reactive({
   dailyRecycleCleanupTime: "03:30",
   dailyRecycleCleanupTimeZone: "Asia/Shanghai",
   requestIntervalMs: 2500,
+  directLinkRoot: "",
+  publicBaseUrl: "",
+  pan123SourceDirId: "",
+  pan123SourceDirPath: "",
 });
 
 const helperTestText = ref("");
@@ -488,6 +492,10 @@ function syncHelperFromConfig() {
   helperForm.dailyRecycleCleanupTime = helper.dailyRecycleCleanupTime || "03:30";
   helperForm.dailyRecycleCleanupTimeZone = helper.dailyRecycleCleanupTimeZone || "Asia/Shanghai";
   helperForm.requestIntervalMs = Number(helper.requestIntervalMs || 2500);
+  helperForm.directLinkRoot = helper.directLinkRoot || "";
+  helperForm.publicBaseUrl = helper.publicBaseUrl || "";
+  helperForm.pan123SourceDirId = helper.pan123SourceDirId || "";
+  helperForm.pan123SourceDirPath = helper.pan123SourceDirPath || "";
 }
 
 async function saveHelper() {
@@ -506,6 +514,10 @@ async function saveHelper() {
       dailyRecycleCleanupTime: helperForm.dailyRecycleCleanupTime || "03:30",
       dailyRecycleCleanupTimeZone: helperForm.dailyRecycleCleanupTimeZone || "Asia/Shanghai",
       requestIntervalMs: Math.max(0, Number(helperForm.requestIntervalMs || 2500)),
+      directLinkRoot: helperForm.directLinkRoot.trim(),
+      publicBaseUrl: helperForm.publicBaseUrl.trim(),
+      pan123SourceDirId: helperForm.pan123SourceDirId.trim(),
+      pan123SourceDirPath: helperForm.pan123SourceDirPath.trim(),
     };
     await writeSubmissionConfig(next);
     notifySuccess("115 助手配置已保存");
@@ -543,6 +555,204 @@ async function runHelperAction(action: "offline" | "recycle") {
   } finally {
     helperRunning.value = false;
   }
+}
+
+// ============ 直链离线（点对点离线） ============
+const dlinkFiles = ref<DirectLinkFile[]>([]);
+const dlinkRoot = ref("");
+const dlinkBaseUrl = ref("");
+const dlinkLoading = ref(false);
+const dlinkSubmitting = ref(false);
+const dlinkSelected = ref<Set<string>>(new Set());
+const dlinkResultText = ref("");
+const helperUrlsText = ref("");
+
+async function loadDLinkFiles() {
+  dlinkLoading.value = true;
+  try {
+    const data = await pan115HelperApi.dlinks();
+    if (data.enabled === false) {
+      dlinkResultText.value = data.message || "115 助手未启用";
+      dlinkFiles.value = [];
+      return;
+    }
+    dlinkFiles.value = data.files || [];
+    dlinkRoot.value = data.root || "";
+    dlinkBaseUrl.value = data.baseUrl || "";
+    dlinkResultText.value = "";
+  } catch (error) {
+    notifyError(`读取直链文件失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    dlinkLoading.value = false;
+  }
+}
+
+function toggleDLinkFile(rel: string) {
+  if (dlinkSelected.value.has(rel)) dlinkSelected.value.delete(rel);
+  else dlinkSelected.value.add(rel);
+  dlinkSelected.value = new Set(dlinkSelected.value);
+}
+
+function copyDLink(url: string) {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(url).then(() => notifySuccess("直链已复制"), () => notifyError("复制失败"));
+  } else {
+    notifyError("当前环境不支持剪贴板");
+  }
+}
+
+async function submitDLinkOffline() {
+  const keys = Array.from(dlinkSelected.value);
+  if (!keys.length) {
+    notifyError("请先勾选要提交离线的文件");
+    return;
+  }
+  if (!(await confirm(`确认将 ${keys.length} 个文件提交 115 离线？`, "提交直链离线"))) return;
+  dlinkSubmitting.value = true;
+  try {
+    const data = await pan115HelperApi.dlinksOffline(keys);
+    dlinkResultText.value = `成功 ${data.success || 0}/${data.total || 0}，失败 ${data.failed || 0}`;
+    notifySuccess(`直链离线完成：成功 ${data.success || 0}/${data.total || 0}`);
+  } catch (error) {
+    notifyError(`提交失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    dlinkSubmitting.value = false;
+  }
+}
+
+async function submitHelperUrls() {
+  const urls = helperUrlsText.value.split(/\s+/).map((line) => line.trim()).filter(Boolean);
+  if (!urls.length) {
+    notifyError("请先粘贴 http(s) 直链");
+    return;
+  }
+  dlinkSubmitting.value = true;
+  try {
+    const data = await pan115HelperApi.urlsOffline(urls);
+    dlinkResultText.value = `成功 ${data.success || 0}/${data.total || 0}，失败 ${data.failed || 0}`;
+    notifySuccess(`直链离线完成：成功 ${data.success || 0}/${data.total || 0}`);
+  } catch (error) {
+    notifyError(`提交失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    dlinkSubmitting.value = false;
+  }
+}
+
+// ============ 123 网盘直链（AList 式） ============
+const pan123Files = ref<Pan123PanLinkFile[]>([]);
+const pan123SourceDir = ref(0);
+const pan123BaseUrl = ref("");
+const pan123Loading = ref(false);
+const pan123Selected = ref<Set<number>>(new Set());
+
+async function loadPan123Files() {
+  pan123Loading.value = true;
+  try {
+    const data = await pan115HelperApi.pan123Dlinks();
+    pan123Files.value = data.files || [];
+    pan123SourceDir.value = data.sourceDirId || 0;
+    pan123BaseUrl.value = data.baseUrl || "";
+  } catch (error) {
+    notifyError(`读取 123 网盘文件失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    pan123Loading.value = false;
+  }
+}
+
+function togglePan123File(fileId: number) {
+  if (pan123Selected.value.has(fileId)) pan123Selected.value.delete(fileId);
+  else pan123Selected.value.add(fileId);
+  pan123Selected.value = new Set(pan123Selected.value);
+}
+
+async function submitPan123Offline() {
+  const keys = Array.from(pan123Selected.value).map(String);
+  if (!keys.length) {
+    notifyError("请先勾选要提交离线的 123 网盘文件");
+    return;
+  }
+  if (!(await confirm(`确认将 ${keys.length} 个 123 网盘文件提交 115 离线？`, "提交 123 直链离线"))) return;
+  pan123Loading.value = true;
+  try {
+    const data = await pan115HelperApi.pan123DlinksOffline(keys);
+    notifySuccess(`123 直链离线完成：成功 ${data.success || 0}/${data.total || 0}`);
+  } catch (error) {
+    notifyError(`提交失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    pan123Loading.value = false;
+  }
+}
+
+// ============ 123 网盘源目录选择（目录树浏览） ============
+const pan123PickerOpen = ref(false);
+const pan123PickerLoading = ref(false);
+const pan123PickerDir = ref(0);
+const pan123PickerPath = ref<{ fileId: number; name: string }[]>([]);
+const pan123PickerDirs = ref<Pan123BrowseItem[]>([]);
+const pan123PickerFiles = ref<Pan123BrowseItem[]>([]);
+
+function pan123PickerPathText() {
+  return "/" + pan123PickerPath.value.map((item) => item.name).join("/");
+}
+
+function pan123PickerTargetId() {
+  const last = pan123PickerPath.value[pan123PickerPath.value.length - 1];
+  return last ? last.fileId : 0;
+}
+
+async function loadPan123Picker(parentId: number, jumpTo = false) {
+  if (!jumpTo) {
+    // 下钻：把 parentId 追加为当前目录（根目录 id=0 不追加）
+  }
+  pan123PickerLoading.value = true;
+  try {
+    const data = await pan115HelperApi.pan123Browse(parentId);
+    pan123PickerDir.value = data.parentId || 0;
+    pan123PickerDirs.value = data.directories || [];
+    pan123PickerFiles.value = data.files || [];
+  } catch (error) {
+    notifyError(`读取 123 目录失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    pan123PickerLoading.value = false;
+  }
+}
+
+async function openPan123Picker() {
+  pan123PickerPath.value = [];
+  pan123PickerDirs.value = [];
+  pan123PickerFiles.value = [];
+  pan123PickerOpen.value = true;
+  // 若已配置目录 ID，跳到该目录方便直接确认；路径以当前配置为准
+  const savedId = Number(helperForm.pan123SourceDirId) || 0;
+  if (savedId) {
+    pan123PickerPath.value = [{ fileId: savedId, name: helperForm.pan123SourceDirPath ? helperForm.pan123SourceDirPath.split("/").filter(Boolean).pop() || "已选目录" : "已选目录" }];
+  }
+  await loadPan123Picker(pan123PickerTargetId(), true);
+}
+
+function pan123PickerEnterDir(item: Pan123BrowseItem) {
+  pan123PickerPath.value = [...pan123PickerPath.value, { fileId: item.fileId, name: item.name }];
+  loadPan123Picker(item.fileId);
+}
+
+function pan123PickerGoTo(index: number) {
+  const sliced = pan123PickerPath.value.slice(0, index + 1);
+  pan123PickerPath.value = sliced;
+  const target = sliced[sliced.length - 1];
+  loadPan123Picker(target ? target.fileId : 0, true);
+}
+
+function pan123PickerGoRoot() {
+  pan123PickerPath.value = [];
+  loadPan123Picker(0, true);
+}
+
+function pan123PickerConfirm() {
+  const id = pan123PickerTargetId();
+  helperForm.pan123SourceDirId = String(id);
+  helperForm.pan123SourceDirPath = pan123PickerPathText();
+  pan123PickerOpen.value = false;
+  notifySuccess(`已选择 123 网盘源目录${id ? `（ID ${id}）` : "（根目录）"}，记得保存配置`);
 }
 
 // ============ Cookie state (扫码) ============
@@ -1175,6 +1385,7 @@ onUnmounted(() => {
     <!-- ====================== Helper Tab ====================== -->
     <div v-show="tab === 'helper'" class="section-grid">
       <GlassCard
+        span="full"
         accent="group"
         icon="mdi-tools"
         title="115 助手"
@@ -1188,12 +1399,20 @@ onUnmounted(() => {
         <FormGrid>
           <v-switch v-model="helperForm.enabled" label="启用 115 助手" hide-details />
           <v-text-field v-model="helperForm.offlineTargetDirId" label="离线保存目录 ID" variant="outlined" density="compact" />
+          <v-text-field v-model="helperForm.directLinkRoot" label="直链根目录" placeholder="留空用默认 <数据目录>/directlink" variant="outlined" density="compact" />
+          <v-text-field v-model="helperForm.publicBaseUrl" label="公网基址" placeholder="https://域名（留空自动用请求地址）" variant="outlined" density="compact" />
+          <v-text-field v-model="helperForm.pan123SourceDirId" label="123 网盘源目录 ID" placeholder="网盘直链虚拟目录根目录 fileId（留空不启用）" variant="outlined" density="compact" />
           <v-text-field v-model.number="helperForm.requestIntervalMs" label="请求间隔毫秒" type="number" variant="outlined" density="compact" />
           <v-text-field v-model="helperForm.trashPassword" label="回收站密码" type="password" variant="outlined" density="compact" />
           <v-switch v-model="helperForm.dailyRecycleCleanupEnabled" label="每日自动清理回收站" hide-details />
           <v-text-field v-model="helperForm.dailyRecycleCleanupTime" label="每日清理时间" type="time" variant="outlined" density="compact" />
           <v-select v-model="helperForm.dailyRecycleCleanupTimeZone" :items="timeZones" label="清理时区" variant="outlined" density="compact" />
         </FormGrid>
+
+        <div class="button-row">
+          <v-btn variant="outlined" prepend-icon="mdi-folder-open-outline" @click="openPan123Picker">选择 123 网盘源目录…</v-btn>
+          <span v-if="helperForm.pan123SourceDirPath" class="picked-dir-path"><v-icon icon="mdi-folder-outline" size="16" />{{ helperForm.pan123SourceDirPath }}</span>
+        </div>
 
         <v-textarea
           v-model="helperForm.pan115Cookie"
@@ -1208,6 +1427,98 @@ onUnmounted(() => {
       </GlassCard>
 
       <GlassCard
+        span="full"
+        accent="success"
+        icon="mdi-link-variant"
+        title="直链离线（点对点）"
+        desc="把文件放入直链根目录生成 AList 式直链，批量提交 115 离线；适合点对点离线大文件。"
+      >
+        <template #actions>
+          <v-btn variant="text" :loading="dlinkLoading" @click="loadDLinkFiles">刷新直链文件</v-btn>
+          <v-btn color="primary" :loading="dlinkSubmitting" @click="submitDLinkOffline">提交选中离线</v-btn>
+        </template>
+
+        <div v-if="dlinkRoot" class="hub-status-line">
+          直链根目录：<code class="mono-value">{{ dlinkRoot }}</code> · 基址：{{ dlinkBaseUrl || "未配置" }}
+        </div>
+
+        <div v-if="!dlinkFiles.length && !dlinkLoading" class="empty-state">
+          <p>暂无直链文件。请先把文件放入上面的直链根目录，再点击「刷新直链文件」。</p>
+        </div>
+        <div v-else class="hub-offline-list">
+          <div v-for="file in dlinkFiles" :key="file.rel" class="hub-offline-row">
+            <v-checkbox
+              :model-value="dlinkSelected.has(file.rel)"
+              @update:model-value="toggleDLinkFile(file.rel)"
+              :label="file.name"
+              :subtitle="`${formatBytes(file.size)} · ${file.rel}`"
+              density="compact"
+              hide-details
+            />
+            <div class="button-row">
+              <v-btn size="small" variant="text" @click="copyDLink(file.url)">复制直链</v-btn>
+            </div>
+          </div>
+        </div>
+
+        <v-divider class="my-3" />
+        <div class="hub-form-section-title">
+          <v-icon icon="mdi-text-box-outline" size="18" />
+          <div><strong>粘贴 http(s) 直链</strong><span>可直接提交任意网盘 / AList 直链离线。</span></div>
+        </div>
+        <v-textarea
+          v-model="helperUrlsText"
+          label="http(s) 直链"
+          placeholder="每行一条 http(s) 直链"
+          :rows="3"
+          variant="outlined"
+          density="compact"
+        />
+        <div class="button-row">
+          <v-btn variant="outlined" :loading="dlinkSubmitting" @click="submitHelperUrls">提交直链离线</v-btn>
+        </div>
+        <div v-if="dlinkResultText" class="hub-status-line">{{ dlinkResultText }}</div>
+      </GlassCard>
+
+      <GlassCard
+        span="full"
+        accent="info"
+        icon="mdi-cloud-outline"
+        title="123 网盘直链（AList 式）"
+        desc="列出 123 网盘指定目录的文件，生成代理直链并提交 115 离线（后端代理取流，规避直链时效问题）。"
+      >
+        <template #actions>
+          <v-btn variant="text" :loading="pan123Loading" @click="loadPan123Files">刷新网盘文件</v-btn>
+          <v-btn color="primary" :loading="pan123Loading" @click="submitPan123Offline">提交选中离线</v-btn>
+        </template>
+
+        <div v-if="pan123SourceDir" class="hub-status-line">
+          123 源目录 ID：{{ pan123SourceDir }}<template v-if="helperForm.pan123SourceDirPath"> · 路径：{{ helperForm.pan123SourceDirPath }}</template><template v-if="pan123BaseUrl"> · 代理基址：{{ pan123BaseUrl }}</template>
+        </div>
+        <div v-else class="hub-status-line">未选择 123 源目录。</div>
+
+        <div v-if="!pan123Files.length && !pan123Loading" class="empty-state">
+          <p>暂无 123 网盘文件。请先在配置中填写「123 网盘源目录 ID」，再点击「刷新网盘文件」。</p>
+        </div>
+        <div v-else class="hub-offline-list">
+          <div v-for="file in pan123Files" :key="file.fileId" class="hub-offline-row">
+            <v-checkbox
+              :model-value="pan123Selected.has(file.fileId)"
+              @update:model-value="togglePan123File(file.fileId)"
+              :label="file.name"
+              :subtitle="`${formatBytes(file.size)} · ${file.rel}`"
+              density="compact"
+              hide-details
+            />
+            <div class="button-row">
+              <v-btn size="small" variant="text" @click="copyDLink(file.url)">复制直链</v-btn>
+            </div>
+          </div>
+        </div>
+      </GlassCard>
+
+      <GlassCard
+        span="full"
         accent="info"
         icon="mdi-flask-outline"
         title="助手测试"
@@ -1289,12 +1600,95 @@ onUnmounted(() => {
         </div>
       </GlassCard>
     </div>
+
+    <!-- ====================== 123 网盘源目录选择 ====================== -->
+    <v-dialog v-model="pan123PickerOpen" max-width="620">
+      <v-card class="dir-picker-card">
+        <v-card-title class="dir-picker-title">
+          <v-icon icon="mdi-folder-open-outline" size="22" class="mr-2" />
+          选择 123 网盘源目录
+        </v-card-title>
+        <v-card-text>
+          <div class="dir-picker-breadcrumb">
+            <v-btn size="small" variant="text" @click="pan123PickerGoRoot">根目录</v-btn>
+            <template v-for="(item, index) in pan123PickerPath" :key="item.fileId">
+              <v-icon icon="mdi-chevron-right" size="16" />
+              <v-btn size="small" variant="text" @click="pan123PickerGoTo(index)">{{ item.name }}</v-btn>
+            </template>
+          </div>
+          <div class="hub-status-line">
+            当前目录 ID：{{ pan123PickerDir || 0 }} · 点击文件夹进入下级，可多级下钻
+          </div>
+          <v-divider class="my-2" />
+          <div v-if="pan123PickerLoading" class="empty-state"><p>目录加载中…</p></div>
+          <div v-else-if="!pan123PickerDirs.length && !pan123PickerFiles.length" class="empty-state">
+            <p>此目录为空。可点击下方「选择此目录」将其设为源目录。</p>
+          </div>
+          <div v-else class="dir-picker-list">
+            <v-list-item
+              v-for="dir in pan123PickerDirs"
+              :key="dir.fileId"
+              :title="dir.name"
+              prepend-icon="mdi-folder"
+              append-icon="mdi-chevron-right"
+              @click="pan123PickerEnterDir(dir)"
+            />
+            <v-list-item
+              v-for="file in pan123PickerFiles"
+              :key="file.fileId"
+              :title="file.name"
+              :subtitle="formatBytes(file.size)"
+              prepend-icon="mdi-file-document-outline"
+            />
+          </div>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="pan123PickerOpen = false">取消</v-btn>
+          <v-btn color="primary" :disabled="pan123PickerLoading" @click="pan123PickerConfirm">选择此目录</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
 <style scoped>
 .hub-textarea {
   margin-top: 12px;
+}
+
+.picked-dir-path {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-top: 6px;
+}
+
+.dir-picker-title {
+  font-weight: 650;
+  display: flex;
+  align-items: center;
+}
+
+.dir-picker-breadcrumb {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-bottom: 6px;
+}
+
+.dir-picker-list {
+  max-height: 340px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
 }
 
 .button-row {

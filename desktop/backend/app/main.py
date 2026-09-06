@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -30,6 +30,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
 setup_logging(DATA_DIR)
 
+from .directlink import read_directlink_status, serve_directlink_file, submit_arbitrary_urls_offline, submit_directlink_offline
 from .pan115 import CODE_RE as PAN123_CODE_RE, empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
 from .pan115_cookie import (
     PAN115_QR_DEVICES,
@@ -49,6 +50,7 @@ from .pan123 import (
     parse_pan123_share_url,
 )
 from .pan115_transfer import extract_115_links
+from .panlink import browse_pan123_dir, list_pan123_links, proxy_pan123_download, submit_pan123_offline
 from .session_store import SessionStore, positive_user_ids
 from .submission import (
     build_submission_display_preview,
@@ -1168,6 +1170,14 @@ class TextActionRequest(BaseModel):
     targetUserId: Optional[int] = None
 
 
+class Pan115DirectLinkOfflineRequest(BaseModel):
+    keys: List[str] = Field(default_factory=list)
+
+
+class Pan115UrlOfflineRequest(BaseModel):
+    urls: List[str] = Field(default_factory=list)
+
+
 class TransferConfigRequest(BaseModel):
     enabled: bool = False
     pan115Cookie: str = ""
@@ -1656,6 +1666,112 @@ async def empty_pan115_helper_recycle() -> Dict[str, Any]:
     except Exception as error:
         raise HTTPException(status_code=400, detail=str(error))
     return {**result, "actionOk": bool(result.get("ok")), "ok": True}
+
+
+@app.get("/api/pan115-helper/dlinks")
+async def get_pan115_helper_dlinks(request: Request) -> Dict[str, Any]:
+    submission = store.read_submission_config()
+    helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+    if not helper.get("enabled"):
+        return {"ok": True, "enabled": False, "message": "115 助手未启用"}
+    try:
+        return read_directlink_status(helper, request)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.post("/api/pan115-helper/dlinks/offline")
+async def submit_pan115_helper_dlinks_offline(request: Pan115DirectLinkOfflineRequest, http_request: Request) -> Dict[str, Any]:
+    submission = store.read_submission_config()
+    helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+    try:
+        result = await submit_directlink_offline(helper, request.keys, http_request)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {**result, "actionOk": bool(result.get("ok")), "ok": True}
+
+
+@app.post("/api/pan115-helper/urls/offline")
+async def submit_pan115_helper_urls_offline(request: Pan115UrlOfflineRequest) -> Dict[str, Any]:
+    submission = store.read_submission_config()
+    helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+    try:
+        result = await submit_arbitrary_urls_offline(helper, request.urls)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {**result, "actionOk": bool(result.get("ok")), "ok": True}
+
+
+@app.get("/dlink/{rel:path}")
+async def get_directlink_file(rel: str) -> FileResponse:
+    submission = store.read_submission_config()
+    helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+    try:
+        return await serve_directlink_file(helper, rel)
+    except Exception as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+
+async def _authorized_pan123_client() -> Any:
+    """返回已授权的 123 OpenAPI 客户端（复用 123→115 搬运通道的授权登录态）。
+
+    直链代理 / 网盘列目录 / 推离线都依赖这个登录态；未授权时 create_status_pan123_client
+    会抛 RuntimeError，由调用方转成 HTTPException 呈现给前端。
+    """
+    return await transfer_service.create_status_pan123_client()
+
+
+@app.get("/dpan/123/{file_id}")
+async def proxy_pan123_file(file_id: int, request: Request):
+    submission = store.read_submission_config()
+    helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+    try:
+        client = await _authorized_pan123_client()
+        return await proxy_pan123_download(client, helper, file_id, request)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error))
+
+
+@app.get("/api/pan115-helper/pan123/dlinks")
+async def get_pan115_helper_pan123_dlinks(request: Request) -> Dict[str, Any]:
+    submission = store.read_submission_config()
+    helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+    try:
+        client = await _authorized_pan123_client()
+        return await list_pan123_links(client, helper, request)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.post("/api/pan115-helper/pan123/dlinks/offline")
+async def submit_pan115_helper_pan123_dlinks_offline(request: Pan115DirectLinkOfflineRequest, http_request: Request) -> Dict[str, Any]:
+    submission = store.read_submission_config()
+    helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
+    try:
+        client = await _authorized_pan123_client()
+        result = await submit_pan123_offline(client, helper, request.keys, http_request)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {**result, "actionOk": bool(result.get("ok")), "ok": True}
+
+
+@app.get("/api/pan115-helper/pan123/browse")
+async def browse_pan115_helper_pan123(parent_id: int = 0) -> Dict[str, Any]:
+    try:
+        client = await _authorized_pan123_client()
+        return await browse_pan123_dir(client, parent_id)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
 
 @app.get("/api/transfer/config")

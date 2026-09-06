@@ -637,6 +637,10 @@ DEFAULT_SUBMISSION_CONFIG.setdefault("pan115Helper", {
     "dailyRecycleCleanupTime": "03:30",
     "dailyRecycleCleanupTimeZone": "Asia/Shanghai",
     "requestIntervalMs": 2500,
+    "directLinkRoot": "",
+    "publicBaseUrl": "",
+    "pan123SourceDirId": "",
+    "pan123SourceDirPath": "",
 })
 DEFAULT_SUBMISSION_CONFIG.setdefault("telegramAdminUserIds", [])
 DEFAULT_SUBMISSION_CONFIG.setdefault("channelOwnerUserIds", [])

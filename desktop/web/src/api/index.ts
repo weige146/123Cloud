@@ -3,7 +3,12 @@ import type {
   AdminStatus,
   AccountCooldown,
   Pan115Device,
+  Pan115DirectLinksStatus,
+  Pan115HelperActionResult,
   Pan115HelperStatus,
+  Pan123DirectLinksStatus,
+  Pan123BrowseItem,
+  Pan123BrowseResult,
   SubmissionConfig,
   SubmissionDraft,
   SubmissionStatus,
@@ -109,6 +114,12 @@ export const pan115HelperApi = {
   status: () => api.get<Pan115HelperStatus>("/api/pan115-helper/status"),
   offline: (text: string) => api.post("/api/pan115-helper/offline", { text }),
   emptyRecycle: () => api.post("/api/pan115-helper/recycle/empty", {}),
+  dlinks: () => api.get<Pan115DirectLinksStatus>("/api/pan115-helper/dlinks"),
+  dlinksOffline: (keys: string[]) => api.post<Pan115HelperActionResult>("/api/pan115-helper/dlinks/offline", { keys }),
+  urlsOffline: (urls: string[]) => api.post<Pan115HelperActionResult>("/api/pan115-helper/urls/offline", { urls }),
+  pan123Dlinks: () => api.get<Pan123DirectLinksStatus>("/api/pan115-helper/pan123/dlinks"),
+  pan123DlinksOffline: (keys: string[]) => api.post<Pan115HelperActionResult>("/api/pan115-helper/pan123/dlinks/offline", { keys }),
+  pan123Browse: (parentId = 0) => api.get<Pan123BrowseResult>(`/api/pan115-helper/pan123/browse?parentId=${parentId || 0}`),
 };
 
 // ====== 115 搬运 ======

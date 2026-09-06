@@ -24,7 +24,7 @@ import {
   mdiTagMultiple, mdiTagMultipleOutline, mdiTagRemove, mdiTagTextOutline, mdiThemeLightDark, mdiTimerCog,
   mdiTools, mdiTrashCanOutline, mdiTrendingDown, mdiTrendingUp, mdiTruck, mdiVideo, mdiViewDashboardOutline,
   mdiVolumeHigh, mdiWeatherNight, mdiWhiteBalanceSunny,
-  mdiAccount, mdiAccountSwitchOutline, mdiCellphoneArrowDown, mdiChevronLeft, mdiCloudCheckOutline, mdiCloudSyncOutline, mdiConsole, mdiConsoleLine, mdiDatabaseOutline, mdiDockLeft, mdiFileHidden, mdiFlash, mdiFolderArrowRightOutline, mdiFolderOpenOutline, mdiLan, mdiLinkVariant, mdiLinkVariantOff, mdiMoonWaningCrescent, mdiOpenInNew, mdiPause, mdiPlay, mdiProgressDownload, mdiReload, mdiRestart, mdiServer, mdiTextBoxOutline, mdiTimerCogOutline, mdiTruckFast, mdiTuneVariant,
+  mdiAccount, mdiAccountSwitchOutline, mdiCellphoneArrowDown, mdiChevronLeft, mdiCloudCheckOutline, mdiCloudOutline, mdiCloudSyncOutline, mdiConsole, mdiConsoleLine, mdiDatabaseOutline, mdiDockLeft, mdiFileHidden, mdiFlash, mdiFolderArrowRightOutline, mdiFolderOpenOutline, mdiLan, mdiLinkVariant, mdiLinkVariantOff, mdiMoonWaningCrescent, mdiOpenInNew, mdiPause, mdiPlay, mdiProgressDownload, mdiReload, mdiRestart, mdiServer, mdiTextBoxOutline, mdiTimerCogOutline, mdiTruckFast, mdiTuneVariant,
 } from "@mdi/js";
 
 const iconPaths: Record<string, string> = {
@@ -165,6 +165,7 @@ const iconPaths: Record<string, string> = {
   "mdi-cellphone-arrow-down": mdiCellphoneArrowDown,
   "mdi-chevron-left": mdiChevronLeft,
   "mdi-cloud-check-outline": mdiCloudCheckOutline,
+  "mdi-cloud-outline": mdiCloudOutline,
   "mdi-cloud-sync-outline": mdiCloudSyncOutline,
   "mdi-console": mdiConsole,
   "mdi-console-line": mdiConsoleLine,
