@@ -14,6 +14,8 @@ import type {
   TransferTask,
   Channel,
   Routing,
+  TelegramSessionStartResult,
+  TelegramSessionVerifyResult,
 } from "./types";
 
 export interface MyChannelConfig {
@@ -62,6 +64,14 @@ export const submissionApi = {
     api.post<{ ok: boolean; preview: SubmissionDisplayPreview }>("/api/submission/display/preview", { config, sample }),
   status: () => api.get<SubmissionStatus>("/api/submission/status"),
   testBot: (token: string) => api.post<{ ok: boolean; message: string }>("/api/submission/test/bot", { token }),
+  testTelegramApi: (payload: { apiId: string; apiHash: string; session: string }) =>
+    api.post<{ ok: boolean; message: string }>("/api/submission/test/tg-api", payload),
+  startTelegramSession: (payload: { apiId: string; apiHash: string; phone: string }) =>
+    api.post<TelegramSessionStartResult>("/api/submission/telegram/session/start", payload),
+  verifyTelegramSession: (payload: { loginId: string; code: string; password?: string }) =>
+    api.post<TelegramSessionVerifyResult>("/api/submission/telegram/session/verify", payload),
+  cancelTelegramSession: (loginId: string) =>
+    api.post<{ ok: boolean }>("/api/submission/telegram/session/cancel", { loginId }),
   drafts: (limit = 100) => api.get<{ ok: boolean; drafts: SubmissionDraft[]; count: number }>(`/api/submission/drafts?limit=${limit}`),
   clearDrafts: () => api.delete<{ ok: boolean }>("/api/submission/drafts"),
   deleteDraft: (id: string) => api.delete<{ ok: boolean }>(`/api/submission/drafts/${encodeURIComponent(id)}`),

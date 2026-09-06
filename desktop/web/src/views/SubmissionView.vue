@@ -14,7 +14,7 @@ import SubmissionRoutingPanel from "@/components/SubmissionRoutingPanel.vue";
 
 const route = useRoute();
 const router = useRouter();
-const { state, writeSubmissionConfig, notifySuccess, notifyError, confirm } = useGlobalState();
+const { state, writeSubmissionConfig, notifySuccess, notifyError, confirm, loadStatus } = useGlobalState();
 
 // 「机器人」= Bot 连接/权限/草稿；「频道路由」= 各频道主账号的分发规则
 type SubmissionTab = "bot" | "routing";
@@ -197,6 +197,133 @@ async function testBot() {
   }
 }
 
+async function testTgApi() {
+  const session = String(form.tgSession ?? "").trim();
+  if (!session) {
+    notifyError("请先获取或填写 TG 用户 Session");
+    return;
+  }
+  tgMessage.value = "正在连接 Telegram…";
+  try {
+    const data = await submissionApi.testTelegramApi({
+      apiId: String(form.tgApiId ?? "").trim(),
+      apiHash: String(form.tgApiHash ?? "").trim(),
+      session,
+    });
+    tgMessage.value = data.message || "TG API 测试成功";
+    notifySuccess(tgMessage.value);
+  } catch (error) {
+    tgMessage.value = `TG API 测试失败：${error instanceof Error ? error.message : String(error)}`;
+    notifyError(tgMessage.value);
+  }
+}
+
+// ---- 获取 TG 用户 Session：手机号 → 验证码 → （可选）两步验证密码 ----
+type TgStage = "idle" | "code" | "password";
+const tgLogin = reactive({ phone: "", code: "", password: "" });
+const tgStage = ref<TgStage>("idle");
+const tgBusy = ref(false);
+const tgMessage = ref("");
+const tgLoginId = ref("");
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function resetTelegramLogin() {
+  const loginId = tgLoginId.value;
+  tgLoginId.value = "";
+  tgStage.value = "idle";
+  tgLogin.code = "";
+  tgLogin.password = "";
+  if (loginId) {
+    try {
+      await submissionApi.cancelTelegramSession(loginId);
+    } catch {
+      // 服务端会话可能已经过期，取消失败不用打断用户
+    }
+  }
+}
+
+async function requestTelegramCode() {
+  const apiId = String(form.tgApiId ?? "").trim();
+  const apiHash = String(form.tgApiHash ?? "").trim();
+  if (!apiId || !apiHash) {
+    notifyError("请先填写 TG API ID 和 API Hash");
+    return;
+  }
+  if (!String(tgLogin.phone ?? "").trim()) {
+    notifyError("请填写手机号（带国际区号，例如 +8613800000000）");
+    return;
+  }
+  tgBusy.value = true;
+  tgMessage.value = "正在发送验证码…";
+  try {
+    if (tgLoginId.value) {
+      await submissionApi.cancelTelegramSession(tgLoginId.value).catch(() => undefined);
+      tgLoginId.value = "";
+    }
+    const data = await submissionApi.startTelegramSession({
+      apiId,
+      apiHash,
+      phone: String(tgLogin.phone ?? "").trim(),
+    });
+    tgLoginId.value = data.loginId || "";
+    tgLogin.code = "";
+    tgLogin.password = "";
+    tgStage.value = "code";
+    tgMessage.value = data.message || "验证码已发送，请查收";
+    notifySuccess("验证码已发送");
+  } catch (error) {
+    tgMessage.value = `获取验证码失败：${errorMessage(error)}`;
+    notifyError(tgMessage.value);
+  } finally {
+    tgBusy.value = false;
+  }
+}
+
+async function verifyTelegramLogin() {
+  if (!tgLoginId.value) {
+    notifyError("请先点击「获取验证码」");
+    return;
+  }
+  if (!String(tgLogin.code ?? "").trim()) {
+    notifyError("请填写 Telegram 发来的验证码");
+    return;
+  }
+  tgBusy.value = true;
+  tgMessage.value = "正在登录…";
+  try {
+    const data = await submissionApi.verifyTelegramSession({
+      loginId: tgLoginId.value,
+      code: String(tgLogin.code ?? "").trim(),
+      password: String(tgLogin.password ?? "").trim(),
+    });
+    if (data.needPassword) {
+      tgStage.value = "password";
+      tgMessage.value = data.message || "该账号开启了两步验证，请输入云密码";
+      return;
+    }
+    if (data.session) form.tgSession = data.session;
+    if (data.apiId) form.tgApiId = String(data.apiId);
+    if (data.apiHash) form.tgApiHash = String(data.apiHash);
+    tgLoginId.value = "";
+    tgStage.value = "idle";
+    tgLogin.code = "";
+    tgLogin.password = "";
+    tgMessage.value = data.message || "Session 已获取并保存";
+    // 后端已经写库，这里回读一次让顶部状态与配置同步；
+    // 放在 loadStatus 之后再提示，避免被"后端连接正常"的 toast 顶掉
+    await loadStatus();
+    notifySuccess(tgMessage.value);
+  } catch (error) {
+    tgMessage.value = `登录失败：${errorMessage(error)}`;
+    notifyError(tgMessage.value);
+  } finally {
+    tgBusy.value = false;
+  }
+}
+
 onMounted(() => {
   refreshDrafts();
 });
@@ -252,6 +379,7 @@ onMounted(() => {
       >
         <template #actions>
           <v-btn variant="text" @click="testBot">测试 Bot</v-btn>
+          <v-btn variant="text" @click="testTgApi">测试 TG API</v-btn>
           <v-btn color="primary" :loading="saving" @click="save">
             {{ state.loaded ? "保存" : "读取中…" }}
           </v-btn>
@@ -319,6 +447,64 @@ onMounted(() => {
               density="compact"
               hide-details
             />
+          </FormField>
+          <FormField
+            :full="true"
+            label="获取 TG 用户 Session"
+            hint="在客户端里直接登录 Telegram 账号拿 Session：填手机号 → 收验证码 → 登录成功自动填入上方并保存，不用再去别处跑脚本粘贴。"
+          >
+            <div class="tg-login">
+              <div class="tg-login-row">
+                <v-text-field
+                  v-model="tgLogin.phone"
+                  placeholder="+8613800000000"
+                  variant="outlined"
+                  density="compact"
+                  hide-details
+                  :disabled="tgBusy || tgStage !== 'idle'"
+                  @keyup.enter="requestTelegramCode"
+                />
+                <v-btn
+                  v-if="tgStage === 'idle'"
+                  color="primary"
+                  variant="tonal"
+                  :loading="tgBusy"
+                  @click="requestTelegramCode"
+                >
+                  <v-icon start>mdi-message-outline</v-icon>
+                  获取验证码
+                </v-btn>
+                <v-btn v-else variant="text" :disabled="tgBusy" @click="resetTelegramLogin">取消登录</v-btn>
+              </div>
+              <div v-if="tgStage !== 'idle'" class="tg-login-row">
+                <v-text-field
+                  v-model="tgLogin.code"
+                  placeholder="Telegram 发来的验证码"
+                  variant="outlined"
+                  density="compact"
+                  hide-details
+                  :disabled="tgBusy"
+                  @keyup.enter="verifyTelegramLogin"
+                />
+                <v-btn color="primary" :loading="tgBusy" @click="verifyTelegramLogin">
+                  <v-icon start>mdi-login</v-icon>
+                  登录并生成 Session
+                </v-btn>
+              </div>
+              <v-text-field
+                v-if="tgStage === 'password'"
+                v-model="tgLogin.password"
+                type="password"
+                autocomplete="new-password"
+                placeholder="两步验证密码（云密码）"
+                variant="outlined"
+                density="compact"
+                hide-details
+                :disabled="tgBusy"
+                @keyup.enter="verifyTelegramLogin"
+              />
+              <div v-if="tgMessage" class="tg-login-message">{{ tgMessage }}</div>
+            </div>
           </FormField>
         </FormGrid>
         <div class="status-line mono-value">{{ statusText }}</div>
@@ -413,6 +599,31 @@ onMounted(() => {
   border-radius: var(--radius-sm);
   background: var(--glass-bg-3);
   border: 1px solid var(--glass-border-3);
+  color: var(--text-secondary);
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.tg-login {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tg-login-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.tg-login-row > :first-child {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.tg-login-message {
+  font-size: 11.5px;
   color: var(--text-secondary);
   line-height: 1.6;
   word-break: break-all;

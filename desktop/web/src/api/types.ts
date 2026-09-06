@@ -114,6 +114,36 @@ export interface TelegramApi {
   session?: string;
 }
 
+export interface TelegramAccount {
+  userId?: number;
+  username?: string;
+  displayName?: string;
+  phone?: string;
+}
+
+/** 第一步：发送验证码的结果。 */
+export interface TelegramSessionStartResult {
+  ok: boolean;
+  loginId?: string;
+  phone?: string;
+  delivery?: string;
+  expiresInSeconds?: number;
+  message?: string;
+}
+
+/** 第二步：验证码换 Session 的结果；needPassword 时需要补两步验证密码再提交一次。 */
+export interface TelegramSessionVerifyResult {
+  ok: boolean;
+  loginId?: string;
+  needPassword?: boolean;
+  session?: string;
+  apiId?: string;
+  apiHash?: string;
+  account?: TelegramAccount | null;
+  saved?: boolean;
+  message?: string;
+}
+
 export interface Templates {
   shareName?: string;
   shareUrl?: string;

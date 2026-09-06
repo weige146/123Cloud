@@ -73,6 +73,13 @@ from .submission import (
     telegram_message_text,
     telegram_user_allowed,
 )
+from .telegram_history import TelegramHistoryCleaner, reset_telegram_client_state
+from .telegram_session import (
+    TelegramLoginError,
+    cancel_login,
+    start_login,
+    verify_code,
+)
 from .transfer_service import PAN115_ACCOUNT_COOLDOWN_MS, TransferService
 
 
@@ -1122,6 +1129,28 @@ class BotTestRequest(BaseModel):
     token: str = ""
 
 
+class TelegramApiTestRequest(BaseModel):
+    apiId: str = ""
+    apiHash: str = ""
+    session: str = ""
+
+
+class TelegramSessionStartRequest(BaseModel):
+    apiId: str = ""
+    apiHash: str = ""
+    phone: str = ""
+
+
+class TelegramSessionVerifyRequest(BaseModel):
+    loginId: str = ""
+    code: str = ""
+    password: str = ""
+
+
+class TelegramSessionCancelRequest(BaseModel):
+    loginId: str = ""
+
+
 class OwnUserChannelConfigRequest(BaseModel):
     """Configuration submitted from the Telegram Web App for the current user only."""
 
@@ -1431,6 +1460,65 @@ async def test_submission_bot(request: BotTestRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail=str(data.get("description") or f"Telegram {response.status_code}"))
     result = data.get("result") if isinstance(data.get("result"), dict) else {}
     return {"ok": True, "message": f"Bot 已连接：{result.get('username') or result.get('first_name') or 'unknown'}", "result": result}
+
+
+@app.post("/api/submission/test/tg-api")
+async def test_submission_telegram_api(request: TelegramApiTestRequest) -> Dict[str, Any]:
+    """用当前配置的用户 Session 连一次 Telegram，验证旧帖清理能不能用。"""
+    try:
+        message = await TelegramHistoryCleaner().test({
+            "apiId": str(request.apiId or "").strip(),
+            "apiHash": str(request.apiHash or "").strip(),
+            "session": str(request.session or "").strip(),
+        })
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error))
+    return {"ok": True, "message": message}
+
+
+@app.post("/api/submission/telegram/session/start")
+async def start_telegram_session(request: TelegramSessionStartRequest) -> Dict[str, Any]:
+    """第一步：给手机号发登录验证码。"""
+    try:
+        return await start_login(request.apiId, request.apiHash, request.phone)
+    except TelegramLoginError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error))
+
+
+@app.post("/api/submission/telegram/session/verify")
+async def verify_telegram_session(request: TelegramSessionVerifyRequest) -> Dict[str, Any]:
+    """第二步：验证码（+ 两步验证密码）换 Session，成功后写回投稿配置。"""
+    try:
+        result = await verify_code(request.loginId, request.code, request.password)
+    except TelegramLoginError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error))
+
+    session = str(result.get("session") or "").strip()
+    if session:
+        config = store.read_submission_config()
+        telegram_api = config.get("telegramApi") if isinstance(config.get("telegramApi"), dict) else {}
+        telegram_api = {
+            **telegram_api,
+            "apiId": str(result.get("apiId") or telegram_api.get("apiId") or "").strip(),
+            "apiHash": str(result.get("apiHash") or telegram_api.get("apiHash") or "").strip(),
+            "session": session,
+        }
+        config["telegramApi"] = telegram_api
+        store.write_submission_config(config)
+        # 旧帖清理用的 client 单例记着旧 session，换 session 后必须让它重建
+        reset_telegram_client_state()
+        result["saved"] = True
+    return result
+
+
+@app.post("/api/submission/telegram/session/cancel")
+async def cancel_telegram_session(request: TelegramSessionCancelRequest) -> Dict[str, Any]:
+    """放弃进行中的登录（断开连接、丢弃验证码会话）。"""
+    return await cancel_login(request.loginId)
 
 
 @app.post("/api/submission/submit")

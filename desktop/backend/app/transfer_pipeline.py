@@ -559,7 +559,8 @@ class OfflineDownloadManager:
         transfer_config = self.pipeline.config
         poll_ms = max(2000, int(transfer_config.get("offlinePollMs") or 5000))
         max_polls = max(1, int(transfer_config.get("offlineMaxPolls") or 240))
-        last_progress_log_ms = 0.0
+        # 心跳：不写日志，只用来定期回写任务、及时感知"任务被删除/取消"
+        last_check_ms: Optional[float] = None
 
         await self.fill()
         while True:
@@ -567,7 +568,7 @@ class OfflineDownloadManager:
             if unresolved == 0:
                 break
             inflight = self.inflight_items()
-            progressed = bool(self.pending)
+            progressed = False
             for item in inflight:
                 file = item.file
                 candidate_names = _offline_candidate_names(file)
@@ -643,18 +644,12 @@ class OfflineDownloadManager:
             if self.pending:
                 await self.fill()
 
-            done_count = len(self.items) - self.unresolved_count()
+            # 等待过程不写"进行中"心跳日志：默认 15 秒一轮的检查提示会把
+            # 每个文件的成功/失败信息淹掉。这里只在落盘状态变化时存档，
+            # 另外每 60 秒静默检查一次，保证"删除/取消任务"能及时生效。
             now_ms = time.monotonic() * 1000
-            if progressed or now_ms - last_progress_log_ms >= 60_000:
-                waiting = len(self.inflight_items())
-                queued = len(self.pending)
-                queue_text = f"，排队中 {queued}" if queued else ""
-                _add_task_log(
-                    task, "info",
-                    f"离线下载进行中：已完成 {done_count}/{len(self.items)}，"
-                    f"正在下载 {waiting}{queue_text}，{poll_ms // 1000} 秒后再检查",
-                )
-                last_progress_log_ms = now_ms
+            if progressed or last_check_ms is None or now_ms - last_check_ms >= 60_000:
+                last_check_ms = now_ms
                 if not await service._save_transfer_task(task):
                     raise TaskCancelled()
             await _delay(poll_ms)

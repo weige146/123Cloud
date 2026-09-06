@@ -34,7 +34,7 @@ Windows 包无法在 macOS 上交叉构建（PyInstaller 限制），由 CI 在 
   - 例：线上现在是 `1.2.4`，本次开发/发布就是 `1.2.5`；再下一次 `1.2.6`。
   - 禁止跳号（`1.2.4 → 1.3.0`）、禁止回退、禁止与线上版本持平。
 - 每次改动脚本准备发布前，先打开上面的 Greasy Fork 页面确认「版本」字段的当前线上值（以页面元信息的"版本：x.y.z"为准，不要相信页面正文/文档里手写的版本号，那里可能过时），再据此 +1 写回 `@version`。
-- 当前线上版本：`1.2.4`（更新于 2026-09-02），因此下一版为 **`1.2.5`**。
+- 当前线上版本：`1.2.7`（核对于 2026-09-05），本地已就绪待发布版本为 **`1.2.8`**（TMDB 英文别名识别修复）。
 
 ## 架构备忘
 
@@ -42,5 +42,7 @@ Windows 包无法在 macOS 上交叉构建（PyInstaller 限制），由 CI 在 
 - `desktop/backend/app/transfer_service.py` — 搬运任务调度门面：入队、去重、并发、暂停窗口、115 账号池健康、直链轮换、通知钩子。
 - `desktop/backend/app/transfer_pipeline.py` — 单次搬运的六阶段管线：解析 → 规划 → 秒传 → 离线 → 等待 → 收尾；`OfflineDownloadManager` 滚动提交 + 统一等待（同时在 123 排队的离线任务数上限 = 后台"并发"配置 1-5，完成一个自动补交；完成判定 = 列目录 + 大小比对）。
 - `desktop/backend/app/logsetup.py` — 统一日志：控制台 + 落盘轮转 + 内存环形缓冲（`GET /api/logs`）。应用日志必须是**大白话流程叙述**，第三方库一律降噪到 WARNING。
+- `desktop/backend/app/telegram_session.py` — TG 用户 Session 获取：手机号 → 验证码 →（可选两步验证密码）→ StringSession，登录会话只在内存里活 10 分钟。配套接口在 main.py：`/api/submission/telegram/session/start|verify|cancel`；登录成功后 session 由后端直接写回投稿配置的 `telegramApi`，并调 `reset_telegram_client_state()` 让旧帖清理的 client 单例重建。
+- 离线等待阶段**不打印心跳日志**：后台「离线轮询间隔」默认 15 秒，每轮一条「…秒后再检查」会把每个文件的成功/失败全部淹掉。现在只保留成功/失败；每 60 秒做一次静默存档，仅用于及时感知任务被删除/取消。
 - Telegram 有两条通道：**投稿入口走 HTTP**（油猴脚本 `POST /api/submission/submit`，与后台共用 `route_submission_text` 分流），**最小化轮询**（`telegram_callback_polling_loop`）只处理草稿预览按钮回调和按钮触发的后续输入，不接收投稿文本；搬运任务通知、投稿预览、频道发布均为出站。
 - 油猴脚本（`油猴脚本/123-helper.user.js`）不改动：它对 `/api/submission/submit` 的响应有硬校验（`ok===true` 且 `draftCount`、`sentCount` 必须等于批次条数），后端必须保持这个响应契约。
