@@ -58,6 +58,13 @@ const routes: RouteRecordRaw[] = [
     meta: { title: "115 Cookie", desc: "扫码获取 115 Cookie。", icon: "mdi-cookie" },
   },
   {
+    path: "/admin/pan115-pool",
+    name: "pan115-pool",
+    component: () => import("@/views/Pan115HubView.vue"),
+    props: { initialTab: "pool" },
+    meta: { title: "秒传池", desc: "搜索共享池内容目录，SHA1 秒传到 123 云盘（管理员 Token 专用）。", icon: "mdi-database-search" },
+  },
+  {
     path: "/admin/settings",
     name: "settings",
     component: () => import("@/views/SettingsView.vue"),

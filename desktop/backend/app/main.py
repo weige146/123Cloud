@@ -52,6 +52,7 @@ from .pan123 import (
 from .pan115_transfer import extract_115_links
 from .panlink import browse_pan123_dir, list_pan123_links, proxy_pan123_download, submit_pan123_offline
 from .session_store import SessionStore, positive_user_ids
+from . import sha1_cloud, sha1_pool
 from .submission import (
     build_submission_display_preview,
     clear_submission_drafts,
@@ -164,6 +165,8 @@ store = SessionStore(DATA_DIR)
 pan123 = Pan123Client()
 transfer_service = TransferService(store)
 logger = logging.getLogger(__name__)
+# 恢复设置页里保存的秒传池 Token 覆盖（无则用安装包内置的分发 Token）
+sha1_cloud.set_pool_token_override(str(store.read_value("sha1PoolTokenOverride") or "") or None)
 pan115_recycle_cleanup_task: Optional[asyncio.Task[None]] = None
 telegram_callback_polling_task: Optional[asyncio.Task[None]] = None
 PAN123_COPY_PASSWORD_PENDING_PREFIX = "telegram_pan123_copy_password:"
@@ -1212,6 +1215,15 @@ class Transfer123to115TaskRequest(BaseModel):
     targetUserId: Optional[int] = None
 
 
+class PoolReuseRequest(BaseModel):
+    dirId: str = "0"
+    items: List[Dict[str, Any]] = []
+
+
+class PoolTokenRequest(BaseModel):
+    token: str = ""
+
+
 class Pan115QrSessionRequest(BaseModel):
     device: str = "alipaymini"
 
@@ -1823,6 +1835,67 @@ async def create_pan123to115_transfer_task(request: Transfer123to115TaskRequest)
     except Exception as error:
         raise HTTPException(status_code=400, detail=str(error))
     return {"ok": True, "task": task}
+
+
+@app.get("/api/pool/search")
+async def search_sha1_pool(keyword: str = "", limit: int = 50) -> Dict[str, Any]:
+    """秒传池目录搜索（仅管理员 Token 可用，守则见 sha1_pool 模块注释）。"""
+    return await sha1_pool.pool_search_client.search(keyword, limit)
+
+
+def _mask_token(token: str) -> Optional[str]:
+    token = str(token or "").strip()
+    return f"{token[:8]}…" if len(token) > 12 else None
+
+
+@app.get("/api/pool/token")
+async def read_pool_token() -> Dict[str, Any]:
+    override = str(store.read_value("sha1PoolTokenOverride") or "").strip()
+    return {
+        "override": bool(override),
+        "overridePreview": _mask_token(override),
+        "defaultPreview": _mask_token(str(os.environ.get("SHA1_POOL_API_TOKEN") or "")),
+    }
+
+
+@app.post("/api/pool/token")
+async def write_pool_token(request: PoolTokenRequest) -> Dict[str, Any]:
+    token = str(request.token or "").strip()
+    if len(token) < 20:
+        raise HTTPException(status_code=400, detail="Token 看起来不对：长度应不少于 20 个字符")
+    store.write_value("sha1PoolTokenOverride", token)
+    sha1_cloud.set_pool_token_override(token)
+    sha1_pool.pool_search_client.reset_state()
+    logger.info("秒传池 Token 已切换为自定义 Token（前缀 %s…），目录搜索已按新 Token 权限工作", token[:8])
+    return {"ok": True, "override": True, "overridePreview": _mask_token(token)}
+
+
+@app.delete("/api/pool/token")
+async def reset_pool_token() -> Dict[str, Any]:
+    store.delete_value("sha1PoolTokenOverride")
+    sha1_cloud.set_pool_token_override(None)
+    sha1_pool.pool_search_client.reset_state()
+    logger.info("秒传池 Token 已重置为安装包内置的默认 Token")
+    return {"ok": True, "override": False}
+
+
+@app.post("/api/pool/reuse")
+async def reuse_sha1_pool_items(request: PoolReuseRequest) -> Dict[str, Any]:
+    try:
+        client = await _authorized_pan123_client()
+        results = await sha1_pool.reuse_via_sha1(client, str(request.dirId or "0"), request.items)
+    except HTTPException:
+        raise
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    hit = sum(1 for item in results if item.get("ok"))
+    logger.info(
+        "秒传池秒传完成：成功 %d/%d → 123 目录 %s（未命中的内容 123 已不存在）",
+        hit, len(results), str(request.dirId or "0"),
+    )
+    return {"ok": True, "results": results}
 
 
 @app.post("/api/transfer/kick")

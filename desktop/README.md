@@ -1,96 +1,81 @@
-# 123Cloud Desktop（Electron 壳）
+# 123Cloud Desktop（桌面客户端）
 
-把 123Cloud 的 Telegram 投稿、115 搬运、115 助手、115 Cookie 打包成 Windows / macOS 独立桌面应用。
+123Cloud 的 Windows / macOS 桌面应用：Electron 壳 + Python 后端（FastAPI）+ 液态玻璃前端，把网盘搬运、投稿发布等能力收进一个客户端。
 
-## 架构
+## 功能介绍
 
-```
-Electron 主进程 (electron/main.cjs)
- ├─ 单实例锁 → 选空闲端口 → 启动 PyInstaller 侧车 cloudgateway
- ├─ 轮询 /api/health 就绪后 → 窗口加载 http://127.0.0.1:{port}/admin
- └─ 退出时 SIGTERM 侧车；侧车崩溃按指数退避自动重启（≤5 次）
-PyInstaller 侧车 (backend.spec → backend-dist/cloudgateway/)
- └─ FastAPI 后端原样打包，内部托管前端 SPA
-前端 (../web) — 液态玻璃 UI，浏览器与桌面共用
-```
+### 115 → 123 搬运
 
-- 侧车只监听 `127.0.0.1`，端口由壳动态注入（`CLOUD123_PORT`），也可在应用「设置 → 服务端口」固定。
-- 数据目录由壳注入（`DATA_DIR`）：macOS `~/Library/Application Support/123Cloud/`，Windows `%APPDATA%/123Cloud/`。
-- 运行日志在应用「设置 → 运行日志」实时查看（内存环形缓冲，最近 10000 行），同时轮转落盘到 `DATA_DIR/logs/backend.log`（5MB×3 份），重启后仍可排查。
+把 115 分享链接 / 目录自动搬到 123 云盘，六阶段管线：解析 → 规划 → 秒传 → 离线下载 → 统一等待 → 收尾。
 
-## 开发模式
+- SHA1 / MD5 秒传优先，秒不动的自动滚动提交 123 离线下载（并发 1-5 可配，完成一个补交一个）
+- 断点恢复、超时自动重提、任务去重、失败重试
+- 115 多账号 Cookie 池轮换，失效自动冷却换号
+- 完成后可选自动删除 115 源文件（独立开关，安全闸门保护）
+
+### 123 → 115 反向搬运
+
+把 123 云盘的文件反向搬回 115：按内容指纹反查 115 SHA1，直接秒传入 115，无需重新下载上传。
+
+### 共享 SHA1 秒传池（默认启用）
+
+所有用户的搬运成果（内容指纹 + 文件名）自动进入共享池：你搬过的内容，别人搬运时直接秒传命中，反之亦然。
+
+- 安装即用，零配置；每个用户独立 API Token，独立限流、可单独撤销
+- 管理员 Token 的客户端额外开放「秒传池」入口（115 中心 → 秒传池）：搜索共享池内容目录，勾选后直接 SHA1 秒传到指定 123 文件夹
+- 密钥在「设置 → 秒传池密钥」管理：默认用安装包内置的分发 Token（只加速搬运、无法搜索目录），粘贴管理员 Token 即可解锁搜索，「重置」恢复默认
+- 共享池命中的秒传不写本地学习表、不自动删除 115 源文件（防投毒护栏）
+- 服务异常自动熔断、静默降级，只影响秒传加速，不影响搬运本身
+- 本地学习表始终兜底
+
+### Telegram 投稿机器人
+
+- 123 分享链接 / 秒传链接自动生成投稿草稿：TMDB 识别、豆瓣评分、海报、资源信息自动补齐
+- 按发布组规则路由到对应 Telegram 频道，草稿确认后一键发布
+- 配套油猴脚本（`油猴脚本/123-helper.user.js`）：在 123 网页端点分享即可推送投稿 / 触发搬运
+- 应用内 TG Session 登录，草稿预览按钮交互
+
+### 115 助手与 Cookie
+
+- 单账号提交离线磁力 / ed2k 任务，定时清理 115 回收站
+- 扫码获取 115 Cookie，写入助手或搬运 Cookie 池
+
+### 运行日志
+
+应用内「设置 → 运行日志」实时查看（内存环形缓冲最近 10000 行），同时轮转落盘（5MB × 3 份），重启后仍可排查。
+
+## 安装
+
+从 [Releases](https://github.com/weige146/123Cloud/releases) 下载对应平台安装包：
+
+- **macOS**：未签名，首次打开右键 →「打开」→ 再点「打开」；若提示已损坏，执行 `xattr -cr "/Applications/123Cloud.app"`
+- **Windows**：SmartScreen 弹窗时点「更多信息」→「仍要运行」
+
+## 开发与构建
 
 ```bash
-# 准备后端虚拟环境
-cd backend
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cd ..
+# 后端（Python 3.9+）
+cd desktop/backend
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -e '.[dev]'
+.venv/bin/python -m pytest tests/ -q
 
-# 安装桌面依赖并启动（venv 后端(:8321) → Vite(:5174, HMR) → Electron 窗口）
-npm install
-npm run dev
-```
+# 一键起开发环境（venv 后端 :8321 → Vite :5174 → Electron 窗口）
+cd desktop && npm install && npm run dev
 
-## 本地构建（先打包实测，再提交）
-
-> 项目约束：改动完成后先本地打包交给维护者实测，**实测确认前不 commit / push / 打 tag**（见根目录 [AGENTS.md](../AGENTS.md)）。
-
-```bash
-# 1. 前端构建（产物会内嵌进后端二进制）
-cd web && npm ci && npm run build && cd ..
-
-# 2. PyInstaller 打后端侧车 → backend-dist/cloudgateway/
+# 本地出包：前端 → PyInstaller 侧车 → Electron
+cd desktop/web && npm ci && npm run build && cd ..
 python3 -m PyInstaller backend.spec --noconfirm --distpath backend-dist --workpath backend-build
-
-# 3. Electron 出包 → release/123Cloud-<版本>-macOS-arm64.dmg
 npm ci && npm run dist:mac
 ```
 
-推送 `main`（或打 `v*` 标签）后，[.github/workflows/ci.yml](../.github/workflows/ci.yml) 会跑同样的构建：
+推送 `main` 或打 `v*` 标签后，CI 自动跑测试并在 macOS / Windows 两个 runner 出包，tag 推送自动创建公开 Release。改动先本地打包实测、验收通过后再提交（见根目录 [AGENTS.md](../AGENTS.md)）。
 
-1. `tests` job 先跑后端 pytest 与前端构建校验；
-2. `package` job 在 macOS 与 Windows 两个 runner 上分别出包（PyInstaller 无法交叉编译，Windows 版必须由 Windows runner 构建）；
-3. 到仓库 **Actions → 对应运行 → Artifacts** 下载 `123Cloud-macOS`（DMG）与 `123Cloud-Windows`（安装器 exe）。
-
-## 首次打开（未签名）
-
-安装包在 CI 上做了 ad-hoc 签名（无付费开发者证书），首次打开会提示「无法验证开发者」：
-
-- **macOS**：右键 App →「打开」→ 再点「打开」即可；若仍提示已损坏（旧版安装包），执行 `xattr -cr "/Applications/123Cloud.app"`。
-- **Windows**：SmartScreen 弹窗时点「更多信息」→「仍要运行」。
-
-## 接入签名（可选）
-
-在 GitHub 仓库 Secrets 配好证书后，于 workflow 的 electron-builder 步骤注入环境变量：
-
-- macOS：`CSC_LINK` / `CSC_KEY_PASSWORD`（Developer ID 证书），并去掉 `electron-builder.yml` 中的 `identity: null`。
-- Windows：`CSC_LINK` 指向 `.pfx` 代码签名证书。
-
-## 目录说明
-
-### 源代码与配置（保留，不要删）
+## 主要目录
 
 | 路径 | 说明 |
 | --- | --- |
-| `backend/` | FastAPI 后端源码（`python -m app` 即侧车入口，含 tests/） |
-| `web/` | Vue 3 液态玻璃前端源码（`dist/` 为其构建产物） |
-| `electron/` | Electron 主进程 / 侧车管理 / preload / 开发编排 |
-| `build/` | 应用图标；`icon-source.jpg` 是 logo 源图，换图标就替换它再跑 `build/generate_icon.py` |
-| `backend.spec` | PyInstaller 打包配置（内嵌前端） |
-| `sidecar_entry.py` | 侧车打包入口 |
-| `electron-builder.yml` | 安装包打包配置（DMG / NSIS） |
-| `package.json` / `package-lock.json` | Electron 依赖清单 |
-
-仓库根目录的 `油猴脚本/123-helper.user.js` 是配套的 123 云盘网页增强脚本（Tampermonkey 安装），可把网页端的分享链接一键推送为客户端投稿草稿。
-
-### 自动生成（删了也没关系，CI / 构建流程会重新生成）
-
-| 路径 | 是什么 | 如何再生成 |
-| --- | --- | --- |
-| `backend-build/` | PyInstaller 中间产物 | 出包流程自动生成 |
-| `backend-dist/` | 打包好的后端侧车（electron-builder 打包时会用到） | 出包流程自动生成 |
-| `release/` | 安装包产物（DMG / exe） | 出包流程自动生成 |
-| `web/dist/` | 前端构建产物 | `cd web && npm run build` |
-| `web/node_modules/`、`node_modules/` | npm 依赖 | `npm install` |
-| `data/` | 开发模式跑后端时的本地数据（桌面应用用的是系统数据目录，与此无关） | 可直接删除 |
+| `backend/` | FastAPI 后端源码（含 tests/） |
+| `web/` | Vue 3 前端源码 |
+| `electron/` | Electron 主进程 / 侧车管理 |
+| `backend.spec` / `electron-builder.yml` | 打包配置 |
+| `build/` | 应用图标 |

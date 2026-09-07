@@ -60,11 +60,12 @@ const navigation: NavigationItem[] = [
     shortLabel: "115",
     icon: "mdi-cloud-sync",
     path: "/admin/transfer",
-    routes: ["/admin/transfer", "/admin/pan115-helper", "/admin/pan115-cookie"],
+    routes: ["/admin/transfer", "/admin/pan115-helper", "/admin/pan115-cookie", "/admin/pan115-pool"],
     children: [
       { label: "115 搬运", path: "/admin/transfer", icon: "mdi-cloud-sync" },
       { label: "115 助手", path: "/admin/pan115-helper", icon: "mdi-tools" },
       { label: "115 Cookie", path: "/admin/pan115-cookie", icon: "mdi-cookie" },
+      { label: "秒传池", path: "/admin/pan115-pool", icon: "mdi-database-search" },
     ],
   },
   { key: "settings", label: "设置", shortLabel: "设置", icon: "mdi-cog-outline", path: "/admin/settings", routes: ["/admin/settings"] },

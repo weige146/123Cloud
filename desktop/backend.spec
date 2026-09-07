@@ -18,6 +18,9 @@ a = Analysis(
     datas=[
         # The frozen sidecar serves the admin SPA itself at /admin.
         (os.path.join(ROOT, "web", "dist"), "adminweb"),
+        # 共享SHA1库的 CA 证书（公钥可公开），随侧车分发；
+        # Electron 启动侧车时若未设置 SHA1DB_SSL_CA 会自动指向它。
+        (os.path.join(ROOT, "backend", "assets", "ca.pem"), "."),
     ],
     hiddenimports=[
         "uvicorn",
@@ -39,6 +42,7 @@ a = Analysis(
         "telethon",
         "zoneinfo",
         "tzdata",
+        "pymysql",
     ],
     hookspath=[],
     hooksconfig={},

@@ -88,6 +88,21 @@ jobs:
       - name: Install desktop dependencies
         working-directory: desktop
         run: npm ci
+      - name: Write shared sha1db config
+        working-directory: desktop
+        shell: bash
+        # 共享秒传池内置配置：Secret SHA1_POOL_ENV_FILE 的内容原样写进 sha1db.env
+        # （至少含 SHA1_POOL_API_URL / SHA1_POOL_API_TOKEN，随安装包分发）。
+        # 注意：只能放普通用户 Token，管理员 Token 绝不进安装包。
+        # 没配 Secret 就写占位，共享库自动停用。文件含凭据，只在构建机上存在，绝不进 git。
+        env:
+          SHA1_POOL_ENV_FILE: ${{ secrets.SHA1_POOL_ENV_FILE }}
+        run: |
+          if [ -n "$SHA1_POOL_ENV_FILE" ]; then
+            printf '%s' "$SHA1_POOL_ENV_FILE" > sha1db.env
+          else
+            printf '# 未设置 Secret SHA1_POOL_ENV_FILE，共享秒传池停用\n' > sha1db.env
+          fi
       - name: Build macOS DMG
         if: matrix.platform == 'macos'
         working-directory: desktop

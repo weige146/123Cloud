@@ -13,11 +13,13 @@ dependencies = [
   "httpx>=0.24",
   "pydantic>=1.10",
   "telethon>=1.36",
+  "PyMySQL[rsa]>=1.2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
+  "cryptography>=42",
 ]
 
 [tool.setuptools]

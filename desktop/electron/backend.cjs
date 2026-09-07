@@ -15,6 +15,37 @@ const RESTART_MAX = 5;
 // 对齐 tdr-123help 的 Web 日志队列容量（10000 条），避免刷屏把有用日志顶掉
 const LOG_BUFFER_MAX_LINES = 10000;
 
+// 共享SHA1秒传池的配置注入（键名 SHA1DB_* / SHA1_POOL_API_*，文件不进 git）。
+// 优先级：真实环境变量 > 数据目录用户配置（用户可自己放 Token，免重装）> 包内内置配置。
+// 包内文件：本地打包用 desktop/sha1db.env，CI 打包时由 Secret 生成，electron-builder 放进 Resources。
+function _loadSha1dbEnvFile(filePath) {
+  const values = {};
+  let text;
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return values;
+  }
+  for (const line of String(text).split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    if (!key.startsWith("SHA1")) continue;
+    const value = trimmed.slice(eq + 1).trim();
+    if (value) values[key] = value;
+  }
+  return values;
+}
+
+function _sha1dbBundledEnvFile() {
+  if (require("electron").app.isPackaged) {
+    return path.join(process.resourcesPath, "sha1db.env");
+  }
+  return path.join(__dirname, "..", "sha1db.env");
+}
+
 class BackendManager extends EventEmitter {
   constructor() {
     super();
@@ -93,6 +124,21 @@ class BackendManager extends EventEmitter {
       DATA_DIR: this.dataDir,
       LOG_LEVEL: "info",
     };
+    // 共享秒传池配置：进程环境变量（已在上面的 base 里）> 数据目录用户配置 > 包内内置配置。
+    for (const file of [_sha1dbBundledEnvFile(), path.join(this.dataDir, "sha1db.env")]) {
+      for (const [key, value] of Object.entries(_loadSha1dbEnvFile(file))) {
+        if (!options.env[key]) options.env[key] = value;
+      }
+    }
+    // 秒传池/直连的 CA 证书随包分发：没手动设置就自动指向包内 ca.pem，免配绝对路径。
+    // PyInstaller 6 onedir 会把 datas 放进 _internal/，打包态指向 _internal/ca.pem。
+    const bundledCa = this.isPackagedSidecar()
+      ? path.join(path.dirname(this.sidecarPath()), "_internal", "ca.pem")
+      : path.join(__dirname, "..", "backend", "assets", "ca.pem");
+    if (fs.existsSync(bundledCa)) {
+      if (!options.env.SHA1_POOL_API_CA) options.env.SHA1_POOL_API_CA = bundledCa;
+      if (!options.env.SHA1DB_SSL_CA) options.env.SHA1DB_SSL_CA = bundledCa;
+    }
 
     this.child = spawn(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
     this._log(`[shell] sidecar pid=${this.child.pid}`);

@@ -73,9 +73,35 @@ process.on("SIGTERM", shutdown);
     execSync("npm install", { cwd: webDir, stdio: "inherit" });
   }
 
+  // dev 模式与打包版同源：读 desktop/sha1db.env 注入秒传池配置（环境变量优先），
+  // CA 指向 backend/assets/ca.pem，行为对齐 BackendManager._spawn。
+  const sha1dbEnv = {};
+  try {
+    for (const line of fs.readFileSync(path.join(repoRoot, "sha1db.env"), "utf8").split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq > 0 && trimmed.slice(0, eq).trim().startsWith("SHA1") && trimmed.slice(eq + 1).trim()) {
+        sha1dbEnv[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+      }
+    }
+  } catch (_) { /* 没有内置配置文件，共享库停用 */ }
+  if (!sha1dbEnv.SHA1_POOL_API_CA && !sha1dbEnv.SHA1DB_SSL_CA) {
+    const ca = path.join(backendDir, "assets", "ca.pem");
+    if (fs.existsSync(ca)) {
+      sha1dbEnv.SHA1_POOL_API_CA = ca;
+      sha1dbEnv.SHA1DB_SSL_CA = ca;
+    }
+  }
+
   run("backend", python, ["-m", "app"], {
     cwd: backendDir,
-    env: { ...process.env, PYTHONPATH: backendDir, CLOUD123_PORT: String(BACKEND_PORT) },
+    env: {
+      ...sha1dbEnv,
+      ...process.env,
+      PYTHONPATH: backendDir,
+      CLOUD123_PORT: String(BACKEND_PORT),
+    },
   });
   await waitFor(`http://127.0.0.1:${BACKEND_PORT}/api/health`, 60_000, "backend");
   console.log("[dev] backend ready on", BACKEND_PORT);

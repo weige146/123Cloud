@@ -4,3 +4,4 @@ httpx>=0.24
 pydantic>=1.10
 telethon>=1.36
 tzdata>=2024.1
+PyMySQL[rsa]>=1.2.0

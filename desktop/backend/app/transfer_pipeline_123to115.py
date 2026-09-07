@@ -36,6 +36,7 @@ import httpx
 from .pan115 import Pan115Client, select_115_account
 from .pan115_transfer import PAN123_OFFLINE_USER_AGENT
 from .pan123 import Pan123OpenAPIClient
+from . import sha1_cloud
 from .transfer_pipeline import (
     TaskCancelled,
     _add_task_log,
@@ -437,9 +438,15 @@ class TransferPipeline123to115:
         learned = store.get_transfer_sha1_by_etag(etag, size) if etag else None
         if not learned:
             learned = store.get_transfer_sha1_by_name(name, size)
+        # 共享SHA1库：只按内容指纹 (etag, size) 反查，不按 (name, size)（同名同大小不代表同内容）
+        if not learned and etag:
+            shared = await sha1_cloud.lookup_sha1_by_etag(etag, size)
+            if shared:
+                learned = shared
+                _add_task_log(task, "info", f"从共享SHA1库命中 115 SHA1：{display}")
         if not learned or not learned.get("sha1"):
             return mark_failed(
-                "本地学习表中没有该文件（需经 115→123 秒传搬运过，学习表才会记录它的 115 SHA1）"
+                "本地学习表和共享SHA1库中都没有该文件（需经 115→123 秒传搬运过才会有记录）"
             )
         sha1 = str(learned["sha1"])
 

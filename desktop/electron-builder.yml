@@ -23,6 +23,10 @@ extraResources:
     to: cloudgateway
     filter:
       - "**/*"
+  # 共享SHA1库内置配置（凭据不进 git）：本地打包前自建该文件；
+  # CI 打包前由 Secret 生成（见 ci.yml），没有 Secret 时写入占位文件（功能停用）。
+  - from: sha1db.env
+    to: sha1db.env
 
 mac:
   icon: build/icon.icns

@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import { useTheme } from "@/composables/useTheme";
 import { useGlobalState } from "@/composables/useGlobalState";
 import { useUpdater } from "@/composables/useUpdater";
-import { adminApi } from "@/api";
+import { adminApi, poolApi, type PoolTokenStatus } from "@/api";
 import { displayName, formatBytes } from "@/utils/format";
 import PageHero from "@/components/PageHero.vue";
 import GlassCard from "@/components/GlassCard.vue";
@@ -216,7 +216,56 @@ async function savePortConfig() {
   }
 }
 
+// ===== 秒传池密钥（默认用安装包内置的分发 Token；可切换管理员 Token 解锁目录搜索） =====
+const poolToken = ref<PoolTokenStatus>({ override: false, overridePreview: null, defaultPreview: null });
+const poolTokenInput = ref("");
+const poolTokenSaving = ref(false);
+const poolTokenResetting = ref(false);
+
+async function loadPoolToken() {
+  try {
+    poolToken.value = await poolApi.tokenStatus();
+  } catch {
+    /* 未配置秒传池时静默 */
+  }
+}
+
+async function savePoolToken() {
+  const token = poolTokenInput.value.trim();
+  if (token.length < 20) {
+    notifyError("Token 看起来不对：长度应不少于 20 个字符");
+    return;
+  }
+  poolTokenSaving.value = true;
+  try {
+    const data = await poolApi.setToken(token);
+    poolToken.value = { ...poolToken.value, override: data.override, overridePreview: data.overridePreview };
+    poolTokenInput.value = "";
+    notifySuccess("秒传池 Token 已切换为自定义 Token");
+  } catch (error) {
+    notifyError(`保存失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    poolTokenSaving.value = false;
+  }
+}
+
+async function resetPoolToken() {
+  if (!(await confirm("重置秒传池密钥？", "恢复为安装包内置的分发 Token，秒传池搜索将不可用。"))) return;
+  poolTokenResetting.value = true;
+  try {
+    await poolApi.resetToken();
+    poolToken.value = { ...poolToken.value, override: false, overridePreview: null };
+    poolTokenInput.value = "";
+    notifySuccess("已重置为默认分发 Token");
+  } catch (error) {
+    notifyError(`重置失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    poolTokenResetting.value = false;
+  }
+}
+
 onMounted(async () => {
+  void loadPoolToken();
   const api = desktopApi();
   if (api?.getInfo) {
     try {
@@ -308,6 +357,31 @@ onMounted(async () => {
             <v-btn color="primary" :loading="finishing" prepend-icon="mdi-check" @click="finishBrowserAuth">完成授权</v-btn>
           </template>
         </div>
+      </GlassCard>
+
+      <GlassCard title="秒传池密钥" desc="默认使用安装包内置的分发 Token：只加速搬运，不能搜索共享池目录。切换为管理员 Token 可解锁「秒传池」页的目录搜索；重置即恢复默认。" icon="mdi-key-variant" :hover="false">
+        <FormField label="当前生效">
+          <code class="settings-path">
+            {{ poolToken.override ? `自定义 Token（${poolToken.overridePreview}）` : `默认分发 Token（${poolToken.defaultPreview || "未配置"}）` }}
+          </code>
+        </FormField>
+        <FormField hint="仅本机生效、保存在本地数据目录；管理员 Token 可解锁秒传池搜索，分发出去的安装包始终是默认分发 Token。">
+          <div class="port-row">
+            <v-text-field
+              v-model="poolTokenInput"
+              label="新的秒传池 Token"
+              placeholder="粘贴管理员 Token（不少于 20 个字符）"
+              type="password"
+              variant="outlined"
+              density="compact"
+              hide-details
+              clearable
+              class="port-input"
+            />
+            <v-btn color="primary" :loading="poolTokenSaving" prepend-icon="mdi-key-change" @click="savePoolToken">保存并切换</v-btn>
+            <v-btn variant="outlined" :loading="poolTokenResetting" :disabled="!poolToken.override" prepend-icon="mdi-restore" @click="resetPoolToken">重置为默认</v-btn>
+          </div>
+        </FormField>
       </GlassCard>
 
       <GlassCard title="服务端口" desc="后端默认只监听本机并自动选择空闲端口。" icon="mdi-lan" :hover="false">

@@ -383,7 +383,7 @@ class TransferServiceTests(unittest.TestCase):
                 ])
                 return True
 
-            async def _remember_transfer_hash(self, file, pan123_file):
+            async def _remember_transfer_hash(self, file, pan123_file, share_to_cloud=False):
                 return None
 
             async def _remember_known_transfer_hash(self, file, etag):
@@ -732,6 +732,161 @@ class TransferServiceTests(unittest.TestCase):
             }
             self.assertEqual(service.account_cooldown_snapshot(), [])
             self.assertEqual(service._account_health, {})
+
+    # ------------------------------------------------------------------
+    # 共享 SHA1 库接入：管线侧的安全边界
+    # ------------------------------------------------------------------
+    def _make_reuse_pipeline(self, pan123, cached_hash=None):
+        """直接驱动 _reuse_one 用的最小管线：pan123 已就位，本地学习表按 cached_hash 应答。"""
+        pipeline, stub, task = self._make_pipeline([], pan123)
+        pipeline.pan123 = pan123
+        stub._store = MagicMock()
+        stub._store.get_transfer_hash.return_value = cached_hash
+        stub.remember_calls = []
+        stub.known_calls = []
+        stub.deletion_calls = []
+
+        async def remember(file, pan123_file, share_to_cloud=False):
+            stub.remember_calls.append((pan123_file.get("fileId"), share_to_cloud))
+
+        async def remember_known(file, etag, *args, **kwargs):
+            stub.known_calls.append((etag, args, kwargs))
+
+        async def delete_source(task, file, account):
+            stub.deletion_calls.append(file.get("name"))
+            return None
+
+        stub._remember_transfer_hash = remember
+        stub._remember_known_transfer_hash = remember_known
+        stub._delete_115_source_after_success_if_needed = delete_source
+        return pipeline, stub, task
+
+    @staticmethod
+    def _reuse_file():
+        return {
+            "id": "1", "name": "episode.mkv", "size": 1024, "path": [], "status": "pending",
+            "sourceType": "115_share", "sha1": "b" * 40, "targetDirId": "99",
+        }
+
+    def test_shared_etag_that_fails_md5_reuse_is_dropped_before_offline(self):
+        """共享库 etag 秒传失败：丢掉未验证映射，避免重试复用、避免标记残留误伤自动删源。"""
+        async def run() -> None:
+            pan123 = AsyncMock()
+            pan123.sha1_reuse.return_value = None
+            pan123.md5_reuse.return_value = None
+            pipeline, stub, _task = self._make_reuse_pipeline(pan123)
+            file = self._reuse_file()
+            with patch("app.transfer_pipeline.sha1_cloud.lookup_etag_by_sha1", new=AsyncMock(return_value="a" * 32)):
+                result = await pipeline._reuse_one(file)
+            self.assertEqual(result, "offline")
+            pan123.md5_reuse.assert_awaited_once_with("99", "episode.mkv", "a" * 32, 1024)
+            self.assertNotIn("md5", file)
+            self.assertNotIn("md5Source", file)
+            self.assertEqual(stub.remember_calls, [])
+            self.assertEqual(stub.known_calls, [])
+
+        asyncio.run(run())
+
+    def test_shared_etag_hit_never_learns_locally_or_deletes_source(self):
+        """共享库命中的 MD5 秒传：不写本地学习表、不触发自动删源，来源标记保留在 file 上随任务持久化。"""
+        async def run() -> None:
+            pan123 = AsyncMock()
+            pan123.sha1_reuse.return_value = None
+            pan123.md5_reuse.return_value = 555
+            pipeline, stub, _task = self._make_reuse_pipeline(pan123)
+            file = self._reuse_file()
+            with patch("app.transfer_pipeline.sha1_cloud.lookup_etag_by_sha1", new=AsyncMock(return_value="a" * 32)):
+                result = await pipeline._reuse_one(file)
+            self.assertEqual(result, "reused")
+            self.assertEqual(file["method"], "md5_reuse_shared")
+            self.assertEqual(file["md5Source"], "shared_db")
+            self.assertEqual(file["pan123FileId"], 555)
+            self.assertEqual(stub.known_calls, [])
+            self.assertEqual(stub.remember_calls, [])
+            self.assertEqual(stub.deletion_calls, [])
+
+        asyncio.run(run())
+
+    def test_local_learning_hit_is_not_pushed_to_shared_db(self):
+        """本地学习表命中：不问共享库，也不带任何回写共享库的意图（本地表可能混有名称/大小推断）。"""
+        async def run() -> None:
+            pan123 = AsyncMock()
+            pan123.sha1_reuse.return_value = None
+            pan123.md5_reuse.return_value = 556
+            pipeline, stub, _task = self._make_reuse_pipeline(pan123, cached_hash={"etag": "c" * 32})
+            file = self._reuse_file()
+            lookup = AsyncMock(return_value="a" * 32)
+            with patch("app.transfer_pipeline.sha1_cloud.lookup_etag_by_sha1", new=lookup):
+                result = await pipeline._reuse_one(file)
+            self.assertEqual(result, "reused")
+            lookup.assert_not_awaited()
+            self.assertEqual(file["method"], "md5_reuse")
+            self.assertNotIn("md5Source", file)
+            self.assertEqual(stub.known_calls, [("c" * 32, (), {})])
+            self.assertEqual(stub.deletion_calls, ["episode.mkv"])
+
+        asyncio.run(run())
+
+    def test_sha1_reuse_shares_etag_only_for_the_reused_object(self):
+        """SHA1 秒传后按名字+大小回查 etag：回查到的就是刚秒传出的对象才回写共享库。"""
+        async def run() -> None:
+            for listed_id, expected_share in ((777, True), (778, False)):
+                pan123 = AsyncMock()
+                pan123.sha1_reuse.return_value = 777
+                pan123.list_files.return_value = [
+                    {"fileId": listed_id, "filename": "episode.mkv", "size": 1024, "type": 0, "etag": "d" * 32},
+                ]
+                pipeline, stub, _task = self._make_reuse_pipeline(pan123)
+                file = self._reuse_file()
+                result = await pipeline._reuse_one(file)
+                self.assertEqual(result, "reused")
+                self.assertEqual(file["method"], "sha1_reuse")
+                self.assertEqual(stub.remember_calls, [(listed_id, expected_share)])
+
+        asyncio.run(run())
+
+    def test_offline_completion_shares_only_when_matched_by_name(self):
+        """离线落盘按候选名+大小命中才回写共享库；按大小兜底认领的只进本地学习表。"""
+        async def run_case(listed_name: str, expected_share: bool) -> None:
+            files = [{"id": "1", "name": "episode.mkv", "size": 1024, "path": [], "status": "pending", "sourceType": "115_share"}]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "9"
+            state = {"downloaded": False}
+            listed = {"fileId": 99, "filename": listed_name, "size": 1024, "type": 0, "etag": "e" * 32}
+
+            async def list_files(dir_id):
+                return [listed] if state["downloaded"] else []
+
+            async def create_offline(_url, _dir_id, _filename):
+                state["downloaded"] = True
+                return 123
+
+            async def find_file_by_size(*args, **kwargs):
+                return listed if state["downloaded"] else None
+
+            pan123.list_files.side_effect = list_files
+            pan123.create_offline_download.side_effect = create_offline
+            pan123.find_file_by_size.side_effect = find_file_by_size
+
+            pipeline, stub, task = self._make_pipeline(files, pan123)
+            calls = []
+
+            async def remember(file, pan123_file, share_to_cloud=False):
+                calls.append((pan123_file.get("fileId"), share_to_cloud))
+
+            stub._remember_transfer_hash = remember
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
+                await pipeline.run()
+            self.assertEqual(task["files"][0]["status"], "success")
+            self.assertEqual(calls, [(99, expected_share)])
+
+        async def run() -> None:
+            await run_case("episode.mkv", True)
+            await run_case("renamed-by-123.mkv", False)
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

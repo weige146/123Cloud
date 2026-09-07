@@ -35,6 +35,7 @@ from .pan123 import (
     parse_pan123_share_url,
 )
 from .session_store import SessionStore
+from . import sha1_cloud
 # 管线与工具函数统一定义在 transfer_pipeline，这里引用并向上层保持兼容导出
 from .transfer_pipeline import (  # noqa: F401
     TaskCancelled,
@@ -1115,6 +1116,14 @@ class TransferService:
         file: Dict[str, Any],
         pan115_account: Dict[str, str],
     ) -> Optional[asyncio.Task[None]]:
+        if file.get("md5Source") == "shared_db":
+            # 共享库映射未经验证（可能被投毒）：禁止自动删除 115 源文件
+            logger.warning(
+                "文件 %s 的 MD5 来自共享SHA1库（未经验证），跳过自动删除源文件",
+                file.get("name") or (file.get("sha1") or "")[:16],
+                extra={"task_id": task.get("id")},
+            )
+            return None
         if not _is_local_115_file(file):
             return None
         transfer_config = await self._get_transfer_config()
@@ -1303,12 +1312,26 @@ class TransferService:
         existing.add(int(message_id))
         task["transferNoticeMessageIds"] = list(existing)
 
-    async def _remember_transfer_hash(self, file: Dict[str, Any], pan123_file: Dict[str, Any]) -> None:
+    async def _remember_transfer_hash(
+        self, file: Dict[str, Any], pan123_file: Dict[str, Any],
+        share_to_cloud: bool = False,
+    ) -> None:
+        """记录 115 sha1 ↔ 123 etag 学习映射。
+
+        share_to_cloud=False 时只写本地学习表（如"同名同大小已存在"这类未经内容验证的
+        推断场景，禁止扩散到共享库）；只有内容经过验证的真实搬运成功（离线完成、
+        SHA1 秒传回查到实际对象等）才允许 share_to_cloud=True 回写共享库。
+        """
         if not file.get("sha1") or not pan123_file.get("etag"):
             return
         saved = self._store.save_transfer_hash(file["sha1"], file.get("size", 0), pan123_file["etag"], file["name"])
         if saved:
             file["md5"] = str(pan123_file["etag"]).lower()
+            # 现在的 md5 来自 123 上真实存在的对象，之前从共享库拿到的未验证标记作废
+            file.pop("md5Source", None)
+        if share_to_cloud:
+            # 共享SHA1库回写：只在内容经过验证的搬运成功后调用，失败静默；只上传文件基本名称
+            await sha1_cloud.learn_transfer(file["sha1"], file.get("size", 0), pan123_file["etag"], file["name"])
 
     async def _remember_known_transfer_hash(self, file: Dict[str, Any], etag: str) -> None:
         if not file.get("sha1"):

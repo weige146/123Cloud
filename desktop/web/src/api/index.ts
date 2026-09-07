@@ -139,3 +139,49 @@ export const transferApi = {
   accountCooldowns: () => api.get<{ ok: boolean; accounts: AccountCooldown[]; cooldownMinutes: number }>("/api/transfer/account-cooldowns"),
   clearAccountCooldowns: () => api.delete<{ ok: boolean; cleared: number; accounts: string[] }>("/api/transfer/account-cooldowns"),
 };
+
+// ====== 秒传池（管理员自用：目录搜索 + SHA1 秒传） ======
+export interface PoolSearchResult {
+  sha1: string;
+  size: number;
+  name: string;
+}
+
+export interface PoolSearchResponse {
+  available: boolean;
+  results: PoolSearchResult[];
+  cached: boolean;
+  error?: string;
+}
+
+export interface PoolReuseItemResult {
+  sha1: string;
+  name: string;
+  size: number;
+  ok: boolean;
+  fileId?: number;
+  error?: string;
+}
+
+export interface PoolTokenStatus {
+  override: boolean;
+  overridePreview: string | null;
+  defaultPreview: string | null;
+}
+
+export const poolApi = {
+  search: (keyword: string, limit = 50) =>
+    api.get<PoolSearchResponse>(`/api/pool/search?keyword=${encodeURIComponent(keyword)}&limit=${limit}`),
+  reuse: (dirId: string, items: PoolSearchResult[]) =>
+    api.post<{ ok: boolean; results: PoolReuseItemResult[] }>("/api/pool/reuse", { dirId, items }),
+  tokenStatus: () => api.get<PoolTokenStatus>("/api/pool/token"),
+  setToken: (token: string) =>
+    api.post<{ ok: boolean; override: boolean; overridePreview: string | null }>("/api/pool/token", { token }),
+  resetToken: () => api.delete<{ ok: boolean; override: boolean }>("/api/pool/token"),
+};
+
+export interface PoolTokenStatus {
+  override: boolean;
+  overridePreview: string | null;
+  defaultPreview: string | null;
+}

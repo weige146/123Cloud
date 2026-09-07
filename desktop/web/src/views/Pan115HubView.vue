@@ -6,13 +6,13 @@ import StatTile from "@/components/StatTile.vue";
 import SegmentedTabs from "@/components/SegmentedTabs.vue";
 import GlassCard from "@/components/GlassCard.vue";
 import FormGrid from "@/components/FormGrid.vue";
-import { transferApi, pan115HelperApi, pan115CookieApi } from "@/api";
+import { transferApi, pan115HelperApi, pan115CookieApi, poolApi, type PoolSearchResult } from "@/api";
 import type { AccountCooldown, DirectLinkFile, Pan123BrowseItem, Pan123PanLinkFile, Pan115Device, TransferConfig, TransferOfflineTask, TransferTask, TransferTaskFile } from "@/api/types";
 import { formatBytes } from "@/utils/format";
 import { useGlobalState } from "@/composables/useGlobalState";
 import { useResponsive } from "@/composables/useResponsive";
 
-type HubTab = "transfer" | "helper" | "cookie";
+type HubTab = "transfer" | "helper" | "cookie" | "pool";
 
 const props = withDefaults(
   defineProps<{
@@ -27,12 +27,13 @@ const { state, loadStatus, ensureSubmissionConfig, writeSubmissionConfig, notify
 const { isMobile } = useResponsive();
 
 const tab = ref<HubTab>(props.initialTab);
-const loadedTabs = reactive<Record<HubTab, boolean>>({ transfer: false, helper: false, cookie: false });
+const loadedTabs = reactive<Record<HubTab, boolean>>({ transfer: false, helper: false, cookie: false, pool: false });
 
 const TAB_ROUTES: Record<HubTab, string> = {
   transfer: "/admin/transfer",
   helper: "/admin/pan115-helper",
   cookie: "/admin/pan115-cookie",
+  pool: "/admin/pan115-pool",
 };
 
 let syncingRoute = false;
@@ -690,6 +691,7 @@ const pan123PickerDir = ref(0);
 const pan123PickerPath = ref<{ fileId: number; name: string }[]>([]);
 const pan123PickerDirs = ref<Pan123BrowseItem[]>([]);
 const pan123PickerFiles = ref<Pan123BrowseItem[]>([]);
+const pan123PickerMode = ref<"helper" | "pool">("helper");
 
 function pan123PickerPathText() {
   return "/" + pan123PickerPath.value.map((item) => item.name).join("/");
@@ -717,15 +719,17 @@ async function loadPan123Picker(parentId: number, jumpTo = false) {
   }
 }
 
-async function openPan123Picker() {
+async function openPan123Picker(mode: "helper" | "pool" = "helper") {
+  pan123PickerMode.value = mode;
   pan123PickerPath.value = [];
   pan123PickerDirs.value = [];
   pan123PickerFiles.value = [];
   pan123PickerOpen.value = true;
   // 若已配置目录 ID，跳到该目录方便直接确认；路径以当前配置为准
-  const savedId = Number(helperForm.pan123SourceDirId) || 0;
+  const savedId = Number(mode === "pool" ? poolDirId.value : helperForm.pan123SourceDirId) || 0;
   if (savedId) {
-    pan123PickerPath.value = [{ fileId: savedId, name: helperForm.pan123SourceDirPath ? helperForm.pan123SourceDirPath.split("/").filter(Boolean).pop() || "已选目录" : "已选目录" }];
+    const savedPath = mode === "pool" ? poolDirPath.value : helperForm.pan123SourceDirPath;
+    pan123PickerPath.value = [{ fileId: savedId, name: savedPath ? savedPath.split("/").filter(Boolean).pop() || "已选目录" : "已选目录" }];
   }
   await loadPan123Picker(pan123PickerTargetId(), true);
 }
@@ -749,6 +753,13 @@ function pan123PickerGoRoot() {
 
 function pan123PickerConfirm() {
   const id = pan123PickerTargetId();
+  if (pan123PickerMode.value === "pool") {
+    poolDirId.value = String(id);
+    poolDirPath.value = pan123PickerPathText();
+    pan123PickerOpen.value = false;
+    notifySuccess(`已选择秒传目标目录${id ? `（ID ${id}）` : "（根目录）"}`);
+    return;
+  }
   helperForm.pan123SourceDirId = String(id);
   helperForm.pan123SourceDirPath = pan123PickerPathText();
   pan123PickerOpen.value = false;
@@ -942,6 +953,109 @@ async function saveCookieToHelper() {
   }
 }
 
+// ============ Pool state (秒传池 · 管理员自用) ============
+// 守则见《开发者-AI对接文档-搜索接口》：显式触发、结果缓存、403 即停用、失败不重试、单批 ≤20 条。
+const poolKeyword = ref("");
+const poolSearching = ref(false);
+const poolResults = ref<PoolSearchResult[]>([]);
+const poolSelected = ref<Set<string>>(new Set());
+const poolItemState = ref<Record<string, string>>({});
+const poolNotice = ref("");
+const poolDirId = ref("0");
+const poolDirPath = ref("");
+const poolReusing = ref(false);
+
+async function searchPool() {
+  const keyword = poolKeyword.value.trim();
+  if (!keyword) {
+    notifyError("请输入搜索关键词");
+    return;
+  }
+  poolSearching.value = true;
+  poolNotice.value = "";
+  try {
+    const data = await poolApi.search(keyword);
+    if (!data.available) {
+      poolResults.value = [];
+      poolSelected.value = new Set();
+      poolNotice.value = data.error || "当前 Token 无搜索权限（仅管理员可用）";
+      return;
+    }
+    poolResults.value = data.results;
+    poolSelected.value = new Set();
+    if (data.error) {
+      poolNotice.value = data.error;
+    } else if (!data.results.length) {
+      poolNotice.value = data.cached ? `「${keyword}」无匹配（缓存结果）` : `「${keyword}」在池子里没有匹配`;
+    } else {
+      poolNotice.value = data.cached
+        ? `「${keyword}」命中 ${data.results.length} 条（缓存结果）`
+        : `「${keyword}」命中 ${data.results.length} 条，勾选后秒传到目标文件夹`;
+    }
+  } catch (error) {
+    notifyError(`搜索失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    poolSearching.value = false;
+  }
+}
+
+function togglePoolResult(sha1: string) {
+  const next = new Set(poolSelected.value);
+  if (next.has(sha1)) next.delete(sha1);
+  else next.add(sha1);
+  poolSelected.value = next;
+}
+
+function poolSubtitle(item: PoolSearchResult) {
+  const state = poolItemState.value[item.sha1];
+  return `${formatBytes(item.size)}${state ? ` · ${state}` : ""}`;
+}
+
+function poolChipColor(state: string) {
+  if (state === "秒传成功") return "success";
+  if (state === "暂不可用") return "grey";
+  return "error";
+}
+
+async function reusePoolSelection() {
+  const items = poolResults.value.filter((item) => poolSelected.value.has(item.sha1));
+  if (!items.length) {
+    notifyError("先勾选要秒传的条目（单批最多 20 条）");
+    return;
+  }
+  const dirId = poolDirId.value.trim() || "0";
+  if (!/^\d+$/.test(dirId)) {
+    notifyError("123 目标目录 ID 必须是数字（根目录填 0）");
+    return;
+  }
+  poolReusing.value = true;
+  try {
+    const data = await poolApi.reuse(dirId, items.slice(0, 20));
+    const states: Record<string, string> = {};
+    let hit = 0;
+    let miss = 0;
+    let failed = 0;
+    for (const row of data.results) {
+      states[row.sha1] = row.ok ? "秒传成功" : row.error || "暂不可用";
+      if (row.ok) hit += 1;
+      else if (states[row.sha1] === "暂不可用") miss += 1;
+      else failed += 1;
+    }
+    poolItemState.value = { ...poolItemState.value, ...states };
+    poolSelected.value = new Set();
+    const parts = [`成功 ${hit} 条`];
+    if (miss) parts.push(`暂不可用 ${miss} 条（123 已不存在）`);
+    if (failed) parts.push(`失败 ${failed} 条`);
+    poolNotice.value = `本次秒传结束：${parts.join("，")}。结果已标在每行右侧，未命中重试无效。`;
+    notifySuccess(`秒传完成：${parts.join("，")}`);
+  } catch (error) {
+    poolNotice.value = `秒传失败：${error instanceof Error ? error.message : String(error)}`;
+    notifyError(`秒传失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    poolReusing.value = false;
+  }
+}
+
 // ============ Tab orchestration ============
 function ensureTabLoaded(key: HubTab) {
   if (loadedTabs[key]) return;
@@ -991,6 +1105,7 @@ const tabsList = [
   { key: "transfer", label: "搬运", icon: "mdi-cloud-sync" },
   { key: "helper", label: "助手", icon: "mdi-tools" },
   { key: "cookie", label: "扫码", icon: "mdi-cookie" },
+  { key: "pool", label: "秒传池", icon: "mdi-database-search" },
 ];
 
 onMounted(() => {
@@ -1540,6 +1655,72 @@ onUnmounted(() => {
     </div>
 
     <!-- ====================== Cookie Tab ====================== -->
+    <div v-show="tab === 'pool'" class="section-stack">
+      <GlassCard
+        span="full"
+        accent="group"
+        icon="mdi-database-search"
+        title="秒传池 · 内容目录秒传"
+        desc="搜索共享池的文件目录（管理员 Token 专用），勾选后 SHA1 秒传到指定 123 文件夹；123 已不存在的内容会标记暂不可用。"
+      >
+        <FormGrid>
+          <v-text-field
+            v-model="poolKeyword"
+            label="文件名关键词"
+            placeholder="回车或点「搜索」触发（结果本地缓存 10 分钟）"
+            variant="outlined"
+            density="compact"
+            clearable
+            @keyup.enter="searchPool"
+          />
+          <v-text-field
+            v-model="poolDirId"
+            label="123 目标目录 ID（根目录填 0）"
+            variant="outlined"
+            density="compact"
+          />
+        </FormGrid>
+
+        <div class="button-row">
+          <v-btn variant="outlined" prepend-icon="mdi-folder-open-outline" @click="openPan123Picker('pool')">选择目标文件夹…</v-btn>
+          <span v-if="poolDirPath" class="picked-dir-path"><v-icon icon="mdi-folder-outline" size="16" />{{ poolDirPath }}</span>
+          <v-btn color="primary" prepend-icon="mdi-magnify" :loading="poolSearching" @click="searchPool">搜索</v-btn>
+          <v-btn
+            color="success"
+            prepend-icon="mdi-fast-forward"
+            :loading="poolReusing"
+            :disabled="!poolSelected.size"
+            @click="reusePoolSelection"
+          >秒传选中（{{ poolSelected.size }}/20）</v-btn>
+        </div>
+
+        <div v-if="poolNotice" class="hub-status-line">{{ poolNotice }}</div>
+
+        <div v-if="!poolResults.length" class="empty-state">
+          <p>输入关键词搜索共享池目录；普通用户 Token 无搜索权限，此页会提示不可用。</p>
+        </div>
+        <div v-else class="hub-offline-list">
+          <div v-for="item in poolResults" :key="item.sha1" class="hub-offline-row">
+            <v-checkbox
+              :model-value="poolSelected.has(item.sha1)"
+              @update:model-value="togglePoolResult(item.sha1)"
+              :label="item.name"
+              :subtitle="poolSubtitle(item)"
+              density="compact"
+              hide-details
+            />
+            <v-chip
+              v-if="poolItemState[item.sha1]"
+              size="small"
+              variant="tonal"
+              :color="poolChipColor(poolItemState[item.sha1])"
+              class="flex-shrink-0"
+            >{{ poolItemState[item.sha1] }}</v-chip>
+          </div>
+        </div>
+      </GlassCard>
+    </div>
+
     <div v-show="tab === 'cookie'" class="section-stack">
       <GlassCard
         accent="group"

@@ -43,3 +43,10 @@ desktop/node_modules/
 desktop/release/
 desktop/backend-dist/
 desktop/backend-build/
+
+# 共享SHA1库内置配置（凭据只存本地和 CI Secret，绝不提交）
+desktop/sha1db.env
+
+# 打包验证产物
+desktop/backend-build-verify/
+desktop/backend-dist-verify/

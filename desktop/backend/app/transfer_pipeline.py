@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from .pan115_transfer import Pan115TransferClient
 from .pan123 import Pan123OpenAPIClient
+from . import sha1_cloud
 
 logger = logging.getLogger(__name__)
 
@@ -588,6 +589,9 @@ class OfflineDownloadManager:
                             break
                 except Exception as error:
                     _add_unique_task_log(task, "warn", f"123 目标目录暂时查不动，本轮跳过（{error}）")
+                # 候选名 + 大小都对上才算"内容已验证"，允许回写共享库；
+                # 下面按大小兜底认领的结果只进本地学习表，不扩散给其他用户
+                matched_by_name = created is not None
                 if not created:
                     suspicious = await self._find_suspicious_artifact(item)
                     if suspicious:
@@ -598,7 +602,7 @@ class OfflineDownloadManager:
                         file, item.target_dir_id, item.target_root_id, item.before_ids
                     )
                 if created:
-                    await self._mark_done(item, created)
+                    await self._mark_done(item, created, share_to_cloud=matched_by_name)
                     progressed = True
                     continue
 
@@ -654,13 +658,13 @@ class OfflineDownloadManager:
                     raise TaskCancelled()
             await _delay(poll_ms)
 
-    async def _mark_done(self, item: OfflineItem, created: Dict[str, Any]) -> None:
+    async def _mark_done(self, item: OfflineItem, created: Dict[str, Any], share_to_cloud: bool = False) -> None:
         service = self.pipeline.service
         task = self.pipeline.task
         file = item.file
         self.pipeline.dir_cache.invalidate_dir(item.target_dir_id)
         created = await self._rename_if_needed(item, created)
-        await service._remember_transfer_hash(file, created)
+        await service._remember_transfer_hash(file, created, share_to_cloud=share_to_cloud)
         file["status"] = "success"
         file["method"] = file.get("method") or "offline"
         file["pan123FileId"] = created.get("fileId")
@@ -946,6 +950,7 @@ class TransferPipeline:
         if had_offline_attempt:
             recovered = await self.recover_offline_file(file, target_dir_id, self.target_root_id)
             if recovered:
+                # 断点认领只按"同大小"匹配，不算内容验证：只写本地学习表，不回写共享库
                 await service._remember_transfer_hash(file, recovered)
                 file["status"] = "success"
                 file["method"] = "offline"
@@ -984,8 +989,11 @@ class TransferPipeline:
                         self.dir_cache.invalidate_dir(target_dir_id)
                         created_file = await self.dir_cache.find_same_file(self.pan123, target_dir_id, file["name"], file.get("size", 0))
                         if created_file:
-                            # 回查 123 侧 etag 记入学习表，供 123→115 反向搬运秒传使用
-                            await service._remember_transfer_hash(file, created_file)
+                            # 回查 123 侧 etag 记入学习表，供 123→115 反向搬运秒传使用。
+                            # SHA1 秒传成功说明 123 已验证内容一致；但回查是按名字+大小找的，
+                            # 只有找到的就是刚秒传出来的那个对象（fileId 一致）才回写共享库
+                            is_reused_object = str(created_file.get("fileId") or created_file.get("id") or "") == str(reused_file_id)
+                            await service._remember_transfer_hash(file, created_file, share_to_cloud=is_reused_object)
                         file["status"] = "success"
                         file["method"] = "sha1_reuse"
                         file["pan123FileId"] = reused_file_id
@@ -1003,28 +1011,49 @@ class TransferPipeline:
                     _add_task_log(task, "warn", f"SHA1 秒传出错，转离线下载：{display}（{error}）")
                     break
 
-        # MD5 秒传（etag 可来自本地缓存）
+        # MD5 秒传（etag 可来自本地缓存或共享SHA1库）
         rapid_etag = file.get("md5")
         if not rapid_etag and file.get("sha1"):
             cached_hash = service._store.get_transfer_hash(file["sha1"], file.get("size", 0))
             if cached_hash:
                 rapid_etag = cached_hash.get("etag")
                 file["md5"] = cached_hash.get("etag")
+        if not rapid_etag and file.get("sha1"):
+            shared_etag = await sha1_cloud.lookup_etag_by_sha1(file["sha1"], file.get("size", 0))
+            if shared_etag:
+                rapid_etag = shared_etag
+                file["md5"] = shared_etag
+                # 来源标记持久化到 file 上（随任务保存/恢复）：
+                # 重试、断点恢复后仍能识别这是未经验证的共享映射
+                file["md5Source"] = "shared_db"
+                _add_task_log(task, "info", f"从共享SHA1库命中 123 etag：{display}")
         if rapid_etag:
             for attempt in range(2):
                 try:
                     reused_file_id = await self.pan123.md5_reuse(target_dir_id, file["name"], rapid_etag, file.get("size", 0))
                     if reused_file_id:
                         self.dir_cache.invalidate_dir(target_dir_id)
-                        await service._remember_known_transfer_hash(file, rapid_etag)
-                        file["status"] = "success"
-                        file["method"] = "md5_reuse"
-                        file["pan123FileId"] = reused_file_id
-                        file["finishedAt"] = _utc_now_iso()
-                        _add_task_log(task, "info", f"MD5 秒传成功：{display}")
-                        deletion_task = await service._delete_115_source_after_success_if_needed(task, file, self.deletion_account())
-                        if deletion_task:
-                            task.setdefault("_pendingPan115Deletions", []).append(deletion_task)
+                        if file.get("md5Source") == "shared_db":
+                            # 共享库映射未经本人验证（可能被投毒）：
+                            # 不写入本地学习表，也不触发自动删除 115 源文件等不可逆动作
+                            file["status"] = "success"
+                            file["method"] = "md5_reuse_shared"
+                            file["pan123FileId"] = reused_file_id
+                            file["finishedAt"] = _utc_now_iso()
+                            _add_task_log(task, "info", f"MD5 秒传成功（共享库来源，已跳过自动删源）：{display}")
+                        else:
+                            # 本地学习表命中：不回写共享库。本地表里混有"同名同大小已存在"这类
+                            # 仅凭名称/大小推断的条目，无法区分是否经过内容验证；
+                            # 共享库只接受离线落盘、SHA1 秒传这两种验证过的来源
+                            await service._remember_known_transfer_hash(file, rapid_etag)
+                            file["status"] = "success"
+                            file["method"] = "md5_reuse"
+                            file["pan123FileId"] = reused_file_id
+                            file["finishedAt"] = _utc_now_iso()
+                            _add_task_log(task, "info", f"MD5 秒传成功：{display}")
+                            deletion_task = await service._delete_115_source_after_success_if_needed(task, file, self.deletion_account())
+                            if deletion_task:
+                                task.setdefault("_pendingPan115Deletions", []).append(deletion_task)
                         return "reused"
                     break
                 except Exception as error:
@@ -1033,6 +1062,12 @@ class TransferPipeline:
                         continue
                     _add_task_log(task, "warn", f"MD5 秒传出错，转离线下载：{display}（{error}）")
                     break
+            if file.get("md5Source") == "shared_db":
+                # 共享库给的 etag 没能秒传：丢掉这条未验证映射。
+                # 既避免重试时跳过查表反复用它，也避免标记残留到离线成功后
+                # 把一个已下载核对过的文件误判成"未验证"而跳过自动删源
+                file.pop("md5", None)
+                file.pop("md5Source", None)
 
         return "offline"
 
