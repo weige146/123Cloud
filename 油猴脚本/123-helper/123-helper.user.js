@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.2.9
+// @version      1.3.0
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -130,6 +130,108 @@
 
   // src/api.js
   var RETRY_PATTERN = /正在|移动|处理中|操作中|稍后|稍候|繁忙|频繁|busy|try\s*again|retry|429|too\s*many|rate\s*limit|throttl|请求过快|访问过于频繁|限流/i;
+  // 分享接口限速门（2026-09 对真实分享实测）：分享页域名（*.mshare.123pan.cn 等）按窗口计数配额，
+  // 约 60 个请求/分钟、窗口回补仅约 33 个/分钟，超了返回 HTTP 200 +
+  // {"code":"429","message":"分享接口请求过于频繁"}，约 60 秒自动解封，不带 Retry-After 头；
+  // 而 www.123865.com 实测并发 16 持续 90 秒 11731 个请求（~130 req/s）零 429——等于没有限流。
+  // 门分两条车道（configureFor 按实际请求的 host 切换）：
+  //   快车道（直连 123865）：零间距只留 2ms 抖动 + 目录并发默认 32（实测 258 req/s 零 429）；
+  //   慢车道（回退页面域名）：最小间距 1s，尊重 60/分钟配额。
+  // 无论哪条车道，收到 429 都全门一起长冷却（60s 起步翻倍封顶 5 分钟），冷却后直接放慢到
+  // 该车道最大间距（慢车道实测 1.2s 仍会反复撞），再按大步长（400ms 或对半）逐级提速。
+  // 断点里存 snapshot()，续扫 restore()，不会带着刚触发的风控状态立刻再撞。
+  var shareApiGate = {
+    fastLane: { baseInterval: 0, maxInterval: 1200, jitterMs: 2 },
+    slowLane: { baseInterval: 1000, maxInterval: 2000, jitterMs: 120 },
+    baseInterval: 0,
+    interval: 0,
+    maxInterval: 1200,
+    jitterMs: 2,
+    cooldownBaseMs: 60e3,
+    cooldownMaxMs: 300e3,
+    recoverAfterMs: 90e3,
+    cooldownUntil: 0,
+    strikes: 0,
+    okStreak: 0,
+    lastStart: 0,
+    lastHitAt: 0,
+    configureFor(host) {
+      const lane = host === CANONICAL_SHARE_ORIGIN ? this.fastLane : this.slowLane;
+      const cruising = this.interval <= this.baseInterval;
+      const cooling = Date.now() < this.cooldownUntil;
+      this.baseInterval = lane.baseInterval;
+      this.maxInterval = lane.maxInterval;
+      this.jitterMs = lane.jitterMs;
+      if (cooling) return; // 冷却中的惩罚间距保持不动，冷却结束按新车道档位靠 ok() 降回来
+      this.interval = cruising ? lane.baseInterval : Math.min(Math.max(this.interval, lane.baseInterval), lane.maxInterval);
+    },
+    reset() {
+      this.interval = this.baseInterval;
+      this.cooldownUntil = 0;
+      this.strikes = 0;
+      this.okStreak = 0;
+      this.lastHitAt = 0;
+    },
+    snapshot() {
+      return { interval: this.interval, maxInterval: this.maxInterval, cooldownUntil: this.cooldownUntil, strikes: this.strikes, lastHitAt: this.lastHitAt };
+    },
+    restore(saved) {
+      if (!saved || typeof saved !== "object") return;
+      this.interval = Math.min(Math.max(1, Number(saved.interval) || this.baseInterval), this.maxInterval);
+      this.maxInterval = Math.max(this.baseInterval, Number(saved.maxInterval) || this.maxInterval);
+      this.strikes = Math.max(0, Number(saved.strikes) || 0);
+      this.lastHitAt = Math.max(0, Number(saved.lastHitAt) || 0);
+      const until = Number(saved.cooldownUntil) || 0;
+      if (until > Date.now()) this.cooldownUntil = until;
+    },
+    async waitTurn(signal, onWait) {
+      for (;;) {
+        if (signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
+        const now = Date.now();
+        const cooldownLeft = this.cooldownUntil - now;
+        if (cooldownLeft > 0) {
+          onWait?.(Math.ceil(cooldownLeft / 1e3), this.strikes);
+          await sleep(Math.min(cooldownLeft, 1e3));
+          continue;
+        }
+        const gap = this.lastStart + this.interval + Math.floor(Math.random() * 120) - now;
+        if (gap > 0) {
+          await sleep(gap);
+          continue;
+        }
+        this.lastStart = Date.now();
+        return;
+      }
+    },
+    hit() {
+      const now = Date.now();
+      if (now >= this.cooldownUntil) this.strikes += 1;
+      this.okStreak = 0;
+      this.lastHitAt = now;
+      this.cooldownUntil = now + Math.min(this.cooldownBaseMs * 2 ** (this.strikes - 1), this.cooldownMaxMs);
+      // 一次直接提到最大间距（约 28 个/分钟，实测 mshare 窗口回补仅约 33 个/分钟，
+      // 提到 1.2s 仍会反复撞限），之后靠 ok() 逐步降回来
+      this.interval = Math.min(Math.max(this.interval * 2, this.maxInterval), this.maxInterval);
+      return this.cooldownUntil - now;
+    },
+    ok() {
+      this.okStreak += 1;
+      // 提速要谨慎：距上次撞限不足 90s 时窗口配额可能还没回满，提前降档会马上再撞
+      if (this.okStreak < 12 || Date.now() - this.lastHitAt < this.recoverAfterMs) return;
+      this.okStreak = 0;
+      this.interval = Math.max(this.baseInterval, Math.floor(this.interval / 2));
+      if (this.strikes > 0) this.strikes -= 1;
+    }
+  };
+  function isShareRateLimited(error) {
+    if (Number(error?.status) === 429 || String(error?.code) === "429") return true;
+    return /频繁|限流|请求过快|too\s*many|rate\s*limit|throttl/i.test(String(error?.message || ""));
+  }
+  // 分享目录接口的 host 选择：分享页自身域名（mshare 等）配额最小（约 60 个/分钟），
+  // www.123865.com 独立额度大得多（实测 400+ 连发无风控），且 CORS 对任意来源放开、
+  // 接口免登录，所以默认跨域直连 123865（不带 cookie，CORS 是 * 时带 cookie 会被浏览器拒收）；
+  // 该域名网络不通/返回异常时退回页面自身域名，会话内记住可用的那个。
+  var shareApiHost = "";
   var CRC_TABLE = (() => {
     const table = [];
     for (let index = 0; index < 256; index += 1) {
@@ -739,12 +841,12 @@
       const { token, loginUuid } = this.credentials();
       return Boolean(this.host && token && loginUuid);
     }
-    buildUrl(path, query = {}) {
-      const url = new URL(path, this.host);
+    buildUrl(path, query = {}, hostOverride = "") {
+      const url = new URL(path, hostOverride || this.host);
       for (const [key, value] of Object.entries(query)) if (value !== void 0 && value !== null) url.searchParams.set(key, String(value));
       return url.toString();
     }
-    async request(method, path, { query = {}, body, signal, attempts = this.retryAttempts, backoffCap = 6e3, signed = true, auth = true, appVersion = this.appVersion, timeoutMs = this.requestTimeout } = {}) {
+    async request(method, path, { query = {}, body, signal, attempts = this.retryAttempts, backoffCap = 6e3, signed = true, auth = true, appVersion = this.appVersion, timeoutMs = this.requestTimeout, credentialsMode = "include", host = "", isRetryable = null } = {}) {
       const { token, loginUuid } = auth ? this.credentials() : { token: "", loginUuid: "" };
       if (auth && (!token || !loginUuid)) throw new Error("\u8BF7\u5148\u767B\u5F55 123 \u4E91\u76D8\u5E76\u6253\u5F00\u6587\u4EF6\u5217\u8868\u9875");
       const finalQuery = signed ? { ...query, ...signedQuery(path, Date.now(), void 0, appVersion) } : query;
@@ -761,9 +863,9 @@
           requestController.abort();
         }, Math.max(1e3, Number(timeoutMs || this.requestTimeout)));
         try {
-          const response = await fetch(this.buildUrl(path, finalQuery), {
+          const response = await fetch(this.buildUrl(path, finalQuery, host), {
             method,
-            credentials: "include",
+            credentials: credentialsMode,
             signal: requestController.signal,
             headers: {
               accept: "*/*",
@@ -785,7 +887,10 @@
           error.code = code;
           error.auth = isAuthFailure(response.status, code, message);
           if (error.auth) throw error;
-          if (attempt < attempts - 1 && (RETRY_PATTERN.test(error.message) || [408, 425, 429, 500, 502, 503, 504].includes(response.status))) {
+          // 100011 = 网盘接口频控（实测 file/list/new 约 15 QPS/用户，报错文案为空，
+          // 不认它会直接把导出/导入中止），必须像 429 一样退避重试
+          const retryable = isRetryable ? isRetryable(error) : (String(code) === "100011" || RETRY_PATTERN.test(error.message) || [408, 425, 429, 500, 502, 503, 504].includes(response.status));
+          if (attempt < attempts - 1 && retryable) {
             lastError = error;
             continue;
           }
@@ -797,7 +902,8 @@
           }
           lastError = error;
           if (error?.auth) throw error;
-          if (["AbortError", "TimeoutError"].includes(error?.name) || attempt >= attempts - 1 || !RETRY_PATTERN.test(String(error?.message)) && error?.status && ![408, 425, 429, 500, 502, 503, 504].includes(error.status)) throw error;
+          const retryable = isRetryable ? isRetryable(error) : (String(error?.code) === "100011" || (!RETRY_PATTERN.test(String(error?.message)) && error?.status && ![408, 425, 429, 500, 502, 503, 504].includes(error.status) ? false : true));
+          if (["AbortError", "TimeoutError"].includes(error?.name) || attempt >= attempts - 1 || !retryable) throw error;
         } finally {
           clearTimeout(timeout);
           if (signal) signal.removeEventListener("abort", abortRequest);
@@ -848,26 +954,70 @@
         sharePwd = options.sharePwd || "";
       }
       if (!shareKey) throw new Error("\u5206\u4EAB Key \u4E0D\u80FD\u4E3A\u7A7A");
+      const pacing = options.pacing || shareApiGate;
+      const note = (message) => options.onPace?.(message);
       const output = [];
       let page = Number(options.page || 1);
       for (;; page += 1) {
-        const data = await this.request("GET", "/b/api/share/get", {
-          signal: options.signal,
-          auth: false,
-          // 分享接口限流窗口长：重试更多次、退避上限放宽到 12s，避免"分享接口请求过于频繁"直接冒给用户
-          attempts: options.attempts || 8,
-          backoffCap: 12e3,
-          query: {
-            limit: String(options.limit || 100),
-            next: "0",
-            orderBy: "file_name",
-            orderDirection: "asc",
-            parentFileId: String(parentId || "0"),
-            Page: String(page),
-            shareKey,
-            ...sharePwd ? { SharePwd: sharePwd } : {}
+        let data = null;
+        let lastError = null;
+        let cooldownRetries = 0;
+        // host 候选顺序：会话内已验证可用的 → 稳定大域名 www.123865.com → 页面自身域名
+        const origin = String(location.origin || "");
+        const hosts = [...new Set([shareApiHost, CANONICAL_SHARE_ORIGIN, origin].filter(Boolean))];
+        outer: for (const host of hosts) {
+          pacing.configureFor?.(host); // 按实际请求的 host 切快/慢车道（123865 快、页面域名慢）
+          for (;;) {
+            await pacing.waitTurn(options.signal, (seconds, strikes) => note(`\u5206\u4EAB\u63A5\u53E3\u98CE\u63A7\u51B7\u5374\u4E2D\uFF1A${seconds}s \u540E\u81EA\u52A8\u7EE7\u7EED\uFF08\u7B2C ${strikes} \u6B21\u89E6\u53D1\uFF0C\u5DF2\u653E\u6162\u8282\u594F\uFF1B\u8FDB\u5EA6\u5DF2\u5B58\u65AD\u70B9\uFF09`));
+            let attempt = null;
+            try {
+              attempt = await this.request("GET", "/b/api/share/get", {
+                signal: options.signal,
+                auth: false,
+                // 瞬时网络抖动交给 request 内部短退避；分享接口的 429 计数配额由外层冷却重试处理
+                attempts: 2,
+                backoffCap: 4e3,
+                // 429 不允许 request 内部退避重试（那会在风控窗口里继续烧配额），立刻抛给外层限速门
+                isRetryable: (retryError) => !isShareRateLimited(retryError),
+                host,
+                // 跨域直连 123865 时必须不带 cookie（接口免登录，CORS 是 * 时带 cookie 浏览器会拒收响应）
+                credentialsMode: host === origin ? "include" : "omit",
+                query: {
+                  limit: String(options.limit || 100),
+                  next: "0",
+                  orderBy: "file_name",
+                  orderDirection: "asc",
+                  parentFileId: String(parentId || "0"),
+                  Page: String(page),
+                  shareKey,
+                  ...sharePwd ? { SharePwd: sharePwd } : {}
+                }
+              });
+            } catch (error) {
+              if (error?.name === "AbortError" || error?.name === "TimeoutError") throw error;
+              lastError = error;
+              if (isShareRateLimited(error)) {
+                // 撞配额：留在当前 host 进长冷却（期间其他在途请求也会被门挡住），冷却结束自动接着翻页
+                cooldownRetries += 1;
+                if (cooldownRetries > 5) throw error;
+                const cooldownSeconds = Math.round(pacing.hit() / 1e3);
+                note(`\u5206\u4EAB\u63A5\u53E3\u89E6\u53D1\u98CE\u63A7\uFF0C\u6B47 ${cooldownSeconds}s \u81EA\u52A8\u7EE7\u7EED\uFF08\u626B\u63CF\u8FDB\u5EA6\u5DF2\u4FDD\u5B58\uFF0C\u53D6\u6D88\u4E5F\u4E0D\u4E22\uFF09`);
+                continue;
+              }
+              break; // 网络不通/域名异常 → 换下一个 host
+            }
+            if (!attempt?.data) {
+              // 网关把接口路径回成了网页 HTML 之类：这个 host 打不了分享接口
+              lastError = new Error(`\u5206\u4EAB\u63A5\u53E3\u5728 ${host} \u8FD4\u56DE\u5F02\u5E38\u5185\u5BB9`);
+              break;
+            }
+            shareApiHost = host;
+            data = attempt;
+            pacing.ok();
+            break outer;
           }
-        });
+        }
+        if (!data) throw lastError || new Error("\u5206\u4EAB\u63A5\u53E3\u8BF7\u6C42\u5931\u8D25");
         const body = data?.data || {};
         const list = body.InfoList || body.infoList || body.fileList || body.list || [];
         const normalized = (Array.isArray(list) ? list : []).map((item) => normalizeFile({
@@ -885,8 +1035,8 @@
         if (next === "-1" || next === String(page)) {
           break;
         }
-        // 翻页间隔：分享接口限流严格，连页请求之间留 400ms
-        await sleep(Number(options.pageDelay ?? 400));
+        // 翻页间隔只留少量余量：最小请求间距已由分享接口限速门（pacing.waitTurn）统一保证
+        await sleep(Number(options.pageDelay ?? 120));
         if (options.signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
       }
       return output;
@@ -5826,9 +5976,10 @@
     };
     const cache = /* @__PURE__ */ new Map();
     const listingCache = /* @__PURE__ */ new Map();
-    // 秒传执行并发：默认 16、上限 32（与秒传导入导出速度对齐；此前被封顶在 5，
-    // 大批量导入比同类脚本慢约 3 倍）。
-    const concurrency = Math.max(1, Math.min(32, Number(options.concurrency) || 16));
+    // 秒传执行并发：默认 32、上限 32（2026-09-08 实测 upload_request 复用接口 32 并发
+    // 85 req/s 全部成功、零频控，此前默认 16；目录预建并发随之下调上限到 12 与 list 接口
+    // 的 ~15 QPS 频控对齐）。
+    const concurrency = Math.max(1, Math.min(32, Number(options.concurrency) || 32));
     // 目录按层并发预建：先把本次导入涉及的全部父目录按深度逐层并发建立/复用，
     // 避免文件阶段逐个 ensurePath 串行逐级查目录拖慢导入。
     {
@@ -6036,7 +6187,8 @@
       parentId,
       files: [],
       completedFolders: [],
-      pending: [{ id: parentId, path: "" }]
+      pending: [{ id: parentId, path: "" }],
+      pacing: null
     };
     if (batchContext) state.batch = { lines: [...batchContext.lines], done: Number(batchContext.done) || 0 };
     else delete state.batch;
@@ -6079,7 +6231,10 @@
     const rootSet = new Set(rootIndexes);
     // 目录按层并发扫描（与秒传导入同款策略）：每层最多 concurrency 个目录同时 listAll，
     // 显著快于旧的深度优先串行扫描；断点续传、去重、中断抢救语义保持不变。
-    const concurrency = Math.max(1, Math.min(8, Number(options.concurrency) || 6));
+    // 并发实测（2026-09-08）：file/list/new 有 ~15 QPS/用户频控（code 100011，空文案），
+    // 并发再高吞吐也不会涨（实测 8/16/32 成功速率都恒定 ~15 目录/秒），8 已够饱和；
+    // 100011 本身由 request() 退避重试兜底。
+    const concurrency = Math.max(1, Math.min(16, Number(options.concurrency) || 8));
     let files = [];
     let allFiles = files;
     let othersPending = [];
@@ -6197,10 +6352,11 @@
   async function collectPublicShareFiles(api, value, options = {}) {
     const { shareKey, sharePwd } = typeof value === "string" ? parsePublicShareInput(value) : value;
     const checkpoint = options.checkpoint || null;
-    // 目录按层并发扫描：分享接口（listSharedDirectoryContents）是 123 限流最严的接口之一，
-    // 并发默认压到 2（上限 4）——比旧串行版快，但不会触发"分享接口请求过于频繁"。
-    // 注意与秒传导出（collectFastlinkFiles，走网盘自身接口，默认 6）不同。
-    const concurrency = Math.max(1, Math.min(4, Number(options.concurrency) || 2));
+    // 分享接口（listSharedDirectoryContents）走全局限速门 shareApiGate：直连 www.123865.com 时
+    // 零间距全速并发（默认 32，实测 258 req/s 零 429），回退页面域名时自动切 1s 慢车道；
+    // 撞上 429 计数配额（mshare 分享域名实测约 60 个/分钟）自动长冷却再续扫，不再直接报错。
+    const pacing = options.pacing || shareApiGate;
+    const concurrency = Math.max(1, Math.min(32, Number(options.concurrency) || 32));
     let output = [];
     let allFiles = output;
     let frontier = [];
@@ -6213,6 +6369,7 @@
       seenIds = new Set(allFiles.map((file) => String(file.id)));
       frontier = [...(checkpoint.state.pending || [])];
       checkpoint.state.pending = [];
+      if (checkpoint.state.pacing) pacing.restore(checkpoint.state.pacing);
     } else {
       frontier = [{ id: String(options.parentId || "0"), path: "" }];
     }
@@ -6221,6 +6378,7 @@
       checkpoint.state.files = allFiles;
       checkpoint.state.completedFolders = [...completedFolders];
       checkpoint.state.pending = [...frontier];
+      checkpoint.state.pacing = pacing.snapshot();
       checkpoint.save(force);
     };
     const pushFile = (entry) => {
@@ -6255,7 +6413,12 @@
               if (checkpoint?.state) checkpoint.state.files = allFiles;
             }
           }
-          const entries = await api.listSharedDirectoryContents(entry.id, shareKey, sharePwd, { signal: options.signal, limit: options.limit });
+          const entries = await api.listSharedDirectoryContents(entry.id, shareKey, sharePwd, {
+            signal: options.signal,
+            limit: options.limit,
+            pacing,
+            onPace: (message) => options.onProgress?.(output.length, 0, message)
+          });
           // 收集放进 worker 内做：同层其他目录先完成时进度不会因本层中断而丢失
           for (const entry2 of [...(entries || [])]) {
             const name = cleanPathPart(entry2.name || entry2.fileName || "\u672A\u77E5\u6587\u4EF6");
@@ -6511,7 +6674,11 @@
       button.removeAttribute("data-error");
       try {
         const source = options.locationRef?.href || target.defaultView?.location?.href || "";
-        const artifact = await exportPublicShare(options.api, source, { useFolderName: true });
+        const artifact = await exportPublicShare(options.api, source, {
+          useFolderName: true,
+          // 分享接口触发风控冷却时把倒计时透到状态条，用户能看见"歇几秒后自动继续"
+          onProgress: (_done, _total, message) => showStatus(target, message)
+        });
         (options.download || downloadJson)(target, artifact.filename, artifact.text);
         button.textContent = "JSON \u5DF2\u4E0B\u8F7D";
         showStatus(target, `\u5DF2\u751F\u6210 ${artifact.filename}`);
@@ -20011,6 +20178,12 @@ ${end.comment}` : end.comment;
       const artifacts = [];
       for (let index = startIndex; index < lines.length; index += 1) {
         const input = parsePublicShareInput(lines[index]);
+        if (index > startIndex) {
+          // 分享接口按窗口计数配额（mshare 域名实测约 60 个/分钟）：上一条扫完歇几秒再开下一条，
+          // 连续扫大分享时不至于把下一个窗口一开场就打穿
+          this.setProgress(index, lines.length, "\u4E0A\u4E00\u6761\u5DF2\u626B\u5B8C\uFF0C\u6B47\u51E0\u79D2\u518D\u89E3\u6790\u4E0B\u4E00\u6761\uFF08\u907F\u5F00\u5206\u4EAB\u63A5\u53E3\u98CE\u63A7\uFF09");
+          await sleep(2500 + Math.floor(Math.random() * 1500));
+        }
         const checkpoint = createFastlinkShareCheckpoint(input, this.fastlinkExportOptions(), { lines, done: index });
         try {
           const artifact = await this.runTask(async (signal) => exportPublicShare(this.api, input, {
