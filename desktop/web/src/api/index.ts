@@ -261,24 +261,6 @@ export interface LibraryFastlinkJson {
   files: Array<{ path: string; fileName: string; etag: string; size: number; type: number; s3KeyFlag: string }>;
 }
 
-export interface LibraryShareItem {
-  id: string;
-  name: string;
-  type: number;
-  etag: string;
-  size: number;
-  s3KeyFlag: string;
-}
-
-export interface LibraryShareTask {
-  taskId: string;
-  status: string;
-  createdAt?: number;
-  progress: { step: string; files: number; dirs: number; skipped: number };
-  result: Record<string, unknown> | null;
-  error: string | null;
-}
-
 export interface LibraryTransferTask {
   taskId: string;
   status: string;
@@ -379,40 +361,6 @@ export const libraryApi = {
     api.get<{ ok: boolean; detail: TmdbDetail | null }>(
       `/api/library/tmdb/${tmdbId}?title=${encodeURIComponent(title)}&year=${year || 0}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
     ),
-  shareHistory: (token: string) =>
-    api.get<{ ok: boolean; tasks: LibraryShareTask[] }>(
-      `/api/library/share/history${token ? `?token=${encodeURIComponent(token)}` : ""}`,
-    ),
-  shareBrowse: (url: string, parentId: string, token: string, page = 1) =>
-    api.post<{ ok: boolean; shareKey: string; parentId: string; items: LibraryShareItem[]; hasMore: boolean }>(
-      "/api/library/share/browse",
-      { url, parentId, page, token },
-    ),
-  shareExtract: (payload: {
-    url: string;
-    cat?: string;
-    sub?: string;
-    title?: string;
-    selectedItems?: LibraryShareItem[];
-    fileFilters?: string[];
-    resume?: boolean;
-    token?: string;
-  }) => api.post<{ ok: boolean; taskId: string }>("/api/library/share/extract", payload),
-  shareTask: (taskId: string, token: string) =>
-    api.get<{ ok: boolean; task: LibraryShareTask }>(
-      `/api/library/share/task?taskId=${encodeURIComponent(taskId)}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
-    ),
-  shareCheckpoint: (url: string, selectedItems: LibraryShareItem[], token: string) =>
-    api.post<{ ok: boolean; checkpoint: { hasCheckpoint: boolean; totalFiles?: number; updatedAt?: string } }>(
-      "/api/library/share/checkpoint",
-      { url, selectedItems, token },
-    ),
-  deleteShareCheckpoint: (url: string, selectedItems: LibraryShareItem[], token: string) =>
-    api.post<{ ok: boolean; deleted: boolean }>("/api/library/share/checkpoint/delete", {
-      url,
-      selectedItems,
-      token,
-    }),
   transfer: (dirs: string[], targetPath: string, targetDirId: string, token: string, includeFiles?: string[]) =>
     api.post<{ ok: boolean; taskId: string; workCount: number; fileCount: number }>("/api/library/transfer", {
       dirs,

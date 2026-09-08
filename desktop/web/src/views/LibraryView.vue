@@ -13,8 +13,6 @@ import {
   type LibraryConfig,
   type LibraryFile,
   type LibraryLibInfo,
-  type LibraryShareItem,
-  type LibraryShareTask,
   type LibraryStatus,
   type LibraryTransferTask,
   type LibraryWork,
@@ -25,10 +23,9 @@ import { useGlobalState } from "@/composables/useGlobalState";
 
 const { notifySuccess, notifyError, confirm } = useGlobalState();
 
-type LibraryTab = "browse" | "share" | "config";
+type LibraryTab = "browse" | "config";
 const tabsList: Array<{ key: LibraryTab; label: string; icon: string }> = [
   { key: "browse", label: "搜索浏览", icon: "mdi-magnify" },
-  { key: "share", label: "分享提取", icon: "mdi-cloud-download-outline" },
   { key: "config", label: "影库设置", icon: "mdi-cog-outline" },
 ];
 const tab = ref<LibraryTab>("browse");
@@ -828,257 +825,6 @@ async function pollTransferTask(taskId: string) {
   transferTimer = window.setInterval(tick, 1500);
 }
 
-// ===== 分享提取入库 =====
-const shareUrl = ref("");
-const shareTitle = ref("");
-const extractCat = ref("");
-const extractSub = ref("");
-watch(extractCat, () => {
-  extractSub.value = "";
-});
-const shareLoading = ref(false);
-const shareBrowseOpen = ref(false);
-const shareItems = ref<LibraryShareItem[]>([]);
-const sharePath = ref<Array<{ id: string; name: string }>>([]);
-const shareSelected = ref<Set<string>>(new Set());
-const shareItemMap = ref<Map<string, LibraryShareItem>>(new Map());
-const shareFilters = ref<Set<string>>(new Set());
-const shareResumeInfo = ref<{ totalFiles: number; updatedAt: string } | null>(null);
-const fileTypes: Record<string, string[]> = {
-  视频: ["mp4", "mkv", "avi", "mov", "wmv", "flv", "ts", "m4v", "rmvb", "rm", "webm", "m2ts", "vob", "mpg", "mpeg", "3gp", "f4v"],
-  字幕: ["srt", "ass", "ssa", "sub", "sup", "idx", "smi", "srtx", "vtt"],
-  音频: ["mp3", "flac", "wav", "aac", "ogg", "m4a", "wma", "ape", "alac", "opus", "mka"],
-  图片: ["jpg", "jpeg", "png", "bmp", "gif", "webp", "ico", "tiff", "tif", "heic", "svg"],
-  文档: ["txt", "pdf", "nfo", "doc", "docx", "xls", "xlsx", "epub", "mobi", "info"],
-  压缩包: ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"],
-};
-const shareExtractTask = ref<LibraryShareTask | null>(null);
-const shareBatchInput = ref("");
-const shareBatchRunning = ref(false);
-const shareBatchLines = ref<Array<{ url: string; status: string; info: string }>>([]);
-const shareHistoryList = ref<LibraryShareTask[]>([]);
-let shareTimer: number | undefined;
-
-const shareSelectedCount = computed(() => shareSelected.value.size);
-
-async function loadShareLevel(parentId: string) {
-  const data = await libraryApi.shareBrowse(shareUrl.value.trim(), parentId, apiToken.value);
-  shareItems.value = data.items || [];
-}
-
-async function browseShare() {
-  if (!shareUrl.value.trim()) {
-    notifyError("请粘贴 123 分享链接");
-    return;
-  }
-  shareLoading.value = true;
-  try {
-    sharePath.value = [];
-    shareSelected.value = new Set();
-    shareItemMap.value = new Map();
-    await loadShareLevel("0");
-    shareBrowseOpen.value = true;
-    try {
-      const cp = await libraryApi.shareCheckpoint(shareUrl.value.trim(), [], apiToken.value);
-      shareResumeInfo.value = cp.checkpoint?.hasCheckpoint
-        ? { totalFiles: cp.checkpoint.totalFiles || 0, updatedAt: cp.checkpoint.updatedAt || "" }
-        : null;
-    } catch {
-      shareResumeInfo.value = null;
-    }
-  } catch (error) {
-    notifyError(`浏览分享失败：${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    shareLoading.value = false;
-  }
-}
-
-async function enterShareFolder(item: LibraryShareItem) {
-  shareLoading.value = true;
-  try {
-    sharePath.value = [...sharePath.value, { id: item.id, name: item.name }];
-    await loadShareLevel(item.id);
-  } catch (error) {
-    sharePath.value = sharePath.value.slice(0, -1);
-    notifyError(`进入文件夹失败：${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    shareLoading.value = false;
-  }
-}
-
-async function shareJumpTo(index: number) {
-  shareLoading.value = true;
-  try {
-    sharePath.value = sharePath.value.slice(0, index + 1);
-    await loadShareLevel(sharePath.value[index].id);
-  } catch (error) {
-    notifyError(`跳转失败：${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    shareLoading.value = false;
-  }
-}
-
-function shareGoRoot() {
-  sharePath.value = [];
-  void loadShareLevel("0");
-}
-
-function toggleShareItem(item: LibraryShareItem) {
-  const next = new Set(shareSelected.value);
-  if (next.has(item.id)) next.delete(item.id);
-  else next.add(item.id);
-  shareSelected.value = next;
-  const map = new Map(shareItemMap.value);
-  if (next.has(item.id)) map.set(item.id, item);
-  shareItemMap.value = map;
-}
-
-function toggleShareAllVisible() {
-  const next = new Set(shareSelected.value);
-  const allSelected = shareItems.value.every((item) => next.has(item.id));
-  for (const item of shareItems.value) {
-    if (allSelected) next.delete(item.id);
-    else {
-      next.add(item.id);
-      const map = new Map(shareItemMap.value);
-      map.set(item.id, item);
-      shareItemMap.value = map;
-    }
-  }
-  shareSelected.value = next;
-}
-
-function toggleFilter(name: string) {
-  const next = new Set(shareFilters.value);
-  if (next.has(name)) next.delete(name);
-  else next.add(name);
-  shareFilters.value = next;
-}
-
-async function startExtract(resume = false) {
-  const selected = resume
-    ? []
-    : Array.from(shareSelected.value)
-        .map((id) => shareItemMap.value.get(id))
-        .filter((item): item is LibraryShareItem => Boolean(item));
-  shareLoading.value = true;
-  try {
-    const data = await libraryApi.shareExtract({
-      url: shareUrl.value.trim(),
-      title: shareTitle.value.trim(),
-      cat: extractCat.value,
-      sub: extractSub.value,
-      selectedItems: selected,
-      fileFilters: Array.from(shareFilters.value),
-      resume,
-      token: apiToken.value,
-    });
-    shareBrowseOpen.value = false;
-    shareResumeInfo.value = null;
-    notifySuccess(resume ? "已从断点继续提取" : "提取任务已创建，扫完的秒传 JSON 会自动入库");
-    await pollShareTask(data.taskId);
-  } catch (error) {
-    notifyError(`创建提取任务失败：${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    shareLoading.value = false;
-  }
-}
-
-async function extractWholeShare() {
-  if (!shareUrl.value.trim()) {
-    notifyError("请粘贴 123 分享链接");
-    return;
-  }
-  await startExtract(false);
-}
-
-async function discardShareCheckpoint() {
-  try {
-    await libraryApi.deleteShareCheckpoint(shareUrl.value.trim(), [], apiToken.value);
-    shareResumeInfo.value = null;
-    notifySuccess("已放弃上次的提取进度");
-  } catch (error) {
-    notifyError(`操作失败：${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-async function pollShareTask(taskId: string) {
-  window.clearInterval(shareTimer);
-  const tick = async () => {
-    try {
-      const data = await libraryApi.shareTask(taskId, apiToken.value);
-      shareExtractTask.value = data.task;
-      if (data.task.status !== "running") {
-        window.clearInterval(shareTimer);
-        await Promise.all([loadStatus(), loadCategories(), loadShareHistory()]);
-      }
-    } catch {
-      window.clearInterval(shareTimer);
-    }
-  };
-  await tick();
-  shareTimer = window.setInterval(tick, 2000);
-}
-
-async function loadShareHistory() {
-  try {
-    shareHistoryList.value = (await libraryApi.shareHistory(apiToken.value)).tasks || [];
-  } catch {
-    /* 静默 */
-  }
-}
-
-async function runBatchExtract() {
-  const lines = shareBatchInput.value.split(/\n+/).map((l) => l.trim()).filter((l) => l);
-  if (!lines.length) {
-    notifyError("请先粘贴分享链接（每行一条，可带提取码）");
-    return;
-  }
-  shareBatchRunning.value = true;
-  shareBatchLines.value = lines.map((url) => ({ url, status: "等待", info: "" }));
-  try {
-    for (const line of shareBatchLines.value) {
-      line.status = "提取中";
-      try {
-        const started = await libraryApi.shareExtract({
-          url: line.url,
-          cat: extractCat.value,
-          sub: extractSub.value,
-          fileFilters: Array.from(shareFilters.value),
-          token: apiToken.value,
-        });
-        for (;;) {
-          const t = await libraryApi.shareTask(started.taskId, apiToken.value);
-          if (t.task.status !== "running") {
-            if (t.task.status === "done") {
-              line.status = "完成";
-              line.info = `${t.task.result?.totalFilesCount ?? 0} 个文件`;
-            } else {
-              line.status = "失败";
-              line.info = String(t.task.error || "");
-            }
-            break;
-          }
-          line.info = `已扫 ${t.task.progress.files} 个文件`;
-          await new Promise((resolve) => setTimeout(resolve, 1500));
-        }
-      } catch (error) {
-        line.status = "失败";
-        line.info = error instanceof Error ? error.message : String(error);
-      }
-    }
-    shareBatchInput.value = "";
-    notifySuccess("批量提取完成，结果已入库");
-    await Promise.all([loadStatus(), loadCategories(), loadShareHistory()]);
-  } finally {
-    shareBatchRunning.value = false;
-  }
-}
-
-watch(tab, (value) => {
-  if (value === "share") void loadShareHistory();
-});
-
 // ===== 存储分析 =====
 const storageRings = computed(() => {
   let offset = 25;
@@ -1127,7 +873,7 @@ function saveUiState() {
 function restoreUiState() {
   try {
     const state = JSON.parse(localStorage.getItem(UI_STATE_KEY) || "{}") || {};
-    if (["browse", "share", "config"].includes(state.tab)) tab.value = state.tab;
+    if (["browse", "config"].includes(state.tab)) tab.value = state.tab;
     activeCat.value = String(state.activeCat || "");
     activeSub.value = String(state.activeSub || "");
     page.value = Math.max(1, Number(state.page) || 1);
@@ -1148,7 +894,6 @@ onMounted(async () => {
 onUnmounted(() => {
   window.clearInterval(statusTimer);
   window.clearInterval(transferTimer);
-  window.clearInterval(shareTimer);
   window.clearTimeout(searchDebounce);
 });
 </script>
@@ -1400,121 +1145,6 @@ onUnmounted(() => {
         </div>
       </GlassCard>
     </div>
-
-    <!-- ====================== 分享提取 ====================== -->
-    <div v-show="tab === 'share'" class="section-stack">
-      <GlassCard accent="group" icon="mdi-cloud-download-outline" title="分享链接提取入库" desc="粘贴 123 分享链接直接提取整部分享入库；或「浏览分享」逐级勾选部分文件/文件夹。提取结果自动写入影库导入目录。">
-        <FormGrid>
-          <v-text-field
-            v-model="shareUrl"
-            label="123 分享链接（可带提取码）"
-            placeholder="https://www.123pan.com/s/xxxx 提取码：xxxx"
-            variant="outlined"
-            density="compact"
-            clearable
-          />
-          <v-text-field
-            v-model="shareTitle"
-            label="自定义作品名（可选）"
-            placeholder="默认按分享内目录聚合"
-            variant="outlined"
-            density="compact"
-            hide-details
-          />
-          <v-select
-            v-model="extractCat"
-            :items="categories.map((c) => c.name)"
-            label="归入一级分类（可选）"
-            variant="outlined"
-            density="compact"
-            clearable
-            hide-details
-          />
-          <v-select
-            v-model="extractSub"
-            :items="(categories.find((c) => c.name === extractCat)?.subs || []).map((x) => x.name)"
-            label="二级分类（可选）"
-            variant="outlined"
-            density="compact"
-            clearable
-            hide-details
-            :disabled="!extractCat"
-          />
-        </FormGrid>
-
-        <div class="button-row">
-          <v-btn color="primary" prepend-icon="mdi-folder-search-outline" :loading="shareLoading" @click="browseShare">浏览分享…</v-btn>
-          <v-btn color="success" variant="tonal" prepend-icon="mdi-cloud-download-outline" :loading="shareLoading" @click="extractWholeShare">整部分享直接提取</v-btn>
-          <v-btn
-            v-for="name in Object.keys(fileTypes)"
-            :key="name"
-            size="small"
-            :variant="shareFilters.has(name) ? 'tonal' : 'outlined'"
-            :color="shareFilters.has(name) ? 'primary' : 'default'"
-            @click="toggleFilter(name)"
-          >{{ name }}</v-btn>
-          <span v-if="shareFilters.size" class="muted-hint">勾选的类型之外会被跳过；不勾=不过滤</span>
-        </div>
-
-        <div v-if="shareResumeInfo" class="extract-progress">
-          <div class="extract-step">
-            <v-icon icon="mdi-progress-clock" size="18" />
-            检测到上次未完成的提取（已扫 {{ shareResumeInfo.totalFiles }} 个文件{{ shareResumeInfo.updatedAt ? ` · ${shareResumeInfo.updatedAt}` : "" }}）
-          </div>
-          <div class="button-row">
-            <v-btn size="small" color="primary" @click="startExtract(true)">从断点继续提取</v-btn>
-            <v-btn size="small" variant="text" @click="discardShareCheckpoint">放弃进度</v-btn>
-          </div>
-        </div>
-
-        <div v-if="shareExtractTask" class="extract-progress">
-          <div class="extract-step">
-            <v-icon :icon="shareExtractTask.status === 'running' ? 'mdi-progress-clock' : shareExtractTask.status === 'done' ? 'mdi-check-circle' : 'mdi-alert-circle'" size="18" />
-            {{ shareExtractTask.progress.step }}
-          </div>
-          <div v-if="shareExtractTask.status === 'running'" class="extract-nums">
-            已扫 {{ shareExtractTask.progress.files }} 个文件 · {{ shareExtractTask.progress.dirs }} 个目录 · 跳过 {{ shareExtractTask.progress.skipped }}
-          </div>
-          <div v-else-if="shareExtractTask.result" class="extract-nums">
-            {{ String(shareExtractTask.result.file || "") }} · {{ shareExtractTask.result.formattedTotalSize }}
-          </div>
-        </div>
-      </GlassCard>
-
-      <GlassCard icon="mdi-playlist-plus" title="批量链接提取" desc="每行一条分享链接（可带提取码），按顺序逐个提取入库，避免打爆分享接口。">
-        <v-textarea
-          v-model="shareBatchInput"
-          :rows="4"
-          label="分享链接列表"
-          placeholder="https://www.123pan.com/s/aaaa 提取码：abcd&#10;https://www.123pan.com/s/bbbb"
-          variant="outlined"
-          density="compact"
-        />
-        <div class="button-row">
-          <v-btn color="primary" prepend-icon="mdi-playlist-play" :loading="shareBatchRunning" @click="runBatchExtract">批量提取（{{ shareBatchLines.length || "" }}）</v-btn>
-          <span v-if="shareFilters.size" class="muted-hint">应用上方当前的类型过滤与分类归属</span>
-        </div>
-        <div v-if="shareBatchLines.length" class="hub-offline-list">
-          <div v-for="(line, index) in shareBatchLines" :key="index" class="hub-offline-row">
-            <span class="lib-name">{{ line.url }}</span>
-            <span class="share-item-meta">{{ line.status }} {{ line.info }}</span>
-          </div>
-        </div>
-      </GlassCard>
-
-      <GlassCard v-if="shareHistoryList.length" icon="mdi-history" title="提取历史" desc="最近 30 次提取任务（重启后清空）。">
-        <div class="hub-offline-list">
-          <div v-for="task in shareHistoryList" :key="task.taskId" class="hub-offline-row">
-            <span class="lib-name">{{ String(task.result?.file || task.progress.step) }}</span>
-            <span class="share-item-meta">
-              {{ task.createdAt ? new Date(task.createdAt * 1000).toLocaleString() : "" }} ·
-              {{ task.status === "done" ? `完成（${task.result?.formattedTotalSize || ""}）` : task.status === "running" ? "进行中" : "失败" }}
-            </span>
-          </div>
-        </div>
-      </GlassCard>
-    </div>
-
     <!-- ====================== 影库设置 ====================== -->
     <div v-show="tab === 'config'" class="section-stack">
       <GlassCard accent="group" icon="mdi-cog-outline" title="导入影库" desc="选择影库文件（支持 123 助手全部格式）解析入数据库；源文件之后删掉也不影响查询。">
@@ -1553,7 +1183,7 @@ onUnmounted(() => {
         </FormField>
       </GlassCard>
 
-      <GlassCard icon="mdi-key-outline" title="访问令牌" desc="开放局域网/外网访问时建议配置：影库搜索、文件、导出、分享提取与转存接口将要求携带令牌。油猴脚本里填同一串令牌即可。">
+      <GlassCard icon="mdi-key-outline" title="访问令牌" desc="开放局域网/外网访问时建议配置：影库搜索、文件、导出与转存接口将要求携带令牌。油猴脚本里填同一串令牌即可。">
         <FormGrid>
           <FormField hint="留空保存 = 保留现有令牌；勾选清除则删除。本机管理页始终能看到明文。">
             <div class="port-row">
@@ -1622,49 +1252,6 @@ onUnmounted(() => {
           <v-spacer />
           <v-btn variant="text" @click="transferPickerOpen = false">取消</v-btn>
           <v-btn color="primary" :disabled="transferPickerLoading" @click="pickerConfirm">选择此目录</v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
-
-    <!-- ====================== 分享内容勾选弹窗 ====================== -->
-    <v-dialog v-model="shareBrowseOpen" max-width="680">
-      <v-card class="dir-picker-card">
-        <v-card-title class="dir-picker-title">
-          <v-icon icon="mdi-cloud-download-outline" size="22" class="mr-2" />
-          勾选要提取的文件 / 文件夹（已选 {{ shareSelectedCount }}）
-        </v-card-title>
-        <v-card-text>
-          <div class="dir-picker-breadcrumb">
-            <v-btn size="small" variant="text" @click="shareGoRoot">根目录</v-btn>
-            <template v-for="(item, index) in sharePath" :key="item.id">
-              <v-icon icon="mdi-chevron-right" size="16" />
-              <v-btn size="small" variant="text" @click="shareJumpTo(index)">{{ item.name }}</v-btn>
-            </template>
-          </div>
-          <div v-if="shareLoading" class="empty-state"><p>目录加载中…</p></div>
-          <div v-else-if="!shareItems.length" class="empty-state"><p>此目录为空。</p></div>
-          <div v-else class="dir-picker-list">
-            <div v-for="item in shareItems" :key="item.id" class="share-item-row">
-              <v-checkbox
-                :model-value="shareSelected.has(item.id)"
-                density="compact"
-                hide-details
-                :label="item.name"
-                @update:model-value="toggleShareItem(item)"
-              />
-              <span class="share-item-meta">
-                <v-btn v-if="item.type === 1" size="x-small" variant="text" prepend-icon="mdi-folder-open-outline" @click="enterShareFolder(item)">进入</v-btn>
-                <template v-else>{{ formatBytes(item.size) }}</template>
-              </span>
-            </div>
-          </div>
-        </v-card-text>
-        <v-card-actions>
-          <v-btn variant="text" @click="toggleShareAllVisible">{{ shareItems.every((i) => shareSelected.has(i.id)) && shareItems.length ? "全不选" : "全选本层" }}</v-btn>
-          <span class="muted-hint">勾选文件夹整体提取；可逐层进入累计勾选</span>
-          <v-spacer />
-          <v-btn variant="text" @click="shareBrowseOpen = false">取消</v-btn>
-          <v-btn color="primary" :disabled="!shareSelectedCount" :loading="shareLoading" @click="startExtract(false)">提取选中（{{ shareSelectedCount }}）</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>

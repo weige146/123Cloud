@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 
 from fastapi import HTTPException
 
-from app import library_transfer, main, movie_library, movie_library_db, share_extractor
+from app import library_transfer, main, movie_library, movie_library_db
 from app.movie_library import (
     b62_to_hex,
     etag_hex,
@@ -35,7 +35,6 @@ from app.movie_library import (
     parse_dir_name,
     parse_library_content,
 )
-from app.share_extractor import ShareExtractor, match_file_type
 
 
 def _write_json(path: Path, payload) -> None:
@@ -241,68 +240,6 @@ class MovieLibraryEngineTests(unittest.TestCase):
             self.assertEqual([f["fileName"] for f in works[0]["files"]], ["a.mkv"])
             self.assertEqual(db.transfer_files([WORK_A], ["不存在.mkv"]), [])
             self.assertEqual(db.transfer_files(["不存在目录"]), [])
-
-    def test_db_share_history_persists(self):
-        """提取历史落库：写入后可读回，重复写入覆盖不叠加。"""
-        from app.movie_library_db import LibraryDb
-        with tempfile.TemporaryDirectory() as d:
-            db = LibraryDb(Path(d) / "cloud123.db")
-            task = {
-                "taskId": "t1", "createdAt": time.time(), "status": "done",
-                "result": {"file": "a.123fastlink.json", "totalFilesCount": 3, "formattedTotalSize": "1.2 GB"},
-                "error": None,
-            }
-            db.save_share_history(task)
-            db.save_share_history(task)  # 幂等
-            history = db.share_history(30)
-            self.assertEqual(len(history), 1)
-            self.assertEqual(history[0]["taskId"], "t1")
-            self.assertEqual(history[0]["result"]["totalFilesCount"], 3)
-
-
-class ShareExtractorPureTests(unittest.TestCase):
-    def test_parse_input(self):
-        key, pwd = ShareExtractor.parse_input("https://www.123pan.com/s/abcXYZ?提取码：99fn")
-        self.assertEqual(key, "abcXYZ")
-        self.assertEqual(pwd, "99fn")
-        key, pwd = ShareExtractor.parse_input("123865.com/s/onlykey")
-        self.assertEqual(key, "onlykey")
-        self.assertEqual(pwd, "")
-
-    def test_match_file_type(self):
-        self.assertTrue(match_file_type("a.mkv", None))
-        self.assertTrue(match_file_type("a.mkv", ["视频"]))
-        self.assertFalse(match_file_type("a.jpg", ["视频"]))
-        self.assertTrue(match_file_type("a.jpg", ["视频", "图片"]))
-
-    def test_build_fastlink_rewrites_paths_and_etags(self):
-        files = [
-            {"path": "剧 (2020) {tmdb-5}/Season 1/e1.mkv", "fileName": "e1.mkv", "etag": _etag(1), "size": 10},
-            {"path": "剧 (2020) {tmdb-5}/Season 1/e2.mkv", "fileName": "e2.mkv", "etag": hex_to_base62(_etag(2)), "size": 20},
-        ]
-        out = ShareExtractor.build_fastlink(files, title="自定义剧名")
-        self.assertEqual(out["commonPath"], "自定义剧名/")
-        self.assertEqual(out["files"][0]["path"], "e1.mkv")
-        # hex 已被转 base62
-        self.assertNotEqual(out["files"][0]["etag"], _etag(1))
-        self.assertEqual(b62_to_hex(out["files"][0]["etag"]), _etag(1))
-        # 已是 base62 的保持不变
-        self.assertEqual(out["files"][1]["etag"], hex_to_base62(_etag(2)))
-        self.assertEqual(out["totalSize"], 30)
-
-    def test_extractor_imports_into_db_on_completion(self):
-        """提取完成后走 importer 直接入库，不再落盘 JSON。"""
-        extractor = ShareExtractor(checkpoint_dir="")
-        captured = {}
-        extractor.importer = lambda name, payload: captured.setdefault("calls", []).append((name, payload)) \
-            or {"ok": True, "added": 1, "skipped": 0}
-        files = [
-            {"path": "剧 (2020) {tmdb-5}/e1.mkv", "fileName": "e1.mkv", "etag": _etag(1), "size": 10},
-        ]
-        out = ShareExtractor.build_fastlink(files, title="剧 (2020) {tmdb-5}")
-        extractor.importer("提取-剧.json", out)
-        self.assertEqual(captured["calls"][0][0], "提取-剧.json")
-        self.assertEqual(captured["calls"][0][1]["totalFilesCount"], 1)
 
 
 class _FakePan123:
@@ -641,20 +578,9 @@ class LibraryRouteTests(unittest.TestCase):
                 ))
             self.assertEqual(ctx.exception.status_code, 404)
 
-    def test_share_history_and_poster_cache_routes(self):
+    def test_poster_cache_route(self):
         with unittest.mock.patch.object(main, "store", self.store):
-            # 历史已落库：轮询写入后接口可读回（重启不清空）
             asyncio.run(main.write_library_config(main.LibraryConfigRequest(), _StubRequest()))
-            movie_library_db.save_share_history({
-                "taskId": "fake1", "createdAt": time.time(), "status": "done",
-                "result": {"file": "a.123fastlink.json", "totalFilesCount": 3, "formattedTotalSize": "1 GB"},
-                "error": None,
-            })
-            result = asyncio.run(main.library_share_history(_StubRequest()))
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["tasks"][0]["taskId"], "fake1")
-            self.assertEqual(result["tasks"][0]["result"]["totalFilesCount"], 3)
-
             self.store.write_value("moviePoster:555", {"url": "http://img/555.jpg"})
             poster = asyncio.run(main.library_poster(_StubRequest(), tmdbId=555, title="x", year=0, token=""))
             self.assertEqual(poster["url"], "http://img/555.jpg")

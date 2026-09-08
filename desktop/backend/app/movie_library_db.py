@@ -60,15 +60,6 @@ CREATE INDEX IF NOT EXISTS idx_library_works_pinyin_first ON library_works(pinyi
 CREATE INDEX IF NOT EXISTS idx_library_works_cat ON library_works(cat, sub);
 CREATE INDEX IF NOT EXISTS idx_library_works_source ON library_works(source);
 CREATE INDEX IF NOT EXISTS idx_library_work_files_dir ON library_work_files(dir);
-CREATE TABLE IF NOT EXISTS library_share_history (
-    task_id TEXT PRIMARY KEY,
-    created_at REAL NOT NULL,
-    status TEXT NOT NULL,
-    file TEXT NOT NULL DEFAULT '',
-    total_files INTEGER NOT NULL DEFAULT 0,
-    formatted_total_size TEXT NOT NULL DEFAULT '',
-    error TEXT NOT NULL DEFAULT ''
-);
 """
 
 
@@ -476,37 +467,6 @@ class LibraryDb:
         finally:
             connection.close()
 
-    # ---------- 提取历史（持久化） ----------
-    def save_share_history(self, task: Dict[str, Any]) -> None:
-        result = task.get("result") or {}
-        connection = self._connect()
-        try:
-            with connection:
-                connection.execute(
-                    "INSERT OR REPLACE INTO library_share_history"
-                    " (task_id, created_at, status, file, total_files, formatted_total_size, error)"
-                    " VALUES (?,?,?,?,?,?,?)",
-                    (str(task.get("taskId") or ""), float(task.get("createdAt") or 0), str(task.get("status") or ""),
-                     str(result.get("file") or ""), int(result.get("totalFilesCount") or 0),
-                     str(result.get("formattedTotalSize") or ""), str(task.get("error") or "")),
-                )
-        finally:
-            connection.close()
-
-    def share_history(self, limit: int = 30) -> List[Dict[str, Any]]:
-        connection = self._connect()
-        try:
-            rows = connection.execute(
-                "SELECT * FROM library_share_history ORDER BY created_at DESC LIMIT ?", (max(1, limit),)).fetchall()
-            return [{
-                "taskId": r["task_id"], "createdAt": r["created_at"], "status": r["status"],
-                "result": {"file": r["file"], "totalFilesCount": r["total_files"],
-                           "formattedTotalSize": r["formatted_total_size"]},
-                "error": r["error"],
-            } for r in rows]
-        finally:
-            connection.close()
-
 
 # ---- 模块级单例（main 启动时 init 一次） ----
 _default_db: Optional[LibraryDb] = None
@@ -569,11 +529,3 @@ def transfer_files(dirs: List[str], include_files: Optional[List[str]] = None) -
 
 def works_exist(dirs: List[str]) -> bool:
     return _db().works_exist(dirs)
-
-
-def save_share_history(task: Dict[str, Any]) -> None:
-    _db().save_share_history(task)
-
-
-def share_history(limit: int = 30) -> List[Dict[str, Any]]:
-    return _db().share_history(limit)

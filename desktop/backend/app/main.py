@@ -32,7 +32,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
 setup_logging(DATA_DIR)
 
 from .directlink import read_directlink_status, serve_directlink_file, submit_arbitrary_urls_offline, submit_directlink_offline
-from . import library_transfer, movie_library, movie_library_db, share_extractor
+from . import library_transfer, movie_library, movie_library_db
 from .pan115 import CODE_RE as PAN123_CODE_RE, empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
 from .pan115_cookie import (
     PAN115_QR_DEVICES,
@@ -165,8 +165,6 @@ ADMIN_WEB_DIR = _resolve_admin_web_dir()
 
 store = SessionStore(DATA_DIR)
 movie_library_db.init(store.db_file)
-share_extractor.extractor.checkpoint_dir = str(DATA_DIR / "library_checkpoints")
-share_extractor.extractor.importer = lambda name, payload: movie_library_db.import_payload(name, payload)
 pan123 = Pan123Client()
 transfer_service = TransferService(store)
 logger = logging.getLogger(__name__)
@@ -229,7 +227,6 @@ async def stop_background_tasks() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    await share_extractor.extractor.aclose()
     await transfer_service.close()
     await pan123.close()
     await close_telegram_client()
@@ -1918,35 +1915,11 @@ class LibraryConfigRequest(BaseModel):
     clearToken: bool = False
 
 
-class LibraryShareBrowseRequest(BaseModel):
-    url: str = ""
-    parentId: str = "0"
-    page: int = 1
-    token: str = ""
-
-
-class LibraryShareExtractRequest(BaseModel):
-    url: str = ""
-    cat: str = ""
-    sub: str = ""
-    title: str = ""
-    selectedItems: List[Dict[str, Any]] = Field(default_factory=list)
-    fileFilters: List[str] = Field(default_factory=list)
-    resume: bool = False
-    token: str = ""
-
-
 class LibraryTransferRequest(BaseModel):
     dirs: List[str] = Field(default_factory=list)
     includeFiles: List[str] = Field(default_factory=list)
     targetPath: str = ""
     targetDirId: str = "0"
-    token: str = ""
-
-
-class LibraryShareCheckpointRequest(BaseModel):
-    url: str = ""
-    selectedItems: List[Dict[str, Any]] = Field(default_factory=list)
     token: str = ""
 
 
@@ -2275,13 +2248,6 @@ async def library_tmdb_detail(
     return {"ok": True, "detail": best}
 
 
-@app.get("/api/library/share/history")
-async def library_share_history(request: Request, token: str = "") -> Dict[str, Any]:
-    """最近的分享提取任务（已落库，重启不清空，最多 30 条）。"""
-    _guard_library_token(request, token)
-    return {"ok": True, "tasks": movie_library_db.share_history(30)}
-
-
 @app.post("/api/library/export/save")
 async def save_library_export(request: LibraryExportSaveRequest, request_obj: Request) -> Dict[str, Any]:
     """服务端直接把秒传 JSON 写进导出目录（不走浏览器下载，大分类也快）。"""
@@ -2464,68 +2430,6 @@ async def export_library_json(
     if payload is None:
         raise HTTPException(status_code=404, detail="没有可导出的内容")
     return {"ok": True, "library": payload}
-
-
-@app.get("/api/library/file-types")
-async def read_library_file_types(request: Request, token: str = "") -> Dict[str, Any]:
-    _guard_library_token(request, token)
-    return {"ok": True, "types": share_extractor.FILE_TYPE_FILTERS}
-
-
-@app.post("/api/library/share/browse")
-async def browse_share_for_library(request: LibraryShareBrowseRequest, request_obj: Request) -> Dict[str, Any]:
-    _guard_library_token(request_obj, request.token)
-    try:
-        share_key, share_pwd = share_extractor.extractor.parse_input(request.url)
-        host = await share_extractor.extractor.resolve_host(share_key)
-        items, has_more = await share_extractor.extractor.list_dir(
-            host, share_key, share_pwd, request.parentId or "0", max(1, int(request.page or 1)),
-        )
-    except share_extractor.ShareExtractorError as error:
-        raise HTTPException(status_code=400, detail=str(error))
-    return {"ok": True, "shareKey": share_key, "parentId": request.parentId or "0",
-            "items": items, "hasMore": has_more}
-
-
-@app.post("/api/library/share/extract")
-async def extract_share_to_library(request: LibraryShareExtractRequest, request_obj: Request) -> Dict[str, Any]:
-    _guard_library_token(request_obj, request.token)
-    try:
-        tid = share_extractor.extractor.start_task(
-            request.url, request.cat, request.sub, request.title,
-            request.selectedItems or None, request.fileFilters or None, bool(request.resume),
-        )
-    except share_extractor.ShareExtractorError as error:
-        raise HTTPException(status_code=400, detail=str(error))
-    logger.info(f"影库提取：已创建提取任务 {tid}（完成后直接入库）")
-    return {"ok": True, "taskId": tid}
-
-
-@app.get("/api/library/share/task")
-async def read_share_extract_task(
-    request: Request, taskId: str = Query(...), token: str = "",
-) -> Dict[str, Any]:
-    _guard_library_token(request, token)
-    task = share_extractor.extractor.get_task(taskId)
-    if task is None:
-        raise HTTPException(status_code=404, detail="提取任务不存在或已过期")
-    if task.get("status") != "running":
-        movie_library_db.save_share_history(task)  # 幂等写入，持久化提取历史
-    return {"ok": True, "task": task}
-
-
-@app.post("/api/library/share/checkpoint")
-async def check_share_checkpoint(request: LibraryShareCheckpointRequest, request_obj: Request) -> Dict[str, Any]:
-    _guard_library_token(request_obj, request.token)
-    info = share_extractor.extractor.check_checkpoint(request.url, request.selectedItems or None)
-    return {"ok": True, "checkpoint": info}
-
-
-@app.post("/api/library/share/checkpoint/delete")
-async def delete_share_checkpoint(request: LibraryShareCheckpointRequest, request_obj: Request) -> Dict[str, Any]:
-    _guard_library_token(request_obj, request.token)
-    deleted = share_extractor.extractor.delete_checkpoint(request.url, request.selectedItems or None)
-    return {"ok": True, "deleted": deleted}
 
 
 @app.post("/api/library/transfer")
