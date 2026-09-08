@@ -1,0 +1,14 @@
+{
+  "name": "tmdb-helper-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "TMDB 助手（tmdb-helper.user.js）回归测试：纯逻辑 + jsdom UI 冒烟",
+  "scripts": {
+    "test": "node run-all.mjs"
+  },
+  "dependencies": {
+    "jsdom": "^30.0.1",
+    "playwright-core": "^1.63.0"
+  }
+}

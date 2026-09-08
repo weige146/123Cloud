@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.2.7
+// @version      1.2.9
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
-// @author       local
 // @license      MIT
+// @icon         https://statics.123957.com/static-by-custom/favicon.ico
 // @match        *://*.123pan.com/*
 // @match        *://*.123pan.cn/*
 // @match        *://*.123684.com/*
@@ -34,8 +34,10 @@
 // @resource     mediaInfoWasm https://cdn.jsdelivr.net/npm/mediainfo.js@0.3.7/dist/MediaInfoModule.wasm#sha256=6a724ccf89a0ed239841443668e0a166dfc06eb4647de44e1375ebc887721d03
 // @run-at       document-start
 // @noframes
-// @downloadURL https://update.greasyfork.org/scripts/592236/123%20%E5%8A%A9%E6%89%8B.user.js
-// @updateURL https://update.greasyfork.org/scripts/592236/123%20%E5%8A%A9%E6%89%8B.meta.js
+// @homepageURL  https://greasyfork.org/zh-CN/scripts/592236-123-%E5%8A%A9%E6%89%8B
+// @supportURL   https://github.com/weige146/123Cloud/issues
+// @updateURL    https://update.greasyfork.org/scripts/592236/123%20%E5%8A%A9%E6%89%8B.meta.js
+// @downloadURL  https://update.greasyfork.org/scripts/592236/123%20%E5%8A%A9%E6%89%8B.user.js
 // ==/UserScript==
 (() => {
   // src/core/utils.js
@@ -742,14 +744,14 @@
       for (const [key, value] of Object.entries(query)) if (value !== void 0 && value !== null) url.searchParams.set(key, String(value));
       return url.toString();
     }
-    async request(method, path, { query = {}, body, signal, attempts = this.retryAttempts, signed = true, auth = true, appVersion = this.appVersion, timeoutMs = this.requestTimeout } = {}) {
+    async request(method, path, { query = {}, body, signal, attempts = this.retryAttempts, backoffCap = 6e3, signed = true, auth = true, appVersion = this.appVersion, timeoutMs = this.requestTimeout } = {}) {
       const { token, loginUuid } = auth ? this.credentials() : { token: "", loginUuid: "" };
       if (auth && (!token || !loginUuid)) throw new Error("\u8BF7\u5148\u767B\u5F55 123 \u4E91\u76D8\u5E76\u6253\u5F00\u6587\u4EF6\u5217\u8868\u9875");
       const finalQuery = signed ? { ...query, ...signedQuery(path, Date.now(), void 0, appVersion) } : query;
       let lastError;
       for (let attempt = 0; attempt < attempts; attempt += 1) {
         if (signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
-        if (attempt > 0) await sleep(Math.min(6e3, 800 * 1.7 ** (attempt - 1)));
+        if (attempt > 0) await sleep(Math.min(backoffCap, 800 * 1.7 ** (attempt - 1)));
         const requestController = new AbortController();
         let timedOut = false;
         const abortRequest = () => requestController.abort(signal?.reason);
@@ -852,6 +854,9 @@
         const data = await this.request("GET", "/b/api/share/get", {
           signal: options.signal,
           auth: false,
+          // 分享接口限流窗口长：重试更多次、退避上限放宽到 12s，避免"分享接口请求过于频繁"直接冒给用户
+          attempts: options.attempts || 8,
+          backoffCap: 12e3,
           query: {
             limit: String(options.limit || 100),
             next: "0",
@@ -880,18 +885,41 @@
         if (next === "-1" || next === String(page)) {
           break;
         }
+        // 翻页间隔：分享接口限流严格，连页请求之间留 400ms
+        await sleep(Number(options.pageDelay ?? 400));
+        if (options.signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
       }
       return output;
     }
     async fileInfos(fileIds, signal) {
       const output = [];
-      for (const ids of chunk([...new Set(fileIds.map(Number).filter((value) => value > 0))], 100)) {
-        const data = await this.request("POST", "/b/api/file/info", { signal, body: { fileIdList: ids.map((FileId) => ({ FileId })) } });
-        const body = data?.data || data || {};
-        const list = body.InfoList ?? body.infoList ?? body.FileInfoList ?? body.fileInfoList ?? body.fileList ?? body.FileList ?? body.list ?? [];
-        output.push(...(Array.isArray(list) ? list : []).map(normalizeFile).filter(Boolean));
+      const ids = [...new Set(fileIds.map(Number).filter((value) => value > 0))];
+      // 123 的 /b/api/file/info 会静默截断过大的 fileIdList（约 33 个起丢，不报错），
+      // 选中 34-100 个文件时 fileInfos 只返回约 33 条，批量重命名等入口因此
+      // "单次最多只能处理约 33 个文件"。改为小批量请求，并对返回不足的批次
+      // 自动逐个补查缺失 ID，保证请求多少就拿到多少。
+      for (const batch of chunk(ids, 33)) {
+        const files2 = await this.fileInfoBatch(batch, signal);
+        output.push(...files2);
+        if (files2.length >= batch.length) continue;
+        const found = new Set(files2.map((file) => Number(file.id)));
+        const lost = batch.filter((id) => !found.has(id));
+        console.warn(`[123助手] /file/info 返回 ${files2.length}/${batch.length}，自动补查 ${lost.length} 个缺失 ID`);
+        for (const id of lost) {
+          try {
+            output.push(...await this.fileInfoBatch([id], signal));
+          } catch (error) {
+            console.warn(`[123助手] 补查文件信息失败：${id}`, error?.message || error);
+          }
+        }
       }
       return output;
+    }
+    async fileInfoBatch(ids, signal) {
+      const data = await this.request("POST", "/b/api/file/info", { signal, body: { fileIdList: ids.map((FileId) => ({ FileId })) } });
+      const body = data?.data || data || {};
+      const list = body.InfoList ?? body.infoList ?? body.FileInfoList ?? body.fileInfoList ?? body.fileList ?? body.FileList ?? body.list ?? [];
+      return (Array.isArray(list) ? list : []).map(normalizeFile).filter(Boolean);
     }
     async getDownloadUrl(file, signal) {
       const fileId = Number(file?.id || file?.fileId || 0);
@@ -1177,7 +1205,25 @@
         if (signal) signal.removeEventListener("abort", abortParent);
       }
     }
-    async ensurePath(rootId, parts, cache = /* @__PURE__ */ new Map(), signal) {
+    async findChildFolder(parentFileId, name, listingCache = null, signal) {
+      const parentKey = String(parentFileId || "0");
+      const target = String(name || "").trim().toLocaleLowerCase();
+      if (!target) return null;
+      let pending;
+      if (listingCache && listingCache.has(parentKey)) {
+        pending = listingCache.get(parentKey);
+      } else {
+        pending = this.listAll(parentKey, { signal }).catch((error) => {
+          if (listingCache) listingCache.delete(parentKey);
+          throw error;
+        });
+        if (listingCache) listingCache.set(parentKey, pending);
+      }
+      const children = await pending;
+      const found = (children || []).find((file) => Number(file.type) === 1 && String(file.name || "").trim().toLocaleLowerCase() === target);
+      return found ? String(found.id) : null;
+    }
+    async ensurePath(rootId, parts, cache = /* @__PURE__ */ new Map(), signal, listingCache = null) {
       let current = String(rootId || "0");
       let path = current;
       for (const part of parts.filter(Boolean)) {
@@ -1188,8 +1234,12 @@
         }
         const parentId = current;
         const pending = (async () => {
-          const existing = (await this.listAll(parentId, { signal })).find((file) => file.type === 1 && file.name === part);
-          return String(existing?.id || await this.createFolder(parentId, part, signal));
+          try {
+            const existing = await this.findChildFolder(parentId, part, listingCache, signal);
+            if (existing) return String(existing);
+          } catch (_) {
+          }
+          return String(await this.createFolder(parentId, part, signal));
         })();
         cache.set(path, pending);
         try {
@@ -1208,13 +1258,22 @@
       const output = [];
       let marker = "0";
       for (let page = 0; ; page += 1) {
+        if (page > 0) {
+          // 分享列表接口限流很严，翻页之间留出间隔，避免触发"分享接口请求过于频繁"
+          await sleep(Number(options.pageDelay ?? 600));
+          if (options.signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
+        }
         const data = await this.request("GET", path, {
           signal: options.signal,
+          // 退避上限放宽到 12s：该接口的限流窗口比通用接口长，6s 内连重试容易全部打在窗口里
+          attempts: options.attempts || 8,
+          backoffCap: 12e3,
           query: { driveId: "0", limit: String(options.limit || 500), next: marker, orderBy: "share_id", orderDirection: "desc", SearchData: search, event: "shareListFile", operateType: "1" }
         });
         const body = data?.data || {};
         const list = body.InfoList || body.infoList || body.ShareList || body.shareList || body.list || [];
         output.push(...(Array.isArray(list) ? list : []).map((item) => normalizeShare(item, kind)));
+        options.onPage?.(output.length, page + 1);
         const next = String(body.Next ?? body.next ?? "-1");
         if (!next || next === "-1" || next === marker) break;
         marker = next;
@@ -1778,7 +1837,9 @@
       randomPassword: true,
       passwordLength: 4,
       autoSubmitEnabled: false,
-      submissionUrl: ""
+      submissionUrl: "",
+      libraryUrl: "",
+      libraryToken: ""
     },
     fastlinkTools: {
       debugMode: false,
@@ -2752,7 +2813,46 @@
       const match = String(counter.textContent || "").match(/(?:已选择|已选)\s*(\d+)\s*项/);
       if (match) return Number(match[1]);
     }
+    // 官方 UI 改版后工具栏/表头类名可能对不上，最后按全文扫描"已选择 N 项"文本兜底。
+    const scanner = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    for (let node = scanner.nextNode(); node; node = scanner.nextNode()) {
+      const parent = node.parentElement;
+      if (!parent || parent.closest("[data-cloud123-helper]")) continue;
+      const match = String(node.textContent || "").match(/(?:已选择|已选)\s*(\d+)\s*项/);
+      if (match && visibleElement(parent)) return Number(match[1]);
+    }
     return null;
+  }
+  // 跨页/翻页选中修正（参考 123FastRename 的事件累积语义）。123 的文件表格一页只渲染
+  // 几十行，离开当前页（或被虚拟滚动回收）的行不在 DOM 里——绝不能因为"行不在可见区"
+  // 就把选中 id 剔掉，否则勾选/全选 200 个文件后选中集会塌缩成当前页的 30 个。
+  // 这里只信宿主"已选择 N 项"计数的收缩信号：
+  // - 计数 < 已累计选中数（有文件被删除）→ 才把不可见的 id 当陈旧数据剔除；
+  // - 计数读不到（hostCount=null）→ 保留，宁可等计数出现或目录切换时再清；
+  // - 计数 > 已累计数且当前页全部勾选 → 宿主做了跨页全选（表头勾选框未被脚本识别到），
+  //   升级为 selectAll，后续按整个目录取文件。
+  function reconcileSelectionSnapshot(state, visibleRows, hostCount) {
+    if (state.selectAll) {
+      for (const [id, selected] of visibleRows) {
+        if (selected) state.unselectedIds.delete(id);
+        else state.unselectedIds.add(id);
+      }
+      return;
+    }
+    for (const [id, selected] of visibleRows) {
+      if (selected) state.selectedIds.add(id);
+      else state.selectedIds.delete(id);
+    }
+    if (visibleRows.size > 0 && hostCount !== null && hostCount > state.selectedIds.size && [...visibleRows.values()].every(Boolean)) {
+      state.selectAll = true;
+      state.selectedIds.clear();
+      state.unselectedIds.clear();
+      return;
+    }
+    if (hostCount !== null && hostCount < state.selectedIds.size) {
+      for (const id of [...state.selectedIds]) if (!visibleRows.has(id)) state.selectedIds.delete(id);
+      for (const id of [...state.unselectedIds]) if (!visibleRows.has(id)) state.unselectedIds.delete(id);
+    }
   }
   var PageBridge = class {
     constructor(api, config = {}) {
@@ -2986,22 +3086,11 @@
         visibleRows.set(id, Boolean(visibleRows.get(id)) || rowSelected(row));
       }
       // 删除/移除/移动后，123 的"已选择 N 项"计数常常滞后于真实 DOM：
-      // 行已经没了，但宿主工具栏的计数文本还在显示原值，
-      // 仅靠 hostCount 兜底会漏掉这种"行没了、计数还停在旧值"的情况。
-      // 主动剔除 selectedIds / unselectedIds 中已不在当前可见行里的 id，避免后续
-      // snapshot().hasSelection 被陈旧 id 误判为 true、导致工具栏按钮在删除后残留显示。
-      if (!this.selectAll) {
-        for (const id of [...this.selectedIds]) if (!visibleRows.has(id)) this.selectedIds.delete(id);
-        for (const id of [...this.unselectedIds]) if (!visibleRows.has(id)) this.unselectedIds.delete(id);
-      }
-      for (const [id, selected] of visibleRows) {
-        if (this.selectAll) {
-          if (selected) this.unselectedIds.delete(id);
-          else this.unselectedIds.add(id);
-        } else if (selected) this.selectedIds.add(id);
-        else this.selectedIds.delete(id);
-      }
+      // 行已经没了，但宿主工具栏的计数文本还在显示原值。
+      // 陈旧 id 的剔除交给 reconcileSelectionSnapshot：只在计数证明选中确实缩水
+      // （或当前页无行）时才清理，避免把翻页/虚拟滚动后看不见的选中项误删。
       const hostCount = readHostSelectedCount();
+      reconcileSelectionSnapshot(this, visibleRows, hostCount);
       if (!this.selectAll && hostCount === 0) {
         this.selectedIds.clear();
         this.unselectedIds.clear();
@@ -3169,22 +3258,22 @@
         const records = Array.isArray(snapshot.records) ? snapshot.records : frozenSnapshot ? [] : readTableSelectionRecords() || [];
         if (records.length) {
           const byRecordId = new Map(records.map((record) => normalizeFile(record)).filter(Boolean).map((file) => [String(file.id), file]));
-          const mapped = [...snapshot.selectedIds].map((id) => byRecordId.get(String(id))).filter(Boolean);
+          const mapped = sortItemsByName([...snapshot.selectedIds].map((id) => byRecordId.get(String(id))).filter(Boolean));
           if (mapped.length === snapshot.selectedIds.size) return mapped;
           if (typeof this.api?.fileInfos !== "function") {
             const pageContext = readFilePageContext();
             const files = await this.currentDirectoryFiles(signal, pageContext.global ? "0" : snapshot.currentDir, pageContext);
-            return files.filter((file) => snapshot.selectedIds.has(String(file.id)));
+            return sortItemsByName(files.filter((file) => snapshot.selectedIds.has(String(file.id))));
           }
         }
         const selectedIds = [...snapshot.selectedIds];
         const files2 = signal === void 0 ? await this.api.fileInfos(selectedIds) : await this.api.fileInfos(selectedIds, signal);
         const byId = new Map(files2.map((file) => [String(file.id), file]));
-        return selectedIds.map((id) => byId.get(String(id))).filter(Boolean);
+        return sortItemsByName(selectedIds.map((id) => byId.get(String(id))).filter(Boolean));
       }
       const pageContext = readFilePageContext();
       const files = await this.currentDirectoryFiles(signal, pageContext.global ? "0" : snapshot.currentDir, pageContext);
-      return snapshot.selectAll ? files.filter((file) => !snapshot.unselectedIds.has(String(file.id))) : files.filter((file) => snapshot.selectedIds.has(String(file.id)));
+      return sortItemsByName(snapshot.selectAll ? files.filter((file) => !snapshot.unselectedIds.has(String(file.id))) : files.filter((file) => snapshot.selectedIds.has(String(file.id))));
     }
     setCommands(commands) {
       this.commands = commands || {};
@@ -5253,6 +5342,13 @@
     if (rowKey && record && record[rowKey] !== void 0) return record[rowKey];
     return record?.FileId ?? record?.fileId ?? record?.id ?? record?.key;
   }
+  // 勾选集合的插入顺序 = 页面轮询首次观察到勾选的顺序（先点的排前面），
+  // 直接沿用会让重命名预览和编号类规则（{n}/序号）跟着点击顺序走，
+  // 因此所有选中项出口统一按文件名自然排序（数字段按数值比，未补零也不乱序）。
+  var ITEM_NAME_COLLATOR = new Intl.Collator("zh-Hans-CN", { numeric: true, sensitivity: "base" });
+  function sortItemsByName(items) {
+    return items.sort((a, b) => ITEM_NAME_COLLATOR.compare(String(a?.name ?? ""), String(b?.name ?? "")));
+  }
   function readTableSelectionRecords() {
     try {
       const fiber = findTableFiber();
@@ -5729,13 +5825,59 @@
       }
     };
     const cache = /* @__PURE__ */ new Map();
-    const prepared = await mapLimit(todo, Math.max(1, Math.min(4, options.concurrency || 3)), async (file) => {
+    const listingCache = /* @__PURE__ */ new Map();
+    // 秒传执行并发：默认 16、上限 32（与秒传导入导出速度对齐；此前被封顶在 5，
+    // 大批量导入比同类脚本慢约 3 倍）。
+    const concurrency = Math.max(1, Math.min(32, Number(options.concurrency) || 16));
+    // 目录按层并发预建：先把本次导入涉及的全部父目录按深度逐层并发建立/复用，
+    // 避免文件阶段逐个 ensurePath 串行逐级查目录拖慢导入。
+    {
+      const byDepth = /* @__PURE__ */ new Map();
+      const dedupPaths = /* @__PURE__ */ new Set();
+      for (const file of todo) {
+        const parts = [...commonParts, ...importedPathParts(file.path).slice(0, -1)];
+        let parentKey = String(rootId || "0");
+        for (let depth = 0; depth < parts.length; depth += 1) {
+          const key = `${parentKey}/${parts[depth]}`;
+          if (!dedupPaths.has(key)) {
+            dedupPaths.add(key);
+            if (!byDepth.has(depth)) byDepth.set(depth, []);
+            byDepth.get(depth).push({ key, parentKey, name: parts[depth], depth });
+          }
+          parentKey = key;
+        }
+      }
+      for (let depth = 0; byDepth.has(depth); depth += 1) {
+        if (options.signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
+        await mapLimit(byDepth.get(depth), Math.min(12, concurrency), async (node) => {
+          try {
+            if (cache.has(node.key)) return;
+            if (node.depth > 0 && !cache.has(node.parentKey)) return;
+            const parentId = node.depth === 0 ? String(rootId || "0") : String(await cache.get(node.parentKey));
+            const pending = (async () => {
+              try {
+                const existing = await api.findChildFolder(parentId, node.name, listingCache, options.signal);
+                if (existing) return String(existing);
+              } catch (_) {
+              }
+              return String(await api.createFolder(parentId, node.name, options.signal));
+            })();
+            cache.set(node.key, pending);
+            await pending;
+          } catch (preError) {
+            cache.delete(node.key);
+          }
+        }, { signal: options.signal });
+      }
+    }
+    const prepared = await mapLimit(todo, concurrency, async (file) => {
       const parts = importedPathParts(file.path);
-      const parentId = await api.ensurePath(rootId, [...commonParts, ...parts.slice(0, -1)], cache, options.signal);
+      const parentId = await api.ensurePath(rootId, [...commonParts, ...parts.slice(0, -1)], cache, options.signal, listingCache);
       return { ...file, parentId };
     }, { signal: options.signal });
     let done = 0;
-    const details = await mapLimit(prepared, Math.max(1, Math.min(5, options.concurrency || 3)), async (file) => {
+    let lastUI = 0;
+    const details = await mapLimit(prepared, concurrency, async (file) => {
       try {
         await api.reuseFile(file, file.parentId, options.signal);
         markProgress(file);
@@ -5744,7 +5886,11 @@
         return { ...file, name: [...commonParts, file.path].filter(Boolean).join("/"), status: "failed", message: error.message };
       } finally {
         done += 1;
-        options.onProgress?.(done, prepared.length, file.path);
+        const now = Date.now();
+        if (done === prepared.length || done % 20 === 0 || now - lastUI > 300) {
+          lastUI = now;
+          options.onProgress?.(done, prepared.length, file.path);
+        }
       }
     }, { signal: options.signal });
     if (progress) {
@@ -5931,10 +6077,13 @@
     const checkpoint = options.checkpoint;
     const rootIndexes = (options.checkpointRoots || [0]).map((value) => Number(value));
     const rootSet = new Set(rootIndexes);
+    // 目录按层并发扫描（与秒传导入同款策略）：每层最多 concurrency 个目录同时 listAll，
+    // 显著快于旧的深度优先串行扫描；断点续传、去重、中断抢救语义保持不变。
+    const concurrency = Math.max(1, Math.min(8, Number(options.concurrency) || 6));
     let files = [];
     let allFiles = files;
     let othersPending = [];
-    let stack = [];
+    let frontier = [];
     let completedFolders = new Set();
     let seenIds = new Set();
     if (checkpoint?.state) {
@@ -5943,9 +6092,9 @@
       files = allFiles.filter((file) => rootSet.has(Number(file.root)));
       completedFolders = new Set(state.completedFolders || []);
       seenIds = new Set(allFiles.map((file) => String(file.id)));
-      for (const entry of state.pending || []) (rootSet.has(Number(entry?.root)) ? stack : othersPending).push(entry);
+      for (const entry of state.pending || []) (rootSet.has(Number(entry?.root)) ? frontier : othersPending).push(entry);
     } else {
-      stack = (items || []).map((item, index) => {
+      frontier = (items || []).map((item, index) => {
         const root = Number.isSafeInteger(rootIndexes[index]) ? rootIndexes[index] : 0;
         return Number(item?.type) === 1
           ? { root, type: "folder", id: String(item?.id || ""), name: String(item?.name || ""), prefix: "" }
@@ -5956,7 +6105,7 @@
       if (!checkpoint?.state) return;
       checkpoint.state.files = allFiles;
       checkpoint.state.completedFolders = [...completedFolders];
-      checkpoint.state.pending = [...othersPending, ...stack];
+      checkpoint.state.pending = [...othersPending, ...frontier];
       checkpoint.save(force);
     };
     const pushFile = (entry) => {
@@ -5967,48 +6116,45 @@
       if (files !== allFiles) files.push(entry);
       options.onProgress?.(files.length, 0, entry.fileName);
     };
-    while (stack.length) {
+    while (frontier.length) {
       if (options.signal?.aborted) {
         persist(true);
         throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
       }
-      const entry = stack[stack.length - 1];
-      if (entry.type === "file") {
-        stack.pop();
-        pushFile(entry.entry);
+      const level = frontier.flatMap((entry) => entry.type === "file" ? (pushFile(entry.entry), []) : completedFolders.has(entry.id) ? [] : [entry]);
+      frontier = [];
+      if (!level.length) {
+        persist(false);
         continue;
       }
-      if (completedFolders.has(entry.id)) {
-        stack.pop();
-        continue;
-      }
-      // 上次中断在这个目录时可能已收了一部分文件，重扫前先剔除本目录前缀下的旧记录
-      const ownPrefix = `${entry.prefix}${entry.name}`;
-      const stale = files.filter((file) => file.path === ownPrefix || file.path.startsWith(`${ownPrefix}/`));
-      if (stale.length) {
-        const removed = new Set(stale);
-        for (const file of stale) seenIds.delete(String(file.id || ""));
-        allFiles = allFiles.filter((file) => !removed.has(file));
-        files = files.filter((file) => !removed.has(file));
-        if (checkpoint?.state) checkpoint.state.files = allFiles;
-      }
-      let children;
       try {
-        children = await api.listAll(entry.id, { signal: options.signal });
+        await mapLimit(level, concurrency, async (entry) => {
+          // 上次中断在这个目录时可能已收了一部分文件，重扫前先剔除本目录前缀下的旧记录
+          const ownPrefix = `${entry.prefix}${entry.name}`;
+          const stale = files.filter((file) => file.path === ownPrefix || file.path.startsWith(`${ownPrefix}/`));
+          if (stale.length) {
+            const removed = new Set(stale);
+            for (const file of stale) seenIds.delete(String(file.id || ""));
+            allFiles = allFiles.filter((file) => !removed.has(file));
+            files = files.filter((file) => !removed.has(file));
+            if (checkpoint?.state) checkpoint.state.files = allFiles;
+          }
+          const children = await api.listAll(entry.id, { signal: options.signal });
+          // 先收文件再排下一层目录（收集子项是同步的，中断只可能发生在 listAll 期间；
+          // 收集放进 worker 内做，同层其他目录先完成时进度不会因本层中断而丢失）
+          for (const child of [...(children || [])]) {
+            if (Number(child.type) === 1) frontier.push({ root: entry.root, type: "folder", id: String(child.id || ""), name: String(child.name || ""), prefix: `${ownPrefix}/` });
+            else pushFile(freshFastlinkFileEntry(child, String(child.name || ""), cleanFastlinkPath(`${ownPrefix}/${child.name}`), entry.root));
+          }
+          completedFolders.add(entry.id);
+        }, { signal: options.signal });
+        persist(false);
       } catch (error) {
+        // 本层未扫完的目录放回待扫队列（连同已完成目录发现的新子目录一起入断点），续传时不丢层
+        frontier = [...frontier, ...level.filter((entry) => !completedFolders.has(entry.id))];
         persist(true);
         throw error;
       }
-      // 先弹出已完成的目录再压入子目录（收集子项是同步的，中断只可能发生在 listAll 期间）
-      stack.pop();
-      const childFolders = [];
-      for (const child of [...(children || [])].reverse()) {
-        if (Number(child.type) === 1) childFolders.push({ root: entry.root, type: "folder", id: String(child.id || ""), name: String(child.name || ""), prefix: `${ownPrefix}/` });
-        else pushFile(freshFastlinkFileEntry(child, String(child.name || ""), cleanFastlinkPath(`${ownPrefix}/${child.name}`), entry.root));
-      }
-      stack.push(...childFolders);
-      completedFolders.add(entry.id);
-      persist(false);
     }
     const missing = files.filter((file) => !file.etag);
     if (missing.length) {
@@ -6051,9 +6197,13 @@
   async function collectPublicShareFiles(api, value, options = {}) {
     const { shareKey, sharePwd } = typeof value === "string" ? parsePublicShareInput(value) : value;
     const checkpoint = options.checkpoint || null;
+    // 目录按层并发扫描：分享接口（listSharedDirectoryContents）是 123 限流最严的接口之一，
+    // 并发默认压到 2（上限 4）——比旧串行版快，但不会触发"分享接口请求过于频繁"。
+    // 注意与秒传导出（collectFastlinkFiles，走网盘自身接口，默认 6）不同。
+    const concurrency = Math.max(1, Math.min(4, Number(options.concurrency) || 2));
     let output = [];
     let allFiles = output;
-    let stack = [];
+    let frontier = [];
     let completedFolders = new Set();
     let seenIds = new Set();
     if (checkpoint?.state) {
@@ -6061,16 +6211,16 @@
       output = allFiles;
       completedFolders = new Set(checkpoint.state.completedFolders || []);
       seenIds = new Set(allFiles.map((file) => String(file.id)));
-      stack = [...(checkpoint.state.pending || [])];
+      frontier = [...(checkpoint.state.pending || [])];
       checkpoint.state.pending = [];
     } else {
-      stack = [{ id: String(options.parentId || "0"), path: "" }];
+      frontier = [{ id: String(options.parentId || "0"), path: "" }];
     }
     const persist = (force = false) => {
       if (!checkpoint?.state) return;
       checkpoint.state.files = allFiles;
       checkpoint.state.completedFolders = [...completedFolders];
-      checkpoint.state.pending = [...stack];
+      checkpoint.state.pending = [...frontier];
       checkpoint.save(force);
     };
     const pushFile = (entry) => {
@@ -6081,46 +6231,48 @@
       if (output !== allFiles) output.push(entry);
       options.onProgress?.(output.length, 0, entry.path);
     };
-    while (stack.length) {
+    while (frontier.length) {
       if (options.signal?.aborted) {
         persist(true);
         throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
       }
-      const entry = stack[stack.length - 1];
-      if (completedFolders.has(entry.id)) {
-        stack.pop();
+      const level = frontier.filter((entry) => !completedFolders.has(entry.id));
+      frontier = [];
+      if (!level.length) {
+        persist(false);
         continue;
       }
-      // 上次中断在这个目录时可能已收了一部分文件，重扫前先剔除本目录前缀下的旧记录
-      if (entry.path) {
-        const stale = output.filter((file) => file.path === entry.path || file.path.startsWith(`${entry.path}/`));
-        if (stale.length) {
-          const removed = new Set(stale);
-          for (const file of stale) seenIds.delete(String(file.id || ""));
-          allFiles = allFiles.filter((file) => !removed.has(file));
-          output = output.filter((file) => !removed.has(file));
-          if (checkpoint?.state) checkpoint.state.files = allFiles;
-        }
-      }
-      let entries;
       try {
-        entries = await api.listSharedDirectoryContents(entry.id, shareKey, sharePwd, { signal: options.signal, limit: options.limit });
+        await mapLimit(level, concurrency, async (entry) => {
+          // 上次中断在这个目录时可能已收了一部分文件，重扫前先剔除本目录前缀下的旧记录
+          if (entry.path) {
+            const stale = output.filter((file) => file.path === entry.path || file.path.startsWith(`${entry.path}/`));
+            if (stale.length) {
+              const removed = new Set(stale);
+              for (const file of stale) seenIds.delete(String(file.id || ""));
+              allFiles = allFiles.filter((file) => !removed.has(file));
+              output = output.filter((file) => !removed.has(file));
+              if (checkpoint?.state) checkpoint.state.files = allFiles;
+            }
+          }
+          const entries = await api.listSharedDirectoryContents(entry.id, shareKey, sharePwd, { signal: options.signal, limit: options.limit });
+          // 收集放进 worker 内做：同层其他目录先完成时进度不会因本层中断而丢失
+          for (const entry2 of [...(entries || [])]) {
+            const name = cleanPathPart(entry2.name || entry2.fileName || "\u672A\u77E5\u6587\u4EF6");
+            const path = [entry.path, name].filter(Boolean).join("/");
+            if (Number(entry2.type) === 1) frontier.push({ id: String(entry2.id || entry2.fileId || ""), path });
+            else if (entry2.etag && Number.isSafeInteger(Number(entry2.size))) pushFile({ id: String(entry2.id || entry2.fileId || path), fileName: name, path, etag: String(entry2.etag || ""), size: Number(entry2.size), s3KeyFlag: String(entry2.s3KeyFlag || "") });
+            else options.onProgress?.(output.length, 0, path);
+          }
+          completedFolders.add(entry.id);
+        }, { signal: options.signal });
+        persist(false);
       } catch (error) {
+        // 本层未扫完的目录放回待扫队列，续传时不丢层
+        frontier = [...frontier, ...level.filter((entry) => !completedFolders.has(entry.id))];
         persist(true);
         throw error;
       }
-      stack.pop();
-      const childFolders = [];
-      for (const entry2 of [...(entries || [])].reverse()) {
-        const name = cleanPathPart(entry2.name || entry2.fileName || "\u672A\u77E5\u6587\u4EF6");
-        const path = [entry.path, name].filter(Boolean).join("/");
-        if (Number(entry2.type) === 1) childFolders.push({ id: String(entry2.id || entry2.fileId || ""), path });
-        else if (entry2.etag && Number.isSafeInteger(Number(entry2.size))) pushFile({ id: String(entry2.id || entry2.fileId || path), fileName: name, path, etag: String(entry2.etag || ""), size: Number(entry2.size), s3KeyFlag: String(entry2.s3KeyFlag || "") });
-        else options.onProgress?.(output.length, 0, path);
-      }
-      stack.push(...childFolders);
-      completedFolders.add(entry.id);
-      persist(false);
     }
     return filterFastlinkFiles(output, options);
   }
@@ -14044,11 +14196,14 @@ ${end.comment}` : end.comment;
       ...alternativeItems.filter((item) => chineseRegions.has(String(item?.iso_3166_1 || "").toUpperCase())).map(itemTitle),
       ...translations.filter((item) => String(item?.iso_639_1 || "").toLowerCase() === "zh" && chineseRegions.has(String(item?.iso_3166_1 || "").toUpperCase())).map(translatedTitle)
     ];
+    // 不并入 media.englishTitles：enrich 产物会写回 group.media，若在此
+    // 回收旧值，文件名等非 TMDB 来源会被永久固化成"英文别名"。
+    // 英文别名按地区过滤（英文名大多标注在英文地区；按文本判定会混入
+    // 西/德/波兰语等纯 ASCII 拼写的本地化标题）。原名排首位作默认命名。
     const englishCandidates = [
-      ...media.englishTitles || [],
+      ...originalLanguage === "en" ? [original, primary] : [],
       ...translations.filter((item) => String(item?.iso_639_1 || "").toLowerCase() === "en").map(translatedTitle),
-      ...alternativeItems.filter((item) => englishRegions.has(String(item?.iso_3166_1 || "").toUpperCase())).map(itemTitle),
-      ...originalLanguage === "en" ? [original, primary] : []
+      ...alternativeItems.filter((item) => englishRegions.has(String(item?.iso_3166_1 || "").toUpperCase())).map(itemTitle)
     ];
     const chineseTitles = uniqueTitles(chineseCandidates.filter((value) => hasHan(value) && !hasKana(value)).map(toSimplified));
     const englishTitles = uniqueTitles(englishCandidates.filter(isEnglish));
@@ -14073,13 +14228,6 @@ ${end.comment}` : end.comment;
       tmdbUrl: media.tmdbUrl || (id && mediaType ? `https://www.themoviedb.org/${mediaType}/${id}` : "")
     };
   }
-  function sourceEnglishTitle(value) {
-    let stem = splitExtension(String(value || ""))[0].replace(/(?:tmdbid|tmdb)[=\-_: ]?\d{2,10}/gi, " ").replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
-    const marker = stem.match(/\b(?:19|20)\d{2}\b|\bS\d{1,3}(?:E\d{1,5})?\b|\b(?:4320p|3160p|3072p|2880p|2160p|1440p|1080[pi]|720p|WEB[- ]?DL|WEBRip|Blu[- ]?Ray|REMUX|HDTV|HEVC|AVC|H[ .]?26[45])\b/i);
-    if (marker?.index > 0) stem = stem.slice(0, marker.index);
-    const candidates = stem.split(/[\u3400-\u9fff]+/).map((part) => part.replace(/^[^A-Za-z]+|[^A-Za-z0-9'&:+-]+$/g, "").replace(/\s+/g, " ").trim()).filter((part) => /[A-Za-z]/.test(part));
-    return candidates.sort((left, right) => right.split(/\s+/).length - left.split(/\s+/).length || right.length - left.length)[0] || "";
-  }
   function uniqueTitleList(values) {
     const output = [];
     const seen = /* @__PURE__ */ new Set();
@@ -14092,28 +14240,20 @@ ${end.comment}` : end.comment;
     }
     return output;
   }
-  function enrichMediaTitleAliases(media, filenames = []) {
-    const normalized = normalizeTmdbMedia(media);
-    if (!normalized) return null;
-    const sourceTitles = filenames.map(sourceEnglishTitle).filter(Boolean);
-    // Once a TMDB match contains an English title, it is the authoritative
-    // naming source. Filename-derived text is only a fallback for media with
-    // no usable TMDB English title.
-    const tmdbTitles = uniqueTitleList(normalized.englishTitles || []);
-    const englishTitles = tmdbTitles.length ? tmdbTitles : sourceTitles;
-    return { ...normalized, englishTitles: uniqueTitleList(englishTitles) };
+  // 英文别名只认 TMDB 数据（translations / alternative_titles / en 原名），
+  // 不再用文件名英文兜底；无英文别名时由 titleAliasOptions / applyTmdbFields
+  // 回退到中文别名。
+  function enrichMediaTitleAliases(media) {
+    return normalizeTmdbMedia(media);
   }
-  function titleAliasOptions(media, configuredTitle = "") {
+  // mode："en" = 英文命名（无英文别名时回退中文别名），其余 = 中文/兼容命名（中文别名）。
+  function titleAliasOptions(media, mode = "zh") {
     const normalized = normalizeTmdbMedia(media);
     if (!normalized) return [];
-    const configured = String(configuredTitle || "").trim();
-    if (configured === "zh") return uniqueTitleList(normalized.chineseTitles || []);
-    if (configured === "en") return uniqueTitleList(normalized.englishTitles || []);
-    if (/[\u3040-\u30ff\u31f0-\u31ff]/.test(configured)) return [];
-    if (/[\u3400-\u9fff]/.test(configured)) return uniqueTitleList(normalized.chineseTitles || []);
-    const letters = [...configured].filter((character) => new RegExp("\\p{L}", "u").test(character));
-    const english = /[A-Za-z]/.test(configured) && letters.length > 0 && letters.every((character) => /[A-Za-z]/.test(character));
-    return english ? uniqueTitleList(normalized.englishTitles || []) : [];
+    const chinese = uniqueTitleList(normalized.chineseTitles || []);
+    if (mode !== "en") return chinese;
+    const english = uniqueTitleList(normalized.englishTitles || []);
+    return english.length ? english : chinese;
   }
   function tmdbTitleKey(value) {
     return mediaKey(value).replace(/[^a-z0-9\u3400-\u9fff]+/gi, "");
@@ -14205,7 +14345,7 @@ ${end.comment}` : end.comment;
     return {
       ...fields,
       title: normalized.chineseTitles?.[0] || normalized.title || fields.title,
-      namingTitle: normalized.englishTitles?.[0] || normalized.title || fields.namingTitle,
+      namingTitle: normalized.englishTitles?.[0] || normalized.chineseTitles?.[0] || normalized.title || fields.namingTitle,
       year: normalized.year || fields.year,
       tmdbId: String(normalized.id || fields.tmdbId || ""),
       mediaType: normalized.mediaType || fields.mediaType,
@@ -14214,6 +14354,15 @@ ${end.comment}` : end.comment;
       countries: normalized.countries?.length ? normalized.countries : fields.countries || [],
       tmdbData: normalized
     };
+  }
+  // 命名方式由模板字段块决定：任一模板出现 {englishTitle} 即英文命名，否则按中文/兼容处理。
+  function resolveNamingMode(config) {
+    for (const key of ["movie", "tv", "mediaFolder", "seasonFolder", "inPlaceSeasonFolder"]) {
+      for (const block of config?.templates?.[key] || []) {
+        if (block && block.type === "field" && block.key === "englishTitle") return "en";
+      }
+    }
+    return "zh";
   }
   function inferCategory(fields, filenames, library) {
     return inferLibraryCategory(fields, filenames, library);
@@ -14249,7 +14398,7 @@ ${end.comment}` : end.comment;
     // the source files are allowed to pull in an undated S00 entry. Generic
     // contextual words (for example “舞台” or “完整版”) must not make every
     // S00 entry a candidate.
-    const requestedKinds = new Set((fileNames || []).flatMap((name) => specialContext(name).strongKeywords));
+    const requestedKinds = new Set((fileNames || []).flatMap((name) => withVcbSpecialContext(specialContext(name), name, "").strongKeywords));
     const regularDates = regular.map((episode) => parseEpisodeAirDate(episode.airDate)).filter((value) => value !== null);
     const window2 = regularDates.length ? [Math.min(...regularDates) - 45 * 24 * 60 * 60 * 1e3, Math.max(...regularDates) + 120 * 24 * 60 * 60 * 1e3] : null;
     // 命名季（TMDB 季名“中醫季”）没有数字季号，靠季名别名对应目标季；
@@ -14628,6 +14777,36 @@ ${end.comment}` : end.comment;
     const labelWithoutSeason = label.replace(/[\u4e00-\u9fff]{1,8}季/g, "");
     return [...labelWithoutSeason].length >= 2;
   }
+  // VCB-Studio 发布组把特别篇放在 SPs 子目录，并用 [SP##]/[NCOP]/[NCED]/
+  // [PV##]/[CM##]/[Menu##]/[SPOT##]/[IV##]/[MV##]/[Trailer]/[Preview] 等
+  // TYPENUM 标签命名，而不是 S00E##。这些不进全局特殊词逻辑，只在校准流程内
+  // 识别成强特别篇上下文，从而复用现有的 S00 匹配链（与综艺会员版/加更一致）。
+  const VCB_SPECIAL_TAG = /(?:^|[^A-Za-z0-9])[\[【](SP|NCOP|NCED|MENU|PV|CM|SPOT|IV|MV|TRAILER|PREVIEW|WEBPREVIEW)([0-9]{0,4})?[\]】]/i;
+  const VCB_SP_FOLDER = /(?:^|[._\-/\\])SPs?(?:$|[._\-/\\])/i;
+  function vcbSpecialTag(value, relativePath) {
+    if (VCB_SP_FOLDER.test(String(relativePath || ""))) return { kind: "SP", number: 0, folder: true };
+    const match = String(value || "").match(VCB_SPECIAL_TAG);
+    if (!match) return null;
+    return { kind: match[1].toUpperCase(), number: match[2] ? Number(match[2]) : 0, folder: false };
+  }
+  function hasVcbSpecial(value, relativePath) {
+    return Boolean(vcbSpecialTag(value, relativePath));
+  }
+  function withVcbSpecialContext(context, value, relativePath) {
+    const tag = vcbSpecialTag(value, relativePath);
+    if (!tag) return context;
+    const kind = tag.kind === "WEBPREVIEW" ? "PREVIEW" : tag.kind;
+    // 复用当前特殊词映射产出的「特辑」类 token，保证与 S00 条目的关键字匹配一致。
+    const specialTokens = specialContext("特辑").strongKeywords;
+    return {
+      ...context,
+      strong: true,
+      strongKeywords: [...new Set([...context.strongKeywords, ...specialTokens])],
+      keywords: [...new Set([...context.keywords, kind])],
+      identityKinds: [...new Set([...context.identityKinds, kind])],
+      vcbSpecial: tag
+    };
+  }
   function matchEpisodeCandidates(files, episodes, season, targetSeason = 0, seasonRemap = null) {
     const sortedEpisodes = [...episodes].map(normalizedEpisode).sort((left, right) => left.seasonNumber - right.seasonNumber || left.episodeNumber - right.episodeNumber);
     const output = /* @__PURE__ */ new Map();
@@ -14640,7 +14819,7 @@ ${end.comment}` : end.comment;
         hint.season = seasonRemap.to;
         hint.seasonEpisode = hint.seasonEpisode ? hint.seasonEpisode.replace(/^S\d{1,3}/i, `S${String(seasonRemap.to).padStart(2, "0")}`) : hint.seasonEpisode;
       }
-      const context = specialContext(file.name);
+      const context = withVcbSpecialContext(specialContext(file.name), file.name, file.relativePath);
       const pilotOnlyLabel = context.strongKeywords.length > 0 && context.strongKeywords.every((kind) => kind === SPECIAL_KIND_TOKENS.pilot);
       const isRegularSource = pilotOffset > 0 && hint.season === Number(targetSeason || season || 1) && hasExplicitSeasonEpisodeToken(file.name) && hint.episode >= 0 && (!context.strong || pilotOnlyLabel) && !context.contextual;
       return {
@@ -15265,7 +15444,10 @@ ${end.comment}` : end.comment;
       const candidates = await searchTmdbCandidates(tmdb, fields, { ...options, sourceTitle: group.title });
       const candidate = normalizeTmdbMedia(chooseTmdbCandidate(candidates, fields));
       if (!candidate) return null;
-      if (candidate.seasons || candidate.aliases || candidate.chineseTitles?.length || candidate.englishTitles?.length || typeof tmdb.details !== "function") return candidate;
+      // 注意不能用 englishTitles 非空判断"详情已补全"：英文原名的影片搜索结果天然带
+      // 原名这个英文标题，会短路跳过 details（alternative_titles/translations）补全，
+      // 导致英文别名只剩原名一个。TMDB 请求有 24h 缓存，重复 details 成本可忽略。
+      if (candidate.seasons || candidate.aliases || candidate.chineseTitles?.length || typeof tmdb.details !== "function") return candidate;
       try {
         return normalizeTmdbMedia(await tmdb.details(candidate.mediaType, candidate.id));
       } catch {
@@ -15410,8 +15592,7 @@ ${end.comment}` : end.comment;
         media: manuallySelectedMedia || group.media,
         mediaResolved: !manuallySelectedMedia && Boolean(group.media),
         warnings
-      }),
-      names
+      })
     );
     fields = applyTmdbFields(fields, media);
     fields = { ...fields, ...metadataFields, ...groupOverride };
@@ -16001,8 +16182,8 @@ ${end.comment}` : end.comment;
     // A positive target season is always paired with S00 when TMDB exposes it.
     // A file explicitly labelled as a special also forces an S00 request even
     // when the show details did not advertise the season in advance.
-    if (targetSeason > 0 && (hasS00 || group.files.some((file) => isSpecialEpisodeHint(file.name)))) requested.push(0);
-    if (targetSeason <= 0 && group.files.some((file) => isSpecialEpisodeHint(file.name))) requested.push(0);
+    if (targetSeason > 0 && (hasS00 || group.files.some((file) => isSpecialEpisodeHint(file.name) || hasVcbSpecial(file.name, file.relativePath)))) requested.push(0);
+    if (targetSeason <= 0 && group.files.some((file) => isSpecialEpisodeHint(file.name) || hasVcbSpecial(file.name, file.relativePath))) requested.push(0);
     const seasons = availableSeasons(media, requested, { exact: true });
     const episodeGroups = await mapLimit([...new Set(seasons)], 3, async (season) => {
       try {
@@ -16601,6 +16782,202 @@ ${end.comment}` : end.comment;
     if (payload?.ok !== true) return "\u6295\u7A3F\u670D\u52A1\u672A\u786E\u8BA4\u6295\u7A3F\u6210\u529F";
     return "";
   }
+  // ===== 影库搜索（123Cloud 客户端影库接口）=====
+  var LIBRARY_POSTER_CACHE_KEY = "Cloud123.Helper.LibraryPosters.v1";
+  var LIBRARY_TMDB_KEY_STORAGE = "Cloud123.Helper.LibraryTmdbKey";
+  var LIBRARY_BUILTIN_TMDB_KEY = "8265bd1679663a7ea12ac168da84d2e8";
+  function librarySearchState() {
+    return {
+      loaded: false, loading: false, transferBusy: false,
+      keyword: "", cat: "", sub: "", page: 1, size: 20, total: 0,
+      results: [], categories: [], notice: "", statusInfo: null,
+      expanded: null, files: [], filesLoading: false,
+      selectedFiles: [], posters: {}
+    };
+  }
+  function libraryBaseUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) throw new Error("\u8BF7\u5148\u5728\u300C\u8BBE\u7F6E \u2192 \u5E38\u89C4\u300D\u91CC\u586B\u5199\u5F71\u5E93\u63A5\u53E3\u5730\u5740");
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      throw new Error("\u5F71\u5E93\u63A5\u53E3\u5730\u5740\u683C\u5F0F\u65E0\u6548");
+    }
+    if (!/^https?:$/.test(url.protocol) || !url.hostname) throw new Error("\u5F71\u5E93\u63A5\u53E3\u5730\u5740\u4EC5\u652F\u6301 HTTP/HTTPS");
+    // \u5BB9\u9519\uFF1A\u8D34\u6210\u5B8C\u6574\u63A5\u53E3\u5730\u5740\uFF08\u2026/api/library/search\uFF09\u65F6\u81EA\u52A8\u5F52\u5230\u6839\u5730\u5740
+    url.pathname = url.pathname.replace(/\/api\/library\/[a-z-]*$/i, "");
+    return url;
+  }
+  function libraryRequestUrl(config, path, params = {}) {
+    const url = libraryBaseUrl(config?.share?.libraryUrl);
+    const inlineToken = url.searchParams.get("token") || "";
+    url.search = "";
+    url.hash = "";
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params || {})) {
+      if (value !== void 0 && value !== null && String(value) !== "") query.set(key, String(value));
+    }
+    const token = String(config?.share?.libraryToken || "").trim() || inlineToken;
+    if (token) query.set("token", token);
+    const qs = query.toString();
+    return `${url.toString().replace(/\/+$/, "")}${path}${qs ? `?${qs}` : ""}`;
+  }
+  function libraryRequestJson(url, options = {}) {
+    const timeoutMs = Math.max(1000, Number(options.timeoutMs || 20000));
+    if (typeof GM_xmlhttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (callback, value) => {
+          if (settled) return;
+          settled = true;
+          callback(value);
+        };
+        GM_xmlhttpRequest({
+          method: "GET",
+          url,
+          headers: { accept: "application/json" },
+          timeout: timeoutMs,
+          anonymous: true,
+          onload: (response) => {
+            let payload;
+            try {
+              payload = JSON.parse(String(response.responseText || ""));
+            } catch {
+              finish(reject, new Error(`\u5F71\u5E93\u63A5\u53E3\u8FD4\u56DE\u4E86\u975E JSON \u54CD\u5E94\uFF08HTTP ${response.status}\uFF09`));
+              return;
+            }
+            if (response.status < 200 || response.status >= 300) {
+              finish(reject, new Error(String(payload?.detail || payload?.message || `\u5F71\u5E93\u63A5\u53E3 HTTP ${response.status}`)));
+              return;
+            }
+            finish(resolve, payload);
+          },
+          onerror: () => finish(reject, new Error("\u65E0\u6CD5\u8FDE\u63A5\u5F71\u5E93\u63A5\u53E3")),
+          ontimeout: () => finish(reject, new Error("\u5F71\u5E93\u63A5\u53E3\u8BF7\u6C42\u8D85\u65F6"))
+        });
+      });
+    }
+    return fetch(url, { headers: { accept: "application/json" }, cache: "no-store" }).then(async (response) => {
+      const text2 = await response.text();
+      let payload;
+      try {
+        payload = JSON.parse(text2);
+      } catch {
+        throw new Error(`\u5F71\u5E93\u63A5\u53E3\u8FD4\u56DE\u4E86\u975E JSON \u54CD\u5E94\uFF08HTTP ${response.status}\uFF09`);
+      }
+      if (!response.ok) throw new Error(String(payload?.detail || payload?.message || `\u5F71\u5E93\u63A5\u53E3 HTTP ${response.status}`));
+      return payload;
+    }).catch((error) => {
+      if (error instanceof Error) throw error;
+      throw new Error("\u65E0\u6CD5\u8FDE\u63A5\u5F71\u5E93\u63A5\u53E3");
+    });
+  }
+  function readLibraryPosterCache() {
+    try {
+      return JSON.parse(localStorage.getItem(LIBRARY_POSTER_CACHE_KEY) || "{}") || {};
+    } catch {
+      return {};
+    }
+  }
+  function saveLibraryPosterCache(cache) {
+    try {
+      localStorage.setItem(LIBRARY_POSTER_CACHE_KEY, JSON.stringify(cache));
+    } catch {
+      /* \u7F13\u5B58\u5199\u6EE1\u4E0D\u5F71\u54CD\u529F\u80FD */
+    }
+  }
+  async function fetchLibraryPoster(work) {
+    const cache = readLibraryPosterCache();
+    const key = String(work?.dir || "");
+    if (!key) return "";
+    if (cache[key] !== void 0) return cache[key];
+    let poster = "";
+    const tmdbId = Number(work?.tmdbId);
+    if (Number.isSafeInteger(tmdbId) && tmdbId > 0) {
+      let apiKey = LIBRARY_BUILTIN_TMDB_KEY;
+      try {
+        apiKey = String(localStorage.getItem(LIBRARY_TMDB_KEY_STORAGE) || "").trim() || LIBRARY_BUILTIN_TMDB_KEY;
+      } catch {
+        /* localStorage \u4E0D\u53EF\u7528\u65F6\u7528\u5185\u7F6E Key */
+      }
+      const norm = (s) => String(s || "").replace(/[\s\W_]+/g, "").toLowerCase();
+      let bestScore = 0;
+      for (const type of ["movie", "tv"]) {
+        try {
+          const info = await libraryRequestJson(`https://api.tmdb.org/3/${type}/${tmdbId}?api_key=${encodeURIComponent(apiKey)}&language=zh-CN`, { timeoutMs: 8000 });
+          const title = info?.title || info?.name || "";
+          const date = info?.release_date || info?.first_air_date || "";
+          const year = date ? Number(String(date).slice(0, 4)) : 0;
+          let score = 0;
+          if (title && norm(title).includes(norm(work?.title))) score += 2;
+          if (Number(work?.year) && year === Number(work?.year)) score += 1;
+          if (score > bestScore && info?.poster_path) {
+            bestScore = score;
+            poster = `https://image.tmdb.org/t/p/w185${info.poster_path}`;
+          }
+        } catch {
+          /* \u5355\u4E2A\u7C7B\u578B\u62C9\u53D6\u5931\u8D25\u5FFD\u7565 */
+        }
+      }
+      if (bestScore < 1) poster = "";
+    }
+    cache[key] = poster;
+    saveLibraryPosterCache(cache);
+    return poster;
+  }
+  function buildLibraryFastlinkPayload(dir, files) {
+    const list = (files || []).map((file) => {
+      const name = file.fileName || String(file.path || "").split("/").filter(Boolean).pop() || "";
+      return { path: name, fileName: name, etag: String(file.etag || ""), size: Number(file.size) || 0 };
+    }).filter((file) => file.etag && file.size > 0);
+    if (!list.length) throw new Error("\u9009\u4E2D\u7684\u6587\u4EF6\u6CA1\u6709\u53EF\u79D2\u4F20\u7684\u5185\u5BB9");
+    return {
+      commonPath: String(dir || "").split("/").filter(Boolean).pop() || "",
+      usesBase62EtagsInExport: true,
+      files: list
+    };
+  }
+  function libraryVersionLabel(fileName) {
+    if (!fileName) return "\u9ED8\u8BA4";
+    const tags = [];
+    const res = String(fileName).match(/(\d{3,4}p|4K)/i);
+    if (res) tags.push(res[1].toUpperCase());
+    if (/SDR/i.test(fileName)) tags.push("SDR");
+    else if (/HDR/i.test(fileName)) tags.push("HDR");
+    if (/DoVi|Dolby.?Vision/i.test(fileName)) tags.push("DV");
+    if (/H\.?265|HEVC/i.test(fileName)) tags.push("H265");
+    else if (/H\.?264|AVC/i.test(fileName)) tags.push("H264");
+    else if (/AV1/i.test(fileName)) tags.push("AV1");
+    return tags.length ? tags.join(" ") : "\u9ED8\u8BA4";
+  }
+  function libraryEpisodeNum(fileName) {
+    if (!fileName) return null;
+    const patterns = [
+      /\u7b2c\s*0*(\d{1,3})\s*[\u96c6\u8a71\u8bdd\u56de]/,
+      /[Ee][Pp]?\s*0*(\d{1,3})/,
+      /\[\s*0*(\d{1,3})\s*\]/,
+      /[\s_]0*(\d{1,3})\s*[\u96c6\u8a71\u8bdd\u56de]/,
+      /[\s._]0*(\d{1,3})\.(mp4|mkv|avi|rmvb|ts|mov)/i,
+      /[\s._]0*(\d{2,3})$/
+    ];
+    for (const pattern of patterns) {
+      const m = String(fileName).match(pattern);
+      if (m) return parseInt(m[1], 10);
+    }
+    return null;
+  }
+  function renderLibraryFileList(lib) {
+    if (lib.filesLoading) return `<div class="lib-files"><small>\u6587\u4EF6\u52A0\u8F7D\u4E2D\u2026</small></div>`;
+    const selected = new Set(lib.selectedFiles || []);
+    const rows = (lib.files || []).map((file) => {
+      const key = file.path || file.fileName;
+      const episode = libraryEpisodeNum(file.fileName);
+      const version = libraryVersionLabel(file.fileName);
+      return `<label class="lib-file-row" title="${escapeHtml(key)}"><input type="checkbox" data-library-file="${escapeHtml(key)}" ${selected.has(key) ? "checked" : ""}><span>${escapeHtml(file.fileName)}</span><small>${episode != null ? `\u7b2c${episode}\u96c6 \u00B7 ` : ""}${escapeHtml(version)} \u00B7 ${escapeHtml(formatBytes(file.size))}</small></label>`;
+    }).join("");
+    return `<div class="lib-files">${rows || "<small>\u6CA1\u6709\u53EF\u5C55\u793A\u7684\u6587\u4EF6</small>"}<div class="button-row"><button class="button compact primary" data-action="library-transfer-selected" ${lib.transferBusy || !selected.size ? "disabled" : ""}>\u8F6C\u5B58\u9009\u4E2D\uFF08${selected.size}\uFF09</button></div></div>`;
+  }
   var SubmissionClient = class {
     constructor(options = {}) {
       this.request = options.request || submissionRequestJson;
@@ -16772,16 +17149,39 @@ ${end.comment}` : end.comment;
     const convertPane = `${notice("\u5728 .123share \u4E0E\u9879\u76EE\u6807\u51C6 JSON \u4E4B\u95F4\u4E92\u8F6C\u3002\u8F6C\u6362\u53EA\u5728\u672C\u5730\u5B8C\u6210\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u6587\u4EF6\u3002", "", "settings")}<div class="button-row"><button class="button" data-action="fastlink-convert-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u6587\u4EF6</button><span>${escapeHtml(state.convertFileName || "\u652F\u6301 .123share / .json")}</span><input id="fastlink-convert-file" type="file" accept=".123share,.json" hidden></div><div class="editor-surface"><textarea id="fastlink-convert-input" placeholder="\u4E5F\u53EF\u4EE5\u7C98\u8D34\u6587\u4EF6\u5185\u5BB9">${escapeHtml(state.convertInput || "")}</textarea></div>${state.converted ? notice(`\u5DF2\u8F6C\u6362\u4E3A ${state.converted === "json" ? "JSON" : ".123share"} \u5E76\u5F00\u59CB\u4E0B\u8F7D\u3002`, "success", "check") : ""}`;
     const filterPane =`${notice("\u542F\u7528\u540E\uFF0C\u751F\u6210\u6216\u8F6C\u5B58\u65F6\u4F1A\u8DF3\u8FC7\u5BF9\u5E94\u6269\u5C55\u540D\u3002\u8BBE\u7F6E\u4FDD\u5B58\u5728\u9879\u76EE\u914D\u7F6E\u4E2D\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-filter="share" ${settings.filterOnShareEnabled ? "checked" : ""}>\u751F\u6210\u65F6\u542F\u7528\u8FC7\u6EE4</label><label class="check-line"><input type="checkbox" data-fastlink-filter="transfer" ${settings.filterOnTransferEnabled ? "checked" : ""}>\u8F6C\u5B58\u65F6\u542F\u7528\u8FC7\u6EE4</label></div><div class="filter-actions"><button class="button compact" data-action="fastlink-filter-all">\u5168\u9009</button><button class="button compact" data-action="fastlink-filter-none">\u5168\u4E0D\u9009</button><button class="button compact" data-action="fastlink-filter-reset">\u6062\u590D\u9ED8\u8BA4</button></div><div class="fastlink-filter-list">${filters.map((item, index) => `<label class="check-line"><input type="checkbox" data-fastlink-filter="extension" data-index="${index}" ${item.enabled ? "checked" : ""}><span>.${escapeHtml(item.ext)}</span><small>${escapeHtml(item.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B")}</small></label>`).join("")}</div>`;
     const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? settings.seedFolderName ? `${settings.seedFolderName}\uFF08${settings.seedFolderId}\uFF09` : `ID ${settings.seedFolderId}` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
-    const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"]];
+    const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"], ["library", "\u5F71\u5E93\u641C\u7D22", "film"]];
+    const libraryPane = (() => {
+      const lib = state.library ||= librarySearchState();
+      if (!String(ui.config.share?.libraryUrl || "").trim()) {
+        return `${notice("\u8FD8\u6CA1\u6709\u914D\u7F6E\u5F71\u5E93\u63A5\u53E3\u5730\u5740\u3002\u5230\u300C\u8BBE\u7F6E \u2192 \u5E38\u89C4\u300D\u586B\u5199\u5BA2\u6237\u7AEF\u5730\u5740\uFF08\u4F8B\u5982 http://127.0.0.1:62156\uFF0C\u7AEF\u53E3\u540C\u6295\u7A3F\u63A5\u53E3\uFF09\uFF0C\u54EA\u91CC\u80FD\u8FDE\u4E0A\u5C31\u586B\u54EA\u91CC\u3002", "warning", "alert")}<div class="button-row"><button class="button" data-action="library-open-settings">${icon("settings", 15)}\u53BB\u8BBE\u7F6E\u5F71\u5E93\u63A5\u53E3</button></div>`;
+      }
+      const chips = (items, kind, activeKey) => items.map((item) => `<button class="button compact ${item.name === activeKey ? "primary" : ""}" data-action="${kind}" data-name="${escapeHtml(item.name)}">${escapeHtml(item.name)}<small> ${item.count}</small></button>`).join("");
+      const activeCat = lib.categories.find((cat) => cat.name === lib.cat);
+      const totalPages2 = Math.max(1, Math.ceil(lib.total / lib.size));
+      const cards = lib.results.map((work) => {
+        const poster = lib.posters[work.dir];
+        const posterHtml = poster ? `<img class="lib-poster" src="${escapeHtml(poster)}" loading="lazy" alt="">` : `<div class="lib-poster lib-poster-empty"><span>${escapeHtml(String(work.title || "?").slice(0, 4))}</span></div>`;
+        const expanded = lib.expanded === work.dir;
+        return `<div class="lib-card"><div class="lib-card-row">${posterHtml}<div class="lib-card-body"><strong class="lib-title" title="${escapeHtml(work.dir)}">${escapeHtml(work.title)}</strong><small class="lib-sub">${escapeHtml([work.year || "", `${work.videoCount} \u89C6\u9891 / ${work.count} \u6587\u4EF6`, formatBytes(work.totalSize)].filter(Boolean).join(" \u00B7 "))}</small><div class="button-row"><button class="button compact primary" data-action="library-transfer" data-dir="${escapeHtml(work.dir)}" ${lib.transferBusy ? "disabled" : ""}>${icon("download", 13)}\u8F6C\u5B58</button><button class="button compact" data-action="library-open" data-dir="${escapeHtml(work.dir)}">${icon("folderOpen", 13)}${expanded ? "\u6536\u8D77\u6587\u4EF6" : "\u5C55\u5F00\u6587\u4EF6"}</button></div></div></div>${expanded ? renderLibraryFileList(lib) : ""}</div>`;
+      }).join("");
+      return `<div class="lib-searchbar"><label class="field"><span>\u7247\u540D</span><input id="library-keyword" value="${escapeHtml(lib.keyword)}" placeholder="\u8F93\u5165\u7247\u540D\u641C\u7D22\uFF0C\u7559\u7A7A\u6D4F\u89C8\u5168\u90E8"></label><button class="button primary compact" data-action="library-search">${icon("search", 14)}\u641C\u7D22</button><button class="button compact" data-action="library-refresh" ${lib.loading ? "disabled" : ""}>${icon("refresh", 14)}\u5237\u65B0</button><button class="button compact" data-action="library-test" ${lib.loading ? "disabled" : ""}>${icon("play", 14)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>
+      ${lib.statusInfo ? `<div class="lib-status">${escapeHtml(`\u5DF2\u8FDE\u63A5\uFF1A${lib.statusInfo.libCount} \u4E2A\u5E93 \u00B7 ${lib.statusInfo.workCount} \u4E2A\u4F5C\u54C1 \u00B7 ${lib.statusInfo.totalSizeLabel || "0 B"}`)}</div>` : ""}
+      ${lib.categories.length ? `<div class="lib-cats">${chips(lib.categories, "library-cat", lib.cat)}</div>` : ""}
+      ${activeCat && activeCat.subs?.length ? `<div class="lib-cats">${chips(activeCat.subs, "library-sub", lib.sub)}</div>` : ""}
+      ${lib.notice ? notice(lib.notice, "warning", "alert") : ""}
+      ${lib.loading ? `<div class="lib-status">\u52A0\u8F7D\u4E2D\u2026</div>` : lib.results.length ? `<div class="lib-grid">${cards}</div>` : lib.loaded ? `<div class="lib-status">\u6CA1\u6709\u5339\u914D\u7684\u4F5C\u54C1\u3002</div>` : ""}
+      ${lib.total > lib.size ? `<div class="lib-pager"><button class="button compact" data-action="library-page" data-page="${lib.page - 1}" ${lib.page <= 1 ? "disabled" : ""}>\u4E0A\u4E00\u9875</button><span class="footer-note">${lib.page} / ${totalPages2} \u00B7 \u5171 ${lib.total} \u4E2A\u4F5C\u54C1</span><button class="button compact" data-action="library-page" data-page="${lib.page + 1}" ${lib.page >= totalPages2 ? "disabled" : ""}>\u4E0B\u4E00\u9875</button></div>` : ""}`;
+    })();
+    const libraryPaneWrapped = `<div class="lib-body">${libraryPane}</div>`;
     const nav = `<div class="fastlink-tool-grid">${tools.map(([key, label, iconName]) => `<button class="button tool-button ${tool === key ? "active" : ""}" data-action="fastlink-tool" data-tool="${key}">${icon(iconName, 14)}${label}</button>`).join("")}</div>`;
-    let pane = state.picker ? renderFolderPicker(ui, state.picker) : tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : settingsPane;
+    let pane = state.picker ? renderFolderPicker(ui, state.picker) : tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : tool === "library" ? libraryPaneWrapped : settingsPane;
     const modeToolbar = `<div class="mode-toolbar"><div class="segmented"><button data-action="fastlink-mode" data-mode="import" class="${tool === "import" ? "active" : ""}">${icon("import", 15)}\u5BFC\u5165</button><button data-action="fastlink-mode" data-mode="export" class="${tool === "export" ? "active" : ""}">${icon("download", 15)}\u5BFC\u51FA</button></div></div>`;
     const scanProgress = readFastlinkScanCheckpoint();
     const shareProgress = readFastlinkShareCheckpoint();
     const scanSalvageCard = scanProgress ? `${notice(`\u4E0A\u6B21\u79D2\u4F20\u626B\u63CF\u672A\u5B8C\u6210\uFF0C\u5DF2\u4FDD\u5B58 ${scanProgress.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6${state.salvage && state.salvage.flow !== "public" && state.salvage.flow !== "publicBatch" ? `\uFF08${escapeHtml(state.salvage.reason)}\uFF09` : ""}\uFF1B\u5BF9\u540C\u6837\u7684\u9009\u62E9\u518D\u6B21\u5BFC\u51FA\u4F1A\u81EA\u52A8\u7EED\u63A5\u3002`, "warning", "alert")}<div class="button-row"><button class="button compact" data-action="fastlink-resume-scan">\u7EE7\u7EED\u626B\u63CF</button><button class="button compact" data-action="fastlink-salvage-export">\u5BFC\u51FA\u5DF2\u626B\u63CF\u90E8\u5206</button><button class="button compact" data-action="fastlink-salvage-discard">\u653E\u5F03\u8FDB\u5EA6</button></div>` : "";
     const shareSalvageCard = shareProgress ? `${notice(`\u4E0A\u6B21\u5206\u4EAB\u626B\u63CF\u672A\u5B8C\u6210\uFF0C\u5DF2\u4FDD\u5B58 ${shareProgress.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6${shareProgress.batch ? `\uFF08\u6279\u91CF\u89E3\u6790\uFF1A\u5DF2\u5B8C\u6210 ${Number(shareProgress.batch.done) || 0}/${shareProgress.batch.lines.length} \u884C\uFF09` : ""}${state.salvage && (state.salvage.flow === "public" || state.salvage.flow === "publicBatch") ? `\uFF08${escapeHtml(state.salvage.reason)}\uFF09` : ""}\uFF1B\u540C\u6837\u5185\u5BB9\u518D\u6B21\u751F\u6210\u4F1A\u81EA\u52A8\u7EED\u63A5\u3002`, "warning", "alert")}<div class="button-row"><button class="button compact" data-action="fastlink-share-resume">\u7EE7\u7EED\u626B\u63CF</button><button class="button compact" data-action="fastlink-share-salvage-export">\u5BFC\u51FA\u5DF2\u626B\u63CF\u90E8\u5206</button><button class="button compact" data-action="fastlink-share-salvage-discard">\u653E\u5F03\u8FDB\u5EA6</button></div>` : "";
     const body = `${scanSalvageCard}${shareSalvageCard}${nav}${["export", "import"].includes(tool) ? modeToolbar : ""}<div class="fastlink-pane">${pane}</div>${state.artifacts.length && !["export", "import"].includes(tool) ? generatedLinks : ""}`;
-    const action = tool === "export" ? `<button class="button primary" data-action="fastlink-export" ${state.items.length ? "" : "disabled"}>${icon("download", 15)}\u5BFC\u51FA ${state.items.length || ""}</button>` : tool === "import" ? `<button class="button primary" data-action="fastlink-import" ${String(state.input || "").trim() ? "" : "disabled"}>${icon("import", 15)}\u5F00\u59CB\u8F6C\u5B58</button>` : tool === "public" ? `<button class="button primary" data-action="fastlink-public-generate">${icon("download", 15)}\u751F\u6210 JSON \u6587\u4EF6</button>` : tool === "batch" ? `<button class="button primary" data-action="fastlink-public-batch">${icon("share", 15)}\u6279\u91CF\u751F\u6210</button>` : tool === "split" ? `<button class="button primary" data-action="fastlink-split">${icon("download", 15)}\u5F00\u59CB\u62C6\u5206</button>` : tool === "convert" ? `<button class="button primary" data-action="fastlink-convert">${icon("settings", 15)}\u5F00\u59CB\u8F6C\u6362</button>` : tool === "filters" || tool === "settings" ? `<button class="button primary" data-action="fastlink-settings-save">\u4FDD\u5B58\u8BBE\u7F6E</button>` : "";
+    const action = tool === "export" ? `<button class="button primary" data-action="fastlink-export" ${state.items.length ? "" : "disabled"}>${icon("download", 15)}\u5BFC\u51FA ${state.items.length || ""}</button>` : tool === "import" ? `<button class="button primary" data-action="fastlink-import" ${String(state.input || "").trim() ? "" : "disabled"}>${icon("import", 15)}\u5F00\u59CB\u8F6C\u5B58</button>` : tool === "public" ? `<button class="button primary" data-action="fastlink-public-generate">${icon("download", 15)}\u751F\u6210 JSON \u6587\u4EF6</button>` : tool === "batch" ? `<button class="button primary" data-action="fastlink-public-batch">${icon("share", 15)}\u6279\u91CF\u751F\u6210</button>` : tool === "split" ? `<button class="button primary" data-action="fastlink-split">${icon("download", 15)}\u5F00\u59CB\u62C6\u5206</button>` : tool === "convert" ? `<button class="button primary" data-action="fastlink-convert">${icon("settings", 15)}\u5F00\u59CB\u8F6C\u6362</button>` : tool === "filters" || tool === "settings" ? `<button class="button primary" data-action="fastlink-settings-save">\u4FDD\u5B58\u8BBE\u7F6E</button>` : tool === "library" ? `<button class="button primary" data-action="library-refresh" ${state.library?.loading ? "disabled" : ""}>\u5237\u65B0\u5F71\u5E93</button>` : "";
     return dialogFrame(ui, {
       title: "\u79D2\u4F20",
       subtitle: tool === "export" ? `${state.items.length} \u4E2A\u9876\u5C42\u9879\u76EE` : tool === "import" ? "\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55" : "\u79D2\u4F20\u5DE5\u5177\u7BB1",
@@ -16973,7 +17373,8 @@ ${end.comment}` : end.comment;
         return controlFrame(key, label, `<select ${attributes}>${categories.map((category) => `<option value="${escapeHtml(category)}" ${fields[key] === category ? "selected" : ""}>${escapeHtml(category)}</option>`).join("")}</select>`);
       }
       if (key === "title" || key === "namingTitle") {
-        const options = titleAliasOptions(group.media, key === "title" ? "zh" : "en");
+        const mode = key === "title" ? "zh" : resolveNamingMode(ui.config);
+        const options = titleAliasOptions(group.media, mode);
         const listId = `organize-alias-${key}-${String(group.id).replace(/[^A-Za-z0-9_-]/g, "-")}`;
         return controlFrame(key, label, `<input ${attributes} value="${escapeHtml(fields[key] || "")}" ${options.length ? `list="${listId}"` : ""}>${options.length ? `<datalist id="${listId}">${options.map((option) => `<option value="${escapeHtml(option)}"></option>`).join("")}</datalist>` : ""}`);
       }
@@ -17236,7 +17637,7 @@ ${end.comment}` : end.comment;
   function renderPane(ui) {
     const draft = ui.settings.draft;
     if (ui.settings.picker) return renderFolderPicker(ui);
-    if (ui.settings.tab === "general") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("settings", 17)}</span><div><h3>\u5916\u89C2\u4E0E\u4EFB\u52A1</h3><p>\u4E3B\u9898\u4F1A\u5E94\u7528\u5230\u6240\u6709\u52A9\u624B\u5F39\u7A97\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u4E3B\u9898</span><select data-config="appearance.theme"><option value="system" ${draft.appearance.theme === "system" ? "selected" : ""}>\u8DDF\u968F\u7CFB\u7EDF</option><option value="light" ${draft.appearance.theme === "light" ? "selected" : ""}>\u6D45\u8272</option><option value="dark" ${draft.appearance.theme === "dark" ? "selected" : ""}>\u6DF1\u8272</option></select></label><label class="check-line"><input type="checkbox" data-config="appearance.compactRows" ${draft.appearance.compactRows ? "checked" : ""}>\u4F7F\u7528\u7D27\u51D1\u8868\u683C\u884C</label></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("waveform", 17)}</span><div><h3>\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B</h3><p>\u4EC5\u5728\u6D4F\u89C8\u5668\u672C\u5730\u901A\u8FC7 123 \u76F4\u94FE\u3001Range \u5206\u6BB5\u548C MediaInfo WASM \u89E3\u6790\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u5A92\u4F53\u5185\u5BB9\u3002</p></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("share", 17)}</span><div><h3>\u5206\u4EAB\u4E0E\u79D2\u4F20</h3><p>\u53EF\u5728\u5206\u4EAB\u521B\u5EFA\u6210\u529F\u540E\u76F4\u63A5\u53D1\u9001\u5230\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\uFF0C\u7531\u670D\u52A1\u751F\u6210\u5E76\u63A8\u9001\u6295\u7A3F\u8349\u7A3F\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u5206\u4EAB\u5230\u671F\u65F6\u95F4</span><input data-config="share.expiration" value="${escapeHtml(draft.share.expiration)}"></label><label class="field"><span>\u968F\u673A\u53E3\u4EE4\u957F\u5EA6</span><input type="number" min="1" max="8" data-config="share.passwordLength" value="${draft.share.passwordLength}"></label><label class="check-line full"><input type="checkbox" data-config="share.autoSubmitEnabled" ${draft.share.autoSubmitEnabled ? "checked" : ""}>\u5206\u4EAB\u540E\u81EA\u52A8\u63A8\u9001\u5230\u6295\u7A3F\u673A\u5668\u4EBA</label><label class="field full"><span>\u6295\u7A3F\u5730\u5740</span><input data-config="share.submissionUrl" value="${escapeHtml(draft.share.submissionUrl || "")}" placeholder="\u8BF7\u8F93\u5165\u5B8C\u6574\u6295\u7A3F\u63A5\u53E3\u5730\u5740"><small>\u811A\u672C\u4F1A\u5411\u6B64\u5730\u5740\u53D1\u9001 POST \u8BF7\u6C42\uFF1B\u53EF\u586B\u5199 123Cloud \u6216\u5176\u4ED6\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\u7684\u5B8C\u6574\u63A5\u53E3\u5730\u5740\u3002</small></label></div></div></div>`;
+    if (ui.settings.tab === "general") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("settings", 17)}</span><div><h3>\u5916\u89C2\u4E0E\u4EFB\u52A1</h3><p>\u4E3B\u9898\u4F1A\u5E94\u7528\u5230\u6240\u6709\u52A9\u624B\u5F39\u7A97\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u4E3B\u9898</span><select data-config="appearance.theme"><option value="system" ${draft.appearance.theme === "system" ? "selected" : ""}>\u8DDF\u968F\u7CFB\u7EDF</option><option value="light" ${draft.appearance.theme === "light" ? "selected" : ""}>\u6D45\u8272</option><option value="dark" ${draft.appearance.theme === "dark" ? "selected" : ""}>\u6DF1\u8272</option></select></label><label class="check-line"><input type="checkbox" data-config="appearance.compactRows" ${draft.appearance.compactRows ? "checked" : ""}>\u4F7F\u7528\u7D27\u51D1\u8868\u683C\u884C</label></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("waveform", 17)}</span><div><h3>\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B</h3><p>\u4EC5\u5728\u6D4F\u89C8\u5668\u672C\u5730\u901A\u8FC7 123 \u76F4\u94FE\u3001Range \u5206\u6BB5\u548C MediaInfo WASM \u89E3\u6790\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u5A92\u4F53\u5185\u5BB9\u3002</p></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("share", 17)}</span><div><h3>\u5206\u4EAB\u4E0E\u79D2\u4F20</h3><p>\u53EF\u5728\u5206\u4EAB\u521B\u5EFA\u6210\u529F\u540E\u76F4\u63A5\u53D1\u9001\u5230\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\uFF0C\u7531\u670D\u52A1\u751F\u6210\u5E76\u63A8\u9001\u6295\u7A3F\u8349\u7A3F\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u5206\u4EAB\u5230\u671F\u65F6\u95F4</span><input data-config="share.expiration" value="${escapeHtml(draft.share.expiration)}"></label><label class="field"><span>\u968F\u673A\u53E3\u4EE4\u957F\u5EA6</span><input type="number" min="1" max="8" data-config="share.passwordLength" value="${draft.share.passwordLength}"></label><label class="check-line full"><input type="checkbox" data-config="share.autoSubmitEnabled" ${draft.share.autoSubmitEnabled ? "checked" : ""}>\u5206\u4EAB\u540E\u81EA\u52A8\u63A8\u9001\u5230\u6295\u7A3F\u673A\u5668\u4EBA</label><label class="field full"><span>\u6295\u7A3F\u5730\u5740</span><input data-config="share.submissionUrl" value="${escapeHtml(draft.share.submissionUrl || "")}" placeholder="\u8BF7\u8F93\u5165\u5B8C\u6574\u6295\u7A3F\u63A5\u53E3\u5730\u5740"><small>\u811A\u672C\u4F1A\u5411\u6B64\u5730\u5740\u53D1\u9001 POST \u8BF7\u6C42\uFF1B\u53EF\u586B\u5199 123Cloud \u6216\u5176\u4ED6\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\u7684\u5B8C\u6574\u63A5\u53E3\u5730\u5740\u3002</small></label><label class="field full"><span>\u5F71\u5E93\u63A5\u53E3\u5730\u5740\uFF08123Cloud \u5BA2\u6237\u7AEF\uFF09</span><input data-config="share.libraryUrl" value="${escapeHtml(draft.share.libraryUrl || "")}" placeholder="\u4F8B\u5982 http://127.0.0.1:62156\uFF0C\u53EF\u5E26 ?token="><small>\u586B\u5BA2\u6237\u7AEF\u5730\u5740\u5373\u53EF\uFF0C\u7AEF\u53E3\u770B\u5BA2\u6237\u7AEF\u300C\u8BBE\u7F6E \u2192 \u670D\u52A1\u7AEF\u53E3\u300D\uFF08\u540C\u6295\u7A3F\u7AEF\u53E3\uFF09\uFF1B\u54EA\u91CC\u80FD\u8FDE\u4E0A\u5C31\u586B\u54EA\u91CC\uFF0C\u7528\u4E8E\u79D2\u4F20\u5DE5\u5177\u7BB1\u7684\u300C\u5F71\u5E93\u641C\u7D22\u300D\u3002</small></label><label class="field"><span>\u5F71\u5E93\u8BBF\u95EE\u4EE4\u724C</span><input data-config="share.libraryToken" value="${escapeHtml(draft.share.libraryToken || "")}" placeholder="\u5BA2\u6237\u7AEF\u300C\u5F71\u5E93\uFF0D\u5F71\u5E93\u8BBE\u7F6E\u300D\u91CC\u751F\u6210\uFF0C\u672A\u8BBE\u7F6E\u53EF\u7559\u7A7A"></label></div></div></div>`;
     if (ui.settings.tab === "tmdb") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("cloud", 17)}</span><div><h3>TMDB \u8FDE\u63A5</h3><p>\u7528\u4E8E\u5A92\u4F53\u6D77\u62A5\u3001\u6807\u9898\u3001\u5E74\u4EFD\u548C\u5267\u96C6\u4FE1\u606F\u3002</p></div></div>${notice("\u4EE5 ey \u5F00\u5934\u7684\u503C\u6309 Read Access Token \u4F7F\u7528\uFF0C\u5176\u4ED6\u503C\u6309 v3 API Key \u4F7F\u7528\u3002\u51ED\u636E\u4EC5\u53D1\u9001\u5230 TMDB\u3002", "", "cloud")}<div class="form-card"><div class="form-grid"><label class="field full"><span>API Key / Read Access Token</span><input type="password" autocomplete="off" data-config="tmdb.credential" value="${escapeHtml(draft.tmdb.credential)}"></label><label class="field"><span>\u8BED\u8A00</span><input data-config="tmdb.language" value="${escapeHtml(draft.tmdb.language)}"></label><label class="field"><span>\u5730\u533A</span><input data-config="tmdb.region" value="${escapeHtml(draft.tmdb.region)}"></label></div></div><button class="button" data-action="tmdb-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>`;
     if (ui.settings.tab === "library") return renderLibrary(ui);
     if (ui.settings.tab === "naming") return renderNaming(ui);
@@ -17810,6 +18211,29 @@ ${end.comment}` : end.comment;
   .fastlink-window { width:min(980px,calc(100vw - 48px)); height:min(780px,calc(100vh - 48px)); }
   .fastlink-content { display:flex; flex-direction:column; min-height:0; overflow:hidden; padding:0; }
   .fastlink-tool-grid { position:relative; flex:0 0 auto; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; margin:10px 18px 0; padding:5px; background:var(--glass-soft); border:1px solid var(--glass-border); border-radius:var(--radius-sm); box-shadow:var(--shadow-sm); }
+  .lib-body { max-height:calc(100vh - 340px); min-height:240px; overflow-y:auto; overflow-x:hidden; padding-right:4px; scrollbar-gutter:stable; }
+  .lib-searchbar { display:flex; flex-wrap:wrap; gap:8px; align-items:flex-end; margin-top:10px; }
+  .lib-searchbar .field { flex:1 1 180px; min-width:150px; }
+  .lib-status { margin-top:8px; font-size:12px; color:var(--muted); }
+  .lib-cats { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .lib-cats .button small { opacity:.65; }
+  .lib-grid { display:flex; flex-direction:column; gap:10px; margin-top:10px; }
+  .lib-card { display:flex; flex-direction:column; padding:10px 12px; border:1px solid var(--glass-border); border-radius:var(--radius-sm); background:var(--glass-soft); }
+  .lib-card-row { display:flex; align-items:center; gap:12px; min-width:0; }
+  .lib-poster { width:54px; height:78px; flex-shrink:0; object-fit:cover; border-radius:8px; background:rgba(127,127,127,.15); border:1px solid var(--glass-border); }
+  .lib-poster-empty { display:flex; align-items:center; justify-content:center; font-size:22px; color:var(--muted); }
+  .lib-card-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:4px; }
+  .lib-card .button-row { gap:6px; margin-top:2px; }
+  .lib-title { font-size:13px; line-height:1.3; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .lib-sub { font-size:11px; color:var(--muted); }
+  .lib-card .button-row { gap:6px; flex-wrap:nowrap; }
+  .lib-files { margin-top:8px; border-top:1px dashed var(--glass-border); padding-top:8px; display:flex; flex-direction:column; gap:4px; }
+  .lib-file-row { display:flex; align-items:center; gap:8px; font-size:12px; min-width:0; padding:3px 0; cursor:pointer; }
+  .lib-file-row span { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text); }
+  .lib-file-row small { color:var(--muted); flex-shrink:0; white-space:nowrap; }
+  .lib-files { max-height:300px; overflow-y:auto; margin-top:8px; padding-left:66px; }
+  .lib-file-row { padding:2px 0; }
+  .lib-pager { display:flex; align-items:center; justify-content:center; gap:10px; margin-top:10px; }
   .fastlink-tool-grid .tool-button { min-width:0; min-height:34px; justify-content:flex-start; gap:8px; padding:6px 10px; line-height:1.25; white-space:normal; text-align:left; border-color:transparent; border-radius:var(--radius-xs); background:transparent; box-shadow:none; }
   .fastlink-tool-grid .tool-button:hover:not(:disabled) { border-color:var(--glass-border); background:var(--glass); color:var(--text); box-shadow:var(--shadow-sm); }
   .fastlink-tool-grid .tool-button.active { color:var(--accent-strong); border-color:color-mix(in srgb,var(--accent) 35%,var(--glass-border)); background:var(--accent-soft); box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 4px 12px -8px var(--accent-glow); }
@@ -18323,18 +18747,29 @@ ${end.comment}` : end.comment;
       const context = this.shareToolbarContext?.readContext?.() || { kind: this.shareToolbarContext?.kind || "free", search: "" };
       const kind = context.kind === "paid" ? "paid" : "free";
       const buttons = [...this.shareToolbar?.querySelectorAll("button") || []];
+      const exportButton = buttons.find((button) => button.dataset.sharePageAction === "export") || buttons[0];
+      const originalHtml = exportButton?.innerHTML || "";
+      const showButtonProgress = (text) => {
+        if (exportButton) exportButton.innerHTML = `<span>${escapeHtml(text)}</span>`;
+      };
       for (const button of buttons) button.disabled = true;
       try {
-        const shares = await this.api.listShares(context.search || "", { kind, limit: 500 });
+        const shares = await this.api.listShares(context.search || "", { kind, limit: 500, onPage: (count, page) => showButtonProgress(page > 1 ? `\u5BFC\u51FA\u4E2D ${count} \u6761\u2026` : "\u5BFC\u51FA\u4E2D\u2026") });
         const label = kind === "paid" ? "\u4ED8\u8D39\u5206\u4EAB" : "\u514D\u8D39\u5206\u4EAB";
         if (action !== "export") throw new Error("\u4E0D\u652F\u6301\u7684\u5206\u4EAB\u9875\u64CD\u4F5C");
+        showButtonProgress("\u751F\u6210 CSV\u2026");
         const result2 = buildShareExport(shares, { kind });
         if (!result2.count) throw new Error(`\u5F53\u524D${label}${context.search ? "\u641C\u7D22\u7ED3\u679C\u4E2D" : "\u4E2D"}\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u94FE\u63A5`);
         downloadText(result2.filename, result2.content, "text/csv;charset=utf-8");
         this.toast(`\u5DF2\u5BFC\u51FA ${result2.count} \u6761${label}\u8BB0\u5F55`, "success");
         return result2.count;
+      } catch (error) {
+        // 分享列表接口限流提示友好化：告诉用户是临时限流而非功能故障
+        if (/\u9891\u7E41|\u9650\u6D41|too\s*many|rate\s*limit/i.test(String(error?.message || ""))) error.message = `\u5206\u4EAB\u63A5\u53E3\u88AB 123 \u9650\u6D41\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\uFF08${error.message}\uFF09`;
+        throw error;
       } finally {
         for (const button of buttons) button.disabled = false;
+        if (exportButton) exportButton.innerHTML = originalHtml;
       }
     }
     updateToolbarState() {
@@ -19170,7 +19605,8 @@ ${end.comment}` : end.comment;
         convertFileName: "",
         converted: null,
         filterDraft: null,
-        picker: null
+        picker: null,
+        library: librarySearchState()
       };
       this.state.view = "fastlink";
       this.render();
@@ -19293,6 +19729,137 @@ ${end.comment}` : end.comment;
       this.bridge.refresh();
       if (this.completeFastlinkTask(outcome.task, result2)) return;
       this.setResult("\u79D2\u4F20\u5BFC\u5165\u7ED3\u679C", result2);
+    }
+    async loadLibrary(force = false) {
+      const lib = this.fastlink.library ||= librarySearchState();
+      if (lib.loaded && !force) return;
+      lib.loading = true;
+      lib.notice = "";
+      this.render();
+      try {
+        const cats = await libraryRequestJson(libraryRequestUrl(this.config, "/api/library/categories"));
+        lib.categories = Array.isArray(cats?.categories) ? cats.categories : [];
+        lib.loaded = true;
+      } catch (error) {
+        lib.notice = error instanceof Error ? error.message : String(error);
+      }
+      lib.loading = false;
+      await this.searchLibrary();
+    }
+    async testLibraryConnection() {
+      const status = await libraryRequestJson(libraryRequestUrl(this.config, "/api/library/status"));
+      const info = status?.status || {};
+      this.fastlink.library ||= librarySearchState();
+      this.fastlink.library.statusInfo = info;
+      this.toast(`\u5F71\u5E93\u5DF2\u8FDE\u63A5\uFF1A${info.libCount ?? "?"} \u4E2A\u5E93 \u00B7 ${info.workCount ?? "?"} \u4E2A\u4F5C\u54C1 \u00B7 ${info.totalSizeLabel || ""}`, "success");
+      this.render();
+    }
+    async searchLibrary() {
+      const lib = this.fastlink.library ||= librarySearchState();
+      lib.loading = true;
+      this.render();
+      try {
+        const payload = await libraryRequestJson(libraryRequestUrl(this.config, "/api/library/search", {
+          q: lib.keyword,
+          cat: lib.cat,
+          sub: lib.sub,
+          page: lib.page,
+          size: lib.size
+        }));
+        lib.results = Array.isArray(payload?.dirs) ? payload.dirs : [];
+        lib.total = Number(payload?.total) || 0;
+        lib.notice = lib.results.length ? "" : "\u6CA1\u6709\u5339\u914D\u7684\u4F5C\u54C1";
+        lib.loaded = true;
+      } catch (error) {
+        lib.notice = error instanceof Error ? error.message : String(error);
+        lib.results = [];
+      } finally {
+        lib.loading = false;
+        this.render();
+      }
+      const pending = lib.results.filter((work) => lib.posters[work.dir] === void 0).slice(0, 24);
+      if (pending.length) {
+        void Promise.all(pending.map(async (work) => {
+          lib.posters[work.dir] = await fetchLibraryPoster(work);
+        })).then(() => this.render());
+      }
+    }
+    async openLibraryFiles(dir) {
+      const lib = this.fastlink.library ||= librarySearchState();
+      if (lib.expanded === dir) {
+        lib.expanded = null;
+        lib.files = [];
+        lib.selectedFiles = [];
+        this.render();
+        return;
+      }
+      lib.expanded = dir;
+      lib.files = [];
+      lib.selectedFiles = [];
+      lib.filesLoading = true;
+      this.render();
+      try {
+        const payload = await libraryRequestJson(libraryRequestUrl(this.config, "/api/library/files", { dir }));
+        lib.files = Array.isArray(payload?.files) ? payload.files : [];
+      } catch (error) {
+        lib.notice = error instanceof Error ? error.message : String(error);
+      } finally {
+        lib.filesLoading = false;
+        this.render();
+      }
+    }
+    async importLibraryPayload(payload, label) {
+      if (!payload?.files?.length) throw new Error("\u5F71\u5E93\u8FD4\u56DE\u7684\u79D2\u4F20\u6570\u636E\u4E3A\u7A7A");
+      const outcome = await this.runFastlinkTask("import", async (signal) => {
+        this.setProgress(0, 1, `\u89E3\u6790\u5F71\u5E93\u79D2\u4F20\uFF1A${label}`);
+        return importFastlink(this.api, parseFastlinkJson(payload), this.fastlink.currentDir, {
+          signal,
+          concurrency: this.config.requests.writeConcurrency,
+          importProgress: true,
+          ...this.fastlinkTransferOptions(),
+          onProgress: (done, total, name) => this.setProgress(done, total, `\u79D2\u4F20\u5BFC\u5165\uFF1A${name}`)
+        });
+      });
+      if (outcome.error) return;
+      const result2 = outcome.result;
+      this.bridge.refresh();
+      if (Number(result2?.skipped) > 0) this.toast(`\u5DF2\u8DF3\u8FC7\u4E0A\u6B21\u6210\u529F\u5BFC\u5165\u7684 ${result2.skipped} \u9879`, "info");
+      if (this.completeFastlinkTask(outcome.task, result2)) return;
+      this.setResult(`\u5F71\u5E93\u8F6C\u5B58\u7ED3\u679C\uFF08${label}\uFF09`, result2);
+    }
+    async transferLibraryWork(dir) {
+      const lib = this.fastlink.library ||= librarySearchState();
+      if (lib.transferBusy) return;
+      lib.transferBusy = true;
+      lib.notice = "\u6B63\u5728\u4ECE\u5F71\u5E93\u83B7\u53D6\u79D2\u4F20\u6570\u636E\u2026";
+      lib.expanded = null;
+      lib.files = [];
+      lib.selectedFiles = [];
+      this.render();
+      try {
+        const payload = await libraryRequestJson(libraryRequestUrl(this.config, "/api/library/export", { dir }), { timeoutMs: 120000 });
+        lib.notice = "";
+        await this.importLibraryPayload(payload?.library, String(dir).split("/").filter(Boolean).pop() || "\u4F5C\u54C1");
+      } catch (error) {
+        lib.notice = `\u8F6C\u5B58\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`;
+      } finally {
+        lib.transferBusy = false;
+        this.render();
+      }
+    }
+    async transferLibrarySelected() {
+      const lib = this.fastlink.library ||= librarySearchState();
+      if (lib.transferBusy) return;
+      const selected = (lib.files || []).filter((file) => (lib.selectedFiles || []).includes(file.path || file.fileName));
+      const payload = buildLibraryFastlinkPayload(lib.expanded, selected);
+      lib.transferBusy = true;
+      this.render();
+      try {
+        await this.importLibraryPayload(payload, String(lib.expanded || "").split("/").filter(Boolean).pop() || "\u9009\u4E2D\u6587\u4EF6");
+      } finally {
+        lib.transferBusy = false;
+        this.render();
+      }
     }
     fastlinkSeedOptions() {
       const settings = this.config.fastlinkTools || {};
@@ -20007,6 +20574,7 @@ ${end.comment}` : end.comment;
           this.fastlink.tool = tool;
           if (["export", "import"].includes(tool)) this.fastlink.mode = tool;
           if (tool === "filters" && !this.fastlink.filterDraft) this.fastlink.filterDraft = structuredClone(this.config.fastlinkTools || {});
+          if (tool === "library" && !this.fastlink.library?.loaded && !this.fastlink.library?.loading) void this.loadLibrary();
           this.render();
         },
         "fastlink-pick-seed": async () => this.openFastlinkFolderPicker("fastlinkSeed", "\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939"),
@@ -20063,6 +20631,39 @@ ${end.comment}` : end.comment;
           await copyText(artifact.link);
           this.toast("\u79D2\u4F20\u94FE\u63A5\u5DF2\u590D\u5236", "success");
         },
+        "library-open-settings": () => this.openSettings("general"),
+        "library-test": async () => {
+          await this.testLibraryConnection();
+        },
+        "library-refresh": () => this.loadLibrary(true),
+        "library-search": () => {
+          this.fastlink.library ||= librarySearchState();
+          this.fastlink.library.page = 1;
+          return this.searchLibrary();
+        },
+        "library-cat": (control) => {
+          const lib = this.fastlink.library ||= librarySearchState();
+          lib.cat = lib.cat === control.dataset.name ? "" : control.dataset.name || "";
+          lib.sub = "";
+          lib.page = 1;
+          return this.searchLibrary();
+        },
+        "library-sub": (control) => {
+          const lib = this.fastlink.library ||= librarySearchState();
+          lib.sub = lib.sub === control.dataset.name ? "" : control.dataset.name || "";
+          lib.page = 1;
+          return this.searchLibrary();
+        },
+        "library-page": (control) => {
+          const lib = this.fastlink.library ||= librarySearchState();
+          const page = Number(control.dataset.page) || 1;
+          if (page < 1) return;
+          lib.page = page;
+          return this.searchLibrary();
+        },
+        "library-open": (control) => this.openLibraryFiles(control.dataset.dir || ""),
+        "library-transfer": (control) => this.transferLibraryWork(control.dataset.dir || ""),
+        "library-transfer-selected": () => this.transferLibrarySelected(),
         "organize-select-group": (control) => {
           this.organize.selectedGroupId = control.dataset.group;
           this.organize.tool = null;
@@ -20463,6 +21064,19 @@ ${end.comment}` : end.comment;
       if (this.settings.draft.share?.autoSubmitEnabled === true) {
         this.settings.draft.share.submissionUrl = normalizeSubmissionUrl(this.settings.draft.share.submissionUrl);
       }
+      const libraryUrlDraft = String(this.settings.draft.share?.libraryUrl || "").trim();
+      if (libraryUrlDraft) {
+        let libraryUrlOk = false;
+        try {
+          const libraryUrlParsed = new URL(libraryUrlDraft);
+          libraryUrlOk = /^https?:$/.test(libraryUrlParsed.protocol) && Boolean(libraryUrlParsed.hostname);
+        } catch {
+          libraryUrlOk = false;
+        }
+        if (!libraryUrlOk) throw new Error("影库接口地址格式无效，示例：http://192.168.1.5:8321");
+      }
+      this.settings.draft.share.libraryUrl = libraryUrlDraft;
+      this.settings.draft.share.libraryToken = String(this.settings.draft.share?.libraryToken || "").trim();
       const onboarding = this.settings.onboarding;
       const returnView = this.settings.returnView;
       this.settings.draft.organize.setupCompleted = !this.settings.resetRequested;
@@ -20540,6 +21154,16 @@ ${end.comment}` : end.comment;
           this.cleaner.inventory = null;
           this.cleaner.matches = [];
           this.cleaner.selectedIds = /* @__PURE__ */ new Set();
+          this.render();
+          return;
+        }
+        if (target.hasAttribute && target.hasAttribute("data-library-file")) {
+          const lib = this.fastlink.library ||= librarySearchState();
+          const key = target.getAttribute("data-library-file") || "";
+          const selected = new Set(lib.selectedFiles || []);
+          if (target.checked) selected.add(key);
+          else selected.delete(key);
+          lib.selectedFiles = [...selected];
           this.render();
           return;
         }
@@ -20682,6 +21306,15 @@ ${end.comment}` : end.comment;
       }
       if (this.cleaner && target.id === "cleaner-max-size") {
         this.cleaner.maxSize = target.value;
+        return;
+      }
+      if (target.id === "library-keyword") {
+        this.fastlink.library ||= librarySearchState();
+        this.fastlink.library.keyword = target.value;
+        window.clearTimeout(this.librarySearchTimer);
+        this.librarySearchTimer = window.setTimeout(() => {
+          void this.searchLibrary();
+        }, 300);
         return;
       }
       if (target.id === "fastlink-input") {
