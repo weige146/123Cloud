@@ -176,6 +176,19 @@ for (const [pathname, expectedViews] of pageExpectations) {
     window.document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     await flush();
     assert.ok(!overlay.classList.contains("open"), "Esc 应关闭浮层");
+    // 输入法组字期按键不算快捷键：面板输入框打中文时按 Esc 取消候选词不应关浮层（v1.0.1 回归）
+    shadow.querySelector(".tmdbh-ball").click();
+    await flush();
+    assert.ok(overlay.classList.contains("open"), "重新点击悬浮球后浮层应打开");
+    window.document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", isComposing: true, bubbles: true }));
+    await flush();
+    assert.ok(overlay.classList.contains("open"), "组字期 Esc（isComposing=true）不应关闭浮层");
+    window.document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", keyCode: 229, bubbles: true }));
+    await flush();
+    assert.ok(overlay.classList.contains("open"), "组字期 Esc（keyCode=229）不应关闭浮层");
+    window.document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await flush();
+    assert.ok(!overlay.classList.contains("open"), "组字结束后普通 Esc 仍应关闭浮层");
 }
 
 // —— 搜索 + 复制：粘贴文本来源 → 解析 → 条目头 + 复制按钮 → 剪贴板内容正确 ——

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMDB 助手
 // @namespace    local.tmdb-helper
-// @version      1.0.0
+// @version      1.0.1
 // @description  在 themoviedb.org 提供轻量搜索浮层：以统一数据源接口（豆瓣 / IMDb / 粘贴文本，可插拔新数据源）搜索条目，结果一键复制（名称 / 原名 / 名称 (年份) / 简介 / 全部信息），不向页面回写任何数据；悬浮球左键开关浮层、右键直接复制「名称 (年份) {tmdbid=…}」。保留的页面功能只在对应页面出现：季编辑器的批量单集（灵活排期 + 过滤词剔除重编号 + 平台链接抓分集（B站/爱奇艺/腾讯/芒果/优酷/红果短剧）+ 从 TMDB 拉取官方分集回填 + 分集缩略图按 TMDB 官方规范抓取/去黑边/裁切/直传）、图片上传页的直传（电影/剧集/季海报、背景图、标志、单集剧照，直链图自动去黑边）、剧集组页的剧集组管理（官网内部接口），并预留批量操作扩展接口（window.TmdbHelper）。右侧停靠面板：鸿蒙光感玻璃风 UI（磨砂透光、蓝紫渐变，跟随系统深浅主题，面板宽度可拖拽）。
 // @license      MIT
 // @icon         https://www.themoviedb.org/favicon.ico
@@ -33,6 +33,8 @@
      *   候选卡与来源条目上都有复制按钮（名称 / 原名 / 名称 (年份) / 日期 / 简介 / 全部信息）。
  * - 悬浮球：左键开关浮层（只有点击才显示，刷新/跳转后绝不自动弹出）；右键直接复制
  *   「名称 (年份) {tmdbid=…}」（123 助手同款格式）；可拖拽；Alt+T 隐藏/恢复。
+ *   v1.0.1：全局快捷键忽略输入法组字期按键（isComposing/keyCode 229）——面板输入框里打中文、
+ *   按 Esc 取消候选词不再误关整个浮层（与 123 助手同款防护）。
  * - 不再向官方页面回写任何数据：对照填写/字段绑定/新增向导自动填充/季表单写入已全部移除，
  *   脚本只读页面 + 只提供搜索结果信息。
      * - 保留的页面功能（只在对应页面出现，浮层依然是点击才开）：
@@ -5391,6 +5393,9 @@
 
         // —— 全局快捷键 ——
         document.addEventListener("keydown", (event) => {
+            // 输入法组字期的按键（Esc 取消候选词、回车选字，macOS 会带真实 key + isComposing）不算快捷键，
+            // 否则在面板输入框打中文一按 Esc 整个浮层就被关掉
+            if (event.isComposing || event.keyCode === 229) return;
             if (event.key === "Escape" && overlayEl.classList.contains("open")) {
                 setOpen(false);
             }
@@ -5403,6 +5408,7 @@
             }
         }, true);
         root.addEventListener("keydown", (event) => {
+            if (event.isComposing || event.keyCode === 229) return; // 组字期回车是选字，不触发快捷解析
             if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
                 const action = state.view === "episodes" ? "parse-episodes" : state.sourceTab === "text" ? "parse-entry" : "source-search";
                 const btn = bodyEl.querySelector(`[data-action="${action}"]`);
