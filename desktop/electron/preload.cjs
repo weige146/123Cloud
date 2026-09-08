@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld("cloud123", {
   isDesktop: true,
   getInfo: () => ipcRenderer.invoke("app:getInfo"),
   openDataDir: () => ipcRenderer.invoke("app:openDataDir"),
+  pickFolder: (payload) => ipcRenderer.invoke("app:pickFolder", payload),
+  pickFiles: (payload) => ipcRenderer.invoke("app:pickFiles", payload),
   openPan123Oauth: (payload) => ipcRenderer.invoke("app:openPan123Oauth", payload),
   getLogs: () => ipcRenderer.invoke("app:getLogs"),
   getPortConfig: () => ipcRenderer.invoke("app:getPortConfig"),

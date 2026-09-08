@@ -68,6 +68,7 @@ const navigation: NavigationItem[] = [
       { label: "秒传池", path: "/admin/pan115-pool", icon: "mdi-database-search" },
     ],
   },
+  { key: "library", label: "影库", shortLabel: "影库", icon: "mdi-movie-open-outline", path: "/admin/library", routes: ["/admin/library"] },
   { key: "settings", label: "设置", shortLabel: "设置", icon: "mdi-cog-outline", path: "/admin/settings", routes: ["/admin/settings"] },
 ];
 

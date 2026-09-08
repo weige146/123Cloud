@@ -1,4 +1,4 @@
-import { api } from "./client";
+import { api, readJson } from "./client";
 import type {
   AdminStatus,
   AccountCooldown,
@@ -119,7 +119,7 @@ export const pan115HelperApi = {
   urlsOffline: (urls: string[]) => api.post<Pan115HelperActionResult>("/api/pan115-helper/urls/offline", { urls }),
   pan123Dlinks: () => api.get<Pan123DirectLinksStatus>("/api/pan115-helper/pan123/dlinks"),
   pan123DlinksOffline: (keys: string[]) => api.post<Pan115HelperActionResult>("/api/pan115-helper/pan123/dlinks/offline", { keys }),
-  pan123Browse: (parentId = 0) => api.get<Pan123BrowseResult>(`/api/pan115-helper/pan123/browse?parentId=${parentId || 0}`),
+  pan123Browse: (parentId = 0) => api.get<Pan123BrowseResult>(`/api/pan115-helper/pan123/browse?parent_id=${parentId || 0}`),
 };
 
 // ====== 115 搬运 ======
@@ -184,4 +184,261 @@ export interface PoolTokenStatus {
   override: boolean;
   overridePreview: string | null;
   defaultPreview: string | null;
+}
+
+// ====== 影库（影库文件解析入本地数据库，供管理页与油猴脚本搜索转存） ======
+export interface LibraryWork {
+  dir: string;
+  title: string;
+  year: number | null;
+  tmdbId: number | null;
+  count: number;
+  videoCount: number;
+  totalSize: number;
+  cat: string;
+  sub: string;
+}
+
+export interface LibraryCategory {
+  name: string;
+  count: number;
+  size: number;
+  subs: Array<{ name: string; count: number; size: number }>;
+}
+
+export interface LibraryFile {
+  fileName: string;
+  path: string;
+  etag: string;
+  size: number;
+  isVideo: boolean;
+}
+
+export interface LibraryStatus {
+  scanning?: boolean;
+  lastScanAt?: number;
+  lastScanError?: string;
+  libCount: number;
+  workCount: number;
+  fileCount: number;
+  videoCount: number;
+  totalSize: number;
+  totalSizeLabel: string;
+}
+
+export interface LibraryLibInfo {
+  name: string;
+  loadDate: string;
+  fileCount: number;
+  totalSize: number;
+}
+
+export interface LibraryImportResult {
+  ok: boolean;
+  name?: string;
+  added: number;
+  skipped: number;
+  fileCount: number;
+}
+
+export interface LibraryConfig {
+  transferIntervalMs: number;
+  transferConcurrency: number;
+  exportDir: string;
+  tokenSet: boolean;
+  token: string;
+  tokenPreview: string | null;
+}
+
+export interface LibraryFastlinkJson {
+  scriptVersion: string;
+  exportVersion: string;
+  usesBase62EtagsInExport: boolean;
+  commonPath: string;
+  totalFilesCount: number;
+  totalSize: number;
+  formattedTotalSize?: string;
+  files: Array<{ path: string; fileName: string; etag: string; size: number; type: number; s3KeyFlag: string }>;
+}
+
+export interface LibraryShareItem {
+  id: string;
+  name: string;
+  type: number;
+  etag: string;
+  size: number;
+  s3KeyFlag: string;
+}
+
+export interface LibraryShareTask {
+  taskId: string;
+  status: string;
+  createdAt?: number;
+  progress: { step: string; files: number; dirs: number; skipped: number };
+  result: Record<string, unknown> | null;
+  error: string | null;
+}
+
+export interface LibraryTransferTask {
+  taskId: string;
+  status: string;
+  label: string;
+  cancelRequested: boolean;
+  progress: {
+    step: string;
+    done: number;
+    total: number;
+    success: number;
+    missed: number;
+    failed: number;
+    workIndex: number;
+    workCount: number;
+    currentFile: string;
+    targetPath: string;
+    targetDirId: string;
+    startedAt?: number;
+    concurrency?: number;
+    log: string[];
+  };
+  result: Record<string, unknown> | null;
+  error: string | null;
+}
+
+export interface TmdbDetail {
+  title: string;
+  year: number;
+  overview: string;
+  voteAverage: number;
+  genres: string[];
+  posterUrl: string;
+}
+
+export interface LibraryPickFolderResult {
+  cancelled?: boolean;
+  path?: string;
+}
+
+export const libraryApi = {
+  getConfig: () => api.get<{ ok: boolean; config: LibraryConfig }>("/api/library/config"),
+  putConfig: (config: Partial<LibraryConfig> & { clearToken?: boolean }) =>
+    api.put<{ ok: boolean; config: LibraryConfig }>("/api/library/config", config),
+  status: () => api.get<{ ok: boolean; status: LibraryStatus; libs: LibraryLibInfo[] }>("/api/library/status"),
+  importPaths: (paths: string[], token: string) =>
+    api.post<{ ok: boolean; results: Array<{ file: string; ok: boolean; added?: number; skipped?: number; error?: string }>; added: number; skipped: number; failed: number }>(
+      "/api/library/import/paths",
+      { paths, token },
+    ),
+  importDir: (path: string, token: string) =>
+    api.post<{ ok: boolean; total: number; added: number; skipped: number; failed: number; results: Array<{ file: string; status: string; info: string }> }>(
+      "/api/library/import/dir",
+      { path, token },
+    ),
+  sources: () => api.get<{ ok: boolean; sources: LibraryLibInfo[] }>("/api/library/sources"),
+  deleteSource: (name: string, token: string) =>
+    api.post<{ ok: boolean }>("/api/library/sources/delete", { name, token }),
+  categories: (token: string) =>
+    api.get<{ ok: boolean; categories: LibraryCategory[] }>(`/api/library/categories${libraryTokenQuery(token)}`),
+  search: (params: { q?: string; cat?: string; sub?: string; page?: number; size?: number; lib?: string; token?: string }) => {
+    const query = new URLSearchParams();
+    if (params.q) query.set("q", params.q);
+    if (params.cat) query.set("cat", params.cat);
+    if (params.sub) query.set("sub", params.sub);
+    query.set("page", String(params.page ?? 1));
+    query.set("size", String(params.size ?? 20));
+    if (params.lib) query.set("lib", params.lib);
+    if (params.token) query.set("token", params.token);
+    return api.get<{ ok: boolean; total: number; page: number; size: number; dirs: LibraryWork[] }>(
+      `/api/library/search?${query.toString()}`,
+    );
+  },
+  files: (dir: string, token: string) =>
+    api.get<{ ok: boolean; dir: string; title: string; year: number | null; tmdbId: number | null; files: LibraryFile[] }>(
+      `/api/library/files?dir=${encodeURIComponent(dir)}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  exportJson: (params: { dir?: string; cat?: string; sub?: string; cats?: string; token?: string }) => {
+    const query = new URLSearchParams();
+    if (params.dir) query.set("dir", params.dir);
+    if (params.cat) query.set("cat", params.cat);
+    if (params.sub) query.set("sub", params.sub);
+    if (params.cats) query.set("cats", params.cats);
+    if (params.token) query.set("token", params.token);
+    return api.get<{ ok: boolean; library: LibraryFastlinkJson }>(`/api/library/export?${query.toString()}`);
+  },
+  exportSave: (payload: { dir?: string; cat?: string; sub?: string; cats?: string; includeFiles?: string[]; label?: string; token?: string }) =>
+    api.post<{ ok: boolean; file: string; path: string; totalFilesCount: number; formattedTotalSize: string }>(
+      "/api/library/export/save",
+      payload,
+    ),
+  openExportDir: (path: string, token: string) =>
+    api.post<{ ok: boolean; path: string }>("/api/library/export/open", { path, token }),
+  poster: (tmdbId: number, title: string, year: number, token: string) =>
+    api.get<{ ok: boolean; url: string }>(
+      `/api/library/poster?tmdbId=${tmdbId}&title=${encodeURIComponent(title)}&year=${year || 0}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  tmdbDetail: (tmdbId: number, title: string, year: number, token: string) =>
+    api.get<{ ok: boolean; detail: TmdbDetail | null }>(
+      `/api/library/tmdb/${tmdbId}?title=${encodeURIComponent(title)}&year=${year || 0}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  shareHistory: (token: string) =>
+    api.get<{ ok: boolean; tasks: LibraryShareTask[] }>(
+      `/api/library/share/history${token ? `?token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  shareBrowse: (url: string, parentId: string, token: string, page = 1) =>
+    api.post<{ ok: boolean; shareKey: string; parentId: string; items: LibraryShareItem[]; hasMore: boolean }>(
+      "/api/library/share/browse",
+      { url, parentId, page, token },
+    ),
+  shareExtract: (payload: {
+    url: string;
+    cat?: string;
+    sub?: string;
+    title?: string;
+    selectedItems?: LibraryShareItem[];
+    fileFilters?: string[];
+    resume?: boolean;
+    token?: string;
+  }) => api.post<{ ok: boolean; taskId: string }>("/api/library/share/extract", payload),
+  shareTask: (taskId: string, token: string) =>
+    api.get<{ ok: boolean; task: LibraryShareTask }>(
+      `/api/library/share/task?taskId=${encodeURIComponent(taskId)}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  shareCheckpoint: (url: string, selectedItems: LibraryShareItem[], token: string) =>
+    api.post<{ ok: boolean; checkpoint: { hasCheckpoint: boolean; totalFiles?: number; updatedAt?: string } }>(
+      "/api/library/share/checkpoint",
+      { url, selectedItems, token },
+    ),
+  deleteShareCheckpoint: (url: string, selectedItems: LibraryShareItem[], token: string) =>
+    api.post<{ ok: boolean; deleted: boolean }>("/api/library/share/checkpoint/delete", {
+      url,
+      selectedItems,
+      token,
+    }),
+  transfer: (dirs: string[], targetPath: string, targetDirId: string, token: string, includeFiles?: string[]) =>
+    api.post<{ ok: boolean; taskId: string; workCount: number; fileCount: number }>("/api/library/transfer", {
+      dirs,
+      includeFiles: includeFiles || [],
+      targetPath,
+      targetDirId,
+      token,
+    }),
+  transferTask: (taskId: string, token: string) =>
+    api.get<{ ok: boolean; task: LibraryTransferTask }>(
+      `/api/library/transfer/task?taskId=${encodeURIComponent(taskId)}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  transferCancel: (taskId: string, token: string) =>
+    api.post<{ ok: boolean }>("/api/library/transfer/cancel", { taskId, token }),
+  importFile: async (name: string, content: string, token: string) => {
+    const query = new URLSearchParams({ name });
+    if (token) query.set("token", token);
+    const response = await fetch(`/api/library/import?${query.toString()}`, {
+      method: "POST",
+      headers: { "content-type": "text/plain; charset=utf-8" },
+      body: content,
+    });
+    return readJson<{ ok: boolean; name: string; added: number; skipped: number; fileCount: number }>(response);
+  },
+};
+
+function libraryTokenQuery(token: string): string {
+  return token ? `?token=${encodeURIComponent(token)}` : "";
 }

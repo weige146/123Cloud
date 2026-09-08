@@ -196,6 +196,7 @@ function readPortConfig() {
   return null;
 }
 
+
 function getFreePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -304,6 +305,27 @@ function registerIpc() {
   ipcMain.handle("app:openDataDir", async () => {
     const result = await shell.openPath(dataDir);
     return result || "";
+  });
+  // 系统原生选文件夹（影库目录等场景）；关闭/取消返回 { cancelled: true }
+  ipcMain.handle("app:pickFolder", async (_event, payload) => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: String((payload && payload.title) || "选择文件夹"),
+      properties: ["openDirectory", "createDirectory"],
+    });
+    if (result.canceled || !result.filePaths.length) return { cancelled: true };
+    return { path: result.filePaths[0] };
+  });
+  // 系统原生多选文件（影库 JSON 导入）
+  ipcMain.handle("app:pickFiles", async (_event, payload) => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: String((payload && payload.title) || "选择影库文件"),
+      properties: ["openFile", "multiSelections"],
+      filters: (payload && payload.filters) || [
+        { name: "影库文件", extensions: ["json", "txt", "123share", "123fastlink"] },
+      ],
+    });
+    if (result.canceled || !result.filePaths.length) return { cancelled: true };
+    return { paths: result.filePaths };
   });
   // 123 OAuth 授权弹窗：加载 123 官方授权页（账号密码在官方页输入），
   // 监听到跳回授权中转站回调地址（含 ?code= 或 #token）即截获并回传渲染层。

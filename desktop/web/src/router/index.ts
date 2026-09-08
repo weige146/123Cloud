@@ -65,6 +65,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: "秒传池", desc: "搜索共享池内容目录，SHA1 秒传到 123 云盘（管理员 Token 专用）。", icon: "mdi-database-search" },
   },
   {
+    path: "/admin/library",
+    name: "library",
+    component: () => import("@/views/LibraryView.vue"),
+    meta: { title: "影库", desc: "导入影库文件入本地数据库：搜索浏览、导出秒传、一键转存 123 云盘，并开放接口给油猴脚本随时随地搜索转存。", icon: "mdi-movie-open-outline" },
+  },
+  {
     path: "/admin/settings",
     name: "settings",
     component: () => import("@/views/SettingsView.vue"),

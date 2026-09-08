@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
 setup_logging(DATA_DIR)
 
 from .directlink import read_directlink_status, serve_directlink_file, submit_arbitrary_urls_offline, submit_directlink_offline
+from . import library_transfer, movie_library, movie_library_db, share_extractor
 from .pan115 import CODE_RE as PAN123_CODE_RE, empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
 from .pan115_cookie import (
     PAN115_QR_DEVICES,
@@ -162,6 +164,9 @@ def _resolve_admin_web_dir() -> Path:
 ADMIN_WEB_DIR = _resolve_admin_web_dir()
 
 store = SessionStore(DATA_DIR)
+movie_library_db.init(store.db_file)
+share_extractor.extractor.checkpoint_dir = str(DATA_DIR / "library_checkpoints")
+share_extractor.extractor.importer = lambda name, payload: movie_library_db.import_payload(name, payload)
 pan123 = Pan123Client()
 transfer_service = TransferService(store)
 logger = logging.getLogger(__name__)
@@ -214,6 +219,7 @@ async def start_background_tasks() -> None:
     else:
         telegram_callback_polling_task = asyncio.create_task(telegram_callback_polling_loop())
     await transfer_service.init()
+    # 影库：数据库优先，无后台扫描线程
 
 
 async def stop_background_tasks() -> None:
@@ -223,6 +229,7 @@ async def stop_background_tasks() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+    await share_extractor.extractor.aclose()
     await transfer_service.close()
     await pan123.close()
     await close_telegram_client()
@@ -1896,6 +1903,675 @@ async def reuse_sha1_pool_items(request: PoolReuseRequest) -> Dict[str, Any]:
         hit, len(results), str(request.dirId or "0"),
     )
     return {"ok": True, "results": results}
+
+
+# --- 影库（movie library）----------------------------------------------------
+# 影库数据接口在配置了访问令牌后必须带令牌（?token= 或 Bearer），
+# 供油猴脚本/远程浏览器随时随地搜索转存；管理类接口与本客户端其他本地接口一致不设门槛。
+
+
+class LibraryConfigRequest(BaseModel):
+    transferIntervalMs: int = 200
+    transferConcurrency: int = 5
+    exportDir: str = ""
+    token: str = ""
+    clearToken: bool = False
+
+
+class LibraryShareBrowseRequest(BaseModel):
+    url: str = ""
+    parentId: str = "0"
+    page: int = 1
+    token: str = ""
+
+
+class LibraryShareExtractRequest(BaseModel):
+    url: str = ""
+    cat: str = ""
+    sub: str = ""
+    title: str = ""
+    selectedItems: List[Dict[str, Any]] = Field(default_factory=list)
+    fileFilters: List[str] = Field(default_factory=list)
+    resume: bool = False
+    token: str = ""
+
+
+class LibraryTransferRequest(BaseModel):
+    dirs: List[str] = Field(default_factory=list)
+    includeFiles: List[str] = Field(default_factory=list)
+    targetPath: str = ""
+    targetDirId: str = "0"
+    token: str = ""
+
+
+class LibraryShareCheckpointRequest(BaseModel):
+    url: str = ""
+    selectedItems: List[Dict[str, Any]] = Field(default_factory=list)
+    token: str = ""
+
+
+def normalize_movie_library_config(raw: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = raw.get("movieLibrary") if isinstance(raw.get("movieLibrary"), dict) else raw
+    return {
+        "token": str(cfg.get("token") or "").strip(),
+        "transferIntervalMs": clamp_int(cfg.get("transferIntervalMs"), 0, 10000, 200),
+        "transferConcurrency": clamp_int(cfg.get("transferConcurrency"), 1, 10, 5),
+        "exportDir": str(cfg.get("exportDir") or "").strip(),
+    }
+
+
+def _library_config() -> Dict[str, Any]:
+    return normalize_movie_library_config(store.read_config())
+
+
+def _is_loopback(request: Request) -> bool:
+    host = str(request.client.host if request.client else "")
+    return host in ("127.0.0.1", "::1", "testclient")
+
+
+def _guard_library_token(request: Request, provided: str = "") -> None:
+    """影库数据接口令牌校验：未配置令牌一律放行。"""
+    expected = _library_config()["token"]
+    if not expected:
+        return
+    supplied = str(provided or "").strip()
+    if not supplied:
+        auth = request.headers.get("authorization") or ""
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+    if supplied and hmac.compare_digest(supplied, expected):
+        return
+    raise HTTPException(status_code=401, detail="影库访问令牌不正确：请在客户端设置里核对令牌")
+
+
+def _split_lib_filter(lib: str) -> Optional[List[str]]:
+    names = [s.strip() for s in str(lib or "").split(",") if s.strip()]
+    return names or None
+
+
+@app.get("/api/library/config")
+async def read_library_config(request: Request) -> Dict[str, Any]:
+    cfg = _library_config()
+    loopback = _is_loopback(request)
+    token = cfg["token"]
+    return {
+        "ok": True,
+        "config": {
+            "transferIntervalMs": cfg["transferIntervalMs"],
+            "transferConcurrency": cfg.get("transferConcurrency", 5),
+            "exportDir": cfg.get("exportDir", ""),
+            "tokenSet": bool(token),
+            # 令牌明文只回给本机管理页；远程浏览器/脚本只能拿到打码预览
+            "token": token if loopback else "",
+            "tokenPreview": None if loopback else _mask_token(token),
+        },
+    }
+
+
+@app.put("/api/library/config")
+async def write_library_config(request: LibraryConfigRequest, request_obj: Request) -> Dict[str, Any]:
+    current = _library_config()
+    token = str(request.token or "").strip()
+    if token:
+        new_token = token
+    elif request.clearToken:
+        new_token = ""
+    else:
+        new_token = current["token"]  # 留空 = 保留现有令牌，避免远程管理页误清
+    payload = normalize_movie_library_config({
+        "movieLibrary": {
+            "transferIntervalMs": request.transferIntervalMs,
+            "transferConcurrency": request.transferConcurrency,
+            "exportDir": str(request.exportDir or "").strip() or current.get("exportDir", ""),
+            "token": new_token,
+        }
+    })
+    saved = store.write_config({"movieLibrary": payload})
+    saved_cfg = normalize_movie_library_config(saved)
+    logger.info(
+        "影库：配置已保存%s",
+        "，访问令牌已更新" if token or request.clearToken else "",
+    )
+    loopback = _is_loopback(request_obj)
+    return {"ok": True, "config": {
+        "transferIntervalMs": saved_cfg["transferIntervalMs"],
+        "transferConcurrency": saved_cfg.get("transferConcurrency", 5),
+        "exportDir": saved_cfg.get("exportDir", ""),
+        "tokenSet": bool(saved_cfg["token"]),
+        "token": saved_cfg["token"] if loopback else "",
+        "tokenPreview": None if loopback else _mask_token(saved_cfg["token"]),
+    }}
+
+
+class LibraryExportSaveRequest(BaseModel):
+    dir: str = ""
+    cat: str = ""
+    sub: str = ""
+    cats: str = ""
+    includeFiles: List[str] = Field(default_factory=list)
+    label: str = ""
+    token: str = ""
+
+
+class LibraryOpenDirRequest(BaseModel):
+    path: str = ""
+    token: str = ""
+
+
+class LibraryTransferTaskRequest(BaseModel):
+    taskId: str = ""
+    token: str = ""
+
+
+@app.post("/api/library/import")
+async def import_library_file(request: Request, name: str = Query(""), token: str = "") -> Dict[str, Any]:
+    """上传影库文件入库（支持 123 助手全部格式：JSON / 秒传文本 / .123share）。解析后直接写数据库。"""
+    _guard_library_token(request, token)
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="文件内容是空的")
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="文件不是 UTF-8 文本")
+    try:
+        payload = movie_library.parse_library_content(text)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    safe_name = os.path.basename(str(name or "").strip()) or "导入"
+    return movie_library_db.import_payload(safe_name, payload)
+
+
+class LibraryImportPathsRequest(BaseModel):
+    paths: List[str] = Field(default_factory=list)
+    token: str = ""
+
+
+@app.post("/api/library/import/paths")
+async def import_library_paths(request: LibraryImportPathsRequest, request_obj: Request) -> Dict[str, Any]:
+    """按本地路径批量导入影库文件（桌面端文件选择器）。"""
+    _guard_library_token(request_obj, request.token)
+    if not request.paths:
+        raise HTTPException(status_code=400, detail="请选择要导入的文件")
+    results = []
+    for raw_path in request.paths[:50]:
+        path = os.path.abspath(os.path.expanduser(str(raw_path or "").strip()))
+        base = os.path.basename(path)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                payload = movie_library.parse_library_content(f.read())
+        except OSError as error:
+            results.append({"file": base, "ok": False, "error": f"读取失败：{error}"})
+            continue
+        except ValueError as error:
+            results.append({"file": base, "ok": False, "error": str(error)})
+            continue
+        results.append({"file": base, **movie_library_db.import_payload(base, payload)})
+    added = sum(r.get("added", 0) for r in results)
+    skipped = sum(r.get("skipped", 0) for r in results)
+    failed = sum(1 for r in results if not r.get("ok"))
+    logger.info(f"影库导入：批量导入 {len(results)} 个文件 — 新增 {added} 个作品、重复跳过 {skipped} 个、失败 {failed} 个")
+    return {"ok": True, "results": results, "added": added, "skipped": skipped, "failed": failed}
+
+
+class LibraryImportDirRequest(BaseModel):
+    path: str = ""
+    token: str = ""
+
+
+@app.post("/api/library/import/dir")
+async def import_library_dir(request: LibraryImportDirRequest, request_obj: Request) -> Dict[str, Any]:
+    """从文件夹一次性批量导入（递归，跳过 _checkpoints/隐藏目录，深度 ≤3）。不驻留监控。"""
+    _guard_library_token(request_obj, request.token)
+    root = os.path.abspath(os.path.expanduser(str(request.path or "").strip()))
+    if not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail=f"目录不存在：{root}")
+    walked: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth >= 3:
+            dirnames[:] = []
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != "_checkpoints"]
+        for f in filenames:
+            if f.lower().endswith(movie_library.SCAN_EXTENSIONS):
+                walked.append(os.path.join(dirpath, f))
+    if not walked:
+        raise HTTPException(status_code=404, detail="目录里没有找到影库文件（支持 json/txt/123share）")
+    results = []
+    added = skipped = failed = 0
+    for path in sorted(walked):
+        base = os.path.basename(path)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                payload = movie_library.parse_library_content(f.read())
+        except Exception as error:
+            failed += 1
+            results.append({"file": base, "status": "失败", "info": str(error)})
+            continue
+        r = movie_library_db.import_payload(base, payload)
+        added += r["added"]
+        skipped += r["skipped"]
+        results.append({"file": base, "status": "完成", "info": f"新增 {r['added']} · 重复 {r['skipped']} · {r['fileCount']} 个文件"})
+    logger.info(f"影库导入：文件夹批量导入 {len(walked)} 个文件 — 新增 {added} 个作品、重复跳过 {skipped} 个、失败 {failed} 个")
+    return {"ok": True, "total": len(walked), "added": added, "skipped": skipped, "failed": failed, "results": results}
+
+
+TMDB_BUILTIN_KEY = "8265bd1679663a7ea12ac168da84d2e8"
+
+
+def _tmdb_credentials() -> Tuple[str, str]:
+    submission = store.read_submission_config()
+    token = str(submission.get("tmdbToken") or "").strip()
+    lang = str(submission.get("tmdbLanguage") or "").strip() or "zh-CN"
+    return token, lang
+
+
+async def _tmdb_fetch_info(type_: str, tmdb_id: int) -> Optional[Dict[str, Any]]:
+    """按类型查 TMDB 详情：客户端配置的 TMDB TOKEN 优先，失败回退内置公开 Key。"""
+    token, lang = _tmdb_credentials()
+    attempts = []
+    if token:
+        attempts.append((
+            f"https://api.themoviedb.org/3/{type_}/{tmdb_id}?language={lang}",
+            {"Authorization": f"Bearer {token}"},
+        ))
+    attempts.append((
+        f"https://api.tmdb.org/3/{type_}/{tmdb_id}?api_key={TMDB_BUILTIN_KEY}&language=zh-CN",
+        {},
+    ))
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for url, headers in attempts:
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    continue
+                return resp.json()
+            except Exception:
+                continue
+    return None
+
+
+def _tmdb_match_score(info: Dict[str, Any], title: str, year: int) -> int:
+    nq = re.sub(r"[\s\W_]+", "", str(title or ""), flags=re.UNICODE).lower()
+    name = str(info.get("title") or info.get("name") or "")
+    date = str(info.get("release_date") or info.get("first_air_date") or "")
+    info_year = int(date[:4]) if date[:4].isdigit() else 0
+    score = 0
+    if name and nq and nq in re.sub(r"[\s\W_]+", "", name, flags=re.UNICODE).lower():
+        score += 2
+    if year and info_year == year:
+        score += 1
+    return score
+
+
+@app.get("/api/library/poster")
+async def library_poster(
+    request: Request,
+    tmdbId: int = Query(0),
+    title: str = "",
+    year: int = 0,
+    token: str = "",
+) -> Dict[str, Any]:
+    """海报地址：后端代理 TMDB 并缓存（sqlite），远程浏览器无需能连 TMDB。"""
+    _guard_library_token(request, token)
+    if tmdbId <= 0:
+        return {"ok": True, "url": ""}
+    cache_key = f"moviePoster:{tmdbId}"
+    cached = store.read_value(cache_key)
+    if isinstance(cached, dict) and "url" in cached:
+        return {"ok": True, "url": str(cached.get("url") or "")}
+    verified = unverified = ""
+    for type_ in ("movie", "tv"):
+        info = await _tmdb_fetch_info(type_, tmdbId)
+        if not info:
+            continue
+        score = _tmdb_match_score(info, title, year)
+        poster = f"https://image.tmdb.org/t/p/w185{info['poster_path']}" if info.get("poster_path") else ""
+        if poster and score >= 1 and not verified:
+            verified = poster
+        if poster and not unverified:
+            unverified = poster
+    url = verified or unverified
+    if url:
+        store.write_value(cache_key, {"url": url})
+    return {"ok": True, "url": url}
+
+
+@app.get("/api/library/tmdb/{tmdb_id}")
+async def library_tmdb_detail(
+    request: Request,
+    tmdb_id: int,
+    title: str = "",
+    year: int = 0,
+    token: str = "",
+) -> Dict[str, Any]:
+    """TMDB 作品详情（简介/评分/类型），sqlite 缓存。"""
+    _guard_library_token(request, token)
+    cache_key = f"movieTmdb:{tmdb_id}"
+    cached = store.read_value(cache_key)
+    if isinstance(cached, dict):
+        return {"ok": True, "detail": cached}
+    best: Optional[Dict[str, Any]] = None
+    best_score = -1
+    for type_ in ("movie", "tv"):
+        info = await _tmdb_fetch_info(type_, tmdb_id)
+        if not info:
+            continue
+        score = _tmdb_match_score(info, title, year)
+        if score <= best_score:
+            continue
+        best_score = score
+        best = {
+            "title": str(info.get("title") or info.get("name") or ""),
+            "year": int(str(info.get("release_date") or info.get("first_air_date") or "")[:4] or 0),
+            "overview": str(info.get("overview") or ""),
+            "voteAverage": float(info.get("vote_average") or 0),
+            "genres": [str(g.get("name") or "") for g in (info.get("genres") or []) if isinstance(g, dict)],
+            "posterUrl": f"https://image.tmdb.org/t/p/w185{info['poster_path']}" if info.get("poster_path") else "",
+        }
+    if best is not None:
+        store.write_value(cache_key, best)
+    return {"ok": True, "detail": best}
+
+
+@app.get("/api/library/share/history")
+async def library_share_history(request: Request, token: str = "") -> Dict[str, Any]:
+    """最近的分享提取任务（已落库，重启不清空，最多 30 条）。"""
+    _guard_library_token(request, token)
+    return {"ok": True, "tasks": movie_library_db.share_history(30)}
+
+
+@app.post("/api/library/export/save")
+async def save_library_export(request: LibraryExportSaveRequest, request_obj: Request) -> Dict[str, Any]:
+    """服务端直接把秒传 JSON 写进导出目录（不走浏览器下载，大分类也快）。"""
+    _guard_library_token(request_obj, request.token)
+    cfg = _library_config()
+    export_dir = str(cfg.get("exportDir") or "").strip() or os.path.join(str(DATA_DIR), "秒传文件导出")
+
+    payload = None
+    default_label = ""
+    if request.dir:
+        payload = await asyncio.to_thread(movie_library_db.export_work, request.dir)
+        default_label = request.dir.rstrip("/").split("/")[-1]
+    elif request.cat:
+        payload = await asyncio.to_thread(movie_library_db.export_category, request.cat, request.sub)
+        default_label = f"{request.cat}-{request.sub}" if request.sub else request.cat
+    elif request.cats:
+        pairs: List[Tuple[str, str]] = []
+        for pair in [p.strip() for p in request.cats.split("|") if p.strip()]:
+            if "/" in pair:
+                c, s = pair.split("/", 1)
+                pairs.append((c, s))
+            else:
+                pairs.append((pair, ""))
+        payload = await asyncio.to_thread(movie_library_db.export_multi, pairs)
+        default_label = f"合并导出-{len(pairs)}个分类"
+    else:
+        raise HTTPException(status_code=400, detail="请指定 dir（作品目录）、cat/sub（分类）或 cats（多分类合并）")
+    if payload is None:
+        raise HTTPException(status_code=404, detail="没有可导出的内容")
+
+    if request.includeFiles and request.dir:
+        keep = set(request.includeFiles)
+        payload["files"] = [f for f in payload["files"] if f.get("path") in keep or f.get("fileName") in keep]
+        payload["totalFilesCount"] = len(payload["files"])
+        payload["totalSize"] = sum(int(f.get("size") or 0) for f in payload["files"])
+        payload["formattedTotalSize"] = movie_library.fmt_size(payload["totalSize"])
+    if not payload["files"]:
+        raise HTTPException(status_code=404, detail="过滤后没有可导出的文件")
+
+    label = "".join(ch for ch in (request.label or default_label) if ch not in '\\/:*?"<>|').strip() or "导出"
+    os.makedirs(export_dir, exist_ok=True)
+    fname = f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.123fastlink.json"
+    fpath = os.path.join(export_dir, fname)
+    with open(fpath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+    size_bytes = os.path.getsize(fpath)
+    logger.info(
+        "影库导出：%s → %s（%d 个文件，%.1f MB）",
+        label, fname, payload["totalFilesCount"], size_bytes / 1048576,
+    )
+    return {
+        "ok": True,
+        "file": fname,
+        "path": export_dir,
+        "totalFilesCount": payload["totalFilesCount"],
+        "totalSize": payload["totalSize"],
+        "formattedTotalSize": payload.get("formattedTotalSize") or movie_library.fmt_size(payload["totalSize"]),
+        "sizeBytes": size_bytes,
+    }
+
+
+@app.post("/api/library/export/open")
+async def open_library_export_dir(request: LibraryOpenDirRequest, request_obj: Request) -> Dict[str, Any]:
+    """打开导出目录（文件管理器）。"""
+    _guard_library_token(request_obj, request.token)
+    cfg = _library_config()
+    export_dir = str(request.path or "").strip() or str(cfg.get("exportDir") or "").strip() \
+        or os.path.join(str(DATA_DIR), "秒传文件导出")
+    # 还没导出过时目录不存在：自动创建再打开
+    os.makedirs(export_dir, exist_ok=True)
+    import platform
+    import subprocess
+    try:
+        system = platform.system().lower()  # macOS 返回 "Darwin"，必须 lower
+        if system == "darwin":
+            subprocess.Popen(["open", export_dir])
+        elif system == "windows":
+            subprocess.Popen(["explorer", export_dir])
+        else:
+            subprocess.Popen(["xdg-open", export_dir])
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"打开目录失败：{error}")
+    return {"ok": True, "path": export_dir}
+
+
+class LibrarySourceRequest(BaseModel):
+    name: str = ""
+    token: str = ""
+
+
+@app.get("/api/library/sources")
+async def read_library_sources() -> Dict[str, Any]:
+    return {"ok": True, "sources": movie_library_db.list_sources()}
+
+
+@app.post("/api/library/sources/delete")
+@app.delete("/api/library/sources")
+async def delete_library_source(request: LibrarySourceRequest, request_obj: Request) -> Dict[str, Any]:
+    _guard_library_token(request_obj, request.token)
+    name = str(request.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请指定要删除的来源")
+    if not movie_library_db.delete_source(name):
+        raise HTTPException(status_code=404, detail="来源不存在")
+    logger.info(f"影库：已删除来源 {name}（其作品与文件一并移除）")
+    return {"ok": True}
+
+
+@app.get("/api/library/status")
+async def read_library_status() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "status": movie_library_db.totals(),
+        "libs": movie_library_db.list_sources(),
+    }
+
+
+@app.get("/api/library/categories")
+async def read_library_categories(request: Request, lib: str = "", token: str = "") -> Dict[str, Any]:
+    _guard_library_token(request, token)
+    cats = await asyncio.to_thread(movie_library_db.categories, _split_lib_filter(lib))
+    return {"ok": True, "categories": cats}
+
+
+@app.get("/api/library/search")
+async def search_library(
+    request: Request,
+    q: str = "",
+    cat: str = "",
+    sub: str = "",
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    lib: str = "",
+    token: str = "",
+) -> Dict[str, Any]:
+    _guard_library_token(request, token)
+    total, results = await asyncio.to_thread(
+        movie_library_db.search, q, page, size, cat, sub, _split_lib_filter(lib),
+    )
+    return {"ok": True, "total": total, "page": page, "size": size, "dirs": results}
+
+
+@app.get("/api/library/files")
+async def read_library_files(request: Request, dir: str = Query(...), token: str = "") -> Dict[str, Any]:
+    _guard_library_token(request, token)
+    info = await asyncio.to_thread(movie_library_db.list_files, dir)
+    if info is None:
+        raise HTTPException(status_code=404, detail="作品不存在（可能已被删除，请重新搜索）")
+    return {"ok": True, **info}
+
+
+@app.get("/api/library/export")
+async def export_library_json(
+    request: Request,
+    dir: str = "",
+    cat: str = "",
+    sub: str = "",
+    cats: str = "",
+    lib: str = "",
+    token: str = "",
+) -> Dict[str, Any]:
+    _guard_library_token(request, token)
+    libs = _split_lib_filter(lib)
+    payload = None
+    if dir:
+        payload = await asyncio.to_thread(movie_library_db.export_work, dir)
+    elif cat:
+        payload = await asyncio.to_thread(movie_library_db.export_category, cat, sub, libs)
+    elif cats:
+        pairs: List[Tuple[str, str]] = []
+        for pair in [p.strip() for p in cats.split("|") if p.strip()]:
+            if "/" in pair:
+                c, c_sub = pair.split("/", 1)
+                pairs.append((c, c_sub))
+            else:
+                pairs.append((pair, ""))
+        payload = await asyncio.to_thread(movie_library_db.export_multi, pairs, libs)
+    else:
+        raise HTTPException(status_code=400, detail="请指定 dir（作品目录）、cat/sub（分类）或 cats（多分类合并）")
+    if payload is None:
+        raise HTTPException(status_code=404, detail="没有可导出的内容")
+    return {"ok": True, "library": payload}
+
+
+@app.get("/api/library/file-types")
+async def read_library_file_types(request: Request, token: str = "") -> Dict[str, Any]:
+    _guard_library_token(request, token)
+    return {"ok": True, "types": share_extractor.FILE_TYPE_FILTERS}
+
+
+@app.post("/api/library/share/browse")
+async def browse_share_for_library(request: LibraryShareBrowseRequest, request_obj: Request) -> Dict[str, Any]:
+    _guard_library_token(request_obj, request.token)
+    try:
+        share_key, share_pwd = share_extractor.extractor.parse_input(request.url)
+        host = await share_extractor.extractor.resolve_host(share_key)
+        items, has_more = await share_extractor.extractor.list_dir(
+            host, share_key, share_pwd, request.parentId or "0", max(1, int(request.page or 1)),
+        )
+    except share_extractor.ShareExtractorError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, "shareKey": share_key, "parentId": request.parentId or "0",
+            "items": items, "hasMore": has_more}
+
+
+@app.post("/api/library/share/extract")
+async def extract_share_to_library(request: LibraryShareExtractRequest, request_obj: Request) -> Dict[str, Any]:
+    _guard_library_token(request_obj, request.token)
+    try:
+        tid = share_extractor.extractor.start_task(
+            request.url, request.cat, request.sub, request.title,
+            request.selectedItems or None, request.fileFilters or None, bool(request.resume),
+        )
+    except share_extractor.ShareExtractorError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    logger.info(f"影库提取：已创建提取任务 {tid}（完成后直接入库）")
+    return {"ok": True, "taskId": tid}
+
+
+@app.get("/api/library/share/task")
+async def read_share_extract_task(
+    request: Request, taskId: str = Query(...), token: str = "",
+) -> Dict[str, Any]:
+    _guard_library_token(request, token)
+    task = share_extractor.extractor.get_task(taskId)
+    if task is None:
+        raise HTTPException(status_code=404, detail="提取任务不存在或已过期")
+    if task.get("status") != "running":
+        movie_library_db.save_share_history(task)  # 幂等写入，持久化提取历史
+    return {"ok": True, "task": task}
+
+
+@app.post("/api/library/share/checkpoint")
+async def check_share_checkpoint(request: LibraryShareCheckpointRequest, request_obj: Request) -> Dict[str, Any]:
+    _guard_library_token(request_obj, request.token)
+    info = share_extractor.extractor.check_checkpoint(request.url, request.selectedItems or None)
+    return {"ok": True, "checkpoint": info}
+
+
+@app.post("/api/library/share/checkpoint/delete")
+async def delete_share_checkpoint(request: LibraryShareCheckpointRequest, request_obj: Request) -> Dict[str, Any]:
+    _guard_library_token(request_obj, request.token)
+    deleted = share_extractor.extractor.delete_checkpoint(request.url, request.selectedItems or None)
+    return {"ok": True, "deleted": deleted}
+
+
+@app.post("/api/library/transfer")
+async def start_library_transfer(request: LibraryTransferRequest, request_obj: Request) -> Dict[str, Any]:
+    _guard_library_token(request_obj, request.token)
+    dirs = [d.strip() for d in (request.dirs or []) if d.strip()]
+    if not dirs:
+        raise HTTPException(status_code=400, detail="请选择要转存的作品")
+    if len(dirs) > 50:
+        raise HTTPException(status_code=400, detail="一次最多转存 50 个作品，分类大包请用导出 JSON 后分批转存")
+    client = await _authorized_pan123_client()
+    cfg = _library_config()
+    works = await asyncio.to_thread(
+        movie_library_db.transfer_files, dirs, request.includeFiles or None,
+    )
+    if not works:
+        raise HTTPException(status_code=404, detail="所选作品没有可转存的文件（可能已被删除，请重新搜索）")
+    label = dirs[0] if len(dirs) == 1 else f"{len(dirs)} 个作品"
+    tid = library_transfer.transfer_manager.start_task(
+        client, works, request.targetPath, request.targetDirId or "0",
+        cfg["transferIntervalMs"], label,
+        concurrency=cfg.get("transferConcurrency", 5),
+    )
+    library_transfer.transfer_manager.prune()
+    logger.info(f"影库转存：已创建转存任务 {tid}（{label} → {request.targetPath or '目录 ' + str(request.targetDirId or '0')}）")
+    return {"ok": True, "taskId": tid, "workCount": len(works),
+            "fileCount": sum(len(w["files"]) for w in works)}
+
+
+@app.get("/api/library/transfer/task")
+async def read_library_transfer_task(
+    request: Request, taskId: str = Query(...), token: str = "",
+) -> Dict[str, Any]:
+    _guard_library_token(request, token)
+    task = library_transfer.transfer_manager.get_task(taskId)
+    if task is None:
+        raise HTTPException(status_code=404, detail="转存任务不存在或已过期")
+    return {"ok": True, "task": task}
+
+
+@app.post("/api/library/transfer/cancel")
+async def cancel_library_transfer_task(request: LibraryTransferTaskRequest, request_obj: Request) -> Dict[str, Any]:
+    _guard_library_token(request_obj, request.token)
+    if not library_transfer.transfer_manager.request_cancel(request.taskId):
+        raise HTTPException(status_code=400, detail="任务不存在或已结束")
+    return {"ok": True}
 
 
 @app.post("/api/transfer/kick")

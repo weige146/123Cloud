@@ -24,7 +24,7 @@ import {
   mdiTagMultiple, mdiTagMultipleOutline, mdiTagRemove, mdiTagTextOutline, mdiThemeLightDark, mdiTimerCog,
   mdiTools, mdiTrashCanOutline, mdiTrendingDown, mdiTrendingUp, mdiTruck, mdiVideo, mdiViewDashboardOutline,
   mdiVolumeHigh, mdiWeatherNight, mdiWhiteBalanceSunny,
-  mdiAccount, mdiAccountSwitchOutline, mdiCellphoneArrowDown, mdiChevronLeft, mdiCloudCheckOutline, mdiCloudOutline, mdiCloudSyncOutline, mdiConsole, mdiConsoleLine, mdiDatabaseOutline, mdiDockLeft, mdiFileHidden, mdiFlash, mdiFolderArrowRightOutline, mdiFolderOpenOutline, mdiLan, mdiLinkVariant, mdiLinkVariantOff, mdiMoonWaningCrescent, mdiOpenInNew, mdiPause, mdiPlay, mdiProgressDownload, mdiReload, mdiRestart, mdiServer, mdiTextBoxOutline, mdiTimerCogOutline, mdiTruckFast, mdiTuneVariant,
+  mdiAccount, mdiAccountSwitchOutline, mdiAutoFix, mdiBookshelf, mdiCellphoneArrowDown, mdiChartDonut, mdiCheck, mdiChevronLeft, mdiCloudCheckOutline, mdiCloudDownloadOutline, mdiCloudOutline, mdiCloudSyncOutline, mdiConsole, mdiConsoleLine, mdiDatabaseOutline, mdiDockLeft, mdiDownload, mdiFastForward, mdiFileCodeOutline, mdiFileHidden, mdiFlash, mdiFolderArrowRightOutline, mdiFolderOpenOutline, mdiFolderOutline, mdiFolderSearchOutline, mdiHarddisk, mdiKeyChange, mdiKeyOutline, mdiLan, mdiLinkVariant, mdiLinkVariantOff, mdiMessageOutline, mdiMoonWaningCrescent, mdiMovieOpenOutline, mdiOpenInNew, mdiPause, mdiPlay, mdiProgressDownload, mdiReload, mdiRestart, mdiRestore, mdiServer, mdiShieldCheckOutline, mdiSnowflake, mdiSnowflakeOff, mdiSwapHorizontal, mdiTextBoxOutline, mdiTimerCogOutline, mdiTruckFast, mdiTuneVariant, mdiUpload,
 } from "@mdi/js";
 
 const iconPaths: Record<string, string> = {
@@ -192,6 +192,27 @@ const iconPaths: Record<string, string> = {
   "mdi-truck-fast": mdiTruckFast,
   "mdi-tune-variant": mdiTuneVariant,
   "mdi-zap": mdiLightningBolt,
+  "mdi-auto-fix": mdiAutoFix,
+  "mdi-bookshelf": mdiBookshelf,
+  "mdi-chart-donut": mdiChartDonut,
+  "mdi-check": mdiCheck,
+  "mdi-cloud-download-outline": mdiCloudDownloadOutline,
+  "mdi-download": mdiDownload,
+  "mdi-fast-forward": mdiFastForward,
+  "mdi-file-code-outline": mdiFileCodeOutline,
+  "mdi-folder-outline": mdiFolderOutline,
+  "mdi-folder-search-outline": mdiFolderSearchOutline,
+  "mdi-harddisk": mdiHarddisk,
+  "mdi-key-change": mdiKeyChange,
+  "mdi-key-outline": mdiKeyOutline,
+  "mdi-message-outline": mdiMessageOutline,
+  "mdi-movie-open-outline": mdiMovieOpenOutline,
+  "mdi-restore": mdiRestore,
+  "mdi-shield-check-outline": mdiShieldCheckOutline,
+  "mdi-snowflake": mdiSnowflake,
+  "mdi-snowflake-off": mdiSnowflakeOff,
+  "mdi-swap-horizontal": mdiSwapHorizontal,
+  "mdi-upload": mdiUpload,
 };
 
 const mdiSvg: Component = (props: { icon?: string }) => {
