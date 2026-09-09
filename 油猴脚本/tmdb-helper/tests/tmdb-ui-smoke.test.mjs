@@ -136,7 +136,8 @@ const pageExpectations = [
     ["/tv/91097/edit/episode_group/62fe1f4975110d007cca7598", ["groups"]],
     ["/tv/273499/season/1/images/posters", ["upload"]],
     ["/movie/550/images/backdrops", ["upload"]],
-    ["/tv/1399/season/1/episode/1/images/backdrops", ["upload"]]
+    ["/tv/1399/season/1/episode/1/images/backdrops", ["upload"]],
+    ["/tv/1399-game-of-thrones/season/1", ["search"]]
 ];
 
 for (const [pathname, expectedViews] of pageExpectations) {
@@ -572,4 +573,102 @@ for (const [pathname, expectedViews] of pageExpectations) {
     assert.equal(host.style.display, "", "再按 Alt+T 应恢复悬浮球");
 }
 
-console.log("tmdb-ui-smoke：浮层引导、搜索复制（豆瓣/IMDb/粘贴文本）、集编辑器、图片上传、扩展接口全部通过 ✓");
+// —— v1.0.2 百度百科：页签 → 搜索 → 详情（导演/类型）→ 分集剧情抓取/复制 + 「上传海报」按钮 ——
+{
+    const baikeSearchHtml = `<!doctype html><html><body><div class="result-list">
+<div><a href="/item/%E5%A4%A7%E7%89%8C%E9%A9%BE%E5%88%B0/2178476">大牌驾到</a><p>2014年播出的网络综艺节目。</p></div>
+</div></body></html>`;
+    const baikeDetailHtml = `<!doctype html><html><head><meta property="og:image" content="https://bkimg.cdn.bcebos.com/pic/p?x-bce-process=image/resize,h_240"></head><body>
+<h1>大牌驾到</h1>
+<div class="lemma-summary"><div class="para">《大牌驾到》是一档网络综艺脱口秀节目，简介文本足够长。</div></div>
+<img class="main-img" src="https://bkimg.cdn.bcebos.com/pic/p?_x=200">
+<div class="basic-info">
+<dt class="basicInfo-item name">导 演</dt><dd class="basicInfo-item value">王为念 / 李三</dd>
+<dt class="basicInfo-item name">类 型</dt><dd class="basicInfo-item value">脱口秀 / 综艺</dd>
+<dt class="basicInfo-item name">首播时间</dt><dd class="basicInfo-item value">2014-03-06</dd>
+</div>
+<h2 class="para-title">分集剧情</h2>
+<table><tr><th>集数</th><th>剧情简介</th></tr>
+<tr><td>第1集</td><td>第一期节目的剧情内容，文本要足够长才能被认成剧情简介。</td></tr>
+<tr><td>第2集</td><td>第二期剧情简介，同样是足够长的文本内容用于断言。</td></tr>
+</table>
+</body></html>`;
+    const posterPageHtml = `<html><body><script>
+$("#upload_files").kendoUpload({ upload: function(e) { e.data = { media_id: 'aabbccddeeff0011', media_type: 'Movie', type: 'poster', translate: false }; } });
+</script></body></html>`;
+    const routes = [
+        { match: (url) => url.includes("baike.baidu.com/search"), body: baikeSearchHtml },
+        { match: (url) => url.includes("baike.baidu.com/item"), body: baikeDetailHtml },
+        { match: (url) => url.includes("/images/posters"), body: posterPageHtml }
+    ];
+    const { clipboardWrites, shadow } = await boot("/movie/550-fight-club/edit", { routes, withApiKey: false });
+    await flush();
+    shadow.querySelector(".tmdbh-ball").click();
+    await flush();
+    const baikeTab = shadow.querySelector('[data-source-tab="baike"]');
+    assert.ok(baikeTab, "应出现「百度百科」来源页签");
+    baikeTab.click();
+    await flush();
+    shadow.querySelector('[data-role="source-query"]').value = "大牌驾到";
+    shadow.querySelector('[data-action="source-search"]').click();
+    await flush(120);
+    const cand = shadow.querySelector(".tmdbh-candidate");
+    assert.ok(cand, "百科搜索应产出候选卡");
+    cand.click();
+    await flush(1400); // 百科节流 900ms：候选详情要等下一放行窗口
+    const header = shadow.querySelector(".tmdbh-media-copy");
+    assert.ok(header && header.textContent.includes("大牌驾到"), "百科候选应载入词条详情");
+    assert.ok(header.textContent.includes("王为念"), "百科详情应展示导演");
+    assert.ok(header.textContent.includes("脱口秀"), "百科详情应展示类型");
+    assert.ok(shadow.querySelector('[data-action="baike-episodes"]'), "百科条目应出现「抓取分集剧情」按钮");
+    assert.ok(shadow.querySelector('[data-action="record-poster-upload"]'), "有海报且页面可定位条目时应出现「上传海报」按钮");
+    // 分集剧情：抓取 → 区块渲染 → 复制 TSV（同样要等节流放行）
+    shadow.querySelector('[data-action="baike-episodes"]').click();
+    await flush(1400);
+    const epsBlock = shadow.querySelector('[data-role="baike-eps"]');
+    assert.ok(epsBlock, "抓取后应出现分集剧情区块");
+    assert.ok(epsBlock.textContent.includes("第一期"), "分集表格应包含抓到的剧情");
+    assert.ok(epsBlock.querySelector('[data-action="baike-eps-copy"]'), "分集区块应有复制 TSV 按钮");
+    assert.ok(!epsBlock.querySelector('[data-action="baike-eps-fill"]'), "非季编辑页不应出现「填入分集表格」按钮");
+    epsBlock.querySelector('[data-action="baike-eps-copy"]').click();
+    await flush();
+    const tsv = clipboardWrites[clipboardWrites.length - 1];
+    assert.ok(tsv.startsWith("1\t") && tsv.includes("第一期"), `复制 TSV 内容不符：${JSON.stringify(tsv)}`);
+    // 上传海报：点击后走 目标解析（fetch 官方图片页）→ 下载（沙箱 GM 拿不到 blob → 优雅报错 toast）
+    shadow.querySelector('[data-action="record-poster-upload"]').click();
+    await flush(200);
+    const toastEl = shadow.querySelector('[data-role="toast"]');
+    assert.ok(toastEl.textContent.includes("上传海报失败"), `下载失败应优雅提示：${toastEl.textContent}`);
+}
+
+// —— v1.0.2 「上传海报」按钮回归：剧集/季详情页也要出现（tv-detail 上下文字段是 id 不是 tvId） ——
+{
+    const record = { source: "douban", sourceId: "25754848", title: "琅琊榜", poster: "https://img1.doubanio.com/view/photo/raw/public/p1.jpg" };
+    const seedPanelState = JSON.stringify({ savedAt: Date.now(), kind: "tv-detail", tvId: null, record, candidates: [record] });
+    const { shadow } = await boot("/tv/1399-game-of-thrones", { withApiKey: false, seed: { "Tmdb.Helper.PanelState": seedPanelState } });
+    await flush();
+    shadow.querySelector(".tmdbh-ball").click();
+    await flush();
+    assert.ok(shadow.querySelector(".tmdbh-media-copy"), "持久化的来源条目应恢复并渲染条目卡");
+    assert.ok(shadow.querySelector('[data-action="record-poster-upload"]'), "剧集详情页 + 带海报条目应出现「上传海报」按钮");
+    assert.ok(!shadow.querySelector('[data-action="baike-episodes"]'), "豆瓣条目不应出现百科分集按钮");
+    // 季详情页：此前面板根本不注入，现在有搜索 + 上传海报（目标=该季海报库）
+    // （持久化恢复按「同类型同 ID」匹配，seed 要用季详情自身的上下文）
+    const seasonBoot = await boot("/tv/1399-game-of-thrones/season/2", {
+        withApiKey: false,
+        seed: { "Tmdb.Helper.PanelState": JSON.stringify({ savedAt: Date.now(), kind: "season-detail", tvId: 1399, record, candidates: [record] }) }
+    });
+    await flush();
+    assert.ok(seasonBoot.shadow.querySelector(".tmdbh-ball"), "季详情页应注入悬浮球");
+    seasonBoot.shadow.querySelector(".tmdbh-ball").click();
+    await flush();
+    assert.ok(seasonBoot.shadow.querySelector('[data-action="record-poster-upload"]'), "季详情页 + 带海报条目应出现「上传海报」按钮");
+    // 新增页没有条目 ID，不应出现上传海报按钮
+    const newBoot = await boot("/movie/new", { withApiKey: false, seed: { "Tmdb.Helper.PanelState": seedPanelState } });
+    await flush();
+    newBoot.shadow.querySelector(".tmdbh-ball").click();
+    await flush();
+    assert.ok(!newBoot.shadow.querySelector('[data-action="record-poster-upload"]'), "新增页（无条目 ID）不应出现「上传海报」按钮");
+}
+
+console.log("tmdb-ui-smoke：浮层引导、搜索复制（豆瓣/IMDb/粘贴文本/百度百科）、集编辑器、图片上传、扩展接口全部通过 ✓");

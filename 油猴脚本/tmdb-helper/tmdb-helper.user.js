@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TMDB 助手
 // @namespace    local.tmdb-helper
-// @version      1.0.1
-// @description  在 themoviedb.org 提供轻量搜索浮层：以统一数据源接口（豆瓣 / IMDb / 粘贴文本，可插拔新数据源）搜索条目，结果一键复制（名称 / 原名 / 名称 (年份) / 简介 / 全部信息），不向页面回写任何数据；悬浮球左键开关浮层、右键直接复制「名称 (年份) {tmdbid=…}」。保留的页面功能只在对应页面出现：季编辑器的批量单集（灵活排期 + 过滤词剔除重编号 + 平台链接抓分集（B站/爱奇艺/腾讯/芒果/优酷/红果短剧）+ 从 TMDB 拉取官方分集回填 + 分集缩略图按 TMDB 官方规范抓取/去黑边/裁切/直传）、图片上传页的直传（电影/剧集/季海报、背景图、标志、单集剧照，直链图自动去黑边）、剧集组页的剧集组管理（官网内部接口），并预留批量操作扩展接口（window.TmdbHelper）。右侧停靠面板：鸿蒙光感玻璃风 UI（磨砂透光、蓝紫渐变，跟随系统深浅主题，面板宽度可拖拽）。
+// @version      1.0.2
+// @description  在 themoviedb.org 提供轻量搜索浮层：以统一数据源接口（豆瓣 / 百度百科 / IMDb / 粘贴文本，可插拔新数据源）搜索条目，结果一键复制（名称 / 原名 / 名称 (年份) / 简介 / 全部信息），并支持一键把来源海报按 TMDB 官方规范直传到当前条目；百度百科条目还能一键抓取词条里的分集剧情（复制 TSV 或填入季编辑器分集表格）。豆瓣详情字段补全：rexxar 接口缺的编剧/语言/又名等自动用桌面页合并。悬浮球左键开关浮层、右键直接复制「名称 (年份) {tmdbid=…}」。保留的页面功能只在对应页面出现：季编辑器的批量单集（灵活排期 + 过滤词剔除重编号 + 平台链接抓分集（B站/爱奇艺/腾讯/芒果/优酷/红果短剧）+ 从 TMDB 拉取官方分集回填 + 分集缩略图按 TMDB 官方规范抓取/去黑边/裁切/直传）、图片上传页的直传（电影/剧集/季海报、背景图、标志、单集剧照，直链图自动去黑边）、剧集组页的剧集组管理（官网内部接口），并预留批量操作扩展接口（window.TmdbHelper）。右侧停靠面板：鸿蒙光感玻璃风 UI（磨砂透光、蓝紫渐变，跟随系统深浅主题，面板宽度可拖拽）。
 // @license      MIT
 // @icon         https://www.themoviedb.org/favicon.ico
 // @match        *://*.themoviedb.org/*
@@ -18,6 +18,8 @@
 // @connect      *.douban.com
 // @connect      doubanio.com
 // @connect      *.doubanio.com
+// @connect      baike.baidu.com
+// @connect      bkimg.cdn.bcebos.com
 // @connect      *
 // @noframes
 // @homepageURL  https://greasyfork.org/zh-CN/scripts/594907-tmdb-%E5%8A%A9%E6%89%8B
@@ -35,6 +37,22 @@
  *   「名称 (年份) {tmdbid=…}」（123 助手同款格式）；可拖拽；Alt+T 隐藏/恢复。
  *   v1.0.1：全局快捷键忽略输入法组字期按键（isComposing/keyCode 229）——面板输入框里打中文、
  *   按 Esc 取消候选词不再误关整个浮层（与 123 助手同款防护）。
+ *   v1.0.2：搜索浮层三大增强——
+ *   1) 新增「百度百科」数据源：关键词搜索（/search?word= 解析，改版时兜底词条名直连）、
+ *      条目链接直载；详情解析兼容多代页面结构（basicInfo-item/lemma-summary + og:meta 兜底），
+ *      抓 导演/编剧/主演/类型/制片地区/语言/集数/首播/每集长度/出品方/播出平台/海报（bkimg 升原图）；
+ *      条目卡一键「抓取分集剧情」（分集剧情表格 → 集数/集名/简介，可复制 TSV、季编辑页可一键填表）；
+ *      百度风控（安全验证页）给出明确提示。bkimg 图片水合与防盗链 Referer 同步支持。
+ *   2) 搜索浮层「⬆ 上传海报」：来源条目带海报且当前页面可定位 TMDB 条目（电影/剧集详情页、编辑页、
+ *      季详情页、季编辑页、图片上传页）时出现——按页面上下文同源抓官方图片页拿上传配置 → 下载海报 →
+ *      按 TMDB 规范（2:3 居中裁剪、等比缩小、禁放大）处理 → POST /image 直传；小图变体
+ *      （豆瓣 m_ratio / 百科缩放参数 / TMDB w 后缀）自动升级原图。
+ *      注意：剧集详情/编辑页的上下文字段是 id（tvId 只在 season/episode 系页面才有）——
+ *      初版误读 tvId 导致剧集页按钮不渲染，已修；季详情页（/tv/{id}/season/{n}）此前是
+ *      未适配页（面板不注入），现在提供搜索 + 上传海报（目标=该季海报库）。
+ *   3) 豆瓣字段补全：rexxar 接口编剧恒缺、语言/又名常缺——解析层补采 languages/aka，
+ *      详情抓取后若仍有空字段（编剧/导演/类型/地区/语言/又名/简介）自动抓桌面页合并（只填空位
+ *      不覆盖，匿名请求拿到 JS 壳时静默跳过）；「复制全部信息」与条目卡展示增加语言行。
  * - 不再向官方页面回写任何数据：对照填写/字段绑定/新增向导自动填充/季表单写入已全部移除，
  *   脚本只读页面 + 只提供搜索结果信息。
      * - 保留的页面功能（只在对应页面出现，浮层依然是点击才开）：
@@ -556,6 +574,15 @@
         return text.replace(/(\/view\/photo\/)(?!raw\/)[^/]+(\/public\/)/i, "$1raw$2");
     }
 
+    // 百科图片 URL 升级为原图：bkimg CDN 的缩放参数（?x-bce-process=resize… / ?_x=…）把图压到几百像素，
+    // 去掉 query 即原图，才能过 TMDB 最低分辨率
+    function upgradeBaikePosterUrl(url) {
+        const text = String(url || "").trim();
+        if (!text) return text;
+        if (!/bkimg\.cdn\.bcebos\.com|bkimg/i.test(text)) return text;
+        return text.split("?")[0];
+    }
+
     // —— TMDB-Import 式过滤词：命中标题的集剔除，剩余集重编号但保留原有缺集 ——
     // 例：[1,2,3(PV),5] 过滤掉 3 → [1,2,4]（PV 造成的跳档被补上，原本就缺的 4 保留跳档）。
     // words 支持 数组 或 逗号/顿号/空白分隔的字符串；匹配对标题做小写包含判断。
@@ -892,6 +919,9 @@
         if (match) return { kind: `${match[1]}-edit`, mediaType: match[1], id: Number(match[2]) };
         match = path.match(/^\/(movie|tv)\/new\/?$/);
         if (match) return { kind: `${match[1]}-new`, mediaType: match[1] };
+        // 季详情页（/tv/{id}/season/{n}）：此前按未适配处理，面板不注入；v1.0.2 起提供搜索 + 上传海报（目标=该季海报库）
+        match = path.match(/^\/tv\/(\d+)(?:-[^/]*)?\/season\/(\d+)\/?$/);
+        if (match) return { kind: "season-detail", mediaType: "tv", tvId: Number(match[1]), seasonNumber: Number(match[2]) };
         match = path.match(/^\/(movie|tv)\/(\d+)(?:-[^/]*)?\/?$/);
         if (match) return { kind: `${match[1]}-detail`, mediaType: match[1], id: Number(match[2]) };
         return { kind: "other" };
@@ -991,7 +1021,35 @@
             writers: toList(d.writers),
             cast: castToList(d.cast || d.actors),
             companies: toList(d.companies),
+            languages: toList(d.languages),
             rating: String(d.rating || ""),
+            episodeCount: Number(d.episodeCount) || 0,
+            poster: String(d.poster || "")
+        });
+    }
+
+    // 百度百科详情（parseBaikeDetailHtml 的产物）→ 统一记录
+    function normalizeBaikeDetail(detail) {
+        const d = detail && typeof detail === "object" ? detail : {};
+        return createUnifiedRecord({
+            source: "baike",
+            sourceId: String(d.baikeId || ""),
+            url: String(d.baikeUrl || (d.baikeId ? `https://baike.baidu.com/item/${encodeURIComponent(d.title || "")}/${d.baikeId}` : "")),
+            title: String(d.title || "").trim(),
+            originalTitle: String(d.originalTitle || "").trim(),
+            year: Number(d.year) || parseYearValue(d.date || ""),
+            date: normalizeAirDate(d.date || ""),
+            runtime: Number(d.runtime) || 0,
+            overview: String(d.overview || "").trim(),
+            genres: toList(d.genres),
+            countries: toList(d.countries),
+            aliases: toList(d.aliases),
+            directors: toList(d.directors),
+            writers: toList(d.writers),
+            cast: castToList(d.cast),
+            companies: toList(d.companies),
+            networks: toList(d.networks),
+            languages: toList(d.languages),
             episodeCount: Number(d.episodeCount) || 0,
             poster: String(d.poster || "")
         });
@@ -1100,6 +1158,7 @@
             cast.length ? `主演：${cast.join("、")}` : "",
             toList(record.companies).length ? `出品方：${toList(record.companies).join("、")}` : "",
             toList(record.networks).length ? `播出平台：${toList(record.networks).join("、")}` : "",
+            toList(record.languages).length ? `语言：${toList(record.languages).join("、")}` : "",
             values.imdb ? `IMDb：${values.imdb}` : "",
             record.url ? `链接：${record.url}` : "",
             values.overview ? `简介：${values.overview}` : ""
@@ -1720,18 +1779,19 @@
             if (numbers.length) runtime = numbers[numbers.length - 1];
         }
         let originalTitle = "";
+        const genresMatch = infoText.match(/类型\s*[::：]\s*([^\n]+)/);
+        const countriesMatch = infoText.match(/制片国家\/地区\s*[::：]?\s*([^\n]+)/);
+        const episodeCountMatch = infoText.match(/集数\s*[::：]\s*(\d{1,4})/);
         const aliasMatch = infoText.match(/又名\s*[::：]\s*([^\n]+)/);
         if (aliasMatch) {
             const latin = splitAliases(aliasMatch[1]).find(looksLatin);
             if (latin) originalTitle = latin;
         }
-        const genresMatch = infoText.match(/类型\s*[::：]\s*([^\n]+)/);
-        const countriesMatch = infoText.match(/制片国家\/地区\s*[::：]?\s*([^\n]+)/);
-        const episodeCountMatch = infoText.match(/集数\s*[::：]\s*(\d{1,4})/);
-        // 导演/编剧/主演：对照填写需要人物信息；主演行可能极长，截断到 400 字符内的人名
-        const peopleMatch = (label) => {
+        const languagesMatch = infoText.match(/语言\s*[::：]\s*([^\n]+)/);
+        // 导演/编剧/主演：对照填写需要人物信息；主演行可能极长，截断到 1200 字符内的人名
+        const peopleMatch = (label, maxChars = 400) => {
             const match = infoText.match(new RegExp(`${label}\\s*[::：]\\s*([^\\n]+)`));
-            return match ? splitAliases(match[1].slice(0, 400)) : [];
+            return match ? splitAliases(match[1].slice(0, maxChars)) : [];
         };
         return {
             doubanId: String(doubanId || ""),
@@ -1743,11 +1803,13 @@
             originalTitle,
             genres: genresMatch ? genresMatch[1].trim() : "",
             countries: countriesMatch ? countriesMatch[1].trim() : "",
+            languages: languagesMatch ? languagesMatch[1].trim() : "",
+            aliases: aliasMatch ? aliasMatch[1].trim() : "",
             rating: ratingNode ? String(ratingNode.textContent || "").trim() : "",
             episodeCount: episodeCountMatch ? Number(episodeCountMatch[1]) : 0,
             directors: peopleMatch("导演"),
             writers: peopleMatch("编剧"),
-            cast: peopleMatch("主演"),
+            cast: peopleMatch("主演", 1200),
             poster: upgradeDoubanPosterUrl(picNode ? String(picNode.getAttribute("src") || picNode.getAttribute("content") || "").trim() : ""),
             doubanUrl: `https://movie.douban.com/subject/${doubanId}/`
         };
@@ -1789,6 +1851,8 @@
             originalTitle,
             genres: joinList(data.genres),
             countries: joinList(data.countries),
+            languages: joinList(data.languages),
+            aliases: aliases.join("/"),
             rating: ratingValue > 0 ? ratingValue.toFixed(1) : "",
             episodeCount: Number(data.episodes_count) || 0,
             directors: joinList(data.directors),
@@ -1811,6 +1875,27 @@
         return parseDoubanRexxarJson(data, doubanId);
     }
 
+    // rexxar 接口字段不全是常态（编剧恒为 null、语言/又名等常缺），这些字段要靠桌面页补
+    function doubanDetailHasGaps(detail) {
+        const d = detail && typeof detail === "object" ? detail : {};
+        return ["writers", "directors", "genres", "countries", "languages", "aliases", "overview"].some((key) => !String(d[key] || "").trim());
+    }
+
+    // 只把 fallback 里的非空字段填进 base 的空位，不覆盖已有值（rexxar 主路 + 桌面页补全）
+    function mergeDoubanDetail(base, fallback) {
+        const merged = Object.assign({}, base && typeof base === "object" ? base : {});
+        const src = fallback && typeof fallback === "object" ? fallback : {};
+        for (const key of Object.keys(src)) {
+            const incoming = src[key];
+            if (incoming === undefined || incoming === null || incoming === "" || incoming === 0 || (Array.isArray(incoming) && !incoming.length)) continue;
+            const current = merged[key];
+            if (current === undefined || current === null || current === "" || current === 0 || (Array.isArray(current) && !current.length)) {
+                merged[key] = incoming;
+            }
+        }
+        return merged;
+    }
+
     async function fetchDoubanDetail(doubanId, config) {
         const id = String(doubanId || "").replace(/\D/g, "");
         if (!id) throw new Error("无效的豆瓣条目 ID");
@@ -1824,6 +1909,14 @@
             detail = await fetchDoubanDetailRexxar(id, config);
         } catch (err) {
             lastError = err;
+        }
+        // rexxar 缺编剧/语言等字段时用桌面页补全（登录用户桌面页是完整 HTML；匿名请求是 JS 壳，解析不出标题则跳过）
+        if (detail && doubanDetailHasGaps(detail)) {
+            try {
+                const html = await tmdbhDoubanGetText(`https://movie.douban.com/subject/${id}/`, config, (text) => text.includes("v:itemreviewed"));
+                const htmlDetail = parseDoubanDetailHtml(html, id);
+                if (String(htmlDetail.title || "").trim()) detail = mergeDoubanDetail(detail, htmlDetail);
+            } catch (err) { /* 桌面页拿不到就只靠 rexxar 的字段 */ }
         }
         if (!detail) {
             try {
@@ -1845,6 +1938,290 @@
         const found = await searchDoubanByImdb(imdbId, config);
         if (!found) throw new Error("豆瓣未找到该 IMDb 编号对应条目");
         return fetchDoubanDetail(found.id, config);
+    }
+
+    // src/baike.js —— 百度百科数据源（搜索 / 词条详情 / 分集剧情；解析函数为纯函数供测试切片）。
+    // 百科页面结构多代并存（新版 React 渲染 + 旧版服务端渲染），解析全部做成多选择器兜底，
+    // 命中不了时明确报错而不是静默给空数据。
+    const TMDBH_BAIKE_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Referer": "https://baike.baidu.com/"
+    };
+    let tmdbhBaikeLastRequestAt = 0;
+
+    async function tmdbhBaikeThrottle() {
+        const interval = 900;
+        const elapsed = Date.now() - tmdbhBaikeLastRequestAt;
+        if (elapsed < interval) await tmdbhSleep(interval - elapsed);
+        tmdbhBaikeLastRequestAt = Date.now();
+    }
+
+    async function tmdbhBaikeGetText(url, config) {
+        if (config && config.baike && config.baike.enabled === false) {
+            throw new Error("百度百科功能已在设置中关闭");
+        }
+        await tmdbhBaikeThrottle();
+        const response = await tmdbhGmRequest({ method: "GET", url, headers: TMDBH_BAIKE_HEADERS, timeout: 20000 });
+        if (response.status >= 400) throw new Error(`百度百科返回 HTTP ${response.status}`);
+        const text = String(response.responseText || "");
+        // 百度风控：HTTP 200 但正文是安全验证页
+        if (text.slice(0, 4000).includes("百度安全验证")) {
+            throw new Error("百度百科要求安全验证：请在浏览器里打开一次 baike.baidu.com 完成验证后重试");
+        }
+        return text;
+    }
+
+    function tmdbhBaikeCleanText(text) {
+        return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    // 条目链接/输入 → { name, id }：接受完整 URL（含百分号编码）与站内 /item/ 名称/ID 路径两种形态
+    function parseBaikeItemUrl(text) {
+        const match = String(text || "").trim().match(/(?:baike\.baidu\.com)?\/item\/([^#?\s/]+)(?:\/(\d+))?/i);
+        if (!match) return null;
+        let name = match[1];
+        try { name = decodeURIComponent(name); } catch (err) { /* 保持原样 */ }
+        return { name, id: match[2] || "" };
+    }
+
+    // 信息卡键值对：经典结构 .basicInfo-item.name / .value 相邻交替；兜底任意 dt/dd 交替。
+    // 键名去掉全部空白（百科的 dt 标签写作「类 型」「中 文 名」），值保留正常空格
+    function parseBaikeInfoPairs(doc) {
+        const pairs = [];
+        const push = (rawName, rawValue) => {
+            const name = tmdbhBaikeCleanText(rawName).replace(/\s+/g, "");
+            const value = tmdbhBaikeCleanText(rawValue);
+            if (name && value) pairs.push([name, value]);
+        };
+        doc.querySelectorAll(".basic-info .basicInfo-item.name, .basicInfo-item.name").forEach((nameEl) => {
+            const valueEl = nameEl.nextElementSibling;
+            if (!valueEl || !/(^|\s)value(\s|$)/.test(String(valueEl.className || ""))) return;
+            push(nameEl.textContent, valueEl.textContent);
+        });
+        if (pairs.length) return pairs;
+        doc.querySelectorAll("dt").forEach((dt) => {
+            const dd = dt.nextElementSibling;
+            if (!dd || dd.tagName !== "DD") return;
+            push(dt.textContent, dd.textContent);
+        });
+        return pairs;
+    }
+
+    // 词条页 HTML → 百科详情（fields 与豆瓣详情结构对齐，normalizeBaikeDetail 再归一为统一记录）
+    function parseBaikeDetailHtml(html, sourceUrl) {
+        const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+        const metaContent = (selector, attr = "content") => {
+            const node = doc.querySelector(selector);
+            return node ? String(node.getAttribute(attr) || "").trim() : "";
+        };
+        const h1 = doc.querySelector("h1");
+        const title = tmdbhBaikeCleanText(h1 && h1.textContent) || tmdbhBaikeCleanText(metaContent('meta[property="og:title"]'));
+        if (!title) return null;
+        const summaryNode = doc.querySelector(".lemma-summary, .J-lemma-summary");
+        const overview = tmdbhBaikeCleanText(summaryNode && summaryNode.textContent) || tmdbhBaikeCleanText(metaContent('meta[property="og:description"]')) || tmdbhBaikeCleanText(metaContent('meta[name="description"]'));
+        const posterNode = doc.querySelector("img.main-img, .main-img img, .summary-pic img, .contentPic img, .side-content img") || doc.querySelector('meta[property="og:image"]');
+        const pairs = parseBaikeInfoPairs(doc);
+        const infoValue = (...labels) => {
+            for (const label of labels) {
+                const exact = pairs.find((pair) => pair[0] === label);
+                if (exact) return exact[1];
+            }
+            for (const label of labels) {
+                const fuzzy = pairs.find((pair) => pair[0].includes(label));
+                if (fuzzy) return fuzzy[1];
+            }
+            return "";
+        };
+        const joined = (...labels) => splitAliases(infoValue(...labels)).join("/");
+        const episodeMatch = infoValue("集数").match(/(\d{1,4})/);
+        const runtimeMatch = infoValue("每集长度", "单集片长", "片长").match(/(\d{1,3})\s*分钟/);
+        let date = "";
+        for (const rawDate of splitAliases(infoValue("首播时间", "播出时间", "首播", "上映时间", "上映日期", "播出日期"))) {
+            date = normalizeAirDate(rawDate);
+            if (date) break;
+        }
+        const year = parseYearValue(infoValue("首播时间", "播出时间", "上映时间", "年代")) || parseYearValue(date) || parseYearValue(title);
+        const parsedUrl = parseBaikeItemUrl(sourceUrl || "");
+        return {
+            baikeId: (parsedUrl && parsedUrl.id) || "",
+            baikeUrl: sourceUrl || (parsedUrl && parsedUrl.name ? `https://baike.baidu.com/item/${encodeURIComponent(parsedUrl.name)}` : ""),
+            title,
+            originalTitle: splitAliases(infoValue("外文名", "外文片名", "外文剧名", "英文名")).find(looksLatin) || "",
+            year,
+            date,
+            runtime: runtimeMatch ? Number(runtimeMatch[1]) : 0,
+            overview,
+            genres: joined("类型", "题材"),
+            countries: joined("制片地区", "国家/地区", "出品地区"),
+            languages: joined("语言"),
+            aliases: joined("又名", "别名"),
+            directors: joined("导演", "总导演"),
+            writers: joined("编剧"),
+            cast: joined("主演", "主要配音"),
+            companies: joined("出品公司", "制作公司", "出品方"),
+            networks: joined("播出平台", "在线播放平台", "网络播放平台", "首播电视台", "播出电视台"),
+            episodeCount: episodeMatch ? Number(episodeMatch[1]) : 0,
+            poster: upgradeBaikePosterUrl(posterNode ? String(posterNode.getAttribute("src") || posterNode.getAttribute("content") || "") : "")
+        };
+    }
+
+    // 搜索结果页 → 候选列表：取带词条 ID 的 /item/ 链接，标题所在容器文本作摘要
+    function searchBaikeResults(html) {
+        const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+        const results = [];
+        const seen = new Set();
+        doc.querySelectorAll('a[href*="/item/"]').forEach((anchor) => {
+            const parsed = parseBaikeItemUrl(anchor.getAttribute("href") || "");
+            if (!parsed || !parsed.id || !parsed.name) return;
+            if (seen.has(parsed.id)) return;
+            const title = tmdbhBaikeCleanText(anchor.textContent);
+            if (!title) return;
+            seen.add(parsed.id);
+            const container = anchor.closest("li, dl, .result-list, div") || anchor.parentElement;
+            const abstract = tmdbhBaikeCleanText(container && container.textContent || "");
+            results.push(createUnifiedRecord({
+                source: "baike",
+                sourceId: parsed.id,
+                url: `https://baike.baidu.com/item/${encodeURIComponent(parsed.name)}/${parsed.id}`,
+                title,
+                overview: abstract.length > title.length + 8 ? `${abstract.slice(0, 120)}${abstract.length > 120 ? "…" : ""}` : "",
+                year: parseYearValue(abstract)
+            }));
+        });
+        return results.slice(0, 10);
+    }
+
+    async function searchBaikeEntries(keyword, config) {
+        const query = String(keyword || "").trim();
+        if (!query) throw new Error("请输入搜索关键词");
+        // 粘贴条目链接：不经过搜索页，直接载入该词条详情
+        if (/baike\.baidu\.com\/item\//i.test(query)) {
+            return [normalizeBaikeDetail(await fetchBaikeDetail(query, config))];
+        }
+        const cacheKey = `baike:search:${query}`;
+        const cached = tmdbhDoubanCacheGet(cacheKey);
+        if (cached !== undefined) return cached;
+        const html = await tmdbhBaikeGetText(`https://baike.baidu.com/search?word=${encodeURIComponent(query)}`, config);
+        let results = searchBaikeResults(html);
+        if (!results.length) {
+            // 搜索页改版兜底：把关键词当词条名直连（多义词会落到消歧义页，可用链接精确指定）
+            results = [createUnifiedRecord({
+                source: "baike",
+                sourceId: query,
+                url: `https://baike.baidu.com/item/${encodeURIComponent(query)}`,
+                title: query
+            })];
+        }
+        tmdbhDoubanCacheSet(cacheKey, results);
+        return results;
+    }
+
+    async function fetchBaikeDetail(idOrUrl, config) {
+        const raw = String(idOrUrl || "").trim();
+        if (!raw) throw new Error("无效的百科条目链接或词条名");
+        let url = "";
+        if (/^https?:\/\//i.test(raw)) {
+            if (!/baike\.baidu\.com/i.test(raw)) throw new Error("只支持 baike.baidu.com 的词条链接");
+            url = raw.split("#")[0];
+        } else {
+            const parsed = parseBaikeItemUrl(raw);
+            const name = parsed && parsed.name ? parsed.name : raw;
+            url = `https://baike.baidu.com/item/${encodeURIComponent(name)}${parsed && parsed.id ? `/${parsed.id}` : ""}`;
+        }
+        const cacheKey = `baike:detail:${url}`;
+        const cached = tmdbhDoubanCacheGet(cacheKey);
+        if (cached !== undefined) return cached;
+        const html = await tmdbhBaikeGetText(url, config);
+        const detail = parseBaikeDetailHtml(html, url);
+        if (!detail || !String(detail.title || "").trim()) {
+            throw new Error("百科条目解析失败（页面结构可能已变化，欢迎反馈）");
+        }
+        tmdbhDoubanCacheSet(cacheKey, detail);
+        return detail;
+    }
+
+    // 分集剧情表的一行 → 分集行：第一格取集号（第N集/N/E N/第N期），日期格单独识别，
+    // 余格里最长的是剧情、其余短文本是集名（集数｜集名｜剧情 三列与 集数｜剧情 两列都支持）
+    function mapBaikeEpisodeCells(cells) {
+        const list = (Array.isArray(cells) ? cells : []).map((cell) => tmdbhBaikeCleanText(cell)).filter(Boolean);
+        if (!list.length) return null;
+        const numberMatch = list[0].match(/(?:第\s*)?(\d{1,4})\s*(?:[集期话])?/);
+        const number = numberMatch ? Number(numberMatch[1]) : 0;
+        if (!number || number > 2000) return null;
+        const episode = { episodeNumber: number, name: "", airDate: "", overview: "", runtime: 0, stillUrl: "" };
+        const rest = list.slice(1);
+        const dateIndex = rest.findIndex((cell) => normalizeAirDate(cell));
+        if (dateIndex >= 0) {
+            episode.airDate = normalizeAirDate(rest[dateIndex]);
+            rest.splice(dateIndex, 1);
+        }
+        if (rest.length) {
+            let longestIndex = 0;
+            rest.forEach((cell, index) => { if (cell.length > rest[longestIndex].length) longestIndex = index; });
+            const longest = rest[longestIndex];
+            if (longest.length >= 15 || rest.length > 1) {
+                episode.overview = longest;
+                rest.splice(longestIndex, 1);
+                if (rest.length) episode.name = rest[0];
+            } else {
+                episode.name = longest;
+            }
+        }
+        return episode;
+    }
+
+    // 词条页 → 分集列表：「分集剧情」标题向后找表格；找不到再全页按表头特征兜底（集数/剧情）
+    function parseBaikeEpisodes(html) {
+        const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+        const isEpisodeTable = (table) => {
+            const firstRow = table.querySelector("tr");
+            const headText = tmdbhBaikeCleanText(firstRow && firstRow.textContent || "");
+            return /集数|剧情|分集|集名/.test(headText) && table.querySelectorAll("tr").length >= 2;
+        };
+        const tableSet = new Set();
+        const headings = Array.from(doc.querySelectorAll("h2, h3, h4, .para-title, .title-text")).filter((el) => /分集剧情|分集介绍|各集剧情|剧集介绍/.test(tmdbhBaikeCleanText(el.textContent)));
+        for (const heading of headings) {
+            let node = heading.nextElementSibling;
+            for (let hop = 0; hop < 15 && node; hop++) {
+                node.querySelectorAll("table").forEach((table) => tableSet.add(table));
+                if (tableSet.size) break;
+                if (/^(h1|h2|h3|h4)$/i.test(node.tagName || "")) break;
+                node = node.nextElementSibling;
+            }
+        }
+        if (!tableSet.size) {
+            doc.querySelectorAll("table").forEach((table) => {
+                if (isEpisodeTable(table)) tableSet.add(table);
+            });
+        }
+        const episodes = [];
+        const seen = new Set();
+        for (const table of tableSet) {
+            if (!isEpisodeTable(table)) continue;
+            for (const row of table.querySelectorAll("tr")) {
+                const cells = Array.from(row.querySelectorAll("td, th")).map((cell) => cell.textContent);
+                const episode = mapBaikeEpisodeCells(cells);
+                if (episode && !seen.has(episode.episodeNumber)) {
+                    seen.add(episode.episodeNumber);
+                    episodes.push(episode);
+                }
+            }
+        }
+        episodes.sort((a, b) => a.episodeNumber - b.episodeNumber);
+        return { title: "", overview: "", cover: "", episodes };
+    }
+
+    async function fetchBaikeEpisodes(url, config) {
+        const target = String(url || "").trim();
+        if (!/baike\.baidu\.com\/item\//i.test(target)) throw new Error("没有可抓取的百科词条链接");
+        const html = await tmdbhBaikeGetText(target, config);
+        const result = parseBaikeEpisodes(html);
+        if (!result.episodes.length) {
+            throw new Error("该词条页没有解析到分集剧情表格（部分剧集的分集剧情在独立词条里，可搜索「剧名 分集剧情」后粘贴该词条链接重试）");
+        }
+        return result;
     }
 
     // src/tmdbapi.js —— TMDB 官方 API v3 客户端（只读；新增/编辑数据走官网表单与内部接口）
@@ -2341,6 +2718,7 @@
         if (/hitv\.com/i.test(text)) return "https://www.mgtv.com/";
         if (/ykimg\.com/i.test(text)) return "https://v.youku.com/";
         if (/doubanio\.com|douban\.com/i.test(text)) return "https://movie.douban.com/";
+        if (/bkimg\.cdn\.bcebos\.com|bkimg/i.test(text)) return "https://baike.baidu.com/";
         return "";
     }
 
@@ -2351,7 +2729,7 @@
         const promise = tmdbhGmRequest({
             method: "GET",
             url,
-            headers: { "User-Agent": TMDBH_DOUBAN_HEADERS["User-Agent"], "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8", "Referer": "https://movie.douban.com/" },
+            headers: { "User-Agent": TMDBH_DOUBAN_HEADERS["User-Agent"], "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8", "Referer": tmdbhImageReferer(url) || "https://movie.douban.com/" },
             responseType: "blob",
             timeout: 20000
         }).then((response) => {
@@ -2363,12 +2741,12 @@
         return promise;
     }
 
-    // 面板渲染后调用：把豆瓣直链图片替换成 blob 本地副本，失败则隐藏破图
+    // 面板渲染后调用：把豆瓣/百科直链图片替换成 blob 本地副本，失败则隐藏破图
     function tmdbhHydrateDoubanImages(scopeEl) {
         try {
             (scopeEl || document).querySelectorAll('img[data-tmdbh-img="1"]').forEach((img) => {
                 const src = img.getAttribute("src") || "";
-                if (!/doubanio\.com|douban\.com\/view/i.test(src)) return;
+                if (!/doubanio\.com|douban\.com\/view|bkimg\.cdn\.bcebos\.com/i.test(src)) return;
                 tmdbhDoubanImageObjectUrl(src).then((objectUrl) => {
                     if (objectUrl) img.src = objectUrl;
                     else img.style.visibility = "hidden";
@@ -2885,6 +3263,7 @@
         if (kind === "season-edit") return `季编辑器 S${context.seasonNumber}`;
         if (kind === "episode-images") return `单集剧照 S${context.seasonNumber}E${context.episodeNumber}`;
         if (kind === "season-images") return `季图片 S${context.seasonNumber}`;
+        if (kind === "season-detail") return `季详情 S${context.seasonNumber}`;
         if (kind === "images") return "图片上传";
         if (kind === "movie-detail") return "电影详情";
         if (kind === "tv-detail") return "剧集详情";
@@ -2895,7 +3274,7 @@
 
     const TMDBH_VIEW_NAMES = { search: "搜索", episodes: "批量单集", groups: "剧集组", upload: "上传图片" };
 
-    const TMDBH_SOURCE_NAMES = { douban: "豆瓣", imdb: "IMDb", tmdb: "TMDB", text: "粘贴文本" };
+    const TMDBH_SOURCE_NAMES = { douban: "豆瓣", imdb: "IMDb", tmdb: "TMDB", text: "粘贴文本", baike: "百度百科" };
 
     function createTmdbhPanel(env) {
         const { configStore, storage, pageContext, sources, episodeActions } = env;
@@ -2909,7 +3288,7 @@
             record: null,
             recordError: "",
             entryTextDraft: "",
-            mediaChoice: (pageContext.kind === "tv-new" || pageContext.kind === "tv-detail" || pageContext.kind === "season-edit" || pageContext.kind === "tv-edit" || pageContext.kind === "episode-edit" ? "tv" : "movie"),
+            mediaChoice: (pageContext.kind === "tv-new" || pageContext.kind === "tv-detail" || pageContext.kind === "season-edit" || pageContext.kind === "season-detail" || pageContext.kind === "tv-edit" || pageContext.kind === "episode-edit" ? "tv" : "movie"),
             poster: { url: "", file: null, objectUrl: "" },
             posterCropHalf: "",
             entryPoster: "",
@@ -2944,6 +3323,8 @@
             existingIndex: {},
             posterUploaded: false,
             manualImage: null,
+            baikeEpisodes: [],
+            baikeEpisodesError: "",
             schedule: { pattern: "weekly", startNumber: 1, count: 12, perSlot: 1, weekdays: "一", intervalDays: 7, startDate: "", titleTemplate: "第{n}集", runtime: 0 },
             loading: {}
         };
@@ -3092,6 +3473,7 @@
             if (tab === "douban") return "支持 关键词 / 条目链接 / IMDb 编号 / subject 数字 ID";
             if (tab === "imdb") return "输入 tt 编号：经 TMDB find 反查条目（可直接反查豆瓣）";
             if (tab === "text") return "「标题：xxx / 年份：2024 / 简介：……」或「标题 | 年份 | 简介」均可";
+            if (tab === "baike") return "支持 关键词 / 百科条目链接（baike.baidu.com/item/…），载入后可一键抓分集剧情、上传海报";
             const adapter = sources.get(tab);
             return (adapter && adapter.hint) || "自定义数据源（registerDataSource 注册）";
         }
@@ -3101,7 +3483,7 @@
         }
 
         function renderSourceBar() {
-            const builtinTabs = ["douban", "imdb", "text"];
+            const builtinTabs = ["douban", "baike", "imdb", "text"];
             const customTabs = sources.list().map((adapter) => adapter.id).filter((id) => !builtinTabs.includes(id));
             const tabs = [...builtinTabs, ...customTabs];
             const active = state.sourceTab;
@@ -3158,6 +3540,7 @@
                 ${line("主演", cast)}
                 ${line("出品方", rec.companies)}
                 ${line("播出平台", rec.networks)}
+                ${line("语言", rec.languages)}
             `;
         }
 
@@ -3170,8 +3553,14 @@
                 if (state.recordError) return errorBlock;
                 return `<div class="tmdbh-hint">还没有载入来源条目：上方选择数据源并搜索，或用「${TMDBH_SOURCE_NAMES[state.sourceTab]}」直接查询。</div>`;
             }
-            const sourceName = { douban: "豆瓣", imdb: "IMDb", tmdb: "TMDB", text: "粘贴文本", page: "当前页" }[rec.source] || rec.source;
+            const sourceName = { douban: "豆瓣", imdb: "IMDb", tmdb: "TMDB", text: "粘贴文本", baike: "百度百科", page: "当前页" }[rec.source] || rec.source;
             const link = rec.url ? ` <a class="tmdbh-btn compact" href="${tmdbhEscAttr(rec.url)}" target="_blank">来源页</a>` : "";
+            const posterBtn = rec.poster && canUploadPosterHere()
+                ? `<button class="tmdbh-btn compact ${isLoading("record-poster-upload") ? "loading" : ""}" data-action="record-poster-upload" ${isLoading("record-poster-upload") ? "disabled" : ""} title="抓取来源海报，按 TMDB 官方规范（2:3、JPG）处理后直传到当前条目的海报库">⬆ 上传海报</button>`
+                : "";
+            const baikeEpsBtn = rec.source === "baike"
+                ? `<button class="tmdbh-btn compact ${isLoading("baike-episodes") ? "loading" : ""}" data-action="baike-episodes" ${isLoading("baike-episodes") ? "disabled" : ""} title="抓取百科词条里的分集剧情（集数/集名/简介），可复制或直接填入季编辑器的分集表格">⬇ 抓取分集剧情</button>`
+                : "";
             const copyButtons = `
                 <div class="tmdbh-chip-row" data-role="copy-row">
                     <button class="tmdbh-btn compact" data-action="copy-field" data-copy="titleYear" title="复制「名称 (年份)」">⧉ 名称 (年份)</button>
@@ -3179,6 +3568,8 @@
                     ${rec.originalTitle && rec.originalTitle !== rec.title ? `<button class="tmdbh-btn compact" data-action="copy-field" data-copy="originalTitle" title="复制原始标题">⧉ 原名</button>` : ""}
                     <button class="tmdbh-btn compact" data-action="copy-field" data-copy="date" title="复制上映/首播日期">⧉ 日期</button>
                     ${rec.overview ? `<button class="tmdbh-btn compact" data-action="copy-field" data-copy="overview" title="复制简介全文">⧉ 简介</button>` : ""}
+                    ${posterBtn}
+                    ${baikeEpsBtn}
                     <button class="tmdbh-btn compact primary" data-action="copy-record" title="复制标题/年份/类型/演职员/简介等全部信息">⧉ 复制全部信息</button>
                 </div>
             `;
@@ -3193,6 +3584,36 @@
                         ${copyButtons}
                         ${rec.overview ? `<p class="tmdbh-media-overview">${tmdbhEsc(rec.overview)}</p>` : ""}
                         ${recordPeopleLines(rec)}
+                    </div>
+                </div>
+                ${renderBaikeEpisodesBlock(rec)}
+            `;
+        }
+
+        // 百科条目的分集剧情区：抓取结果（集数/集名/简介）+ 复制 TSV / 填入季编辑器分集表格
+        function renderBaikeEpisodesBlock(rec) {
+            if (!rec || rec.source !== "baike" || !state.baikeEpisodes.length) return "";
+            const rows = state.baikeEpisodes;
+            const fillBtn = pageContext.kind === "season-edit"
+                ? `<button class="tmdbh-btn compact primary" data-action="baike-eps-fill" title="把分集填入「批量单集」的分集表格（可再编辑后批量提交）">⇢ 填入分集表格</button>`
+                : "";
+            return `
+                <div class="tmdbh-section" data-role="baike-eps">
+                    <div class="tmdbh-sec-title">
+                        <h4>分集剧情（${rows.length} 集）</h4>
+                        <span>来源：百科词条「分集剧情」表格</span>
+                    </div>
+                    <div class="tmdbh-chip-row">
+                        <button class="tmdbh-btn compact" data-action="baike-eps-copy" title="复制为 TSV（集数/集名/简介），可直接粘贴到季编辑器的分集解析框">⧉ 复制 TSV</button>
+                        ${fillBtn}
+                    </div>
+                    <div class="tmdbh-table-wrap" style="max-height:240px;">
+                        <table class="tmdbh-table">
+                            <thead><tr><th class="num" style="width:52px;">集</th><th style="width:140px;">集名</th><th>剧情简介</th></tr></thead>
+                            <tbody>
+                                ${rows.map((ep) => `<tr><td class="num">${ep.episodeNumber}</td><td>${tmdbhEsc(ep.name || "")}</td><td>${tmdbhEsc(tmdbhTruncate(ep.overview || "", 140))}</td></tr>`).join("")}
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             `;
@@ -3213,7 +3634,7 @@
                             <span class="tmdbh-cand-poster">${cand.poster ? `<img src="${tmdbhEscAttr(cand.poster)}" alt="" referrerpolicy="no-referrer" data-tmdbh-img="1">` : ""}</span>
                             <span>
                                 <strong>${tmdbhEsc(cand.title || "（未命名）")}</strong>
-                                <small>${tmdbhEsc([cand.originalTitle, cand.year, { douban: "豆瓣", imdb: "IMDb", tmdb: "TMDB", text: "文本" }[cand.source] || cand.source, cand.rating ? `★ ${cand.rating}` : ""].filter(Boolean).join(" · "))}</small>
+                                <small>${tmdbhEsc([cand.originalTitle, cand.year, { douban: "豆瓣", imdb: "IMDb", tmdb: "TMDB", text: "文本", baike: "百科" }[cand.source] || cand.source, cand.rating ? `★ ${cand.rating}` : ""].filter(Boolean).join(" · "))}</small>
                                 <p>${tmdbhEsc(tmdbhTruncate(cand.overview || toList(cand.genres).join("/") || "", 60))}</p>
                             </span>
                             <button class="tmdbh-btn compact" data-action="candidate-copy" data-cand="${index}" title="复制「${tmdbhEscAttr(recordTitleYear(cand))}」" style="flex:none;align-self:center;">⧉</button>
@@ -3702,6 +4123,13 @@
 
         // —— 统一数据源运行时：查询 → 候选 → 载入 → 复制/参考 ——
         function applyRecordToState(record) {
+            // 换了条目后上一条的百科分集剧情不再适用，一并清掉
+            const sameRecord = state.record && record
+                && state.record.source === record.source && state.record.sourceId === record.sourceId;
+            if (!sameRecord) {
+                state.baikeEpisodes = [];
+                state.baikeEpisodesError = "";
+            }
             state.record = record;
             state.recordError = "";
             renderBody();
@@ -3850,8 +4278,10 @@
                     }
                 } else if (!["douban", "tmdb", "imdb", "text"].includes(candidate.source)) {
                     const adapter = sources.get(candidate.source);
-                    if (adapter && typeof adapter.findById === "function" && !candidate.overview) {
-                        record = createUnifiedRecord(await adapter.findById(candidate.sourceId, { config }));
+                    // alwaysLoadDetail：候选只是搜索页的浅摘要（如百科），点卡片必须再拉完整详情
+                    if (adapter && typeof adapter.findById === "function" && (!candidate.overview || adapter.alwaysLoadDetail)) {
+                        // candidate 一并传入：部分数据源（如百科）要从候选的 url 定位详情
+                        record = createUnifiedRecord(await adapter.findById(candidate.sourceId, { config, candidate }));
                     }
                 }
                 if (candidate.imdb && !record.imdb) record.imdb = candidate.imdb;
@@ -4049,6 +4479,136 @@
             }
         }
 
+        // —— 一键上传海报（搜索浮层 → 当前条目）：任意页面上把来源条目的海报直传到 TMDB ——
+        // 当前页面能定位到哪个条目，就传到哪个条目的海报库；图片上传页则直接用本页配置
+        // （单集页只收 16:9 剧照，不提供海报上传）
+        function canUploadPosterHere() {
+            if (["images", "season-images"].includes(pageContext.kind)) return true;
+            return Boolean(posterUploadPageUrl());
+        }
+
+        function posterUploadPageUrl() {
+            const kind = pageContext.kind;
+            if ((kind === "movie-detail" || kind === "movie-edit") && pageContext.id) return `/movie/${Number(pageContext.id)}/images/posters`;
+            // tv-detail / tv-edit 的上下文字段是 id（tvId 只在 season/episode 系页面才有）
+            if ((kind === "tv-detail" || kind === "tv-edit") && pageContext.id) return `/tv/${Number(pageContext.id)}/images/posters`;
+            if (kind === "episode-edit" && pageContext.tvId) return `/tv/${Number(pageContext.tvId)}/images/posters`;
+            if ((kind === "season-edit" || kind === "season-detail") && pageContext.tvId) return seasonImagesUrl(pageContext.tvId, effectiveSeason());
+            return "";
+        }
+
+        // 同源抓官方图片页拿内嵌上传配置（media_id/media_type），按页面缓存；图片上传页直接读本页配置
+        const posterTargetCache = new Map();
+        async function resolvePosterUploadTarget() {
+            if (["images", "season-images"].includes(pageContext.kind)) {
+                const config = readUploadConfig();
+                if (!config) throw new Error("本页没有解析到上传配置（请确认已登录 TMDB）");
+                return config;
+            }
+            if (pageContext.kind === "episode-images") throw new Error("单集只支持剧照（16:9），请改用「上传图片」面板直传");
+            const url = posterUploadPageUrl();
+            if (!url) throw new Error("当前页面识别不到 TMDB 条目，请到条目页/编辑页/图片页再试");
+            if (!posterTargetCache.has(url)) {
+                const html = await fetch(url, { credentials: "same-origin" }).then((response) => {
+                    if (!response.ok) throw new Error(`读取官方图片页失败（HTTP ${response.status}，请确认已登录 TMDB）`);
+                    return response.text();
+                });
+                posterTargetCache.set(url, parseImageUploadConfig(html));
+            }
+            const config = posterTargetCache.get(url);
+            if (!config) throw new Error("官方图片页没有解析到上传配置（请确认已登录 TMDB）");
+            return config;
+        }
+
+        async function uploadRecordPoster() {
+            const rec = state.record;
+            if (!rec || !rec.poster) {
+                toast("该条目没有海报可上传", "err");
+                return;
+            }
+            setLoading("record-poster-upload", true);
+            try {
+                const target = await resolvePosterUploadTarget();
+                // 本功能只传海报：media_id/media_type 用页面配置，type 固定 poster
+                // （背景图页等复用同一 media_id，传海报同样有效）
+                const posterTarget = { mediaId: target.mediaId, mediaType: target.mediaType, type: "poster" };
+                // 豆瓣/百科小图升级原图、TMDB 小图变体升级 original，否则过不了 TMDB 最低分辨率
+                const rawUrl = upgradeBaikePosterUrl(String(rec.poster || "").trim());
+                const url = upgradeDoubanPosterUrl(rawUrl).replace(/(image\.tmdb\.org\/t\/p\/)(?:w\d+|h\d+|original)\//, "$1original/");
+                const response = await tmdbhGmRequest({
+                    method: "GET",
+                    url,
+                    headers: { Referer: tmdbhImageReferer(url) || location.origin, "Accept": "image/avif,image/webp,image/*,*/*" },
+                    responseType: "blob",
+                    timeout: 30000
+                });
+                if (response.status >= 400) throw new Error(`海报下载失败（HTTP ${response.status}）`);
+                const blob = response.response;
+                if (!blob || typeof blob !== "object") throw new Error("海报下载结果为空");
+                const ext = (blob.type && blob.type.split("/")[1] || "jpg").replace(/[^a-z0-9]/gi, "") || "jpg";
+                const file = new File([blob], `record-poster.${ext}`, { type: blob.type || "image/jpeg" });
+                const prepared = await prepareImageForUpload(file, "poster");
+                const data = await uploadPosterFile(prepared.file, posterTarget);
+                const mounted = data && data.html && ["images", "season-images"].includes(pageContext.kind)
+                    ? mountUploadedImageCard(data.html, posterTarget)
+                    : false;
+                state.posterUploaded = true;
+                const notesText = prepared.notes.length ? `（${prepared.notes.join("；")}）` : "";
+                toast(`海报已直传到当前条目${notesText}，输出 ${prepared.width}×${prepared.height}。${mounted ? "已显示在页面画廊顶部" : "官方图片页刷新可见"}`, "ok");
+            } catch (err) {
+                toast(`上传海报失败：${err.message}`, "err");
+            } finally {
+                setLoading("record-poster-upload", false);
+            }
+        }
+
+        // —— 百科分集剧情：抓取 → 展示 → 复制 TSV / 填入季编辑器分集表格 ——
+        async function fetchRecordBaikeEpisodes() {
+            const rec = state.record;
+            if (!rec || rec.source !== "baike" || !rec.url) {
+                toast("请先在「百度百科」来源载入条目", "err");
+                return;
+            }
+            setLoading("baike-episodes", true);
+            try {
+                const result = await fetchBaikeEpisodes(rec.url, configStore.get());
+                state.baikeEpisodes = result.episodes;
+                state.baikeEpisodesError = "";
+                renderBody();
+                toast(`抓到 ${result.episodes.length} 集分集剧情`, "ok");
+            } catch (err) {
+                state.baikeEpisodes = [];
+                state.baikeEpisodesError = String(err.message || err);
+                renderBody();
+                toast(`抓取分集失败：${err.message}`, "err");
+            } finally {
+                setLoading("baike-episodes", false);
+            }
+        }
+
+        function baikeEpisodesTsv() {
+            return exportEpisodesToTsv(state.baikeEpisodes);
+        }
+
+        async function copyBaikeEpisodesTsv() {
+            if (!state.baikeEpisodes.length) {
+                toast("还没有已抓取的分集剧情", "err");
+                return;
+            }
+            await tmdbhCopyText(baikeEpisodesTsv());
+            toast(`已复制 ${state.baikeEpisodes.length} 集的 TSV`, "ok");
+        }
+
+        async function fillEpisodesFromBaike() {
+            if (!state.baikeEpisodes.length) {
+                toast("还没有已抓取的分集剧情", "err");
+                return;
+            }
+            await applySiteEpisodes("百度百科", { title: state.record && state.record.title || "", episodes: state.baikeEpisodes.slice() });
+            state.view = "episodes";
+            render();
+        }
+
         // —— 面板状态持久化：搜索到的条目、平台抓取的分集表/信息卡，刷新或切页不丢 ——
         let persistTimer = 0;
         function schedulePersistPanelState() {
@@ -4070,6 +4630,7 @@
                     siteUrlQuery: state.siteUrlQuery,
                     siteMeta: state.siteMeta,
                     siteCandidates: state.siteCandidates,
+                    baikeEpisodes: state.baikeEpisodes,
                     episodes: state.episodes,
                     episodeText: state.episodeText
                 }));
@@ -4092,6 +4653,10 @@
                 if (saved.sourceTab && state.searchQuery[saved.sourceTab] !== undefined) state.sourceTab = saved.sourceTab;
                 if (saved.searchQuery) state.searchQuery = Object.assign(state.searchQuery, saved.searchQuery);
                 if (saved.entryTextDraft) state.entryTextDraft = saved.entryTextDraft;
+                // 百科分集剧情跟来源条目走：仅当恢复的条目还是百科条目时才还原
+                if (Array.isArray(saved.baikeEpisodes) && saved.baikeEpisodes.length && state.record && state.record.source === "baike") {
+                    state.baikeEpisodes = saved.baikeEpisodes;
+                }
             }
             // 平台抓取状态：同剧同季才恢复
             const sameSeason = saved.tvId != null && saved.tvId === pageContext.tvId && Number(saved.season) === Number(pageContext.seasonNumber);
@@ -5008,6 +5573,14 @@
                     await uploadManualImage();
                 } else if (action === "upload-refresh") {
                     location.reload();
+                } else if (action === "record-poster-upload") {
+                    await uploadRecordPoster();
+                } else if (action === "baike-episodes") {
+                    await fetchRecordBaikeEpisodes();
+                } else if (action === "baike-eps-copy") {
+                    await copyBaikeEpisodesTsv();
+                } else if (action === "baike-eps-fill") {
+                    await fillEpisodesFromBaike();
                 } else if (action === "groups-load") {
                     await loadGroups();
                 } else if (action === "group-details") {
@@ -5546,6 +6119,21 @@
                     const record = normalizeTmdbDetail(detail, mediaType);
                     record.imdb = String(imdbId).toUpperCase();
                     return record;
+                }
+            });
+            sources.register({
+                id: "baike",
+                name: "百度百科",
+                hint: "支持 关键词 / 百科条目链接（baike.baidu.com/item/…）",
+                alwaysLoadDetail: true, // 搜索候选只是浅摘要，点卡片必须拉词条详情
+                async search(query, env) {
+                    return searchBaikeEntries(query, env.config);
+                },
+                async findById(id, env) {
+                    // 详情定位优先用候选的词条 URL（多义词/重定向依赖完整路径），其次用搜索词本身
+                    const candidate = env && env.candidate;
+                    const target = (candidate && candidate.url) || String(id || "").trim();
+                    return normalizeBaikeDetail(await fetchBaikeDetail(target, env.config));
                 }
             });
             sources.register({

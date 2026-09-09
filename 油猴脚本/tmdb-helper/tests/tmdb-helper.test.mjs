@@ -89,6 +89,17 @@ globalThis.__api = {
     parseImageUploadConfig,
     posterCropTarget,
     upgradeDoubanPosterUrl,
+    upgradeBaikePosterUrl,
+    parseDoubanDetailHtml,
+    doubanDetailHasGaps,
+    mergeDoubanDetail,
+    parseBaikeItemUrl,
+    parseBaikeInfoPairs,
+    parseBaikeDetailHtml,
+    searchBaikeResults,
+    mapBaikeEpisodeCells,
+    parseBaikeEpisodes,
+    normalizeBaikeDetail,
     TMDBH_IMAGE_SPECS,
     inferImageType,
     detectImageBlackBars,
@@ -295,6 +306,8 @@ assert.deepEqual(js(api.detectPageContext("/movie/new")), { kind: "movie-new", m
 assert.deepEqual(js(api.detectPageContext("/tv/new/")), { kind: "tv-new", mediaType: "tv" });
 assert.deepEqual(js(api.detectPageContext("/tv/1399-game-of-thrones")), { kind: "tv-detail", mediaType: "tv", id: 1399 });
 assert.deepEqual(js(api.detectPageContext("/movie/550/")), { kind: "movie-detail", mediaType: "movie", id: 550 });
+// v1.0.2 季详情页：此前是 other（面板不注入），现在提供搜索 + 上传海报
+assert.deepEqual(js(api.detectPageContext("/tv/1399-game-of-thrones/season/1")), { kind: "season-detail", mediaType: "tv", tvId: 1399, seasonNumber: 1 });
 assert.equal(api.detectPageContext("/").kind, "other");
 
 // —— 分集 payload 构建：空字段不应出现 ——
@@ -1067,6 +1080,230 @@ assert.equal(wideCrop.crop.sx, 0, "16:9 图按 16:9 规范无需裁剪");
     assert.deepEqual(colBars, { top: 0, bottom: 0, left: 20, right: 20 });
     // 无像素数据时返回全 0
     assert.deepEqual(js(api.detectImageBlackBars(null, 160, 90)), { top: 0, bottom: 0, left: 0, right: 0 });
+}
+
+// —— v1.0.2 豆瓣字段补全：桌面页 HTML 解析（语言/又名/加宽主演截断） ——
+{
+    const doubanHtml = `<!doctype html><html><body>
+<div id="content"><h1><span property="v:itemreviewed">琅琊榜</span><span class="year">(2015)</span></h1></div>
+<div id="mainpic"><img src="https://img1.doubanio.com/view/photo/s_ratio_poster/public/p2614289482.jpg"></div>
+<span property="v:summary">江左梅郎的复仇故事，第一段简介。</span>
+<span property="v:summary">第二段简介续写，足够长。</span>
+<strong property="v:average">9.4</strong>
+<div id="info">
+导演: 孔笙 / 李雪<br/>
+编剧: 海宴<br/>
+主演: 胡歌 / 刘涛 / 王凯 / 陈龙 / 黄维德 / 高鑫<br/>
+类型: 剧情 / 古装<br/>
+制片国家/地区: 中国大陆<br/>
+语言: 汉语普通话<br/>
+首播: 2015-09-19(中国大陆)<br/>
+集数: 54<br/>
+单集片长: 45分钟<br/>
+又名: Nirvana in Fire / 琅琊榜<br/>
+</div>
+</body></html>`;
+    const detail = js(api.parseDoubanDetailHtml(doubanHtml, "25754848"));
+    assert.equal(detail.title, "琅琊榜");
+    assert.equal(detail.year, 2015);
+    assert.equal(detail.date, "2015-09-19");
+    assert.equal(detail.genres, "剧情 / 古装");
+    assert.equal(detail.countries, "中国大陆");
+    assert.equal(detail.languages, "汉语普通话");
+    assert.equal(detail.aliases.includes("Nirvana in Fire"), true);
+    assert.equal(detail.originalTitle, "Nirvana in Fire");
+    assert.equal(detail.episodeCount, 54);
+    assert.equal(detail.runtime, 45);
+    assert.deepEqual(js(detail.directors), ["孔笙", "李雪"]);
+    assert.deepEqual(js(detail.writers), ["海宴"]);
+    assert.ok(detail.cast.includes("胡歌") && detail.cast.length >= 6, "主演截断加宽后应收录 6 人以上");
+    assert.equal(detail.rating, "9.4");
+    assert.equal(detail.poster, "https://img1.doubanio.com/view/photo/raw/public/p2614289482.jpg");
+    assert.equal(detail.doubanUrl, "https://movie.douban.com/subject/25754848/");
+    // 异常：无 #info / 空页面 → 各字段安全回退
+    const empty = js(api.parseDoubanDetailHtml("<html><body>风控壳页面</body></html>", "1"));
+    assert.equal(empty.title, "");
+    assert.deepEqual(js(empty.directors), []);
+    assert.equal(empty.poster, "");
+    assert.equal(api.parseDoubanDetailHtml("", "1").genres, "");
+}
+
+// —— v1.0.2 豆瓣字段补全：rexxar 语言/又名采集 + 空字段合并（只填空位不覆盖） ——
+{
+    const rexxarExtra = js(api.parseDoubanRexxarJson({
+        title: "语言又名剧",
+        languages: ["汉语普通话", "粤语"],
+        aka: ["English Name", "港译名"]
+    }, "2"));
+    assert.equal(rexxarExtra.languages, "汉语普通话/粤语");
+    assert.equal(rexxarExtra.aliases, "English Name/港译名");
+    assert.equal(rexxarExtra.originalTitle, "English Name");
+
+    assert.equal(api.doubanDetailHasGaps({ title: "x", writers: "", genres: "剧情" }), true, "编剧为空 → 有缺口");
+    assert.equal(api.doubanDetailHasGaps({ title: "x", writers: "甲", genres: "剧情", directors: "乙", countries: "美国", languages: "英语", aliases: "AKA", overview: "简介" }), false);
+
+    const merged = js(api.mergeDoubanDetail(
+        { title: "剧名", genres: "", writers: "", directors: ["rexxar导演"], overview: "已有简介", episodeCount: 0 },
+        { title: "不该覆盖", genres: "剧情", writers: ["编剧甲"], directors: ["不该覆盖"], overview: "", episodeCount: 12, year: 2015 }
+    ));
+    assert.equal(merged.title, "剧名", "已有值不被覆盖");
+    assert.equal(merged.genres, "剧情");
+    assert.deepEqual(js(merged.writers), ["编剧甲"]);
+    assert.deepEqual(js(merged.directors), ["rexxar导演"], "已有导演不被覆盖");
+    assert.equal(merged.overview, "已有简介");
+    assert.equal(merged.episodeCount, 12);
+    assert.equal(merged.year, 2015, "缺失字段被补上");
+    // 互为 null/undefined 安全
+    assert.deepEqual(js(api.mergeDoubanDetail(null, { title: "x" })), { title: "x" });
+    assert.deepEqual(js(api.mergeDoubanDetail({ title: "y" }, null)), { title: "y" });
+
+    // 统一记录带上语言
+    const withLang = js(api.normalizeDoubanDetail({ doubanId: "1", title: "双语剧", languages: "汉语/粤语" }));
+    assert.deepEqual(js(withLang.languages), ["汉语", "粤语"]);
+}
+
+// —— v1.0.2 百度百科数据源：链接解析 / 海报升级 / 词条详情 / 搜索结果 / 分集剧情 ——
+{
+    // 条目链接解析：完整 URL（百分号编码）+ 站内路径 + 无 ID + 非条目链接
+    assert.deepEqual(js(api.parseBaikeItemUrl("https://baike.baidu.com/item/%E5%A4%A7%E7%89%8C%E9%A9%BE%E5%88%B0/2178476")), { name: "大牌驾到", id: "2178476" });
+    assert.deepEqual(js(api.parseBaikeItemUrl("/item/%E5%A4%A7%E7%89%8C%E9%A9%BE%E5%88%B0")), { name: "大牌驾到", id: "" });
+    assert.deepEqual(js(api.parseBaikeItemUrl("https://baike.baidu.com/item/abc-def#2")), { name: "abc-def", id: "" });
+    assert.equal(api.parseBaikeItemUrl("https://www.themoviedb.org/movie/550"), null);
+    assert.equal(api.parseBaikeItemUrl(""), null);
+
+    // bkimg 海报升级原图：去掉缩放 query
+    assert.equal(api.upgradeBaikePosterUrl("https://bkimg.cdn.bcebos.com/pic/abc?x-bce-process=image/resize,m_lfit,limit_1,h_240"), "https://bkimg.cdn.bcebos.com/pic/abc");
+    assert.equal(api.upgradeBaikePosterUrl("https://bkimg.cdn.bcebos.com/pic/abc?_x=100&_y=200"), "https://bkimg.cdn.bcebos.com/pic/abc");
+    assert.equal(api.upgradeBaikePosterUrl("https://bkimg.cdn.bcebos.com/pic/abc"), "https://bkimg.cdn.bcebos.com/pic/abc");
+    assert.equal(api.upgradeBaikePosterUrl("https://img.example.com/a.jpg?x=1"), "https://img.example.com/a.jpg?x=1");
+
+    // 词条详情解析：多代结构兼容（basicInfo-item + lemma-summary + og:meta 兜底 + bkimg 原图升级）
+    const baikeDetailHtml = `<!doctype html><html><head>
+<meta property="og:title" content="大牌驾到（不应覆盖 h1）">
+<meta property="og:image" content="https://bkimg.cdn.bcebos.com/pic/ogpic?x-bce-process=image/resize,h_240">
+</head><body>
+<h1>大牌驾到</h1>
+<div class="lemma-summary"><div class="para">《大牌驾到》是一档网络综艺脱口秀节目，于2014年开播，简介文本足够长。</div></div>
+<div class="main-img"><img src="https://bkimg.cdn.bcebos.com/pic/mainpic?_x=200&_y=300"></div>
+<div class="basic-info J-basic-info cmn-clearfix">
+<dt class="basicInfo-item name">中 文 名</dt><dd class="basicInfo-item value">大牌驾到</dd>
+<dt class="basicInfo-item name">外文名</dt><dd class="basicInfo-item value">Mr. Star</dd>
+<dt class="basicInfo-item name">类 型</dt><dd class="basicInfo-item value">脱口秀 / 综艺</dd>
+<dt class="basicInfo-item name">制片地区</dt><dd class="basicInfo-item value">中国大陆</dd>
+<dt class="basicInfo-item name">语 言</dt><dd class="basicInfo-item value">汉语普通话</dd>
+<dt class="basicInfo-item name">首播时间</dt><dd class="basicInfo-item value">2014-03-06</dd>
+<dt class="basicInfo-item name">播出平台</dt><dd class="basicInfo-item value"><a>腾讯视频</a></dd>
+<dt class="basicInfo-item name">集 数</dt><dd class="basicInfo-item value">12 集</dd>
+<dt class="basicInfo-item name">每集长度</dt><dd class="basicInfo-item value">约 45 分钟</dd>
+<dt class="basicInfo-item name">出品公司</dt><dd class="basicInfo-item value">某制作公司</dd>
+<dt class="basicInfo-item name">主持人</dt><dd class="basicInfo-item value">主持人甲</dd>
+<dt class="basicInfo-item name">主要嘉宾</dt><dd class="basicInfo-item value">嘉宾甲 / 嘉宾乙</dd>
+</div>
+</body></html>`;
+    const baikeDetail = js(api.parseBaikeDetailHtml(baikeDetailHtml, "https://baike.baidu.com/item/%E5%A4%A7%E7%89%8C%E9%A9%BE%E5%88%B0/2178476"));
+    assert.equal(baikeDetail.title, "大牌驾到");
+    assert.equal(baikeDetail.baikeId, "2178476");
+    assert.equal(baikeDetail.baikeUrl, "https://baike.baidu.com/item/%E5%A4%A7%E7%89%8C%E9%A9%BE%E5%88%B0/2178476");
+    assert.ok(baikeDetail.overview.includes("脱口秀"), "简介应取 lemma-summary");
+    assert.equal(baikeDetail.originalTitle, "Mr. Star");
+    assert.equal(baikeDetail.genres, "脱口秀/综艺");
+    assert.equal(baikeDetail.countries, "中国大陆");
+    assert.equal(baikeDetail.languages, "汉语普通话");
+    assert.equal(baikeDetail.date, "2014-03-06");
+    assert.equal(baikeDetail.year, 2014);
+    assert.equal(baikeDetail.episodeCount, 12);
+    assert.equal(baikeDetail.runtime, 45);
+    assert.equal(baikeDetail.networks, "腾讯视频");
+    assert.equal(baikeDetail.companies, "某制作公司");
+    assert.equal(baikeDetail.poster, "https://bkimg.cdn.bcebos.com/pic/mainpic", "主图优先且去缩放参数");
+    // dt/dd 兜底结构与 og:image 兜底
+    const legacyHtml = `<!doctype html><html><body><h1>旧版词条</h1>
+<dl><dt>类型</dt><dd>剧情</dd><dt>集数</dt><dd>20</dd></dl>
+<meta property="og:image" content="https://bkimg.cdn.bcebos.com/pic/legacy?_x=99">
+</body></html>`;
+    const legacyDetail = js(api.parseBaikeDetailHtml(legacyHtml, "https://baike.baidu.com/item/%E6%97%A7%E7%89%88%E8%AF%8D%E6%9D%A1"));
+    assert.equal(legacyDetail.genres, "剧情");
+    assert.equal(legacyDetail.episodeCount, 20);
+    assert.equal(legacyDetail.poster, "https://bkimg.cdn.bcebos.com/pic/legacy", "无主图时回退 og:image");
+    // 风控壳/空页面 → null（调用方报「解析失败」而不是给空数据）
+    assert.equal(api.parseBaikeDetailHtml("<html><head><title>百度安全验证</title></head><body></body></html>", "https://baike.baidu.com/item/x/1"), null);
+    assert.equal(api.parseBaikeDetailHtml("", ""), null);
+
+    // 统一记录归一化
+    const baikeRecord = js(api.normalizeBaikeDetail(baikeDetail));
+    assert.equal(baikeRecord.source, "baike");
+    assert.equal(baikeRecord.sourceId, "2178476");
+    assert.equal(baikeRecord.title, "大牌驾到");
+    assert.deepEqual(js(baikeRecord.genres), ["脱口秀", "综艺"]);
+    assert.equal(baikeRecord.episodeCount, 12);
+    assert.ok(baikeRecord.url.includes("baike.baidu.com"));
+
+    // 搜索结果页解析：带 ID 的 /item/ 链接才收、同 ID 去重、容器文本作摘要
+    const baikeSearchHtml = `<!doctype html><html><body>
+<div class="search-list"><div class="result-list">
+<div><a class="result_title" href="/item/%E5%A4%A7%E7%89%8C%E9%A9%BE%E5%88%B0/2178476">大牌驾到</a><p>《大牌驾到》是2014年播出的网络综艺节目，内容文本足够长。</p></div>
+<div><a href="https://baike.baidu.com/item/%E5%A4%A7%E7%89%8C%E9%A9%BE%E5%88%B0/2178476">大牌驾到（重复 ID 应去重）</a></div>
+<div><a href="/item/%E7%81%AB%E6%98%9F">火星（无词条 ID，不收）</a></div>
+</div></div>
+</body></html>`;
+    const baikeCands = js(api.searchBaikeResults(baikeSearchHtml));
+    assert.equal(baikeCands.length, 1);
+    assert.equal(baikeCands[0].source, "baike");
+    assert.equal(baikeCands[0].sourceId, "2178476");
+    assert.equal(baikeCands[0].title, "大牌驾到");
+    assert.ok(baikeCands[0].overview.includes("综艺"));
+    assert.equal(baikeCands[0].year, 2014);
+    assert.ok(baikeCands[0].url.includes("2178476"));
+    assert.deepEqual(js(api.searchBaikeResults("<html>没有结果</html>")), []);
+
+    // 分集剧情行：三列（集数｜集名｜剧情）、两列（集数｜剧情）、日期格、表头行跳过
+    assert.deepEqual(
+        js(api.mapBaikeEpisodeCells(["第1集", "第一期节目的剧情内容，文本要足够长才能被认成剧情简介。"])),
+        { episodeNumber: 1, name: "", airDate: "", overview: "第一期节目的剧情内容，文本要足够长才能被认成剧情简介。", runtime: 0, stillUrl: "" }
+    );
+    assert.deepEqual(
+        js(api.mapBaikeEpisodeCells(["第2集", "2024-01-15", "第二期剧情简介，同样是足够长的文本内容用于断言。"])),
+        { episodeNumber: 2, name: "", airDate: "2024-01-15", overview: "第二期剧情简介，同样是足够长的文本内容用于断言。", runtime: 0, stillUrl: "" }
+    );
+    const threeCol = js(api.mapBaikeEpisodeCells(["3", "集名甲", "第三期剧情简介内容，也足够长，用于区分集名与剧情。"]));
+    assert.equal(threeCol.episodeNumber, 3);
+    assert.equal(threeCol.name, "集名甲");
+    assert.ok(threeCol.overview.includes("第三期"));
+    assert.equal(api.mapBaikeEpisodeCells(["集数", "剧情简介"]), null, "表头行不产出分集");
+    assert.equal(api.mapBaikeEpisodeCells(["剧情文字开头没有集号"]), null);
+    assert.equal(api.mapBaikeEpisodeCells([]), null);
+    const shortOnly = js(api.mapBaikeEpisodeCells(["第5集", "短集名"]));
+    assert.equal(shortOnly.name, "短集名");
+    assert.equal(shortOnly.overview, "", "唯一短文本按集名处理，不误当剧情");
+
+    // 分集剧情表格：「分集剧情」标题后的表格优先；无标题时全页按表头特征兜底；无表格返回空
+    const baikeEpsHtml = `<!doctype html><html><body>
+<h2>剧情简介</h2><div class="para">剧情概述文字。</div>
+<h2 class="para-title"> 分集剧情 </h2>
+<div class="para"><table>
+<tr><th>集数</th><th>剧情简介</th></tr>
+<tr><td><div>第1集</div></td><td>第一期节目的剧情内容，文本要足够长才能被认成剧情简介。</td></tr>
+<tr><td>第2集</td><td>2024-01-15</td><td>第二期剧情简介，同样是足够长的文本内容用于断言。</td></tr>
+</table></div>
+<h3>收视率</h3>
+<div><table><tr><th>集数</th><th>收视率</th></tr><tr><td>1</td><td>1.5</td></tr></table></div>
+</body></html>`;
+    const baikeEps = js(api.parseBaikeEpisodes(baikeEpsHtml));
+    assert.equal(baikeEps.episodes.length, 2, "只收「分集剧情」标题后的表格，收视率表不收");
+    assert.equal(baikeEps.episodes[0].episodeNumber, 1);
+    assert.equal(baikeEps.episodes[1].episodeNumber, 2);
+    assert.equal(baikeEps.episodes[1].airDate, "2024-01-15");
+    // 兜底：没有标题时按表头特征全页找
+    const fallbackEpsHtml = `<!doctype html><html><body>
+<table><tr><th>集数</th><th>集名</th><th>剧情简介</th></tr>
+<tr><td>第1集</td><td>开局</td><td>足够长的第一集剧情简介文本，用来通过长度判断。</td></tr>
+<tr><td>第2集</td><td>反转</td><td>足够长的第二集剧情简介文本，用来通过长度判断。</td></tr>
+</table>
+</body></html>`;
+    const fallbackEps = js(api.parseBaikeEpisodes(fallbackEpsHtml));
+    assert.equal(fallbackEps.episodes.length, 2);
+    assert.equal(fallbackEps.episodes[0].name, "开局");
+    assert.deepEqual(js(api.parseBaikeEpisodes("<html><body>没有表格的页面</body></html>")).episodes, []);
 }
 
 console.log("tmdb-helper.test.mjs：全部断言通过 ✓");
