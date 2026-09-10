@@ -366,7 +366,7 @@ test("特别篇关键词：类型名可自定义（如「动脑吧」），新�
 test("特别篇关键词：老配置自动补齐词表，旧英文类型名改写为类型名", () => {
   const migrated = normalizeConfig({ schemaVersion: 10, library: { recognition: { customWords: [], fixedMappings: [{ id: "video-format-1080p", field: "videoFormat", aliases: ["1080p"], output: "1080p" }] } } });
   const mappings = Array.from(migrated.library.recognition.fixedMappings);
-  assert.equal(migrated.schemaVersion, 11);
+  assert.equal(migrated.schemaVersion, 12);
   assert.ok(mappings.some((item) => item.id === "video-format-1080p"), "既有映射保留");
   for (const kind of ["先导片", "加更", "会员专享", "特辑", "未播删减"]) {
     assert.ok(mappings.some((item) => item.field === "specialKind" && item.output === kind), `缺失的特别篇默认条目应自动补齐：${kind}`);

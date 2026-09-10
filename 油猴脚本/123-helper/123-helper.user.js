@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.0
+// @version      1.3.1
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -1963,7 +1963,7 @@
     return keys.flatMap((key, index) => index === 0 ? [field(key)] : [separator(" "), field(key)]);
   }
   var DEFAULT_CONFIG = {
-    schemaVersion: 11,
+    schemaVersion: 12,
     appearance: {
       theme: "system",
       finderMode: false,
@@ -1979,6 +1979,7 @@
       rootName: "",
       categories: clone(DEFAULT_LIBRARY_CATEGORIES),
       excludeWords: [],
+      collectionFolder: false,
       discardSidecarExtensions: ["ass", "srt", "ssa", "sub", "vtt", "nfo", "jpg", "jpeg", "png", "webp"],
       recognition: { customWords: [], releaseGroups: ["Mo Cuishle"], fixedMappings: clone(DEFAULT_FIXED_MAPPINGS).concat(defaultSpecialKeywordMappingEntries()) }
     },
@@ -2128,7 +2129,7 @@
     config.fastlinkTools.secondaryUseJson = config.fastlinkTools.secondaryUseJson !== false;
     delete config.appearance.hideOfficialPromotions;
     applySpecialKeywordMappings(config.library.recognition.fixedMappings);
-    config.schemaVersion = 11;
+    config.schemaVersion = 12;
     delete config.metadata;
     return config;
   }
@@ -4021,6 +4022,20 @@
         airDate: episode.air_date || "",
         overview: episode.overview || ""
       }));
+    }
+    async episodeGroups(tvId) {
+      const data = await this.request(`/tv/${tvId}/episode_groups`, {});
+      return (data.results || []).map((item) => ({
+        id: String(item.id || ""),
+        name: item.name || "",
+        description: item.description || "",
+        type: Number(item.type || 0),
+        groupCount: Number(item.group_count || 0),
+        episodeCount: Number(item.episode_count || 0)
+      })).filter((item) => item.id);
+    }
+    async episodeGroup(groupId) {
+      return this.request(`/tv/episode_group/${groupId}`, {});
     }
   };
 
@@ -14374,6 +14389,7 @@ ${end.comment}` : end.comment;
     ];
     const chineseTitles = uniqueTitles(chineseCandidates.filter((value) => hasHan(value) && !hasKana(value)).map(toSimplified));
     const englishTitles = uniqueTitles(englishCandidates.filter(isEnglish));
+    const collection = media.belongs_to_collection || media.collection || null;
     return {
       ...media,
       id,
@@ -14384,6 +14400,8 @@ ${end.comment}` : end.comment;
       aliases: rawAliases,
       chineseTitles,
       englishTitles,
+      collectionId: Number(collection?.id || 0) || null,
+      collectionName: String(collection?.title || collection?.name || "").trim(),
       year: String(media.year || media.release_date || media.first_air_date || "").slice(0, 4),
       genreIds: media.genre_ids || (media.genres || []).map((genre) => genre.id),
       originalLanguage,
@@ -15765,6 +15783,19 @@ ${end.comment}` : end.comment;
     fields = { ...fields, ...metadataFields, ...groupOverride };
     const category = groupOverride.category || inferCategory(fields, names, config.library);
     const mediaFolder = groupOverride.mediaFolder || buildMediaFolder(fields, config.templates.mediaFolder);
+    const strategy = fields.mediaType === "tv" ? options.strategies?.[group.id] || (options.strategyAssignments?.[group.id]?.size ? { kind: "merge" } : null) : null;
+    let strategyResult = null;
+    if (organizeStrategyActive(strategy)) {
+      strategyResult = computeGroupStrategyAssignments(strategy, group.files, media, {
+        fallbackSeason: Number(fields.season || 1),
+        episodeGroupDetail: strategy.episodeGroupId ? options.episodeGroupCache?.[strategy.episodeGroupId] : null,
+        mergeAssignments: strategy.kind === "merge" ? options.strategyAssignments?.[group.id] : null
+      });
+      for (const message of strategyResult.warnings) warnings.push(`${group.title}\uFF1A${message}`);
+    }
+    const collectionName = fields.mediaType === "movie" ? String(media?.collectionName || "").trim() : "";
+    const collectionEnabled = Boolean(collectionName) && (options.collectionByGroup?.[group.id] ?? config.library.collectionFolder === true);
+    const collectionFolder = collectionEnabled ? cleanPathPart(collectionName) : "";
     const episode = { episodes: [], matches: /* @__PURE__ */ new Map() };
     const tasks = [];
     let videoIndex = 0;
@@ -15795,10 +15826,18 @@ ${end.comment}` : end.comment;
       baselineFields.seasonFolder = buildSeasonFolder(baselineFields, options.inPlace ? config.templates.inPlaceSeasonFolder : config.templates.seasonFolder);
       const baseEpisodeFields = episodeFieldSnapshot(baselineFields);
       const locked = options.episodeLocks?.[String(file.id)];
+      let strategyMatch = null;
+      if (!locked && strategyResult) {
+        strategyMatch = strategyResult.assignments.get(String(file.id)) || null;
+        if (!strategyMatch && !isVideoFile(file.name)) {
+          const inheritKey = parseSeasonEpisode(file.name, 0).seasonEpisode;
+          if (inheritKey) strategyMatch = strategyResult.inherit.get(inheritKey.toUpperCase()) || null;
+        }
+      }
       const plan = options.episodePlans?.[group.id] || {};
       const planActive = [plan.targetSeason, plan.episodeStart].some((value) => String(value ?? "").trim() !== "") || Number(plan.seasonOffset || 0) !== 0 || Number(plan.episodeOffset || 0) !== 0;
       let planned = null;
-      if (!locked && planActive && fileFields.mediaType === "tv" && isVideoFile(file.name)) {
+      if (!locked && !strategyMatch && planActive && fileFields.mediaType === "tv" && isVideoFile(file.name)) {
         const parsed = parseSeasonEpisode(baseEpisodeFields.seasonEpisode || file.name, Number(baseEpisodeFields.season || fileFields.season || fields.season || 1));
         const targetSeason = String(plan.targetSeason ?? "").trim();
         const episodeStart = String(plan.episodeStart ?? "").trim();
@@ -15815,7 +15854,7 @@ ${end.comment}` : end.comment;
           confidence: "locked"
         };
       }
-      const match = locked || planned || automaticMatch;
+      const match = locked || strategyMatch || planned || automaticMatch;
       fileFields = applyEpisodeMatch(fileFields, match, Boolean(locked));
       const seasonFolder = buildSeasonFolder(fileFields, options.inPlace ? config.templates.inPlaceSeasonFolder : config.templates.seasonFolder);
       const extension = extensionOf(file.name);
@@ -15828,7 +15867,7 @@ ${end.comment}` : end.comment;
       const hasManualName = Object.prototype.hasOwnProperty.call(options.manualNames || {}, String(file.id));
       const manualName = options.manualNames?.[String(file.id)];
       const newName = hasManualName ? String(manualName) : normalizedName;
-      const folderParts = options.inPlace ? [mediaFolder, seasonFolder].filter(Boolean) : [category, mediaFolder, seasonFolder].filter(Boolean);
+      const folderParts = options.inPlace ? [collectionFolder, mediaFolder, seasonFolder].filter(Boolean) : [category, collectionFolder, mediaFolder, seasonFolder].filter(Boolean);
       tasks.push({
         ...file,
         groupId: group.id,
@@ -15839,7 +15878,7 @@ ${end.comment}` : end.comment;
         hasManualName,
         folderParts,
         targetPath: [...folderParts, newName].join("/"),
-        fields: { ...fileFields, category, mediaFolder, seasonFolder },
+        fields: { ...fileFields, category, mediaFolder, seasonFolder, collectionFolder },
         discard: shouldDiscard(file.name, config.library),
         matched: Boolean(match),
         autoMatched: Boolean(automaticMatch),
@@ -15857,7 +15896,7 @@ ${end.comment}` : end.comment;
         id: group.id,
         sourceTitle: group.title,
         media,
-        fields: { ...fields, category, mediaFolder },
+        fields: { ...fields, category, mediaFolder, collectionFolder },
         targetSeason: group.targetSeason || "",
         files: tasks,
         sourceFolders: group.sourceFolders,
@@ -15918,6 +15957,15 @@ ${end.comment}` : end.comment;
     if (changedIdentity && mediaFolderWasAuto && !hasOwn(groupOverride, "mediaFolder")) fields.mediaFolder = buildMediaFolder(fields, config.templates.mediaFolder);
     if (!fields.mediaFolder) fields.mediaFolder = buildMediaFolder(fields, config.templates.mediaFolder);
     group.fields = { ...fields };
+    const strategy = fields.mediaType === "tv" ? options.strategies?.[group.id] || (options.strategyAssignments?.[group.id]?.size ? { kind: "merge" } : null) : null;
+    const strategyResult = organizeStrategyActive(strategy) ? computeGroupStrategyAssignments(strategy, group.files, group.media, {
+      fallbackSeason: Number(fields.season || 1),
+      episodeGroupDetail: strategy.episodeGroupId ? options.episodeGroupCache?.[strategy.episodeGroupId] : null,
+      mergeAssignments: strategy.kind === "merge" ? options.strategyAssignments?.[group.id] : null
+    }) : null;
+    const collectionName = fields.mediaType === "movie" ? String(group.media?.collectionName || "").trim() : "";
+    const collectionEnabled = Boolean(collectionName) && (options.collectionByGroup?.[group.id] ?? config.library.collectionFolder === true);
+    const collectionFolder = collectionEnabled ? cleanPathPart(collectionName) : "";
     const plan = options.episodePlans?.[group.id] || {};
     const planActive = [plan.targetSeason, plan.episodeStart].some((value) => String(value ?? "").trim() !== "") || Number(plan.seasonOffset || 0) !== 0 || Number(plan.episodeOffset || 0) !== 0;
     let videoIndex = 0;
@@ -15932,8 +15980,18 @@ ${end.comment}` : end.comment;
       for (const key of EPISODE_FIELD_KEYS) delete merged[key];
       const sourceEpisode = parseSeasonEpisode(baseEpisodeFields.seasonEpisode || file.name, Number(baseEpisodeFields.season || fields.season || 1));
       const locked = options.episodeLocks?.[String(file.id)];
+      let strategyMatch = null;
+      if (!locked && strategyResult) {
+        strategyMatch = strategyResult.assignments.get(String(file.id)) || null;
+        if (!strategyMatch && !isVideoFile(file.name)) {
+          const inheritKey = parseSeasonEpisode(file.name, 0).seasonEpisode;
+          if (inheritKey) strategyMatch = strategyResult.inherit.get(inheritKey.toUpperCase()) || null;
+        }
+      }
       if (locked) {
         Object.assign(merged, applyEpisodeMatch({}, locked, true));
+      } else if (strategyMatch) {
+        Object.assign(merged, applyEpisodeMatch({}, strategyMatch, false));
       } else if (planActive && fields.mediaType === "tv" && isVideoFile(file.name)) {
         const targetSeason = String(plan.targetSeason ?? "").trim();
         const episodeStart = String(plan.episodeStart ?? "").trim();
@@ -15960,10 +16018,10 @@ ${end.comment}` : end.comment;
       });
       const hasManualName = Object.prototype.hasOwnProperty.call(options.manualNames || {}, String(file.id));
       const newName = hasManualName ? String(options.manualNames[String(file.id)]) : normalizedName;
-      const folderParts = options.inPlace ? [fields.mediaFolder, season].filter(Boolean) : [fields.category, fields.mediaFolder, season].filter(Boolean);
+      const folderParts = options.inPlace ? [collectionFolder, fields.mediaFolder, season].filter(Boolean) : [fields.category, collectionFolder, fields.mediaFolder, season].filter(Boolean);
       const next = {
         ...file,
-        fields: { ...merged, category: fields.category, mediaFolder: fields.mediaFolder, seasonFolder: season },
+        fields: { ...merged, category: fields.category, mediaFolder: fields.mediaFolder, seasonFolder: season, collectionFolder },
         seasonFolder: season,
         folderParts,
         normalizedName,
@@ -15972,7 +16030,7 @@ ${end.comment}` : end.comment;
         newName,
         targetPath: [...folderParts, newName].join("/"),
         discard: file.discard,
-        matched: Boolean(locked || !planActive && file.autoMatched),
+        matched: Boolean(locked || strategyMatch || !planActive && file.autoMatched),
         needsManualEpisode: fields.mediaType === "tv" && isVideoFile(file.name) && !merged.seasonEpisode,
         baseEpisodeFields
       };
@@ -16437,6 +16495,278 @@ ${end.comment}` : end.comment;
     const seasonYear = String(season.air_date || season.airDate || "").slice(0, 4);
     if (seasonYear && years.size && [...years].every((year) => Math.abs(Number(year) - Number(seasonYear)) > 1)) return null;
     return { from, to };
+  }
+
+  // src/core/organize-strategy.js
+  // filmix 式整理策略：默认季集 / 单季顺序拆多季 / 单季跳序拆多季 / 多季合并一季 / TMDB 剧集组。
+  // 全部为纯函数：输入文件列表（含 name/relativePath/id）+ TMDB 数据，输出 fileId → 目标季集映射。
+  var TMDB_EPISODE_GROUP_TYPES = { 1: "\u9996\u64AD\u987A\u5E8F", 2: "\u7EDD\u5BF9\u987A\u5E8F", 3: "DVD \u987A\u5E8F", 4: "\u6570\u5B57/\u6D41\u5A92\u4F53\u987A\u5E8F", 5: "\u6545\u4E8B\u7EBF", 6: "\u5236\u4F5C\u987A\u5E8F" };
+  var ORGANIZE_STRATEGY_KINDS = [
+    { kind: "default", title: "\u9ED8\u8BA4\u7B56\u7565\uFF1A\u8BC6\u522B\u5230\u7684\u5B63\u96C6", desc: "\u4F8B\uFF1A\u6309\u7167\u6587\u4EF6\u540D\u548C\u6587\u4EF6\u5939\u540D\u6B63\u5E38\u8BC6\u522B\u7684\u5B63\u96C6\u4FE1\u606F\uFF0C\u5982\u201C\u6743\u529B\u7684\u6E38\u620F.S06E05\u201D\u4E3A\u7B2C6\u5B63\u7B2C5\u96C6\u3002" },
+    { kind: "splitSequential", title: "\u62C6\u5206\u7B56\u7565\uFF1A\u5355\u5B63\u987A\u5E8F\u62C6\u591A\u5B63", desc: "\u4F8B\uFF1A\u9002\u7528\u7C7B\u4F3C\u52A8\u6F2B\u201C\u9F99\u73E0Z\u201D\uFF0C\u539F\u6587\u4EF61\u5B63\uFF0C\u5171291\u96C6\uFF0C\u6309 TMDB \u5B98\u65B9\u5404\u5B63\u96C6\u6570\u987A\u5E8F\u62C6\u5206\u4E3A\u591A\u5B63\uFF0C\u6BCF\u5B63\u4ECE\u7B2C1\u96C6\u5F00\u59CB\u91CD\u65B0\u7F16\u53F7\u3002" },
+    { kind: "splitKeep", title: "\u62C6\u5206\u7B56\u7565\uFF1A\u5355\u5B63\u8DF3\u5E8F\u62C6\u591A\u5B63", desc: "\u4F8B\uFF1A\u9002\u7528\u7C7B\u4F3C\u52A8\u6F2B\u201C\u6D77\u8D3C\u738B\u201D\uFF0C\u539F\u6587\u4EF61\u5B63\uFF0C\u51711119\u96C6\uFF08\u7EDD\u5BF9\u96C6\u6570\uFF09\uFF0C\u6309 TMDB \u5404\u5B63\u96C6\u6570\u8303\u56F4\u53EA\u6539\u5B63\u53F7\uFF0C\u4E0D\u6539\u96C6\u53F7\u3002" },
+    { kind: "merge", title: "\u5408\u5E76\u7B56\u7565\uFF1A\u591A\u5B63\u5408\u5E76\u4E00\u5B63", desc: "\u4F8B\uFF1A\u9002\u7528\u7C7B\u4F3C\u52A8\u6F2B\u201C\u540D\u4FA6\u63A2\u67EF\u5357\u201D\uFF0C\u539F\u6587\u4EF6\u6709\u591A\u5B63\uFF0C\u5408\u5E76\u4E3A\u4E00\u5B63\u540E\uFF0C\u96C6\u4FE1\u606F\u6309\u987A\u5E8F\u7D2F\u52A0\uFF1B\u5176\u4ED6\u540C\u540D\u5206\u7EC4\u7684\u6587\u4EF6\u4F1A\u4E00\u5E76\u7EB3\u5165\u8FDE\u7EED\u7F16\u53F7\u3002" },
+    { kind: "episodeGroup", title: "\u5267\u96C6\u7EC4\u7B56\u7565\uFF1A\u6309 TMDB \u5267\u96C6\u7EC4", desc: "\u8BFB\u53D6\u8BE5\u5267\u5728 TMDB \u7684\u5267\u96C6\u7EC4\uFF08DVD \u987A\u5E8F\u3001\u7EDD\u5BF9\u987A\u5E8F\u3001\u6545\u4E8B\u7EBF\u7B49\uFF09\uFF0C\u5267\u96C6\u7EC4\u7684\u5B50\u7EC4\u4F5C\u4E3A\u76EE\u6807\u5B63\uFF0C\u7EC4\u5185\u987A\u5E8F\u4F5C\u4E3A\u96C6\u53F7\u3002" }
+  ];
+  function organizeStrategyLabel(strategy) {
+    if (!strategy || !strategy.kind || strategy.kind === "default") return "\u9ED8\u8BA4\u7B56\u7565";
+    const meta = ORGANIZE_STRATEGY_KINDS.find((item) => item.kind === strategy.kind);
+    if (!meta) return "\u81EA\u5B9A\u4E49\u7B56\u7565";
+    if (strategy.kind === "episodeGroup") return `\u5267\u96C6\u7EC4\uFF1A${strategy.episodeGroupName || "\u5DF2\u9009\u62E9"}`;
+    return meta.title.split("\uFF1A").slice(1).join("\uFF1A") || meta.title;
+  }
+  function organizeStrategyActive(strategy) {
+    return Boolean(strategy && strategy.kind && strategy.kind !== "default");
+  }
+  function tmdbSeasonCapacities(media) {
+    return (Array.isArray(media?.seasons) ? media.seasons : []).map((season) => ({
+      season: Number(season.season_number ?? season.seasonNumber ?? 0),
+      count: Number(season.episode_count ?? season.episodeCount ?? 0)
+    })).filter((item) => Number.isInteger(item.season) && item.season > 0 && Number.isInteger(item.count) && item.count > 0).sort((left, right) => left.season - right.season);
+  }
+  function strategyIsSpecialFile(file) {
+    const name = String(file?.name || "");
+    if (specialContext(name).strong) return true;
+    const parsed = parseSeasonEpisode(name, 0);
+    return parsed.season === 0 && Boolean(parsed.seasonEpisode);
+  }
+  function strategyEpisodeItems(files, fallbackSeason = 1) {
+    const items = [];
+    for (const file of files || []) {
+      if (!isVideoFile(file.name) || strategyIsSpecialFile(file)) continue;
+      const parsed = parseSeasonEpisode(file.name, fallbackSeason);
+      const endEpisode = Number(parsed.endEpisode || 0);
+      const episode = Number(parsed.episode || 0);
+      items.push({
+        file,
+        parsed,
+        season: Number(parsed.season || fallbackSeason || 1),
+        episode: episode > 0 ? episode : Number.MAX_SAFE_INTEGER,
+        span: endEpisode > episode ? endEpisode - episode + 1 : 1,
+        sortName: String(file.relativePath || file.name || "")
+      });
+    }
+    return items.sort((left, right) => left.season - right.season || left.episode - right.episode || naturalCompare(left.sortName, right.sortName));
+  }
+  function strategySeasonEpisodeMatch(season, episode, endEpisode, reason, extra = {}) {
+    const spanEnd = Number(endEpisode) > Number(episode) ? Number(endEpisode) : 0;
+    return {
+      seasonNumber: season,
+      episodeNumber: episode,
+      seasonEpisode: `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}${spanEnd ? `-E${String(spanEnd).padStart(2, "0")}` : ""}`,
+      name: extra.name || "",
+      airDate: extra.airDate || "",
+      reason
+    };
+  }
+  function planSplitSequentialAssignments(items, capacities, reason) {
+    if (!capacities.length) return { assignments: /* @__PURE__ */ new Map(), warnings: ["\u672A\u8BFB\u53D6\u5230 TMDB \u5404\u5B63\u96C6\u6570\uFF0C\u65E0\u6CD5\u6309\u5B63\u62C6\u5206"] };
+    if (!items.length) return { assignments: /* @__PURE__ */ new Map(), warnings: [] };
+    const warnings = [];
+    const seasons = items.map((item) => item.season).filter((season) => season > 0);
+    const startSeason = seasons.length ? Math.min(...seasons) : 1;
+    let index = capacities.findIndex((capacity) => capacity.season >= startSeason);
+    if (index < 0) {
+      index = 0;
+      warnings.push(`TMDB \u6CA1\u6709\u7B2C ${startSeason} \u5B63\u53CA\u4E4B\u540E\u7684\u6B63\u7247\u5B63\uFF0C\u5DF2\u4ECE\u7B2C ${capacities[0].season} \u5B63\u5F00\u59CB\u62C6\u5206`);
+    }
+    let position = 0;
+    let consumed = 0;
+    let overflow = false;
+    const overflowTotal = capacities.reduce((sum, capacity) => sum + capacity.count, 0);
+    const assignments = /* @__PURE__ */ new Map();
+    for (const item of items) {
+      if (!overflow) {
+        const capacity = capacities[index];
+        if (!capacity) overflow = true;
+        else if (position > 0 && position + item.span > capacity.count) {
+          index += 1;
+          position = 0;
+          if (!capacities[index]) overflow = true;
+        } else if (position >= capacity.count) {
+          index += 1;
+          position = 0;
+          if (!capacities[index]) overflow = true;
+        }
+        if (overflow) warnings.push(`\u6587\u4EF6\u8D85\u51FA TMDB \u603B\u96C6\u6570\uFF08${overflowTotal} \u96C6\uFF09\uFF0C\u8D85\u51FA\u90E8\u5206\u5DF2\u987A\u5EF6\u5230\u6700\u540E\u4E00\u5B63`);
+      }
+      if (overflow) {
+        const last = capacities[capacities.length - 1];
+        const season = last ? last.season : Math.max(1, startSeason);
+        assignments.set(item.file.id, strategySeasonEpisodeMatch(season, consumed + 1, consumed + item.span, reason));
+      } else {
+        const capacity = capacities[index];
+        assignments.set(item.file.id, strategySeasonEpisodeMatch(capacity.season, position + 1, position + item.span, reason));
+        position += item.span;
+      }
+      consumed += item.span;
+    }
+    return { assignments, warnings };
+  }
+  function planSplitKeepAssignments(items, capacities, reason) {
+    if (!capacities.length) return { assignments: /* @__PURE__ */ new Map(), warnings: ["\u672A\u8BFB\u53D6\u5230 TMDB \u5404\u5B63\u96C6\u6570\uFF0C\u65E0\u6CD5\u6309\u5B63\u62C6\u5206"] };
+    const warnings = [];
+    const bounds = [];
+    let total = 0;
+    for (const capacity of capacities) {
+      bounds.push({ season: capacity.season, from: total + 1, to: total + capacity.count });
+      total += capacity.count;
+    }
+    const assignments = /* @__PURE__ */ new Map();
+    const seenEpisodes = /* @__PURE__ */ new Map();
+    let beyond = 0;
+    for (const item of items) {
+      const episode = item.episode === Number.MAX_SAFE_INTEGER ? 0 : item.episode;
+      if (!episode) continue;
+      seenEpisodes.set(episode, (seenEpisodes.get(episode) || 0) + 1);
+      const bound = bounds.find((item2) => episode >= item2.from && episode <= item2.to);
+      if (!bound) beyond += 1;
+      const season = bound ? bound.season : bounds[bounds.length - 1].season;
+      assignments.set(item.file.id, strategySeasonEpisodeMatch(season, episode, episode + item.span - 1, reason));
+    }
+    if (beyond) warnings.push(`${beyond} \u4E2A\u6587\u4EF6\u8D85\u51FA TMDB \u603B\u96C6\u6570\uFF08${total} \u96C6\uFF09\uFF0C\u5DF2\u4FDD\u7559\u5728\u6700\u540E\u4E00\u5B63`);
+    if ([...seenEpisodes.values()].some((count) => count > 1)) warnings.push("\u96C6\u53F7\u5B58\u5728\u91CD\u590D\uFF0C\u6587\u4EF6\u53EF\u80FD\u4E0D\u662F\u7EDD\u5BF9\u96C6\u6570\u7F16\u53F7\uFF0C\u8BF7\u6838\u5BF9\u7ED3\u679C");
+    return { assignments, warnings };
+  }
+  function planMergeAssignments(items, options = {}, reason) {
+    const warnings = [];
+    const seasons = items.map((item) => item.season).filter((season) => season > 0);
+    const baseSeason = Number(options.targetSeason) > 0 ? Math.floor(Number(options.targetSeason)) : seasons.length ? Math.max(1, Math.min(...seasons)) : 1;
+    let counter = Math.max(1, Math.floor(Number(options.episodeStart) || 1));
+    const assignments = /* @__PURE__ */ new Map();
+    for (const item of items) {
+      assignments.set(item.file.id, strategySeasonEpisodeMatch(baseSeason, counter, counter + item.span - 1, reason));
+      counter += item.span;
+    }
+    return { assignments, warnings };
+  }
+  function normalizeEpisodeGroupDetail(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const id = String(raw.id || "");
+    const rawGroups = (Array.isArray(raw.groups) ? raw.groups : []).slice().sort((left, right) => Number(left?.order ?? 0) - Number(right?.order ?? 0));
+    const groups2 = rawGroups.map((subGroup, index) => {
+      const episodes = (Array.isArray(subGroup?.episodes) ? subGroup.episodes : []).slice().sort((left, right) => Number(left?.order ?? 0) - Number(right?.order ?? 0)).map((episode, episodeIndex) => ({
+        id: `eg:${id || "group"}:${subGroup?.id || index}:${episode?.id ?? episodeIndex + 1}`,
+        order: episodeIndex + 1,
+        targetSeason: index + 1,
+        targetEpisode: episodeIndex + 1,
+        originSeasonNumber: Number(episode?.season_number ?? episode?.seasonNumber ?? 0),
+        originEpisodeNumber: Number(episode?.episode_number ?? episode?.episodeNumber ?? 0),
+        name: String(episode?.name || ""),
+        airDate: String(episode?.air_date || episode?.airDate || "")
+      }));
+      return { id: String(subGroup?.id || `sub-${index + 1}`), name: String(subGroup?.name || ""), order: index, index: index + 1, episodes };
+    });
+    return { id, name: String(raw.name || ""), type: Number(raw.type || 0), groups: groups2 };
+  }
+  function flattenEpisodeGroupTargets(detail) {
+    return (detail?.groups || []).flatMap((subGroup) => subGroup.episodes || []);
+  }
+  function episodeGroupNameKey(value) {
+    return toSimplified(String(value || "")).toLocaleLowerCase().replace(/[^a-z0-9\u3400-\u9fff]+/g, "");
+  }
+  function matchEpisodeGroupFiles(items, detail, reason, options = {}) {
+    const episodes = flattenEpisodeGroupTargets(detail);
+    if (!episodes.length) return { assignments: /* @__PURE__ */ new Map(), warnings: ["\u8BE5\u5267\u96C6\u7EC4\u6CA1\u6709\u53EF\u7528\u7684\u96C6\u6570\u636E"] };
+    const warnings = [];
+    const byOriginKey = /* @__PURE__ */ new Map();
+    const byEpisodeNumber = /* @__PURE__ */ new Map();
+    const byName = /* @__PURE__ */ new Map();
+    const byAirDate = /* @__PURE__ */ new Map();
+    const push = (map, key, value) => {
+      if (!key) return;
+      const list = map.get(key) || [];
+      list.push(value);
+      map.set(key, list);
+    };
+    for (const episode of episodes) {
+      if (episode.originSeasonNumber > 0 && episode.originEpisodeNumber > 0) push(byOriginKey, `${episode.originSeasonNumber}x${episode.originEpisodeNumber}`, episode);
+      if (episode.originEpisodeNumber > 0) push(byEpisodeNumber, episode.originEpisodeNumber, episode);
+      const nameKey = episodeGroupNameKey(episode.name);
+      if (nameKey.length >= 2) push(byName, nameKey, episode);
+      if (episode.airDate) push(byAirDate, episode.airDate, episode);
+    }
+    const assignments = /* @__PURE__ */ new Map();
+    let unmatched = 0;
+    for (const item of items) {
+      const hint = parseEpisodeHint(item.file.name, options.fallbackSeason || 1);
+      let episode = null;
+      if (hint.season > 0 && hint.episode > 0) episode = (byOriginKey.get(`${hint.season}x${hint.episode}`) || [])[0] || null;
+      if (!episode && hint.episode > 0) {
+        const candidates = byEpisodeNumber.get(hint.episode) || [];
+        if (candidates.length === 1) episode = candidates[0];
+        else if (candidates.length > 1) episode = candidates.find((candidate) => hint.season > 0 && candidate.originSeasonNumber === hint.season) || (hint.date ? candidates.find((candidate) => candidate.airDate === hint.date) : null) || candidates[0];
+      }
+      if (!episode && hint.date) {
+        const candidates = byAirDate.get(hint.date) || [];
+        if (candidates.length === 1) episode = candidates[0];
+      }
+      if (!episode) {
+        const fileKey = episodeGroupNameKey(String(item.file.name || "").replace(/\.[a-z0-9]{1,5}$/i, ""));
+        if (fileKey.length >= 4) {
+          const candidates = [...byName.entries()].filter(([nameKey]) => fileKey.includes(nameKey)).map(([, list]) => list).flat();
+          const unique = [...new Set(candidates.map((candidate) => candidate.id).map((id) => episodes.find((episode2) => episode2.id === id)))];
+          if (unique.length === 1) episode = unique[0];
+        }
+      }
+      if (episode) assignments.set(item.file.id, strategySeasonEpisodeMatch(episode.targetSeason, episode.targetEpisode, episode.targetEpisode, reason, { name: episode.name, airDate: episode.airDate }));
+      else unmatched += 1;
+    }
+    if (unmatched) warnings.push(`${unmatched} \u4E2A\u6587\u4EF6\u672A\u80FD\u5339\u914D\u5230\u5267\u96C6\u7EC4\u96C6\u6570\uFF0C\u5DF2\u4FDD\u7559\u539F\u8BC6\u522B\u7ED3\u679C`);
+    return { assignments, warnings };
+  }
+  function computeGroupStrategyAssignments(strategy, files, media, context = {}) {
+    const kind = strategy?.kind || "default";
+    if (!organizeStrategyActive({ kind })) return { assignments: /* @__PURE__ */ new Map(), inherit: /* @__PURE__ */ new Map(), warnings: [] };
+    const reason = `\u7B56\u7565\uFF1A${organizeStrategyLabel(strategy)}`;
+    const items = strategyEpisodeItems(files, context.fallbackSeason || 1);
+    let result;
+    if (kind === "splitSequential") result = planSplitSequentialAssignments(items, tmdbSeasonCapacities(media), reason);
+    else if (kind === "splitKeep") result = planSplitKeepAssignments(items, tmdbSeasonCapacities(media), reason);
+    else if (kind === "merge") result = context.mergeAssignments ? { assignments: context.mergeAssignments, warnings: [] } : planMergeAssignments(items, strategy, reason);
+    else if (kind === "episodeGroup") result = context.episodeGroupDetail ? matchEpisodeGroupFiles(items, context.episodeGroupDetail, reason, { fallbackSeason: context.fallbackSeason || 1 }) : { assignments: /* @__PURE__ */ new Map(), warnings: ["\u5267\u96C6\u7EC4\u6570\u636E\u5C1A\u672A\u52A0\u8F7D\uFF0C\u8BF7\u91CD\u65B0\u5E94\u7528\u7B56\u7565"] };
+    else result = { assignments: /* @__PURE__ */ new Map(), warnings: [] };
+    // 旁挂字幕等非视频文件跟随同季集的主文件：按「原始 SxxEyy → 策略目标」建立继承表。
+    const inherit = /* @__PURE__ */ new Map();
+    for (const item of items) {
+      const match = result.assignments.get(item.file.id);
+      if (match && item.parsed.seasonEpisode) inherit.set(item.parsed.seasonEpisode.toUpperCase(), match);
+    }
+    return { assignments: result.assignments, inherit, warnings: result.warnings || [] };
+  }
+  function prepareMergeStrategyAssignments(groups2, strategies, mergeScopes = {}) {
+    const output = {};
+    const groupList = Array.isArray(groups2) ? groups2 : [];
+    const groupById = new Map(groupList.map((item) => [item.id, item]));
+    for (const group of groupList) {
+      const strategy = strategies?.[group.id];
+      if (!organizeStrategyActive(strategy) || strategy.kind !== "merge") continue;
+      if (output[group.id]) continue;
+      const scope = Array.isArray(mergeScopes[group.id]) && mergeScopes[group.id].length ? mergeScopes[group.id] : [{ groupId: group.id, fileIds: (group.files || []).map((file) => String(file.id)) }];
+      const files = [];
+      for (const part of scope) {
+        const sourceGroup = groupById.get(part.groupId);
+        if (!sourceGroup) continue;
+        const byId = new Map((sourceGroup.files || []).map((file) => [String(file.id), file]));
+        for (const fileId of part.fileIds) {
+          const file = byId.get(String(fileId));
+          if (file) files.push(file);
+        }
+      }
+      const computed = computeGroupStrategyAssignments(strategy, files, group.media, { fallbackSeason: Number(group.fields?.season || 1) }).assignments;
+      // 合并范围里的每个分组都要拿到自己的分配表：被并入的分组本身没有策略
+      // 记录，靠 strategyAssignments 里出现自己的 groupId 走「虚拟合并策略」。
+      for (const part of scope) {
+        if (output[part.groupId]) continue;
+        const slice = /* @__PURE__ */ new Map();
+        for (const fileId of part.fileIds) {
+          const match = computed.get(String(fileId));
+          if (match) slice.set(String(fileId), match);
+        }
+        output[part.groupId] = slice;
+      }
+    }
+    return output;
   }
 
   // src/core/empty-folders.js
@@ -17510,7 +17840,7 @@ ${end.comment}` : end.comment;
     const tmdbId = mediaId(media, fields);
     const moving = group.files.filter((file) => !file.discard && !file.conflictDiscard).length;
     const cleaning = group.files.filter((file) => file.discard || file.conflictDiscard).length;
-    return `<div class="media-header"><div class="media-poster">${mediaPoster(media, type, title)}</div><div class="media-copy"><div class="media-title-line"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml([fields.year || media?.year, type === "tv" ? "\u5267\u96C6" : "\u7535\u5F71", tmdbId ? `TMDB ${tmdbId}` : "", media?.voteAverage > 0 ? `\u8BC4\u5206 ${Number(media.voteAverage).toFixed(1)}` : ""].filter(Boolean).join(" \xB7 "))}</p></div><button class="button danger compact" data-action="organize-remove-group" data-group="${escapeHtml(group.id)}">${icon("trash", 14)}\u79FB\u9664\u5206\u7EC4</button></div>${media?.overview ? `<p class="media-overview">${escapeHtml(media.overview)}</p>` : group.sourceTitle !== fields.title ? `<p class="media-overview">\u6765\u6E90\uFF1A${escapeHtml(group.sourceTitle)}</p>` : ""}<div class="chip-row"><span class="chip accent">${escapeHtml(fields.category || "\u672A\u5206\u7C7B")}</span>${media?.voteAverage > 0 ? `<span class="chip success">\u2605 ${Number(media.voteAverage).toFixed(1)}</span>` : ""}<span class="chip success">${moving} \u79FB\u52A8</span>${cleaning ? `<span class="chip danger">${cleaning} \u6E05\u7406</span>` : ""}</div></div></div>`;
+    return `<div class="media-header"><div class="media-poster">${mediaPoster(media, type, title)}</div><div class="media-copy"><div class="media-title-line"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml([fields.year || media?.year, type === "tv" ? "\u5267\u96C6" : "\u7535\u5F71", tmdbId ? `TMDB ${tmdbId}` : "", media?.voteAverage > 0 ? `\u8BC4\u5206 ${Number(media.voteAverage).toFixed(1)}` : ""].filter(Boolean).join(" \xB7 "))}</p></div><button class="button danger compact" data-action="organize-remove-group" data-group="${escapeHtml(group.id)}">${icon("trash", 14)}\u79FB\u9664\u5206\u7EC4</button></div>${media?.overview ? `<p class="media-overview">${escapeHtml(media.overview)}</p>` : group.sourceTitle !== fields.title ? `<p class="media-overview">\u6765\u6E90\uFF1A${escapeHtml(group.sourceTitle)}</p>` : ""}<div class="chip-row"><span class="chip accent">${escapeHtml(fields.category || "\u672A\u5206\u7C7B")}</span>${media?.collectionName ? `<span class="chip accent" title="TMDB \u5408\u96C6">${escapeHtml(media.collectionName)}</span>` : ""}${media?.voteAverage > 0 ? `<span class="chip success">\u2605 ${Number(media.voteAverage).toFixed(1)}</span>` : ""}<span class="chip success">${moving} \u79FB\u52A8</span>${cleaning ? `<span class="chip danger">${cleaning} \u6E05\u7406</span>` : ""}</div></div></div>`;
   }
   function lookupPanel(ui, group) {
     const type = group.fields.mediaType === "tv" ? "tv" : "movie";
@@ -17520,7 +17850,17 @@ ${end.comment}` : end.comment;
   function episodePanel(ui, group) {
     if (group.fields.mediaType !== "tv") return "";
     const plan = ui.organize.episodePlans[group.id] || {};
-    return `<section class="detail-section"><div class="section-title"><div>${icon("hash", 17)}<h4>\u5B63\u96C6\u8C03\u6574</h4></div><button class="button compact" data-action="organize-plan-reset" data-group="${escapeHtml(group.id)}">${icon("restart", 14)}\u91CD\u7F6E</button></div><div class="episode-plan"><label class="field"><span>\u76EE\u6807\u5B63</span><input data-plan-group="${escapeHtml(group.id)}" data-plan-field="targetSeason" value="${escapeHtml(plan.targetSeason || "")}" placeholder="\u81EA\u52A8"></label><label class="field"><span>\u8D77\u59CB\u96C6</span><input data-plan-group="${escapeHtml(group.id)}" data-plan-field="episodeStart" value="${escapeHtml(plan.episodeStart || "")}" placeholder="\u81EA\u52A8"></label><label class="field"><span>\u5B63\u504F\u79FB</span><input type="number" data-plan-group="${escapeHtml(group.id)}" data-plan-field="seasonOffset" value="${escapeHtml(plan.seasonOffset || "0")}"></label><label class="field"><span>\u96C6\u504F\u79FB</span><input type="number" data-plan-group="${escapeHtml(group.id)}" data-plan-field="episodeOffset" value="${escapeHtml(plan.episodeOffset || "0")}"></label></div></section>`;
+    const strategy = ui.organize.strategies?.[group.id];
+    const strategyActive = organizeStrategyActive(strategy);
+    const disabled = strategyActive ? " disabled" : "";
+    return `<section class="detail-section"><div class="section-title"><div>${icon("hash", 17)}<h4>\u5B63\u96C6\u8C03\u6574</h4>${strategyActive ? `<span class="chip accent">${escapeHtml(organizeStrategyLabel(strategy))}</span>` : ""}</div><div class="button-row"><button class="button compact" data-action="organize-strategy-open" data-group="${escapeHtml(group.id)}">${icon("wand", 14)}\u5207\u6362\u7B56\u7565</button><button class="button compact" data-action="organize-plan-reset" data-group="${escapeHtml(group.id)}">${icon("restart", 14)}\u91CD\u7F6E</button></div></div>${strategyActive ? notice(`\u6574\u7406\u7B56\u7565\u300C${escapeHtml(organizeStrategyLabel(strategy))}\u300D\u751F\u6548\u4E2D\uFF1A\u7B56\u7565\u7ED3\u679C\u4F18\u5148\u4E8E\u4E0B\u65B9\u624B\u52A8\u8BA1\u5212\uFF0C\u5355\u6587\u4EF6\u300C\u81EA\u52A8\u5B63\u96C6\u300D\u9501\u5B9A\u4ECD\u53EF\u8986\u76D6\u5355\u4E2A\u6587\u4EF6\u3002`, "", "sparkles") : ""}<div class="episode-plan"><label class="field"><span>\u76EE\u6807\u5B63</span><input data-plan-group="${escapeHtml(group.id)}" data-plan-field="targetSeason" value="${escapeHtml(plan.targetSeason || "")}" placeholder="\u81EA\u52A8"${disabled}></label><label class="field"><span>\u8D77\u59CB\u96C6</span><input data-plan-group="${escapeHtml(group.id)}" data-plan-field="episodeStart" value="${escapeHtml(plan.episodeStart || "")}" placeholder="\u81EA\u52A8"${disabled}></label><label class="field"><span>\u5B63\u504F\u79FB</span><input type="number" data-plan-group="${escapeHtml(group.id)}" data-plan-field="seasonOffset" value="${escapeHtml(plan.seasonOffset || "0")}"${disabled}></label><label class="field"><span>\u96C6\u504F\u79FB</span><input type="number" data-plan-group="${escapeHtml(group.id)}" data-plan-field="episodeOffset" value="${escapeHtml(plan.episodeOffset || "0")}"${disabled}></label></div></section>`;
+  }
+  function collectionPanel(ui, group) {
+    if (group.fields.mediaType === "tv") return "";
+    const name = String(group.media?.collectionName || "").trim();
+    if (!name) return "";
+    const enabled = ui.collectionEnabledForGroup(group);
+    return `<section class="detail-section"><div class="section-title"><div>${icon("grid", 17)}<h4>\u5408\u96C6\u5F52\u6863</h4><span class="chip">${escapeHtml(name)}</span></div><label class="check-line"><input type="checkbox" data-collection-group="${escapeHtml(group.id)}" ${enabled ? "checked" : ""}>\u6309\u5408\u96C6\u5F52\u6863</label></div><p class="section-hint">\u5F00\u542F\u540E\u76EE\u6807\u8DEF\u5F84\u4F1A\u63D2\u5165\u5408\u96C6\u5C42\u7EA7\uFF1A${escapeHtml(name)}/${escapeHtml(group.fields.mediaFolder || "\u7535\u5F71\u540D\uFF08\u5E74\u4EFD\uFF09")}\u3002</p></section>`;
   }
   function fieldsPanel(ui, group) {
     const identityKeys = ["mediaType", "category", "title", "namingTitle", "year", "tmdbId", "mediaFolder"];
@@ -17564,7 +17904,7 @@ ${end.comment}` : end.comment;
   }
   function detailPane(ui, group) {
     if (!group) return emptyState("folder", "\u6CA1\u6709\u53EF\u6574\u7406\u7684\u5A92\u4F53\u6587\u4EF6", "\u8FD4\u56DE\u6587\u4EF6\u5217\u8868\u91CD\u65B0\u9009\u62E9\u540E\u518D\u8BD5");
-    return `${detailHeader(group, ui.organize.overrides?.[group.id])}${lookupPanel(ui, group)}${episodePanel(ui, group)}${fieldsPanel(ui, group)}${filesPanel(ui, group)}`;
+    return `${detailHeader(group, ui.organize.overrides?.[group.id])}${lookupPanel(ui, group)}${episodePanel(ui, group)}${collectionPanel(ui, group)}${fieldsPanel(ui, group)}${filesPanel(ui, group)}`;
   }
   function renderOrganize(ui) {
     const preview = ui.organize.preview;
@@ -17601,6 +17941,23 @@ ${end.comment}` : end.comment;
       className: "organize-window",
       contentClass: "organize-content"
     });
+  }
+  function renderStrategyDialog(ui) {
+    const dialog = ui.organize?.strategyDialog;
+    if (!dialog) return "";
+    const group = ui.organize.preview?.groups.find((item) => item.id === dialog.groupId);
+    if (!group) return "";
+    const cards = ORGANIZE_STRATEGY_KINDS.map((meta) => `<button type="button" class="strategy-card ${dialog.pick === meta.kind ? "picked" : ""}" data-action="organize-strategy-pick" data-kind="${meta.kind}"><span class="strategy-copy"><strong>${escapeHtml(meta.title)}</strong><small>${escapeHtml(meta.desc)}</small></span><span class="strategy-check">${icon("check", 15)}</span></button>`).join("");
+    let groupList = "";
+    if (dialog.pick === "episodeGroup") {
+      const media = group.media;
+      if (!media?.id || (media.mediaType || group.fields.mediaType) !== "tv") groupList = notice("\u8BF7\u5148\u901A\u8FC7\u300C\u67E5\u8BE2\u56DE\u5199\u300D\u9009\u62E9\u4E00\u4E2A TMDB \u5267\u96C6\uFF0C\u518D\u4F7F\u7528\u5267\u96C6\u7EC4\u7B56\u7565\u3002", "warning");
+      else if (dialog.episodeGroupsLoading) groupList = `<div class="strategy-groups-loading">${icon("loading", 18, "spin")} \u6B63\u5728\u8BFB\u53D6 TMDB \u5267\u96C6\u7EC4\u2026</div>`;
+      else if (dialog.episodeGroupsError) groupList = `<div class="strategy-groups-status">${notice(dialog.episodeGroupsError, "error")}<button class="button compact" data-action="organize-strategy-reload" data-group="${escapeHtml(group.id)}">${icon("refresh", 14)}\u91CD\u8BD5</button></div>`;
+      else if (dialog.episodeGroupsList?.length) groupList = `<div class="strategy-groups"><p class="strategy-groups-title">\u9009\u62E9\u5267\u96C6\u7EC4\uFF08\u5B50\u7EC4\u5C06\u4F5C\u4E3A\u76EE\u6807\u5B63\uFF0C\u7EC4\u5185\u987A\u5E8F\u4F5C\u4E3A\u96C6\u53F7\uFF09</p>${dialog.episodeGroupsList.map((item) => `<button type="button" class="strategy-card sub ${dialog.episodeGroupId === item.id ? "picked" : ""}" data-action="organize-strategy-group-pick" data-gid="${escapeHtml(item.id)}"><span class="strategy-copy"><strong>${escapeHtml(item.name || "\u672A\u547D\u540D\u5267\u96C6\u7EC4")}</strong><small>${escapeHtml([TMDB_EPISODE_GROUP_TYPES[item.type] || (item.type ? `\u7C7B\u578B ${item.type}` : ""), item.groupCount ? `${item.groupCount} \u5B50\u7EC4` : "", item.episodeCount ? `${item.episodeCount} \u96C6` : ""].filter(Boolean).join(" \xB7 "))}</small>${item.description ? `<small class="strategy-desc">${escapeHtml(item.description)}</small>` : ""}</span><span class="strategy-check">${icon("check", 15)}</span></button>`).join("")}</div>`;
+      else groupList = `<div class="strategy-groups-loading">\u8BE5\u5267\u5728 TMDB \u6CA1\u6709\u53EF\u7528\u7684\u5267\u96C6\u7EC4</div>`;
+    }
+    return `<div class="dialog-layer" data-action="organize-strategy-cancel"><section class="mini-dialog strategy-dialog" role="dialog" aria-modal="true" aria-label="\u5207\u6362\u6574\u7406\u7B56\u7565" data-action="stop"><header><h3>\u5207\u6362\u7B56\u7565</h3><button class="icon-button" data-action="organize-strategy-cancel" aria-label="\u5173\u95ED">${icon("close", 16)}</button></header><div class="mini-dialog-body strategy-body">${cards}${groupList}</div><footer class="strategy-footer"><button class="button" data-action="organize-plan-reset" data-group="${escapeHtml(group.id)}">${icon("restart", 14)}\u9ED8\u8BA4\u7B56\u7565</button><div class="button-row"><button class="button" data-action="organize-strategy-cancel">\u53D6\u6D88</button><button class="button primary" data-action="organize-strategy-apply" data-group="${escapeHtml(group.id)}"${dialog.applying ? " disabled" : ""}>${dialog.applying ? `${icon("loading", 14, "spin")}\u5E94\u7528\u4E2D\u2026` : "\u786E\u5B9A"}</button></div></footer></section></div>`;
   }
 
   // src/ui/views/rename.js
@@ -17791,7 +18148,7 @@ ${end.comment}` : end.comment;
     const errors = validateLibraryCategories(draft.library.categories);
     const recognitionErrors = validateRecognitionWords(draft.library.recognition?.customWords || []);
     const yamlText = ui.settings.categoryYamlText ?? stringifyCategoryYaml(draft.library.categories);
-    return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("folderCog", 17)}</span><div><h3>\u5A92\u4F53\u5E93\u76EE\u6807</h3><p>\u6574\u7406\u7ED3\u679C\u4ECD\u8F93\u51FA\u4E3A \u5206\u7C7B / \u5A92\u4F53\u76EE\u5F55 / \u5B63\u76EE\u5F55\uFF0C\u4E0D\u589E\u52A0\u7535\u5F71\u6216\u7535\u89C6\u5267\u4E00\u7EA7\u76EE\u5F55\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field full"><span>\u5A92\u4F53\u5E93\u6839\u76EE\u5F55</span><div class="inline-field"><input readonly value="${escapeHtml(draft.library.rootName || "\u672A\u8BBE\u7F6E\uFF0C\u4F7F\u7528\u5F53\u524D\u76EE\u5F55")}"><button class="button" data-action="library-pick">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button></div></label><label class="field full"><span>\u8DF3\u8FC7\u6574\u7406\u7684\u6587\u4EF6\u540D\u5173\u952E\u8BCD\uFF08\u6BCF\u884C\u4E00\u4E2A\uFF09</span><textarea data-config-lines="library.excludeWords">${escapeHtml((draft.library.excludeWords || []).join("\n"))}</textarea></label><label class="field full"><span>\u6574\u7406\u65F6\u6E05\u7406\u7684\u65C1\u6302\u6269\u5C55\u540D</span><input data-config-list="library.discardSidecarExtensions" value="${escapeHtml(draft.library.discardSidecarExtensions.join(", "))}"></label></div></div></div>
+    return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("folderCog", 17)}</span><div><h3>\u5A92\u4F53\u5E93\u76EE\u6807</h3><p>\u6574\u7406\u7ED3\u679C\u4ECD\u8F93\u51FA\u4E3A \u5206\u7C7B / \u5A92\u4F53\u76EE\u5F55 / \u5B63\u76EE\u5F55\uFF0C\u4E0D\u589E\u52A0\u7535\u5F71\u6216\u7535\u89C6\u5267\u4E00\u7EA7\u76EE\u5F55\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field full"><span>\u5A92\u4F53\u5E93\u6839\u76EE\u5F55</span><div class="inline-field"><input readonly value="${escapeHtml(draft.library.rootName || "\u672A\u8BBE\u7F6E\uFF0C\u4F7F\u7528\u5F53\u524D\u76EE\u5F55")}"><button class="button" data-action="library-pick">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button></div></label><label class="field full"><span>\u8DF3\u8FC7\u6574\u7406\u7684\u6587\u4EF6\u540D\u5173\u952E\u8BCD\uFF08\u6BCF\u884C\u4E00\u4E2A\uFF09</span><textarea data-config-lines="library.excludeWords">${escapeHtml((draft.library.excludeWords || []).join("\n"))}</textarea></label><label class="field full"><span>\u6574\u7406\u65F6\u6E05\u7406\u7684\u65C1\u6302\u6269\u5C55\u540D</span><input data-config-list="library.discardSidecarExtensions" value="${escapeHtml(draft.library.discardSidecarExtensions.join(", "))}"></label><label class="check-line full"><input type="checkbox" data-config="library.collectionFolder" ${draft.library.collectionFolder ? "checked" : ""}>\u7535\u5F71\u6309 TMDB \u5408\u96C6\u5F52\u6863\uFF08\u8BC6\u522B\u5230\u5408\u96C6\u65F6\u76EE\u6807\u4E3A \u5408\u96C6\u540D/\u7535\u5F71\u540D\uFF08\u5E74\u4EFD\uFF09\uFF0C\u53EF\u5728\u6574\u7406\u7A97\u53E3\u6309\u5206\u7EC4\u8986\u76D6\uFF09</label></div></div></div>
   ${renderRecognitionEditor(ui, draft, recognitionErrors)}
   ${renderFixedMappings(ui)}
   <div class="settings-section category-editor"><div class="section-head"><span class="section-icon">${icon("folderCog", 17)}</span><div><h3>MoviePilot \u4E8C\u7EA7\u5206\u7C7B</h3><p>\u5206\u7C7B\u5185\u6761\u4EF6\u4E3A AND\uFF1B\u503C\u7528\u9017\u53F7\u8868\u793A OR\u3001! \u8868\u793A\u6392\u9664\uFF0C\u5E74\u4EFD\u652F\u6301\u8303\u56F4\uFF1B\u9996\u4E2A\u547D\u4E2D\u751F\u6548\u3002</p></div><div class="button-row"><span class="category-drag-hint">${icon("menu", 12)}\u62D6\u62FD\u6392\u5E8F</span><button class="button compact" data-action="category-yaml-toggle">${icon("list", 14)}category.yaml</button><button class="button compact" data-action="category-add">${icon("plus", 14)}\u6DFB\u52A0\u5206\u7C7B</button></div></div>
@@ -18204,6 +18561,21 @@ ${end.comment}` : end.comment;
   .candidate-card small { display:block; margin-top:3px; color:var(--muted); font-size:10px; }
   .candidate-card p { margin:5px 0 0; color:var(--muted); font-size:10px; line-height:1.4; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
   .episode-plan { display:grid; grid-template-columns:repeat(4,84px) auto; align-items:end; gap:8px; }
+  .strategy-body { max-height:min(62vh,540px); overflow:auto; }
+  .strategy-card { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; width:100%; text-align:left; padding:12px 14px; border:1px solid var(--glass-border); border-radius:var(--radius-sm); background:var(--glass-soft); cursor:pointer; transition:border-color .18s ease,background .18s ease; }
+  .strategy-card:hover { border-color:color-mix(in srgb,var(--accent) 45%,var(--glass-border)); }
+  .strategy-card.picked { border-color:var(--accent); background:var(--accent-soft); }
+  .strategy-copy { display:grid; gap:4px; min-width:0; }
+  .strategy-copy strong { font-size:13.5px; font-weight:600; color:var(--text); }
+  .strategy-copy small { color:var(--muted); line-height:1.5; }
+  .strategy-desc { opacity:.8; }
+  .strategy-check { visibility:hidden; flex:none; width:22px; height:22px; display:grid; place-items:center; border-radius:50%; background:var(--accent); color:#fff; }
+  .strategy-card.picked .strategy-check { visibility:visible; }
+  .strategy-groups { display:grid; gap:8px; }
+  .strategy-groups-title { margin:0; font-size:12px; color:var(--muted); }
+  .strategy-groups-loading { display:grid; place-items:center; gap:6px; padding:16px; color:var(--muted); }
+  .strategy-groups-status { display:grid; gap:8px; }
+  .strategy-footer { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 18px; border-top:1px solid color-mix(in srgb,var(--glass-border) 72%,transparent); }
   .organize-fields { display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:9px; }
   .organize-field-head { min-height:17px; display:flex; align-items:center; gap:5px; color:var(--muted); font-size:11px; font-weight:600; }
   .organize-field-head > span:first-child { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
@@ -19480,7 +19852,7 @@ ${end.comment}` : end.comment;
       else if (this.state.view === "settings") content = renderSettings(this);
       else if (this.state.view === "result") content = renderResult(this);
       this.root.classList.toggle("compact-rows", this.config.appearance?.compactRows !== false);
-      this.root.innerHTML = `${content}${renderInputDialog(this.state.dialog)}${renderConfirmation(this.state.confirm)}<div data-background-task-slot>${renderBackgroundTask(this)}</div>${renderToasts(this.state.toast)}`;
+      this.root.innerHTML = `${content}${renderInputDialog(this.state.dialog)}${renderConfirmation(this.state.confirm)}${renderStrategyDialog(this)}<div data-background-task-slot>${renderBackgroundTask(this)}</div>${renderToasts(this.state.toast)}`;
       if (!this.stylesAdopted && !this.fallbackStylesInjected) {
         const style = document.createElement("style");
         style.textContent = UI_STYLES;
@@ -20247,6 +20619,10 @@ ${end.comment}` : end.comment;
         overrides: this.organize.overrides,
         episodeLocks: this.organize.episodeLocks,
         episodePlans: this.organize.episodePlans,
+        strategies: this.organize.strategies,
+        episodeGroupCache: this.organize.episodeGroupCache,
+        collectionByGroup: this.organize.collectionByGroup,
+        strategyAssignments: prepareMergeStrategyAssignments(this.organize.preview?.groups || [], this.organize.strategies, this.organize.mergeScopes),
         metadataByGroup: this.organize.metadataByGroup,
         excludedGroupIds: this.organize.excludedGroupIds,
         excludedItemIds: this.organize.excludedItemIds,
@@ -20281,6 +20657,11 @@ ${end.comment}` : end.comment;
         visibleFieldsByGroup: {},
         episodeLocks: {},
         episodePlans: {},
+        strategies: {},
+        mergeScopes: {},
+        episodeGroupCache: {},
+        collectionByGroup: {},
+        strategyDialog: null,
         manualNames: {},
         previewRequestId: 0,
         excludedGroupIds: /* @__PURE__ */ new Set(),
@@ -20363,6 +20744,47 @@ ${end.comment}` : end.comment;
         text: file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields?.seasonEpisode || ""}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"),
         className: file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""
       };
+    }
+    collectionEnabledForGroup(group) {
+      if (!group || group.fields?.mediaType !== "movie") return false;
+      return this.organize.collectionByGroup?.[group.id] ?? this.config.library.collectionFolder === true;
+    }
+    captureMergeScope(group) {
+      const keyOf = (item) => {
+        const media = item?.media;
+        const mediaType = media?.mediaType || item?.fields?.mediaType;
+        if (media?.id && mediaType) return `${mediaType}:${media.id}`;
+        return `title:${toSimplified(String(item?.fields?.title || item?.sourceTitle || "")).replace(/\s+/g, "").toLocaleLowerCase()}`;
+      };
+      const siblings = (this.organize.preview?.groups || []).filter((item) => item.id !== group.id && keyOf(item) === keyOf(group));
+      this.organize.mergeScopes[group.id] = [{ groupId: group.id, fileIds: (group.files || []).map((file) => String(file.id)) }, ...siblings.map((item) => ({ groupId: item.id, fileIds: (item.files || []).map((file) => String(file.id)) }))];
+      return siblings.length;
+    }
+    async loadOrganizeEpisodeGroups() {
+      const dialog = this.organize?.strategyDialog;
+      if (!dialog || dialog.episodeGroupsLoading) return;
+      const group = this.organize.preview?.groups.find((item) => item.id === dialog.groupId);
+      const media = group?.media;
+      if (!media?.id || (media.mediaType || group?.fields?.mediaType) !== "tv") {
+        dialog.episodeGroupsError = "\u8BF7\u5148\u901A\u8FC7\u300C\u67E5\u8BE2\u56DE\u5199\u300D\u9009\u62E9\u4E00\u4E2A TMDB \u5267\u96C6";
+        this.render();
+        return;
+      }
+      dialog.episodeGroupsLoading = true;
+      dialog.episodeGroupsError = "";
+      this.render();
+      try {
+        const results = await this.tmdb.episodeGroups(media.id);
+        dialog.episodeGroupsList = Array.isArray(results) ? results : [];
+        if (!dialog.episodeGroupsList.length) dialog.episodeGroupsError = "";
+      } catch (error) {
+        dialog.episodeGroupsError = `\u8BFB\u53D6 TMDB \u5267\u96C6\u7EC4\u5931\u8D25\uFF1A${error.message}`;
+      } finally {
+        if (this.organize?.strategyDialog === dialog) {
+          dialog.episodeGroupsLoading = false;
+          this.render();
+        }
+      }
     }
     refreshOrganizeDraftDom(group) {
       if (!group || this.state.view !== "organize") return;
@@ -20555,6 +20977,11 @@ ${end.comment}` : end.comment;
       this.organize.excludedGroupIds.add(groupId);
       this.organize.preview.groups = this.organize.preview.groups.filter((group) => group.id !== groupId);
       this.organize.preview.tasks = this.organize.preview.tasks.filter((task) => task.groupId !== groupId);
+      delete this.organize.episodePlans[groupId];
+      delete this.organize.strategies[groupId];
+      delete this.organize.mergeScopes[groupId];
+      delete this.organize.collectionByGroup[groupId];
+      if (this.organize.strategyDialog?.groupId === groupId) this.organize.strategyDialog = null;
       this.organize.selectedGroupId = this.organize.preview.groups[0]?.id || "";
       this.refreshOrganizeSummary();
       this.render();
@@ -20962,6 +21389,7 @@ ${end.comment}` : end.comment;
           this.refreshOrganizeSummary();
           this.refreshOrganizeSurface();
           this.toast(matched.length ? `\u5DF2\u6821\u51C6 ${matched.length} \u4E2A\u6587\u4EF6` : candidates.length ? `\u5DF2\u8BFB\u53D6 ${candidates.length} \u4E2A TMDB \u5B63\u96C6\u5019\u9009` : "TMDB 没有可用于校准的季集数据", "warning");
+          if (matched.length && organizeStrategyActive(this.organize.strategies?.[group.id])) this.toast("\u8BE5\u5206\u7EC4\u5DF2\u5E94\u7528\u6574\u7406\u7B56\u7565\uFF1A\u672C\u6B21\u6821\u51C6\u9501\u5B9A\u4F1A\u4F18\u5148\u4E8E\u7B56\u7565\u751F\u6548", "warning");
         },
         "organize-probe-metadata": async (control) => {
           if (!this.metadata?.probe) {
@@ -21009,14 +21437,113 @@ ${end.comment}` : end.comment;
         "organize-remove-group": (control) => this.removeOrganizeGroup(control.dataset.group),
         "organize-remove-file": (control) => this.removeOrganizeFile(control.dataset.group, control.dataset.file),
         "organize-plan-reset": (control) => {
-          this.organize.selectedGroupId = control.dataset.group;
-          delete this.organize.episodePlans[control.dataset.group];
-          const group = this.organize.preview?.groups.find((item) => item.id === control.dataset.group);
+          const groupId = control.dataset.group;
+          this.organize.selectedGroupId = groupId;
+          delete this.organize.episodePlans[groupId];
+          delete this.organize.strategies[groupId];
+          delete this.organize.mergeScopes[groupId];
+          if (this.organize.strategyDialog?.groupId === groupId) this.organize.strategyDialog = null;
+          const group = this.organize.preview?.groups.find((item) => item.id === groupId);
           for (const file of group?.files || []) delete this.organize.episodeLocks[String(file.id)];
           refreshOrganizeGroupTargets(group, this.config, this.organizeBuildOptions());
           this.organize.preview.tasks = this.organize.preview.groups.flatMap((item) => item.files || []);
           this.refreshOrganizeSummary();
           this.render();
+          if (group) this.toast("\u5DF2\u6062\u590D\u9ED8\u8BA4\u5B63\u96C6\u8BC6\u522B\uFF08\u7B56\u7565\u4E0E\u624B\u52A8\u8BA1\u5212\u5DF2\u6E05\u9664\uFF09", "success");
+        },
+        "organize-strategy-open": (control) => {
+          const groupId = control.dataset.group || this.organize.selectedGroupId;
+          const group = this.organize.preview?.groups.find((item) => item.id === groupId);
+          if (!group) return;
+          if (group.fields.mediaType !== "tv") {
+            this.toast("\u6574\u7406\u7B56\u7565\u4EC5\u9002\u7528\u4E8E\u5267\u96C6\u5206\u7EC4\uFF1B\u7535\u5F71\u53EF\u5728\u300C\u5408\u96C6\u5F52\u6863\u300D\u6309\u5408\u96C6\u805A\u5408", "warning");
+            return;
+          }
+          const current = this.organize.strategies[groupId];
+          this.organize.strategyDialog = {
+            groupId,
+            pick: current?.kind || "default",
+            episodeGroupId: current?.episodeGroupId || "",
+            episodeGroupName: current?.episodeGroupName || "",
+            episodeGroupsList: null,
+            episodeGroupsLoading: false,
+            episodeGroupsError: "",
+            applying: false
+          };
+          this.render();
+        },
+        "organize-strategy-pick": (control) => {
+          const dialog = this.organize.strategyDialog;
+          if (!dialog) return;
+          dialog.pick = control.dataset.kind || "default";
+          if (dialog.pick === "episodeGroup" && !dialog.episodeGroupsList && !dialog.episodeGroupsLoading && !dialog.episodeGroupsError) void this.loadOrganizeEpisodeGroups();
+          this.render();
+        },
+        "organize-strategy-group-pick": (control) => {
+          const dialog = this.organize.strategyDialog;
+          if (!dialog) return;
+          dialog.episodeGroupId = control.dataset.gid || "";
+          dialog.episodeGroupName = dialog.episodeGroupsList?.find((item) => item.id === dialog.episodeGroupId)?.name || "";
+          this.render();
+        },
+        "organize-strategy-reload": () => {
+          void this.loadOrganizeEpisodeGroups();
+        },
+        "organize-strategy-cancel": () => {
+          if (!this.organize.strategyDialog) return;
+          this.organize.strategyDialog = null;
+          this.render();
+        },
+        "organize-strategy-apply": async (control) => {
+          const dialog = this.organize.strategyDialog;
+          if (!dialog || dialog.applying) return;
+          const groupId = dialog.groupId || control.dataset.group;
+          const group = this.organize.preview?.groups.find((item) => item.id === groupId);
+          if (!group) return;
+          const pick = dialog.pick || "default";
+          if (pick === "episodeGroup") {
+            if (!dialog.episodeGroupId) {
+              this.toast("\u8BF7\u5148\u9009\u62E9\u4E00\u4E2A TMDB \u5267\u96C6\u7EC4", "warning");
+              return;
+            }
+            if (!this.organize.episodeGroupCache[dialog.episodeGroupId]) {
+              dialog.applying = true;
+              this.render();
+              try {
+                const raw = await this.tmdb.episodeGroup(dialog.episodeGroupId);
+                this.organize.episodeGroupCache[dialog.episodeGroupId] = normalizeEpisodeGroupDetail(raw);
+              } catch (error) {
+                dialog.applying = false;
+                this.toast(`\u8BFB\u53D6\u5267\u96C6\u7EC4\u5931\u8D25\uFF1A${error.message}`, "error");
+                this.render();
+                return;
+              }
+              dialog.applying = false;
+            }
+            this.organize.strategies[groupId] = { kind: "episodeGroup", episodeGroupId: dialog.episodeGroupId, episodeGroupName: dialog.episodeGroupName };
+          } else if (pick === "merge") {
+            this.organize.strategies[groupId] = { kind: "merge" };
+          } else if (pick === "splitSequential") {
+            this.organize.strategies[groupId] = { kind: "splitSequential" };
+          } else if (pick === "splitKeep") {
+            this.organize.strategies[groupId] = { kind: "splitKeep" };
+          } else {
+            delete this.organize.strategies[groupId];
+            delete this.organize.mergeScopes[groupId];
+          }
+          const applied = this.organize.strategies[groupId];
+          let mergedGroups = 0;
+          if (applied?.kind === "merge") mergedGroups = this.captureMergeScope(group);
+          this.organize.strategyDialog = null;
+          // 策略接管本组季集：清掉旧锁定（校准/手选产物），避免静默压住策略；
+          // 之后仍可对单个文件重新「自动季集」锁定，锁定优先级高于策略。
+          for (const file of group.files || []) delete this.organize.episodeLocks[String(file.id)];
+          this.organize.selectedGroupId = groupId;
+          refreshOrganizeGroupTargets(group, this.config, this.organizeBuildOptions());
+          this.organize.preview.tasks = this.organize.preview.groups.flatMap((item) => item.files || []);
+          this.refreshOrganizeSummary();
+          this.render();
+          this.toast(applied ? `\u5DF2\u5E94\u7528${organizeStrategyLabel(applied)}${applied.kind === "merge" && mergedGroups ? `\uFF08\u5DF2\u7EB3\u5165\u540C\u540D\u5206\u7EC4 ${mergedGroups} \u4E2A\uFF09` : ""}` : "\u5DF2\u6062\u590D\u9ED8\u8BA4\u5B63\u96C6\u8BC6\u522B", "success");
         },
         "organize-prepare-mode": (control) => this.prepareOrganizeExecution(control.dataset.mode),
         "settings-tab": (control) => {
@@ -21351,6 +21878,17 @@ ${end.comment}` : end.comment;
           this.refreshOrganizeDraft(target, { defer: true });
           return;
         }
+        if (target.dataset.collectionGroup) {
+          const groupId = target.dataset.collectionGroup;
+          this.organize.collectionByGroup[groupId] = Boolean(target.checked);
+          const group = this.organize.preview?.groups.find((item) => item.id === groupId);
+          if (!group) return;
+          refreshOrganizeGroupTargets(group, this.config, this.organizeBuildOptions());
+          this.organize.preview.tasks = this.organize.preview.groups.flatMap((item) => item.files || []);
+          this.refreshOrganizeSummary();
+          this.refreshOrganizeDraftDom(group);
+          return;
+        }
         if (target.id === "fastlink-file") {
           const file = target.files?.[0];
           if (!file) return;
@@ -21602,6 +22140,11 @@ ${end.comment}` : end.comment;
     handleKeydown(event) {
       if (event.key === "Escape") {
         event.preventDefault();
+        if (this.organize?.strategyDialog) {
+          this.organize.strategyDialog = null;
+          this.render();
+          return;
+        }
         if (this.state.dialog) {
           this.state.dialog = null;
           this.render();
