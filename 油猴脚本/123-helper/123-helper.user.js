@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.1
+// @version      1.3.2
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -3486,6 +3486,9 @@
         const searchRoot = officialGroup.parentElement || officialGroup;
         const officialMore = officialToolbarControls(searchRoot, { visibleOnly: true }).find((control) => controlText(control) === "\u66F4\u591A");
         if (officialMore) {
+          // 官方「更多」提到 1002：常驻「秒传」(order 999) 与官方其他按钮(0)都排它左侧，位置保持紧邻。
+          // 每轮 syncPage 重设一次，React 重渲染清掉内联样式后下一拍自动补回。
+          officialMore.style.order = "1002";
           for (const fallback2 of document.querySelectorAll(".c123-compact-more")) fallback2.remove();
           this.ensureOfficialMoreMenu(officialGroup, items);
           return;
@@ -3503,11 +3506,20 @@
         const measuring = [...containerHost.children].find((element) => element.classList.contains("measuring-container"));
         containerHost.insertBefore(fallback, measuring || null);
       }
-      const signature = JSON.stringify(items);
+      // 「更多」切换钮样式对齐同容器普通官方按钮（如「新建/离线下载」）：不再借用官方
+      // 「.file-operator-group-button.more」变体——该变体按"分组成员"设计，独立渲染会缺边框
+      // （不是一个完整的框）。参考按钮的 class 随 items 一起进签名，官方改版换 class 时自动重建。
+      const referenceControls = officialToolbarControls(containerHost).filter((control) => controlText(control) !== "\u66F4\u591A");
+      const reference = referenceControls.find((control) => control.classList.contains("file-operator-group-button") && !isPrimaryControl(control))
+        || referenceControls.find((control) => control.tagName === "BUTTON" && !isPrimaryControl(control))
+        || null;
+      const toggleClassName = reference?.getAttribute("class") || "file-operator-group-button";
+      const signature = JSON.stringify({ items, toggleClassName });
       if (fallback.dataset.signature === signature) return;
       fallback.dataset.signature = signature;
       const toggle = document.createElement("div");
-      toggle.className = "file-operator-group-button more c123-compact-more-toggle";
+      toggle.className = `${toggleClassName} c123-compact-more-toggle`.trim();
+      if (!reference) toggle.dataset.c123Fallback = "true";
       toggle.setAttribute("role", "button");
       toggle.setAttribute("tabindex", "0");
       toggle.setAttribute("aria-haspopup", "menu");
@@ -3795,6 +3807,11 @@
     }
     .file-operator-group > .c123-helper-toolbar { display:contents; }
     .file-operator-group > .c123-helper-toolbar > [data-toolbar-direct="true"] { order:-10; }
+    /* 「秒传」常驻按钮固定到「更多」左侧（「离线下载」旁）：order 999 介于官方按钮(0)与「更多」(≥1000)之间；
+       官方「更多」可见时由 ensureCompactMore 给它内联 order:1002，秒传照样排其左侧紧邻位；
+       flex:0 0 auto 防挤压、不参与官方溢出收编（configureOfficialOverflow 不碰 helper 节点），窄屏也不被布局吞掉。 */
+    .file-operator-group > .c123-helper-toolbar > [data-toolbar-direct="true"][data-c123-pin-more="true"] { order:999; flex:0 0 auto; }
+    .home-operator-button-group > .c123-helper-toolbar { order:999; flex:0 0 auto; }
     .c123-helper-toolbar[hidden] { display:none !important; }
     .c123-helper-toolbar > [data-command][hidden] { display:none !important; }
     .c123-helper-toolbar [data-command] { white-space:nowrap; letter-spacing:0; }
@@ -3813,18 +3830,18 @@
       box-shadow:inset 0 1px 0 var(--c123-highlight),var(--c123-shadow); backdrop-filter:blur(22px) saturate(150%); -webkit-backdrop-filter:blur(22px) saturate(150%);
     }
     .c123-compact-more-menu[hidden] { display:none !important; }
-    .c123-helper-toolbar [data-c123-fallback="true"], .c123-helper-share-toolbar button[data-c123-fallback="true"] {
+    .c123-helper-toolbar [data-c123-fallback="true"], .c123-helper-share-toolbar button[data-c123-fallback="true"], .c123-compact-more-toggle[data-c123-fallback="true"] {
       box-sizing:border-box; min-height:32px; display:inline-flex; align-items:center; justify-content:center; gap:6px;
       padding:5px 11px; border:1px solid var(--c123-border); border-radius:var(--c123-radius); color:inherit; background:var(--c123-glass);
       backdrop-filter:blur(14px) saturate(150%); -webkit-backdrop-filter:blur(14px) saturate(150%);
       box-shadow:inset 0 1px 0 var(--c123-highlight),var(--c123-shadow-sm); font:inherit; cursor:pointer; white-space:nowrap;
     }
     .c123-helper-toolbar [data-c123-fallback="true"]:disabled { opacity:.45; cursor:not-allowed; }
-    .c123-helper-toolbar [data-c123-fallback="true"]:hover:not(:disabled), .c123-helper-share-toolbar button[data-c123-fallback="true"]:hover:not(:disabled) {
+    .c123-helper-toolbar [data-c123-fallback="true"]:hover:not(:disabled), .c123-helper-share-toolbar button[data-c123-fallback="true"]:hover:not(:disabled), .c123-compact-more-toggle[data-c123-fallback="true"]:hover:not(:disabled) {
       border-color:color-mix(in srgb,var(--c123-accent) 40%,var(--c123-border)); background:var(--c123-accent-soft); box-shadow:0 4px 12px -2px var(--c123-accent-glow);
     }
     .c123-helper-toolbar [data-c123-fallback="true"]:focus-visible, .c123-helper-share-toolbar button[data-c123-fallback="true"]:focus-visible,
-    .c123-compact-more-item:focus-visible { outline:2px solid var(--c123-accent); outline-offset:2px; }
+    .c123-compact-more-toggle[data-c123-fallback="true"]:focus-visible, .c123-compact-more-item:focus-visible { outline:2px solid var(--c123-accent); outline-offset:2px; }
     .c123-helper-toolbar button svg, .c123-helper-share-toolbar button svg { flex:0 0 auto; pointer-events:none; }
     .c123-helper-share-toolbar { display:inline-flex; align-items:center; gap:8px; margin-left:8px; vertical-align:middle; }
     .home-content .ant-table-tbody > tr > td:nth-child(2),
@@ -19197,10 +19214,13 @@ ${end.comment}` : end.comment;
     mountToolbar(container, context = {}) {
       this.toolbar = container;
       this.toolbarContext = context;
+      // 「秒传」与「更多」同为常驻按钮：不要求勾选、恒可点（显示/隐藏跟随工具栏本身），
+      // data-c123-pin-more 由样式固定到「更多」按钮左侧（「离线下载」旁）且不参与溢出/挤压隐藏；
+      // 无勾选时打开秒传工具箱默认落在「转存」页签（openFastlink 的空选中兜底）。
       const direct = [
         ...!context.hasOfficialRename ? [["rename", "\u91CD\u547D\u540D", true]] : [],
         ["organize", "\u6574\u7406", true],
-        ["fastlink", "\u79D2\u4F20", true],
+        ["fastlink", "\u79D2\u4F20", false, ' data-c123-pin-more="true"'],
         ["fastlinkImport", "\u8F6C\u5B58\u79D2\u4F20", true],
       ];
       const tagName = context.controlTagName === "DIV" ? "div" : "button";
@@ -19210,7 +19230,7 @@ ${end.comment}` : end.comment;
         const semantics = tagName === "div" ? ' role="button" tabindex="0"' : ' type="button"';
         return `<${tagName}${semantics}${buttonClass}${fallback} ${requiresSelection ? 'data-requires-selection="true"' : ""} ${attributes} title="${label}"><span>${label}</span></${tagName}>`;
       };
-      container.innerHTML = direct.map(([command, label, requiresSelection]) => control(command, label, requiresSelection, `data-command="${command}" data-toolbar-direct="true"`)).join("");
+      container.innerHTML = direct.map(([command, label, requiresSelection, extra = ""]) => control(command, label, requiresSelection, `data-command="${command}" data-toolbar-direct="true"${extra}`)).join("");
       for (const commandControl of container.querySelectorAll("[data-command]")) {
         commandControl.addEventListener("click", (event) => this.runToolbarCommand(event.currentTarget, event));
         commandControl.addEventListener("keydown", (event) => {
@@ -19313,7 +19333,9 @@ ${end.comment}` : end.comment;
     }
     updateToolbarState() {
       if (!this.toolbar) return;
-      this.toolbar.hidden = !this.selection.hasSelection;
+      // 工具栏里有「秒传」这类常驻按钮时，无勾选也要保持显示（与「更多」按钮的显隐条件一致）。
+      const pinnedVisible = Boolean(this.toolbar.querySelector('[data-c123-pin-more="true"]'));
+      this.toolbar.hidden = !this.selection.hasSelection && !pinnedVisible;
       this.toolbar.dataset.hasSelection = this.selection.hasSelection ? "true" : "false";
       let seedReady = false;
       if (this.selection.hasSelection && !this.selection.selectAll && this.selection.selectedIds.size === 1) {
@@ -19325,7 +19347,7 @@ ${end.comment}` : end.comment;
         if ("disabled" in button) button.disabled = !this.selection.hasSelection;
         button.setAttribute("aria-disabled", this.selection.hasSelection ? "false" : "true");
         // 没有勾选时直接把整颗按钮隐藏掉（样式 .c123-helper-toolbar > [data-command][hidden]{display:none !important}），
-        // 避免删除/清空后页面里残留置灰的「重命名/整理/秒传/转存秒传」。
+        // 避免删除/清空后页面里残留置灰的「重命名/整理/转存秒传」（「秒传」常驻，不在此列）。
         // 注意：种子按钮（fastlinkImport）由下方专属逻辑按 seedReady 进一步覆盖 hidden 状态。
         if (button !== seedButton) button.hidden = !this.selection.hasSelection;
       }
