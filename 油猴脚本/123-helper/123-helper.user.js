@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.3
+// @version      1.3.4
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -1907,6 +1907,60 @@
     if (list.some((item) => item?.field === "specialKind")) return list;
     return [...list, ...defaultSpecialKeywordMappingEntries()];
   }
+  // 内置「PT 发布组 => 标准发布组」替换词（2026-09 收录自高清剧集网对应表）：PT 站自打的
+  // 组名媒体库不认，替换成对应标准组名后，整理命名的发布组字段才能被正常识别。
+  // 组名保持纯文本写法，用户要在设置里直接阅读编辑这些行；只在版本升级补种时追加到
+  // 用户规则后面，用户删除后不会复活。
+  var BUILTIN_RELEASE_GROUP_WORDS = [
+    "GPTHD => OurTV",
+    "SeeWEB => OurTV",
+    "CTRLHD => WiKi",
+    "DreamHD => CHDWEB",
+    "BlackTV => CHDWEB",
+    "ColorTV => HHWEB",
+    "Xiaomi => HDCTV",
+    "Huawei => PTerWEB",
+    "Momoweb => PTerWEB",
+    "DDHDTV => QHStudio",
+    "Xunlei => QHStudio",
+    "NukeHD => QHStudio",
+    "TagWeb => LeagueWEB",
+    "ZeroTV => ADWeb",
+    "ZerTV => ADWeb",
+    "MiniHD => FRDS",
+    "BitsTV => cXcY@FRDS",
+    "ALT => BeiTai",
+    "BATWEB => HHWEB",
+    "ParkTV => HDSWEB",
+    "MarryTV => HHWEB",
+    "ParkHD => HDSWEB",
+    "QuickIO => ADE",
+    "DeePTV => ADWeb"
+  ];
+  function builtinReleaseGroupWordKey(line) {
+    return String(line || "").replace(/\\b/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+  function seedBuiltinReleaseGroupWords(words) {
+    const list = Array.isArray(words) ? words.map((item) => String(item || "").trim()).filter(Boolean) : [];
+    const seen = new Set(list.map(builtinReleaseGroupWordKey));
+    for (const word of BUILTIN_RELEASE_GROUP_WORDS) {
+      if (seen.has(builtinReleaseGroupWordKey(word))) continue;
+      list.push(word);
+      seen.add(builtinReleaseGroupWordKey(word));
+    }
+    return list;
+  }
+  // 1.3.4 开发版内置表曾用 \b 包组名且误收 SONYHD/LelveTV 两条存疑条目；升级时清掉带 \b
+  // 的旧内置行再按新表补种。只清命中旧内置键的行，用户自写的其他 \b 规则不受影响。
+  var LEGACY_RELEASE_GROUP_WORD_EXTRA_KEYS = ["sonyhd => adwed", "lelvetv => hhweb"];
+  function stripLegacyBuiltinReleaseGroupWords(words) {
+    if (!Array.isArray(words)) return [];
+    const legacy = new Set([...BUILTIN_RELEASE_GROUP_WORDS, ...LEGACY_RELEASE_GROUP_WORD_EXTRA_KEYS].map(builtinReleaseGroupWordKey));
+    return words.filter((line) => {
+      const text = String(line || "");
+      return !(text.includes("\\b") && legacy.has(builtinReleaseGroupWordKey(text)));
+    });
+  }
   var MAPPING_FIELDS = new Set(FIXED_MAPPING_GROUPS.map((group) => group.key));
   function splitAliases(value) {
     if (Array.isArray(value)) return value;
@@ -2106,6 +2160,11 @@
       releaseGroups: Array.isArray(recognition.releaseGroups) ? recognition.releaseGroups.map(String).map((item) => item.trim()).filter(Boolean) : ["Mo Cuishle"],
       fixedMappings: normalizeFixedMappings(recognition.fixedMappings)
     };
+    // v14：内置发布组替换词一次性补种，追加在用户已有规则后面；同时清掉早期开发版种下的
+    // 带 \b 旧内置行。已有的同义规则（忽略大小写）不重复加。
+    if (Number(stored.schemaVersion || 0) < 14) {
+      stored.library.recognition.customWords = seedBuiltinReleaseGroupWords(stripLegacyBuiltinReleaseGroupWords(stored.library.recognition.customWords));
+    }
     delete stored.library.fixedCategories;
     delete stored.library.fallbackMovieCategory;
     delete stored.library.fallbackTvCategory;
@@ -2133,7 +2192,7 @@
     config.fastlinkTools.secondaryUseJson = config.fastlinkTools.secondaryUseJson !== false;
     delete config.appearance.hideOfficialPromotions;
     applySpecialKeywordMappings(config.library.recognition.fixedMappings);
-    config.schemaVersion = 12;
+    config.schemaVersion = 14;
     delete config.metadata;
     return config;
   }
@@ -18535,7 +18594,7 @@ ${end.comment}` : end.comment;
     return `<div class="settings-section recognition-editor"><div class="section-head"><span class="section-icon">${icon("list", 17)}</span><div><h3>\u6587\u4EF6\u540D\u8BC6\u522B\u8BCD</h3><p>\u628A\u6587\u4EF6\u540D\u91CC\u201C\u4E0D\u60F3\u8981\u7684\u8BCD\u201D\u5220\u6389\uFF0C\u6216\u628A\u65E7\u5199\u6CD5\u6539\u6210\u65B0\u5199\u6CD5\u3002\u5927\u591A\u6570\u60C5\u51B5\u4E0D\u9700\u8981\u5199\u6B63\u5219\u3002</p></div></div>
       <div class="form-card recognition-card"><div class="recognition-guide"><strong>\u6700\u7B80\u5355\u7684\u8BB0\u6CD5</strong><div class="recognition-examples"><div><code>\u5E7F\u544A</code><span>\u5220\u9664\u201C\u5E7F\u544A\u201D</span></div><div><code>\u65E7\u540D\u79F0 =&gt; \u65B0\u540D\u79F0</code><span>\u628A\u65E7\u540D\u79F0\u6539\u6210\u65B0\u540D\u79F0</span></div><div><code>myTVSUPER =&gt; MyTVSuper</code><span>\u9700\u8981\u4FDD\u7559\u8FD9\u79CD\u5927\u5C0F\u5199\u65F6\u8FD9\u6837\u5199</span></div><div><code>\u4E0D\u8981\u5199\uFF1A\u65E7\u540D\u79F0 =&gt; \u65E7\u540D\u79F0</code><span>\u524D\u540E\u4E00\u6837\uFF0C\u4E0D\u4F1A\u6709\u4EFB\u4F55\u53D8\u5316</span></div></div></div>
       <div class="recognition-quick-grid"><label class="field"><span>\u5C4F\u853D\u4E00\u4E2A\u8BCD</span><input id="recognition-exclude" placeholder="\u4F8B\u5982 MyTVSuper"><small>\u6587\u4EF6\u540D\u51FA\u73B0\u5B83\u65F6\u4F1A\u88AB\u5220\u9664</small></label><button class="button compact recognition-add-button" data-action="recognition-add-exclude">\u6DFB\u52A0\u5C4F\u853D\u8BCD</button><label class="field"><span>\u628A\u65E7\u8BCD\u6539\u6210\u65B0\u8BCD</span><div class="recognition-replace"><input id="recognition-replace-from" placeholder="\u65E7\u540D\u79F0"><span>\u2192</span><input id="recognition-replace-to" placeholder="\u65B0\u540D\u79F0"></div><small>\u4F8B\u5982 MyTVSuper \u2192 MyTV</small></label><button class="button compact recognition-add-button" data-action="recognition-add-replace">\u6DFB\u52A0\u66FF\u6362\u8BCD</button></div>
-      <details class="recognition-advanced"><summary>\u9AD8\u7EA7\u89C4\u5219\uFF08\u53EF\u9009\uFF09</summary><p>\u53EA\u6709\u9700\u8981\u6B63\u5219\u3001\u96C6\u6570\u504F\u79FB\u6216\u7EC4\u5408\u64CD\u4F5C\u65F6\u624D\u4F7F\u7528\u8FD9\u91CC\u3002\u6BCF\u884C\u4E00\u6761\uFF0C\u65E7\u683C\u5F0F\u4ECD\u7136\u517C\u5BB9\u3002</p><textarea class="code-textarea" data-config-lines="library.recognition.customWords" placeholder="\u5E7F\u544A&#10;MyTVSuper => MyTV&#10;E <> . >> EP+1">${escapeHtml(rules.join("\n"))}</textarea><div class="recognition-offset-helper"><span>\u96C6\u6570\u8C03\u6574\u793A\u4F8B\uFF1A</span><code>E &lt;&gt; . &gt;&gt; EP+1</code><small>\u628A E01 \u53D8\u6210 E02</small></div></details>
+      <details class="recognition-advanced"><summary>\u9AD8\u7EA7\u89C4\u5219\uFF08\u53EF\u9009\uFF09</summary><p>\u53EA\u6709\u9700\u8981\u6B63\u5219\u3001\u96C6\u6570\u504F\u79FB\u6216\u7EC4\u5408\u64CD\u4F5C\u65F6\u624D\u4F7F\u7528\u8FD9\u91CC\u3002\u6BCF\u884C\u4E00\u6761\uFF0C\u65E7\u683C\u5F0F\u4ECD\u7136\u517C\u5BB9\u3002\u5E95\u90E8\u5DF2\u5185\u7F6E\u5E38\u7528 PT \u53D1\u5E03\u7EC4\u66FF\u6362\u8868\uFF08\u5982 <code>GPTHD =&gt; OurTV</code>\uFF09\uFF0C\u8DDF\u5728\u4F60\u7684\u89C4\u5219\u540E\u9762\uFF0C\u53EF\u7F16\u8F91\u53EF\u5220\u9664\u3002</p><textarea class="code-textarea" data-config-lines="library.recognition.customWords" placeholder="\u5E7F\u544A&#10;MyTVSuper => MyTV&#10;E <> . >> EP+1">${escapeHtml(rules.join("\n"))}</textarea><div class="recognition-offset-helper"><span>\u96C6\u6570\u8C03\u6574\u793A\u4F8B\uFF1A</span><code>E &lt;&gt; . &gt;&gt; EP+1</code><small>\u628A E01 \u53D8\u6210 E02</small></div></details>
       <div class="recognition-current"><div class="recognition-current-head"><strong>\u5F53\u524D\u89C4\u5219</strong><span>${rules.length} \u6761</span></div>${ruleList}</div>
       ${recognitionErrors.length ? `<div class="field-error category-errors">${recognitionErrors.map(escapeHtml).join("<br>")}</div>` : ""}
     </div></div>
