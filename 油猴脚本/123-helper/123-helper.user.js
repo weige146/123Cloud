@@ -20155,9 +20155,7 @@ ${end.comment}` : end.comment;
         fileCleaner: () => this.openFileCleaner(),
         cleanEmptyFolders: () => this.openCleanEmptyFolders(),
         wrapLooseFiles: () => this.openWrapLooseFiles(),
-        records: () => this.openRecords(),
         moreCommands: () => [
-          { label: "\u64CD\u4F5C\u8BB0\u5F55", command: "records" },
           { label: "\u6587\u4EF6\u5957\u540D\u6587\u4EF6\u5939", command: "wrapLooseFiles" },
           { label: "\u6587\u4EF6\u6E05\u7406", command: "fileCleaner" }
         ],
