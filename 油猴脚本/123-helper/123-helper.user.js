@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.5
-// @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
+// @version      1.3.6
+// @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类，整理与重命名操作记录按文件夹归档、错整一键还原）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
 // @match        *://*.123pan.com/*
@@ -1146,6 +1146,17 @@
         await this.request("POST", "/b/api/file/trash", {
           signal,
           body: { driveId: 0, fileTrashInfoList: group, operation: true, event: "intoRecycle", operatePlace: 1, RequestSource: null, safeBox: false }
+        });
+      }
+    }
+    // 回收站还原：与入回收站同端点，operation:false + event:"recycleRestore"。
+    // 参数形态照官方网页端 SPA 抓包：fileTrashInfoList 只带小写 fileId，还原回原父目录并恢复原名。
+    async restoreFromTrash(fileIds, signal) {
+      const ids = [...new Set(fileIds.map(Number).filter((value) => value > 0))];
+      for (const group of chunk(ids, 300)) {
+        await this.request("POST", "/b/api/file/trash", {
+          signal,
+          body: { driveId: 0, fileTrashInfoList: group.map((fileId) => ({ fileId })), operation: false, event: "recycleRestore", operatePlace: 1, RequestSource: null, safeBox: false }
         });
       }
     }
@@ -5318,6 +5329,7 @@
   // src/menu.js
   var SETTINGS_MENU_LABEL = "\u6253\u5F00 123 \u52A9\u624B\u8BBE\u7F6E";
   var PURE_PAGE_MENU_LABEL = "\u5207\u6362\u9875\u9762\u7EAF\u51C0\u7248";
+  var RECORDS_MENU_LABEL = "\u6253\u5F00 123 \u52A9\u624B\u64CD\u4F5C\u8BB0\u5F55";
   function registerSettingsMenu(ui) {
     if (typeof GM_registerMenuCommand !== "function" || !ui?.openSettings) return null;
     const settingsMenu = GM_registerMenuCommand(SETTINGS_MENU_LABEL, () => {
@@ -5327,6 +5339,13 @@
       }
       ui.openSettings("general", { source: "menu" });
     });
+    const recordsMenu = typeof ui.openRecords === "function" ? GM_registerMenuCommand(RECORDS_MENU_LABEL, () => {
+      if (ui.state?.progress) {
+        ui.toast?.("\u5F53\u524D\u4EFB\u52A1\u8FDB\u884C\u4E2D\uFF0C\u8BF7\u5B8C\u6210\u540E\u518D\u6253\u5F00\u64CD\u4F5C\u8BB0\u5F55", "warning");
+        return;
+      }
+      ui.openRecords();
+    }) : null;
     const purePageMenu = GM_registerMenuCommand(PURE_PAGE_MENU_LABEL, () => {
       const next = ui.configStore.update((config) => {
         config.appearance ||= {};
@@ -5337,7 +5356,7 @@
       ui.bridge.updateConfig(next);
       ui.toast?.(`\u9875\u9762\u7EAF\u51C0\u7248\u5DF2${next.appearance.purePageMode ? "\u5F00\u542F" : "\u5173\u95ED"}`, "success");
     });
-    return [settingsMenu, purePageMenu];
+    return [settingsMenu, recordsMenu, purePageMenu].filter(Boolean);
   }
 
   // src/share-response.js
@@ -17041,7 +17060,21 @@ ${end.comment}` : end.comment;
       status: task.failed ? "failed" : task.discarded ? "skipped" : "success",
       message: task.error || task.conflictAction || (task.discard ? "\u5DF2\u6E05\u7406\u65C1\u6302" : task.unchangedLocation ? "\u5DF2\u5728\u76EE\u6807\u76EE\u5F55" : "\u5B8C\u6210")
     }));
-    return { ...batchResult(details, [root, snapshot.currentDir]), discardedFiles: tasks.filter((task) => task.discarded).length, deletedFolders };
+    // 操作记录用的执行明细：带原始位置（parentId）与落点（targetDir），失败的行没动过文件、不入库
+    const rows = tasks.map((task) => ({
+      id: task.id,
+      groupId: task.groupId || "",
+      parentId: String(task.parentId || task.parentFileId || "0"),
+      name: task.name,
+      newName: task.newName,
+      targetDir: String(task.targetDir || ""),
+      targetPath: task.targetPath,
+      discarded: Boolean(task.discarded),
+      failed: Boolean(task.failed),
+      type: task.type,
+      size: task.size
+    }));
+    return { ...batchResult(details, [root, snapshot.currentDir]), rows, discardedFiles: tasks.filter((task) => task.discarded).length, deletedFolders };
   }
   async function previewEpisodeCalibration(tmdb, group, seasonNumbers = []) {
     const warnings = [];
@@ -17430,6 +17463,217 @@ ${end.comment}` : end.comment;
       }
     }
     return output;
+  }
+
+  // src/core/operation-records.js
+  // —— 操作记录：整理/批量重命名落库，按刮削文件夹名聚合，同名合并，供一键还原 ——
+  var OPERATION_RECORDS_KEY = "Cloud123.Helper.OperationRecords";
+  var OPERATION_RECORD_MAX = 50;
+  var OPERATION_RECORD_ROW_MAX = 3000;
+  function loadOperationRecords() {
+    const raw = checkpointStorageGet(OPERATION_RECORDS_KEY);
+    if (!raw || typeof raw !== "object" || typeof raw.records !== "object" || !raw.records) return { version: 1, records: {} };
+    return raw;
+  }
+  function saveOperationRecords(store) {
+    try {
+      checkpointStorageSet(OPERATION_RECORDS_KEY, store);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function clearOperationRecords() {
+    checkpointStorageRemove(OPERATION_RECORDS_KEY);
+  }
+  function sortedRecordNames(store) {
+    return Object.keys(store?.records || {}).sort((left, right) => naturalCompare(left, right));
+  }
+  // 记录名 = 刮削媒体文件夹名（如「剧名 (2024)」）；原地整理拿不到时退回
+  // 目标路径里除 Season 目录外最深一层，再退回来源文件夹名。
+  function operationRecordNameForTask(task) {
+    const mediaFolder = String(task?.fields?.mediaFolder || "").trim();
+    if (mediaFolder) return mediaFolder;
+    const parts = [...(task?.folderParts || [])].filter((part) => !/^Season\b/i.test(String(part)));
+    return String(parts[parts.length - 1] || "").trim() || String(task?.sourceFolderName || "").trim() || "未命名记录";
+  }
+  // 整理执行明细 → 按记录名分组的记录行。anchors: 原父目录 id →
+  // { homeId, chain }（扫描锚点与目录名链，还原时用它重建已被清空的源目录）。
+  function buildOrganizeRecordGroups(snapshot, rows, anchors = {}) {
+    const taskById = new Map(((snapshot?.tasks) || []).map((task) => [String(task.id), task]));
+    const groups = /* @__PURE__ */ new Map();
+    for (const row of rows || []) {
+      if (row.failed) continue;
+      const task = taskById.get(String(row.id)) || {};
+      const name = operationRecordNameForTask(task);
+      if (!groups.has(name)) groups.set(name, []);
+      const anchor = anchors[String(row.parentId || "0")] || null;
+      groups.get(name).push({
+        id: String(row.id),
+        kind: "organize",
+        name: String(row.name || ""),
+        newName: String(row.newName || ""),
+        parentId: String(row.parentId || "0"),
+        homeId: String(anchor?.homeId || snapshot?.currentDir || "0"),
+        homeChain: anchor ? anchor.chain : null,
+        targetDir: String(row.targetDir || ""),
+        targetPath: String(row.targetPath || ""),
+        type: Number(row.type ?? task.type ?? 0),
+        size: Number(row.size ?? task.size ?? 0),
+        discarded: Boolean(row.discarded),
+        info: {
+          seasonEpisode: String(task.fields?.seasonEpisode || ""),
+          groupTitle: String(task.sourceTitle || task.fields?.title || ""),
+          mediaType: String(task.fields?.mediaType || "")
+        }
+      });
+    }
+    return [...groups.entries()].map(([name, recordRows]) => ({ name, kind: "organize", rows: recordRows }));
+  }
+  // 批量重命名成功项 → 按所在目录名分组的记录行；dirNames: 父目录 id → 目录名
+  function buildRenameRecordGroups(succeeded, dirNames = {}) {
+    const groups = /* @__PURE__ */ new Map();
+    for (const item of succeeded || []) {
+      const parentId = String(item.parentId || item.parentFileId || "0");
+      const name = String(dirNames[parentId] || "").trim() || `目录 ${parentId}`;
+      if (!groups.has(name)) groups.set(name, []);
+      groups.get(name).push({
+        id: String(item.id),
+        kind: "rename",
+        name: String(item.name || ""),
+        newName: String(item.newName || ""),
+        parentId,
+        homeId: parentId,
+        homeChain: [],
+        targetDir: "",
+        targetPath: "",
+        type: Number(item.type ?? 0),
+        size: Number(item.size ?? 0),
+        discarded: false,
+        info: { seasonEpisode: "", groupTitle: "", mediaType: "" }
+      });
+    }
+    return [...groups.entries()].map(([name, recordRows]) => ({ name, kind: "rename", rows: recordRows }));
+  }
+  // 同名合并：记录名相同并入既有记录，行按文件 id 覆盖（新状态取代旧还原信息）
+  function mergeRecordsIntoStore(store, groups, meta = {}) {
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    store.version = 1;
+    store.records ||= {};
+    for (const group of groups || []) {
+      const existing = store.records[group.name];
+      const rowsById = new Map((existing?.rows || []).map((row) => [String(row.id), row]));
+      for (const row of group.rows) rowsById.set(String(row.id), row);
+      const rows = [...rowsById.values()].sort((left, right) => naturalCompare(left.name || "", right.name || ""));
+      const truncated = rows.length > OPERATION_RECORD_ROW_MAX;
+      store.records[group.name] = {
+        name: group.name,
+        kind: group.kind || "organize",
+        createdAt: existing?.createdAt || meta.createdAt || now,
+        updatedAt: now,
+        modeLabel: existing?.modeLabel || meta.modeLabel || "",
+        scopeLabel: existing?.scopeLabel || meta.scopeLabel || "",
+        truncated,
+        rows: truncated ? rows.slice(0, OPERATION_RECORD_ROW_MAX) : rows
+      };
+    }
+    const names = Object.keys(store.records);
+    if (names.length > OPERATION_RECORD_MAX) {
+      names.sort((left, right) => String(store.records[left].updatedAt || "").localeCompare(String(store.records[right].updatedAt || "")));
+      for (const name of names.slice(0, names.length - OPERATION_RECORD_MAX)) delete store.records[name];
+    }
+    return store;
+  }
+  // 还原前的行状态分类（对照 fileInfos 实时位置）：
+  // restore=仍处于整理后状态可还原；already=已回到原始状态；changed=被再次动过；
+  // missing=云端查不到（或已进回收站）；discarded=记录时进了回收站（若已手动
+  // 还原回原位则算 already，否则走回收站还原）
+  function entryIsTrashed(entry) {
+    return Boolean(entry && (entry.TrashedAt || entry.trashedAt || entry.trashed_at || entry.TrashedTime || entry.trashedTime || entry.TrashedExpire));
+  }
+  function classifyRecordRows(rows, liveById = /* @__PURE__ */ new Map()) {
+    return (rows || []).map((row) => {
+      const live = liveById.get(String(row.id));
+      if (row.discarded) {
+        if (live && !entryIsTrashed(live) && String(live.name || "") === String(row.name || "") && String(live.parentId || "0") === String(row.parentId || "0")) return { row, status: "already", live };
+        return { row, status: "discarded" };
+      }
+      if (!live || entryIsTrashed(live)) return { row, status: "missing" };
+      const currentName = String(live.name || "");
+      const currentParent = String(live.parentId || "0");
+      const organizedName = row.newName || row.name;
+      if (currentName === organizedName && (!row.targetDir || !live.parentId || currentParent === String(row.targetDir))) return { row, status: "restore", live };
+      if (currentName === row.name && currentParent === String(row.parentId || "0")) return { row, status: "already", live };
+      if (currentName === row.name) return { row, status: "restore", live };
+      return { row, status: "changed", live };
+    });
+  }
+  // 还原计划（纯函数）：renames=在文件当前位置改回原名（parentId 用实时值，
+  // 配合 renameTargetsSafely 的同名互换保护）；moves=按原父目录分组移回；
+  // recreates=原父目录已被清掉、需从扫描锚点按目录名链重建的分组；
+  // unrestorable=原目录没了且锚点也定位不到。
+  function planRecordRestore(rows, liveById = /* @__PURE__ */ new Map(), aliveParentIds = /* @__PURE__ */ new Set()) {
+    const renames = [];
+    const moves = /* @__PURE__ */ new Map();
+    const recreates = /* @__PURE__ */ new Map();
+    const unrestorable = [];
+    for (const row of rows || []) {
+      const live = liveById.get(String(row.id));
+      if (!live) {
+        unrestorable.push({ row, message: "云端查不到该文件" });
+        continue;
+      }
+      const currentParent = String(live.parentId || "0");
+      if (String(row.name || "") !== String(live.name || "")) renames.push({ id: String(row.id), parentId: currentParent, name: String(live.name || ""), newName: String(row.name || "") });
+      const originalParent = String(row.parentId || "0");
+      if (currentParent === originalParent) continue;
+      if (aliveParentIds.has(originalParent)) {
+        if (!moves.has(originalParent)) moves.set(originalParent, []);
+        moves.get(originalParent).push(String(row.id));
+      } else if (row.homeId && aliveParentIds.has(String(row.homeId)) && Array.isArray(row.homeChain)) {
+        const key = `${String(row.homeId)}::${(row.homeChain || []).join("/")}`;
+        if (!recreates.has(key)) recreates.set(key, { homeId: String(row.homeId), chain: row.homeChain, ids: [] });
+        recreates.get(key).ids.push(String(row.id));
+      } else unrestorable.push({ row, message: "原目录已删除，无法自动重建" });
+    }
+    return { renames, moves, recreates: [...recreates.values()], unrestorable };
+  }
+  // 落库时解析还原锚点：对每个涉及的源父目录向上走到扫描根（currentDir），
+  // 记下目录名链；还原时若原目录已被清空删除，可从锚点 ensurePath 重建。
+  // 返回 { anchors, scopeName }，scopeName = 扫描根目录名（记录副标题用）。
+  async function resolveRecordAnchors(api, snapshot, rows) {
+    const currentDir = String(snapshot?.currentDir || "0");
+    const parentIds = [...new Set((rows || []).filter((row) => !row.discarded).map((row) => String(row.parentId || "0")).filter((id) => id && id !== "0"))];
+    const cache = /* @__PURE__ */ new Map();
+    const fetchInfo = async (id) => {
+      if (!cache.has(id)) {
+        cache.set(id, null);
+        try {
+          const [entry] = await api.fileInfos([id]);
+          if (entry) cache.set(id, { name: String(entry.name || ""), parentId: String(entry.parentId || "0") });
+        } catch {}
+      }
+      return cache.get(id);
+    };
+    const anchors = {};
+    await mapLimit(parentIds, 4, async (id) => {
+      const chain = [];
+      let cursor = id;
+      for (let guard = 0; guard < 12; guard += 1) {
+        if (cursor === currentDir) {
+          anchors[id] = { homeId: currentDir, chain };
+          return;
+        }
+        const info = await fetchInfo(cursor);
+        if (!info) break;
+        chain.unshift(info.name);
+        cursor = info.parentId;
+      }
+      anchors[id] = { homeId: "", chain: null };
+    });
+    let scopeName = "";
+    if (currentDir !== "0") scopeName = (await fetchInfo(currentDir))?.name || "";
+    return { anchors, scopeName };
   }
 
   // src/core/empty-folders.js
@@ -18635,6 +18879,45 @@ ${end.comment}` : end.comment;
     return `<div class="dialog-layer" data-action="organize-strategy-cancel"><section class="mini-dialog strategy-dialog" role="dialog" aria-modal="true" aria-label="\u5207\u6362\u6574\u7406\u7B56\u7565" data-action="stop"><header><h3>\u5207\u6362\u7B56\u7565</h3><button class="icon-button" data-action="organize-strategy-cancel" aria-label="\u5173\u95ED">${icon("close", 16)}</button></header><div class="mini-dialog-body strategy-body">${cards}${groupList}</div><footer class="strategy-footer"><button class="button" data-action="organize-plan-reset" data-group="${escapeHtml(group.id)}">${icon("restart", 14)}\u9ED8\u8BA4\u7B56\u7565</button><div class="button-row"><button class="button" data-action="organize-strategy-cancel">\u53D6\u6D88</button><button class="button primary" data-action="organize-strategy-apply" data-group="${escapeHtml(group.id)}"${dialog.applying ? " disabled" : ""}>${dialog.applying ? `${icon("loading", 14, "spin")}\u5E94\u7528\u4E2D\u2026` : "\u786E\u5B9A"}</button></div></footer></section></div>`;
   }
 
+  // src/ui/views/records.js
+  function recordInfoText(row) {
+    return [row.info?.seasonEpisode || "", row.info?.groupTitle || ""].filter(Boolean).join(" \xB7 ");
+  }
+  function recordRowStatusBadge(row) {
+    if (row.discarded) return `<span class="record-status warning">\u56DE\u6536\u7AD9</span>`;
+    return `<span class="record-status">\u8BB0\u5F55\u4E2D</span>`;
+  }
+  function renderRecords(ui) {
+    const records = ui.records;
+    const store = records?.store || { records: {} };
+    const names = sortedRecordNames(store);
+    const totalRows = names.reduce((sum, name) => sum + (store.records[name].rows?.length || 0), 0);
+    const cards = names.map((name) => {
+      const record = store.records[name];
+      const expanded = records.expanded === name;
+      const checkedMap = records.checked?.[name] || {};
+      const selectedCount = (record.rows || []).filter((row) => checkedMap[String(row.id)] !== false).length;
+      const discardedCount = (record.rows || []).filter((row) => row.discarded).length;
+      const head = `<div class="record-head" data-action="records-toggle" data-name="${escapeHtml(name)}"><span class="record-caret">${icon(expanded ? "chevronDown" : "chevronRight", 15)}</span><div class="record-title"><strong>${escapeHtml(name)}</strong><small>${escapeHtml([record.kind === "rename" ? "\u6279\u91CF\u91CD\u547D\u540D" : record.modeLabel || "\u5A92\u4F53\u6574\u7406", record.scopeLabel || "", record.updatedAt ? `\u66F4\u65B0 ${String(record.updatedAt).slice(0, 16).replace("T", " ")}` : ""].filter(Boolean).join(" \xB7 "))}</small></div><span class="chip">${record.rows.length} \u9879</span>${discardedCount ? `<span class="chip warning">\u56DE\u6536\u7AD9 ${discardedCount}</span>` : ""}${record.truncated ? `<span class="chip warning">\u5DF2\u622A\u65AD</span>` : ""}</div>`;
+      if (!expanded) return `<section class="record-card">${head}</section>`;
+      const rows = (record.rows || []).map((row) => `<tr><td class="record-check-cell"><input type="checkbox" data-record-check="1" data-name="${escapeHtml(name)}" data-row="${escapeHtml(row.id)}" ${checkedMap[String(row.id)] !== false ? "checked" : ""}></td><td>${escapeHtml(row.name)}</td><td class="${row.newName && row.newName !== row.name ? "success" : "muted"}">${escapeHtml(row.newName || "\u2014")}</td><td>${escapeHtml(row.targetPath || "\u2014")}</td><td>${escapeHtml(recordInfoText(row) || "\u2014")}</td><td>${recordRowStatusBadge(row)}</td></tr>`).join("");
+      const actions = `<div class="record-actions"><button class="button compact" data-action="records-check-all" data-name="${escapeHtml(name)}" data-on="true">\u5168\u9009</button><button class="button compact" data-action="records-check-all" data-name="${escapeHtml(name)}" data-on="false">\u6E05\u9009</button><span class="spacer"></span><span class="footer-note">\u5DF2\u9009 ${selectedCount} / ${record.rows.length}</span><button class="button primary compact" data-action="records-restore" data-name="${escapeHtml(name)}">${icon("archiveRestore", 14)}\u8FD8\u539F\u6240\u9009</button><button class="icon-button danger" data-action="records-delete" data-name="${escapeHtml(name)}" title="\u5220\u9664\u8FD9\u6761\u8BB0\u5F55">${icon("trash", 15)}</button></div>`;
+      return `<section class="record-card expanded">${head}<div class="record-body"><div class="table-wrap flush"><table><thead><tr><th class="record-check-cell"></th><th>\u539F\u6587\u4EF6\u540D</th><th>\u65B0\u6587\u4EF6\u540D</th><th>\u76EE\u6807\u8DEF\u5F84</th><th>\u6821\u51C6 / \u5206\u7EC4</th><th>\u72B6\u6001</th></tr></thead><tbody>${rows}</tbody></table></div>${actions}</div></section>`;
+    }).join("");
+    const body = names.length ? `<div class="records-list">${cards}</div>` : emptyState("archiveRestore", "\u8FD8\u6CA1\u6709\u64CD\u4F5C\u8BB0\u5F55", "\u5B8C\u6210\u4E00\u6B21\u5A92\u4F53\u6574\u7406\u6216\u6279\u91CF\u91CD\u547D\u540D\u540E\u4F1A\u81EA\u52A8\u8BB0\u5728\u8FD9\u91CC");
+    const footer = `<span class="footer-note">\u8BB0\u5F55\u4FDD\u5B58\u5728\u6D4F\u89C8\u5668\u811A\u672C\u5B58\u50A8\u91CC\uFF0C\u8FD8\u539F\u6210\u529F\u7684\u884C\u81EA\u52A8\u9500\u8D26</span><div class="footer-actions"><button class="button" data-action="records-refresh">${icon("refresh", 15)}\u5237\u65B0</button><button class="button danger" data-action="records-clear" ${names.length ? "" : "disabled"}>${icon("trash", 15)}\u6E05\u7A7A\u5168\u90E8</button><button class="button" data-action="close">\u5173\u95ED</button></div>`;
+    return dialogFrame(ui, {
+      title: "\u64CD\u4F5C\u8BB0\u5F55",
+      subtitle: "\u6574\u7406\u4E0E\u6279\u91CF\u91CD\u547D\u540D\u53EF\u968F\u65F6\u8FD8\u539F",
+      iconName: "archiveRestore",
+      metrics: [metric("\u8BB0\u5F55", String(names.length), "archiveRestore"), metric("\u6587\u4EF6\u884C", String(totalRows), "list")],
+      body,
+      footer,
+      className: "records-window",
+      contentClass: "records-content"
+    });
+  }
+
   // src/ui/views/rename.js
   function ruleFields(rule) {
     const field2 = (name, label, type = "text") => `<label class="field"><span>${escapeHtml(label)}</span><input type="${type}" data-rule-id="${rule.id}" data-rule-field="${name}" value="${escapeHtml(rule[name] ?? "")}"></label>`;
@@ -18897,7 +19180,6 @@ ${end.comment}` : end.comment;
     --success:#248a3d; --success-soft:rgba(52,199,89,.15);
     --warning:#c25e00; --warning-soft:rgba(255,149,0,.16);
     --danger:#d70015; --danger-soft:rgba(255,59,48,.12);
-    --mark-soft:rgba(255,204,0,.45);
     /* 模糊 */
     --blur-sm:14px; --blur:22px; --blur-strong:32px;
     /* 透镜与光泽 */
@@ -18957,7 +19239,6 @@ ${end.comment}` : end.comment;
     --success:#30d158; --success-soft:rgba(48,209,88,.18);
     --warning:#ff9f0a; --warning-soft:rgba(255,159,10,.18);
     --danger:#ff453a; --danger-soft:rgba(255,69,58,.18);
-    --mark-soft:rgba(255,214,10,.32);
     --blur-sm:15px; --blur:24px; --blur-strong:36px;
     --glass-lens:linear-gradient(160deg,rgba(255,255,255,.16),rgba(255,255,255,.03) 46%,rgba(255,255,255,.08));
     --sheen:radial-gradient(140% 80% at 50% -14%,rgba(255,255,255,.17),rgba(255,255,255,0) 56%),linear-gradient(180deg,rgba(255,255,255,.10) 0%,rgba(255,255,255,.02) 30%,rgba(255,255,255,.02) 72%,rgba(255,255,255,.06) 100%);
@@ -19270,11 +19551,27 @@ ${end.comment}` : end.comment;
   .episode-select { min-height:30px; font-size:10px; }
   .name-field { min-width:0; }
   .name-field textarea { min-width:0; max-width:100%; min-height:68px; max-height:140px; field-sizing:content; font-size:11px; overflow-wrap:break-word; word-break:normal; }
-  /* 新文件名季集高亮：镜像层叠在 textarea 上方，文字全透明只留季集底色，盒模型/字体必须与 textarea 逐项一致 */
+  /* 新文件名季集高亮：镜像层叠在 textarea 上方，文字全透明只把季集片段描成红字，盒模型/字体必须与 textarea 逐项一致 */
   .name-stack { position:relative; display:block; min-width:0; }
   .name-mirror { position:absolute; inset:0; padding:9px 12px; border:1px solid transparent; border-radius:var(--radius-sm); font-size:11px; line-height:1.55; white-space:pre-wrap; overflow-wrap:break-word; word-break:normal; color:transparent; overflow:hidden; pointer-events:none; }
-  mark.se-token { color:inherit; background:var(--mark-soft); border-radius:3px; padding:0 1px; }
-  .name-mirror mark.se-token { color:transparent; padding:0; }
+  mark.se-token { color:var(--danger); background:none; padding:0; }
+  /* —— 操作记录 —— */
+  .chip.warning { color:var(--warning); background:var(--warning-soft); }
+  .records-content { display:flex; flex-direction:column; }
+  .records-list { display:grid; gap:10px; }
+  .record-card { border:1px solid color-mix(in srgb,var(--glass-border) 70%,transparent); border-radius:var(--radius-sm); background:var(--glass-soft); overflow:hidden; }
+  .record-head { display:flex; align-items:center; gap:10px; padding:11px 14px; cursor:pointer; user-select:none; }
+  .record-head:hover { background:var(--accent-soft); }
+  .record-caret { color:var(--muted); display:grid; place-items:center; flex:none; }
+  .record-title { display:grid; gap:2px; min-width:0; flex:1; }
+  .record-title strong { font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .record-title small { color:var(--muted); font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .record-body { border-top:1px solid color-mix(in srgb,var(--glass-border) 60%,transparent); }
+  .record-body .table-wrap { max-height:46vh; overflow:auto; }
+  .record-check-cell { width:30px; text-align:center; }
+  .record-actions { display:flex; align-items:center; gap:8px; padding:9px 12px; border-top:1px solid color-mix(in srgb,var(--glass-border) 45%,transparent); }
+  .record-status { font-size:10px; color:var(--muted); white-space:nowrap; }
+  .record-status.warning { color:var(--warning); }
   /* —— 设置 —— */
   .settings-layout { height:100%; display:grid; grid-template-columns:210px minmax(0,1fr); }
   .settings-nav { display:grid; align-content:start; gap:3px; padding:12px 10px; background:var(--glass-soft); backdrop-filter:blur(var(--blur-sm)); -webkit-backdrop-filter:blur(var(--blur-sm)); border-right:1px solid color-mix(in srgb,var(--glass-border) 72%,transparent); position:relative; z-index:1; }
@@ -19858,7 +20155,9 @@ ${end.comment}` : end.comment;
         fileCleaner: () => this.openFileCleaner(),
         cleanEmptyFolders: () => this.openCleanEmptyFolders(),
         wrapLooseFiles: () => this.openWrapLooseFiles(),
+        records: () => this.openRecords(),
         moreCommands: () => [
+          { label: "\u64CD\u4F5C\u8BB0\u5F55", command: "records" },
           { label: "\u6587\u4EF6\u5957\u540D\u6587\u4EF6\u5939", command: "wrapLooseFiles" },
           { label: "\u6587\u4EF6\u6E05\u7406", command: "fileCleaner" }
         ],
@@ -20543,6 +20842,7 @@ ${end.comment}` : end.comment;
       else if (this.state.view === "fastlink") content = renderFastlink(this);
       else if (this.state.view === "organize") content = renderOrganize(this);
       else if (this.state.view === "cleaner") content = renderCleaner(this);
+      else if (this.state.view === "records") content = renderRecords(this);
       else if (this.state.view === "settings") content = renderSettings(this);
       else if (this.state.view === "result") content = renderResult(this);
       this.root.classList.toggle("compact-rows", this.config.appearance?.compactRows !== false);
@@ -20652,6 +20952,22 @@ ${end.comment}` : end.comment;
             config.rename.history.unshift({ id: uniqueId("history"), name: "\u6279\u91CF\u91CD\u547D\u540D", createdAt: (/* @__PURE__ */ new Date()).toISOString(), targets: succeeded.map((item) => ({ id: item.id, parentId: item.parentId || item.parentFileId, name: item.name, newName: item.newName })) });
             config.rename.history = config.rename.history.slice(0, 50);
           });
+          // 同步并入操作记录（按所在目录名聚合，同名合并）；失败只提示不影响重命名结果
+          try {
+            const parentIds = [...new Set(succeeded.map((item) => String(item.parentId || item.parentFileId || "0")).filter((id) => id && id !== "0"))];
+            const dirNames = {};
+            await mapLimit(parentIds, 4, async (parentId) => {
+              try {
+                const [entry] = await this.api.fileInfos([parentId], signal);
+                if (entry) dirNames[parentId] = entry.name;
+              } catch {}
+            });
+            const store = loadOperationRecords();
+            mergeRecordsIntoStore(store, buildRenameRecordGroups(succeeded, dirNames), { modeLabel: "\u6279\u91CF\u91CD\u547D\u540D", scopeLabel: "" });
+            saveOperationRecords(store);
+          } catch (error) {
+            this.toast(`\u64CD\u4F5C\u8BB0\u5F55\u4FDD\u5B58\u5931\u8D25\uFF1A${error.message}`, "warning");
+          }
         }
         return batch;
       });
@@ -21650,6 +21966,146 @@ ${end.comment}` : end.comment;
       this.organize.pendingSnapshot = snapshot;
       return this.executeOrganize();
     }
+    openRecords() {
+      if (!this.records) this.records = { store: { version: 1, records: {} }, expanded: "", checked: {} };
+      this.records.store = loadOperationRecords();
+      if (this.records.expanded && !this.records.store.records[this.records.expanded]) this.records.expanded = "";
+      this.state.view = "records";
+      this.render();
+    }
+    async restoreOperationRecord(name) {
+      const records = this.records;
+      const record = records?.store?.records?.[name];
+      if (!record?.rows?.length) return;
+      const checkedMap = records.checked[name] || {};
+      const selected = record.rows.filter((row) => checkedMap[String(row.id)] !== false);
+      if (!selected.length) {
+        this.toast("\u8BF7\u5148\u52FE\u9009\u8981\u8FD8\u539F\u7684\u6587\u4EF6", "warning");
+        return;
+      }
+      const result2 = await this.runTask(async (signal) => {
+        const total = selected.length + 4;
+        let done = 0;
+        const tick = (message) => {
+          done += 1;
+          this.setProgress(Math.min(done, total), total, message);
+        };
+        // 1. 核对文件现状（回收站行也查：手动还原过的直接算已还原）
+        tick("\u6838\u5BF9\u6587\u4EF6\u73B0\u72B6");
+        const rowById = new Map(selected.map((row) => [String(row.id), row]));
+        const liveById = /* @__PURE__ */ new Map();
+        const liveIds = selected.map((row) => Number(row.id)).filter((value) => value > 0);
+        if (liveIds.length) (await this.api.fileInfos(liveIds, signal)).forEach((file) => liveById.set(String(file.id), file));
+        const classified = classifyRecordRows(selected, liveById);
+        const restoreRows = classified.filter((item) => item.status === "restore").map((item) => item.row);
+        const notes = new Map(classified.filter((item) => ["already", "changed", "missing"].includes(item.status)).map((item) => [String(item.row.id), item.status]));
+        // 2. 回收站行先还原（官方接口会放回原父目录并恢复原名）；单次调用失败
+        // 不中止——之后复核会按每行的真实位置判定成败
+        const discardIds = classified.filter((item) => item.status === "discarded").map((item) => String(item.row.id));
+        if (discardIds.length) {
+          tick(`\u4ECE\u56DE\u6536\u7AD9\u8FD8\u539F ${discardIds.length} \u4E2A\u6587\u4EF6`);
+          try {
+            await this.api.restoreFromTrash(discardIds, signal);
+          } catch (error) {
+            if (error?.name === "AbortError") throw error;
+          }
+        }
+        // 3. 原目录存活检查：已在回收站里的目录（fileInfos 查得到但移动接口不收）
+        // 按 TrashedAt 标记剔除，根目录恒活
+        tick("\u68C0\u67E5\u539F\u76EE\u5F55");
+        const parentCandidates = [...new Set(restoreRows.flatMap((row) => [String(row.parentId || "0"), String(row.homeId || "0")]).filter((id) => id && id !== "0"))];
+        const aliveParents = new Set(["0"]);
+        if (parentCandidates.length) (await this.api.fileInfos(parentCandidates.map(Number).filter((value) => value > 0), signal)).forEach((folder) => {
+          if (!entryIsTrashed(folder)) aliveParents.add(String(folder.id));
+        });
+        const plan = planRecordRestore(restoreRows, liveById, aliveParents);
+        // 4. 先改回名（当前位置，同名互换保护），再移回原目录。
+        //    移动逐组容错：目录被拒（如同时被清进回收站）时改走锚点重建，
+        //    单组失败只记该行，不炸掉整批还原。
+        if (plan.renames.length) {
+          tick(`\u8FD8\u539F\u6587\u4EF6\u540D ${plan.renames.length} \u4E2A`);
+          await this.renameTargetsSafely(plan.renames, signal, "\u8FD8\u539F\u6587\u4EF6\u540D");
+        }
+        const pathCache = /* @__PURE__ */ new Map();
+        const anchorDirs = /* @__PURE__ */ new Map();
+        const rowDirs = /* @__PURE__ */ new Map();
+        const rowFailures = /* @__PURE__ */ new Map();
+        const ensureAnchorDir = async (homeId, chain) => {
+          const key = `${String(homeId)}::${(chain || []).join("/")}`;
+          if (anchorDirs.has(key)) return anchorDirs.get(key);
+          const dirId = String(await this.api.ensurePath(homeId, chain, pathCache, signal));
+          anchorDirs.set(key, dirId);
+          return dirId;
+        };
+        const moveRowsHome = async (ids, parentId) => {
+          if (!ids.length) return;
+          await this.api.move(ids, parentId, signal);
+          for (const id of ids) rowDirs.set(String(id), String(parentId));
+        };
+        const rebuildAndMove = async (ids, homeId, chain, failureMessage) => {
+          try {
+            const dirId = await ensureAnchorDir(homeId, chain);
+            await moveRowsHome(ids, dirId);
+          } catch (error) {
+            if (error?.name === "AbortError") throw error;
+            for (const id of ids) rowFailures.set(String(id), `${failureMessage}\uFF1A${error.message}`);
+          }
+        };
+        for (const [parentId, ids] of plan.moves) {
+          tick("\u79FB\u56DE\u539F\u76EE\u5F55");
+          try {
+            await moveRowsHome(ids, parentId);
+          } catch (error) {
+            if (error?.name === "AbortError") throw error;
+            for (const id of ids) {
+              const row = rowById.get(String(id));
+              if (row?.homeId && Array.isArray(row.homeChain) && aliveParents.has(String(row.homeId))) await rebuildAndMove([String(id)], row.homeId, row.homeChain, "\u79FB\u56DE\u539F\u76EE\u5F55\u5931\u8D25");
+              else rowFailures.set(String(id), `\u79FB\u56DE\u539F\u76EE\u5F55\u5931\u8D25\uFF1A${error.message}`);
+            }
+          }
+        }
+        for (const group of plan.recreates) {
+          tick("\u91CD\u5EFA\u539F\u76EE\u5F55");
+          await rebuildAndMove(group.ids, group.homeId, group.chain, "\u539F\u76EE\u5F55\u5DF2\u5220\u9664\u4E14\u65E0\u6CD5\u91CD\u5EFA");
+        }
+        // 5. 复核销账：成功行从记录移除，记录空了整条删除
+        tick("\u590D\u6838\u8FD8\u539F\u7ED3\u679C");
+        const verifyIds = selected.map((row) => Number(row.id)).filter((value) => value > 0);
+        const afterById = /* @__PURE__ */ new Map();
+        if (verifyIds.length) (await this.api.fileInfos(verifyIds, signal)).forEach((file) => afterById.set(String(file.id), file));
+        const settledIds = /* @__PURE__ */ new Set();
+        const details = selected.map((row) => {
+          const id = String(row.id);
+          const failure = rowFailures.get(id);
+          if (failure) return { id, name: row.name, status: "failed", message: failure };
+          const note = notes.get(id);
+          if (note === "already") return { id, name: row.name, status: "skipped", message: "\u5DF2\u5904\u4E8E\u8FD8\u539F\u540E\u72B6\u6001" };
+          if (note === "changed") return { id, name: row.name, status: "skipped", message: "\u6587\u4EF6\u5DF2\u88AB\u518D\u6B21\u6539\u540D\u6216\u79FB\u52A8\uFF0C\u672A\u81EA\u52A8\u8FD8\u539F" };
+          if (note === "missing") return { id, name: row.name, status: "failed", message: row.discarded ? "\u56DE\u6536\u7AD9\u8FD8\u539F\u540E\u672A\u627E\u5230\uFF0C\u8BF7\u5230\u5B98\u7F51\u56DE\u6536\u7AD9\u786E\u8BA4" : "\u4E91\u7AEF\u67E5\u4E0D\u5230\u8BE5\u6587\u4EF6" };
+          const live = afterById.get(id);
+          if (!live || entryIsTrashed(live)) return { id, name: row.name, status: "failed", message: row.discarded ? "\u56DE\u6536\u7AD9\u8FD8\u539F\u540E\u672A\u627E\u5230\uFF0C\u8BF7\u5230\u5B98\u7F51\u56DE\u6536\u7AD9\u786E\u8BA4" : "\u4E91\u7AEF\u67E5\u4E0D\u5230\u8BE5\u6587\u4EF6" };
+          const backHome = String(live.parentId || "0") === String(row.parentId || "0") || String(live.parentId || "0") === String(rowDirs.get(id) || "");
+          if (String(live.name || "") === String(row.name || "") && backHome) {
+            settledIds.add(id);
+            return { id, name: row.name, status: "success", message: row.discarded ? "\u5DF2\u4ECE\u56DE\u6536\u7AD9\u8FD8\u539F" : "\u5DF2\u8FD8\u539F" };
+          }
+          return { id, name: row.name, status: "failed", message: `\u8FD8\u539F\u672A\u5B8C\u6210\uFF08\u5F53\u524D\uFF1A${live.name || "\u672A\u77E5"}\uFF09` };
+        });
+        const store = loadOperationRecords();
+        const nextRecord = store.records?.[name];
+        if (nextRecord) {
+          nextRecord.rows = nextRecord.rows.filter((row) => !settledIds.has(String(row.id)));
+          if (!nextRecord.rows.length) delete store.records[name];
+          saveOperationRecords(store);
+        }
+        records.store = store;
+        return { ...batchResult(details, []), settled: settledIds.size };
+      });
+      this.bridge.refresh?.();
+      if (this.records) this.records.expanded = this.records.store?.records?.[name] ? name : "";
+      this.render();
+      this.setResult(`\u8FD8\u539F\u300C${name}\u300D\u7ED3\u679C`, result2);
+    }
     async executeOrganize() {
       const snapshot = this.organize.pendingSnapshot;
       if (!snapshot) throw new Error("\u6574\u7406\u5FEB\u7167\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u786E\u8BA4");
@@ -21659,7 +22115,20 @@ ${end.comment}` : end.comment;
         await nextPaint();
         this.setProgress(0, snapshot.tasks.length, "\u6267\u884C\u6574\u7406");
         await nextPaint();
-        return executeOrganizePreview(this.api, snapshot, this.config, { signal, onProgress: (done, total, message) => this.setProgress(done, total, message) });
+        const outcome = await executeOrganizePreview(this.api, snapshot, this.config, { signal, onProgress: (done, total, message) => this.setProgress(done, total, message) });
+        // 落操作记录（按刮削文件夹名聚合、同名合并）；记录失败只提示，不影响整理结果
+        if (Array.isArray(outcome.rows) && outcome.rows.length) {
+          try {
+            const { anchors, scopeName } = await resolveRecordAnchors(this.api, snapshot, outcome.rows);
+            const groups = buildOrganizeRecordGroups(snapshot, outcome.rows, anchors);
+            const store = loadOperationRecords();
+            mergeRecordsIntoStore(store, groups, { modeLabel: snapshot.mode.location === "inPlace" ? "\u539F\u5730\u6574\u7406" : "\u6574\u7406\u5165\u5A92\u4F53\u5E93", scopeLabel: scopeName });
+            saveOperationRecords(store);
+          } catch (error) {
+            this.toast(`\u64CD\u4F5C\u8BB0\u5F55\u4FDD\u5B58\u5931\u8D25\uFF1A${error.message}`, "warning");
+          }
+        }
+        return outcome;
       });
       this.organize.pendingSnapshot = null;
       this.bridge.refresh();
@@ -21898,6 +22367,61 @@ ${end.comment}` : end.comment;
         },
         "rename-execute": () => this.executeRename(),
         "rename-undo": () => this.undoRename(),
+        "records-toggle": (control) => {
+          const name = control.dataset.name;
+          if (!this.records || !name) return;
+          this.records.expanded = this.records.expanded === name ? "" : name;
+          this.render();
+        },
+        "records-check-all": (control) => {
+          const name = control.dataset.name;
+          const record = this.records?.store?.records?.[name];
+          if (!record) return;
+          const map = this.records.checked[name] ||= {};
+          const on = control.dataset.on === "true";
+          for (const row of record.rows) map[String(row.id)] = on;
+          this.render();
+        },
+        "records-restore": (control) => this.restoreOperationRecord(control.dataset.name),
+        "records-delete": (control) => {
+          const name = control.dataset.name;
+          if (!name) return;
+          this.state.confirm = {
+            title: "\u5220\u9664\u8BB0\u5F55",
+            message: `\u786E\u5B9A\u5220\u9664\u300C${name}\u300D\u7684\u8BB0\u5F55\u5417\uFF1F\u5220\u9664\u540E\u8FD9\u6279\u6587\u4EF6\u5C31\u4E0D\u80FD\u518D\u4E00\u952E\u8FD8\u539F\u4E86\u3002`,
+            acceptLabel: "\u5220\u9664",
+            tone: "danger",
+            onAccept: () => {
+              const store = this.records?.store || loadOperationRecords();
+              if (store.records) delete store.records[name];
+              saveOperationRecords(store);
+              if (this.records) {
+                this.records.store = store;
+                if (this.records.expanded === name) this.records.expanded = "";
+              }
+              this.render();
+            }
+          };
+          this.render();
+        },
+        "records-clear": () => {
+          this.state.confirm = {
+            title: "\u6E05\u7A7A\u64CD\u4F5C\u8BB0\u5F55",
+            message: "\u6E05\u7A7A\u540E\u6240\u6709\u6574\u7406\u4E0E\u91CD\u547D\u540D\u8BB0\u5F55\u90FD\u4F1A\u4E22\u5931\uFF0C\u65E0\u6CD5\u518D\u4E00\u952E\u8FD8\u539F\u3002",
+            acceptLabel: "\u6E05\u7A7A",
+            tone: "danger",
+            onAccept: () => {
+              clearOperationRecords();
+              if (this.records) {
+                this.records.store = { version: 1, records: {} };
+                this.records.expanded = "";
+              }
+              this.render();
+            }
+          };
+          this.render();
+        },
+        "records-refresh": () => this.openRecords(),
         "share-copy": async () => {
           await copyText(this.share.results.map(shareCopyText).filter(Boolean).join("\n\n"));
           this.toast("\u5206\u4EAB\u94FE\u63A5\u5DF2\u590D\u5236", "success");
@@ -22822,6 +23346,14 @@ ${end.comment}` : end.comment;
       if (target.dataset.ruleId && target.tagName === "INPUT" && target.type !== "checkbox") {
         if (event.isComposing) return;
         this.scheduleRenamePreview(target);
+        return;
+      }
+      if (target.dataset.recordCheck) {
+        const name = target.dataset.name;
+        if (this.records?.checked && name) {
+          const map = this.records.checked[name] ||= {};
+          map[String(target.dataset.row)] = target.checked;
+        }
         return;
       }
       if (target.dataset.organizeName) {
