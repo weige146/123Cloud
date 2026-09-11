@@ -198,7 +198,7 @@
           await sleep(Math.min(cooldownLeft, 1e3));
           continue;
         }
-        const gap = this.lastStart + this.interval + Math.floor(Math.random() * 120) - now;
+        const gap = this.lastStart + this.interval + Math.floor(Math.random() * Math.max(1, this.jitterMs)) - now;
         if (gap > 0) {
           await sleep(gap);
           continue;
@@ -853,11 +853,14 @@
     async request(method, path, { query = {}, body, signal, attempts = this.retryAttempts, backoffCap = 6e3, signed = true, auth = true, appVersion = this.appVersion, timeoutMs = this.requestTimeout, credentialsMode = "include", host = "", isRetryable = null } = {}) {
       const { token, loginUuid } = auth ? this.credentials() : { token: "", loginUuid: "" };
       if (auth && (!token || !loginUuid)) throw new Error("\u8BF7\u5148\u767B\u5F55 123 \u4E91\u76D8\u5E76\u6253\u5F00\u6587\u4EF6\u5217\u8868\u9875");
-      const finalQuery = signed ? { ...query, ...signedQuery(path, Date.now(), void 0, appVersion) } : query;
       let lastError;
       for (let attempt = 0; attempt < attempts; attempt += 1) {
         if (signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
         if (attempt > 0) await sleep(Math.min(backoffCap, 800 * 1.7 ** (attempt - 1)));
+        // 签名含分钟级时间戳，必须每轮重试、且在退避 sleep 之后（紧贴 fetch）重新计算：
+        // 长退避链（如分享列表 8 次×12s 上限）跨分钟后旧签名会被服务端拒绝，
+        // 且签名类错误不在可重试文案里，会直接终局失败。
+        const finalQuery = signed ? { ...query, ...signedQuery(path, Date.now(), void 0, appVersion) } : query;
         const requestController = new AbortController();
         let timedOut = false;
         const abortRequest = () => requestController.abort(signal?.reason);
@@ -1059,13 +1062,17 @@
         const found = new Set(files2.map((file) => Number(file.id)));
         const lost = batch.filter((id) => !found.has(id));
         console.warn(`[123助手] /file/info 返回 ${files2.length}/${batch.length}，自动补查 ${lost.length} 个缺失 ID`);
-        for (const id of lost) {
+        // 补查通常只有几个 ID，4 并发足够（/file/info 走通用退避，不会撞 15 QPS 频控）；
+        // 单个补查失败只告警跳过，与原串行行为一致。
+        const refilled = await mapLimit(lost, 4, async (id) => {
           try {
-            output.push(...await this.fileInfoBatch([id], signal));
+            return await this.fileInfoBatch([id], signal);
           } catch (error) {
             console.warn(`[123助手] 补查文件信息失败：${id}`, error?.message || error);
+            return [];
           }
-        }
+        }, { signal });
+        for (const extra of refilled) output.push(...extra);
       }
       return output;
     }
@@ -1966,10 +1973,16 @@
     if (Array.isArray(value)) return value;
     return String(value || "").split(/[,，|]/);
   }
+  // 归一化结果按输入数组引用缓存（WeakMap）：整理预览每个文件的每个技术字段都会
+  // 走 findFixedMapping → normalizeFixedMappings，此前每次都整表重建 100+ 条映射。
+  // 配置数组在两次预览之间是同一引用；设置草稿走 structuredClone，UI 编辑不会污染缓存。
+  var NORMALIZED_FIXED_MAPPINGS_CACHE = new WeakMap();
   function normalizeFixedMappings(value) {
     const source = value === void 0 ? DEFAULT_FIXED_MAPPINGS : value;
     if (!Array.isArray(source)) return [];
-    return source.map((item, index) => {
+    const cached = NORMALIZED_FIXED_MAPPINGS_CACHE.get(source);
+    if (cached) return cached;
+    const normalized = source.map((item, index) => {
       const field2 = String(item?.field || "").trim();
       const aliases = splitAliases(item?.aliases ?? item?.match ?? item?.from).map((alias) => String(alias || "").trim()).filter(Boolean);
       const output = String(item?.output ?? item?.value ?? item?.to ?? "").trim();
@@ -1980,10 +1993,21 @@
         output
       };
     }).filter((item) => item.aliases.length && item.output);
+    NORMALIZED_FIXED_MAPPINGS_CACHE.set(source, normalized);
+    return normalized;
   }
+  // 别名 → 编译好的匹配正则。整理预览里每个文件 × 每个字段 × 每个别名都会查一次，
+  // 编译结果必须缓存（正则为非全局 i 标志，.test 不受 lastIndex 影响，可安全共享）。
+  var MAPPING_PATTERN_CACHE = new Map();
   function mappingPattern(alias) {
-    const escaped = String(alias || "").trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "[ ._-]*");
-    return escaped ? new RegExp(`(?:^|[^A-Za-z0-9])${escaped}(?=$|[^A-Za-z0-9])`, "i") : null;
+    const raw = String(alias || "").trim();
+    if (!raw) return null;
+    if (MAPPING_PATTERN_CACHE.has(raw)) return MAPPING_PATTERN_CACHE.get(raw);
+    const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "[ ._-]*");
+    const pattern = escaped ? new RegExp(`(?:^|[^A-Za-z0-9])${escaped}(?=$|[^A-Za-z0-9])`, "i") : null;
+    if (MAPPING_PATTERN_CACHE.size > 4096) MAPPING_PATTERN_CACHE.clear();
+    MAPPING_PATTERN_CACHE.set(raw, pattern);
+    return pattern;
   }
   function findFixedMapping(value, field2, mappings = DEFAULT_FIXED_MAPPINGS) {
     const text2 = String(value || "");
@@ -2031,7 +2055,7 @@
     },
     requests: { writeConcurrency: 10, retryAttempts: 6, moveInterval: 120, moveBatchSize: 100 },
     organize: { setupCompleted: false },
-    tmdb: { credential: "", language: "zh-CN", region: "CN" },
+    tmdb: { credential: "", language: "zh-CN", region: "CN", apiBase: "" },
     library: {
       rootId: "",
       rootName: "",
@@ -2191,6 +2215,11 @@
     if (!config.fastlinkTools.seedFolderId) config.fastlinkTools.seedFolderName = "";
     config.fastlinkTools.secondaryUseJson = config.fastlinkTools.secondaryUseJson !== false;
     delete config.appearance.hideOfficialPromotions;
+    // TMDB 替代源：非空即保存；没写协议头自动按 https 处理（如 api.tmdb.org），去尾部斜杠与内部空白
+    const tmdbApiBaseRaw = String(config.tmdb?.apiBase ?? "").replace(/\s+/g, "");
+    if (tmdbApiBaseRaw) {
+      config.tmdb.apiBase = (/^https?:\/\//i.test(tmdbApiBaseRaw) ? tmdbApiBaseRaw : `https://${tmdbApiBaseRaw}`).replace(/\/+$/, "");
+    } else config.tmdb.apiBase = "";
     applySpecialKeywordMappings(config.library.recognition.fixedMappings);
     config.schemaVersion = 14;
     delete config.metadata;
@@ -3013,6 +3042,10 @@
     if (checkbox && checkboxChecked(checkbox)) return true;
     return row.classList.contains("ant-table-row-selected") || row.getAttribute("aria-selected") === "true" || row.getAttribute("data-selected") === "true";
   }
+  // 兜底的全文扫描结果做 400ms 缓存：页面没有该文案时，TreeWalker 会在每次
+  // syncPage（90ms 防抖）都遍历整个 body 的文本节点，大列表页面是持续 CPU 消耗。
+  // 工具栏/表头两条快速路径不缓存，正常页面的选中数变化仍然实时。
+  var HOST_COUNT_SCAN_CACHE = { value: null, at: 0 };
   function readHostSelectedCount() {
     // React can leave an old toolbar in the DOM while replacing the visible one.
     // Only the visible host represents the current selection state.
@@ -3028,14 +3061,22 @@
       if (match) return Number(match[1]);
     }
     // 官方 UI 改版后工具栏/表头类名可能对不上，最后按全文扫描"已选择 N 项"文本兜底。
+    const scannedAt = Date.now();
+    if (scannedAt - HOST_COUNT_SCAN_CACHE.at < 400) return HOST_COUNT_SCAN_CACHE.value;
     const scanner = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    let found = null;
     for (let node = scanner.nextNode(); node; node = scanner.nextNode()) {
       const parent = node.parentElement;
       if (!parent || parent.closest("[data-cloud123-helper]")) continue;
       const match = String(node.textContent || "").match(/(?:已选择|已选)\s*(\d+)\s*项/);
-      if (match && visibleElement(parent)) return Number(match[1]);
+      if (match && visibleElement(parent)) {
+        found = Number(match[1]);
+        break;
+      }
     }
-    return null;
+    HOST_COUNT_SCAN_CACHE.value = found;
+    HOST_COUNT_SCAN_CACHE.at = scannedAt;
+    return found;
   }
   // 跨页/翻页选中修正（参考 123FastRename 的事件累积语义）。123 的文件表格一页只渲染
   // 几十行，离开当前页（或被虚拟滚动回收）的行不在 DOM 里——绝不能因为"行不在可见区"
@@ -4038,6 +4079,21 @@
     settings() {
       return this.settingsProvider?.() || {};
     }
+    // API 基地址：配置了替代源（第三方反代/镜像）就用它，否则官方 api.themoviedb.org。
+    // 没写协议头自动按 https 处理；反代一般保留官方 /3 路径结构，只填了域名（无路径）
+    // 时自动补 /3；带了自定义路径则原样使用。
+    apiBase() {
+      let custom = String(this.settings().apiBase || "").replace(/\s+/g, "");
+      if (!custom) return API_BASE;
+      if (!/^https?:\/\//i.test(custom)) custom = `https://${custom}`;
+      custom = custom.replace(/\/+$/, "");
+      try {
+        const parsed = new URL(custom);
+        if (parsed.pathname === "" || parsed.pathname === "/") return `${custom}/3`;
+      } catch {
+      }
+      return custom;
+    }
     auth() {
       const credential = String(this.settings().credential || "").trim();
       if (!credential) throw new Error("\u8BF7\u5148\u5728 123 \u52A9\u624B\u8BBE\u7F6E\u4E2D\u914D\u7F6E TMDB API Key \u6216 Read Access Token");
@@ -4046,7 +4102,7 @@
     async request(path, params = {}) {
       const settings = this.settings();
       const auth = this.auth();
-      const url = new URL(`${API_BASE}${path}`);
+      const url = new URL(`${this.apiBase()}${path}`);
       const query = { language: settings.language || "zh-CN", ...params };
       if (settings.region && !query.region) query.region = settings.region;
       if (auth.apiKey) query.api_key = auth.apiKey;
@@ -6774,6 +6830,10 @@
           : { root, type: "file", entry: freshFastlinkFileEntry(item, String(item?.name || ""), cleanFastlinkPath(String(item?.name || "")), root) };
       });
     }
+    // 陈旧记录清理只服务断点续扫（进入时已收过文件，重扫中断目录前先剔除旧记录）；
+    // 全新扫描里目录只会被扫一次，过滤反而让每个目录都对全部已收文件做一次前缀
+    // 扫描，大导出（十万级）是平方级开销。以恢复后的 files 是否非空为准。
+    const resumedScan = files.length > 0;
     const persist = (force = false) => {
       if (!checkpoint?.state) return;
       checkpoint.state.files = allFiles;
@@ -6802,15 +6862,17 @@
       }
       try {
         await mapLimit(level, concurrency, async (entry) => {
-          // 上次中断在这个目录时可能已收了一部分文件，重扫前先剔除本目录前缀下的旧记录
           const ownPrefix = `${entry.prefix}${entry.name}`;
-          const stale = files.filter((file) => file.path === ownPrefix || file.path.startsWith(`${ownPrefix}/`));
-          if (stale.length) {
-            const removed = new Set(stale);
-            for (const file of stale) seenIds.delete(String(file.id || ""));
-            allFiles = allFiles.filter((file) => !removed.has(file));
-            files = files.filter((file) => !removed.has(file));
-            if (checkpoint?.state) checkpoint.state.files = allFiles;
+          // 上次中断在这个目录时可能已收了一部分文件，重扫前先剔除本目录前缀下的旧记录
+          if (resumedScan) {
+            const stale = files.filter((file) => file.path === ownPrefix || file.path.startsWith(`${ownPrefix}/`));
+            if (stale.length) {
+              const removed = new Set(stale);
+              for (const file of stale) seenIds.delete(String(file.id || ""));
+              allFiles = allFiles.filter((file) => !removed.has(file));
+              files = files.filter((file) => !removed.has(file));
+              if (checkpoint?.state) checkpoint.state.files = allFiles;
+            }
           }
           const children = await api.listAll(entry.id, { signal: options.signal });
           // 先收文件再排下一层目录（收集子项是同步的，中断只可能发生在 listAll 期间；
@@ -6891,6 +6953,9 @@
     } else {
       frontier = [{ id: String(options.parentId || "0"), path: "" }];
     }
+    // 同 collectFastlinkFiles：陈旧记录清理只服务断点续扫（进入时 output 已有文件），
+    // 全新扫描不做每目录全量前缀过滤。
+    const resumedScan = output.length > 0;
     const persist = (force = false) => {
       if (!checkpoint?.state) return;
       checkpoint.state.files = allFiles;
@@ -6921,7 +6986,7 @@
       try {
         await mapLimit(level, concurrency, async (entry) => {
           // 上次中断在这个目录时可能已收了一部分文件，重扫前先剔除本目录前缀下的旧记录
-          if (entry.path) {
+          if (resumedScan && entry.path) {
             const stale = output.filter((file) => file.path === entry.path || file.path.startsWith(`${entry.path}/`));
             if (stale.length) {
               const removed = new Set(stale);
@@ -14007,8 +14072,20 @@ ${end.comment}` : end.comment;
     if (/^\d+$/.test(raw)) return String(output).padStart(raw.length, "0");
     return String(output);
   }
+  // 识别词正则编译缓存：prepareRecognitionText 每个文件 × 每条识别词都会走这里。
+  // 调用方要么只验证编译、要么用完即重置 lastIndex（replaceRegex 的 test 后显式置 0、
+  // replace 结束自动归零），共享同一 RegExp 实例是安全的。
+  var RECOGNITION_REGEX_CACHE = new Map();
   function regex(value, flags = "g") {
-    return new RegExp(String(value || ""), flags);
+    const source = String(value || "");
+    const key = `${flags}\u0000${source}`;
+    let pattern = RECOGNITION_REGEX_CACHE.get(key);
+    if (!pattern) {
+      pattern = new RegExp(source, flags);
+      if (RECOGNITION_REGEX_CACHE.size > 1024) RECOGNITION_REGEX_CACHE.clear();
+      RECOGNITION_REGEX_CACHE.set(key, pattern);
+    }
+    return pattern;
   }
   function replaceRegex(text2, pattern, replacement) {
     const matcher = regex(pattern);
@@ -14410,7 +14487,10 @@ ${end.comment}` : end.comment;
   // 音频编码提取白名单是硬编码闸门：新编码（如当年的 AV3A）不在其中就提不出来，
   // 设置里配的别名也无效。这里把「音频编码」组的用户别名并入提取与截断正则，
   // 以后新编码在设置里加一条别名即可生效，不用再改代码。
+  var AUDIO_ALIAS_TOKENS_CACHE = new WeakMap();
   function audioAliasTokens(mappings) {
+    const source = mappings === void 0 ? DEFAULT_FIXED_MAPPINGS : mappings;
+    if (Array.isArray(source) && AUDIO_ALIAS_TOKENS_CACHE.has(source)) return AUDIO_ALIAS_TOKENS_CACHE.get(source);
     const tokens = new Set();
     for (const item of normalizeFixedMappings(mappings)) {
       if (item.field !== "audioCodec") continue;
@@ -14418,7 +14498,9 @@ ${end.comment}` : end.comment;
         if (/^[A-Za-z0-9][A-Za-z0-9+.-]*$/.test(alias)) tokens.add(alias);
       }
     }
-    return [...tokens];
+    const list = [...tokens];
+    if (Array.isArray(source)) AUDIO_ALIAS_TOKENS_CACHE.set(source, list);
+    return list;
   }
   function audioAliasTokenSource(mappings) {
     return audioAliasTokens(mappings).map((token) => `${escapeAudioToken(token)}(?:[.\\s-]?\\d\\.\\d)?`).join("|");
@@ -14426,12 +14508,47 @@ ${end.comment}` : end.comment;
   function audioAliasWordSource(mappings) {
     return audioAliasTokens(mappings).map(escapeAudioToken).join("|");
   }
+  var AUDIO_MATCH_REGEX_CACHE = new WeakMap();
   function buildAudioMatchRegex(mappings) {
-    const aliasSource = audioAliasTokenSource(mappings);
-    return new RegExp(`(\\b(?:${DEFAULT_AUDIO_TOKEN_SOURCE})\\b${aliasSource ? `|\\b(?:${aliasSource})(?![A-Za-z0-9])` : ""})`, "i");
+    const source = mappings === void 0 ? DEFAULT_FIXED_MAPPINGS : mappings;
+    if (Array.isArray(source) && AUDIO_MATCH_REGEX_CACHE.has(source)) return AUDIO_MATCH_REGEX_CACHE.get(source);
+    const aliasSource = audioAliasTokenSource(source);
+    const pattern = new RegExp(`(\\b(?:${DEFAULT_AUDIO_TOKEN_SOURCE})\\b${aliasSource ? `|\\b(?:${aliasSource})(?![A-Za-z0-9])` : ""})`, "i");
+    if (Array.isArray(source)) AUDIO_MATCH_REGEX_CACHE.set(source, pattern);
+    return pattern;
   }
   var CHINESE_NUMBER_PATTERN = "0-9\u96F6\u3007\u4E00\u4E8C\u4E24\u5169\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D\u5341\u767E\u5343\u4E07\u842C\u58F9\u8D30\u8CB3\u53C1\u53C3\u8086\u4F0D\u9646\u9678\u67D2\u634C\u7396\u62FE\u4F70\u4EDF\u5EFF\u5345\u534C";
   var CHINESE_SEASON_PATTERN = `(?:\u7B2C\\s*)?[${CHINESE_NUMBER_PATTERN}]+\\s*\u5B63`;
+  // 整理识别热路径的共享正则：原先在函数体内每次 new RegExp（模式串拼接 + 编译），
+  // 而识别阶段每个文件要调用十几到几十次。均为一次性 match/replace/test 或 matchAll
+  //（matchAll 内部会克隆正则），不依赖 lastIndex 跨调用状态，可安全共享。
+  var CN_EPISODE_UNIT = "[\u671F\u96C6\u8BDD\u8A71]";
+  var CN_EPISODE_RE = new RegExp(`\u7B2C\\s*([${CHINESE_NUMBER_PATTERN}]+)\\s*${CN_EPISODE_UNIT}`);
+  var CN_EPISODE_RANGE_RE = new RegExp(`\u7B2C\\s*([${CHINESE_NUMBER_PATTERN}]+)\\s*(?:${CN_EPISODE_UNIT})?\\s*[-~\u5230\u81F3]\\s*(?:\u7B2C\\s*)?([${CHINESE_NUMBER_PATTERN}]+)\\s*${CN_EPISODE_UNIT}`);
+  var CN_SEASON_EPISODE_PAIR_RE = new RegExp(`(?:\u7B2C\\s*)?([${CHINESE_NUMBER_PATTERN}]+)\\s*\u5B63[^\\d\\u3400-\\u9fffA-Za-z]{0,8}\u7B2C\\s*([${CHINESE_NUMBER_PATTERN}]+)\\s*${CN_EPISODE_UNIT}`);
+  var NAMED_SEASON_RE = new RegExp(`(?:\u7B2C\\s*)?([${CHINESE_NUMBER_PATTERN}]+)\\s*\u5B63`);
+  var STRIP_PART_MARKERS_RE = new RegExp(`(?:^|[\\s._·-])(?:(?:Part|Pt)[ ._-]*\\d+|\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*\u90E8\u5206)(?=$|[\\s._·-])`, "gi");
+  var SEASON_MARKERS_RE = new RegExp(`\u7B2C\\s*([${CHINESE_NUMBER_PATTERN}]+)\\s*\u5B63|\\bS(\\d{1,3})`, "gi");
+  var BRACKET_SEASON_TAIL_RE = new RegExp(`^(.*?\\s+(?:${CHINESE_SEASON_PATTERN}|Season\\s*\\d+)).*$`, "i");
+  var BRACKET_EPISODE_TAIL_RE = new RegExp(`\\s+\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*${CN_EPISODE_UNIT}.*$`);
+  var INFER_TITLE_TAIL_RE = new RegExp(`(?:${CHINESE_SEASON_PATTERN}|\u7B2C\\s*\\d+\\s*[\u671F\u96C6]|\\d{4}[.\\-]\\d{1,2}[.\\-]\\d{1,2}|\\d{8}|EP?\\s*\\d+|Part\\s*\\d+)\\s*$`, "gi");
+  var EPISODE_HINT_DATE_RE = new RegExp("(?<!\\d)((?:19|20)\\d{2})[.\\-_\u5E74](\\d{1,2})[.\\-_\u6708](\\d{1,2})(?:\u65E5)?(?!\\d)");
+  var EPISODE_HINT_COMPACT_DATE_RE = new RegExp("(?<!\\d)((?:19|20)\\d{2})(\\d{2})(\\d{2})(?!\\d)");
+  var EPISODE_HINT_FRACTION_RE = new RegExp("(?<!\\d)(\\d{1,4})[._-](\\d)(?!\\d)");
+  var LOOSE_DATE_DASHED_RE = new RegExp("(?<!\\d)(?:19|20)\\d{2}[.\\-_/\u5E74][01]?\\d[.\\-_/\u6708][0-3]?\\d\u65E5?(?!\\d)", "g");
+  var LOOSE_DATE_COMPACT_RE = new RegExp("(?<!\\d)(?:19|20)\\d{2}[01]\\d[0-3]\\d(?!\\d)", "g");
+  var CN_SEASON_UNIT_TAIL_RE = new RegExp(`\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*[\u5B63\u671F\u96C6\u8BDD\u8A71]`, "g");
+  var INFER_TITLE_TOKEN_RE_CACHE = new Map();
+  function inferTitleTokenRegex(aliasSource) {
+    const key = aliasSource || "";
+    let pattern = INFER_TITLE_TOKEN_RE_CACHE.get(key);
+    if (!pattern) {
+      pattern = new RegExp(`\\b(?:S\\d{1,3}(?:E\\d{1,5})?|Season\\s*\\d+|EP?\\d{1,5}|Complete|4320p|2160p|1440p|1080p|720p|WEB[- ]?DL|WEBRip|Blu[- ]?Ray|REMUX|HDTV|H[ .]?26[45]|HEVC|AVC|DDP?|AAC|FLAC|AV3A|HDR10\\+?|DoVi|DV${key ? `|${key}` : ""})\\b|${CHINESE_SEASON_PATTERN}`, "i");
+      if (INFER_TITLE_TOKEN_RE_CACHE.size > 64) INFER_TITLE_TOKEN_RE_CACHE.clear();
+      INFER_TITLE_TOKEN_RE_CACHE.set(key, pattern);
+    }
+    return pattern;
+  }
   var VARIETY_TITLE_SUFFIX = /(?:\s+|[._·-]+)(?:加更(?:篇|版)?|独家加更|超前(?:营业|聚会|企划)|(?:舞台|歌曲|完整)?纯享(?:典藏版)?|舞台全记录|突袭休息室|会员(?:彩蛋|版|加长|专享)|直播(?:回放)?|番外(?:篇|微综)?|幕后(?:纪录|特辑)?|花絮|先导(?:片|篇)?|预告|片花)(?=$|[\s._·-])/i;
   function trimVarietyTitleSuffix(value) {
     const title = String(value || "").replace(/\s+/g, " ").trim().replace(/^[-· ]+|[-· ]+$/g, "");
@@ -14441,16 +14558,16 @@ ${end.comment}` : end.comment;
   // 「第1部分」「part1」这类分段标记只用于区分同内容分段，不应留在标题里；
   // 多分段文件同名冲突时由变体机制（Part01/上中下）负责区分。
   function stripPartMarkers(value) {
-    return String(value || "").replace(new RegExp(`(?:^|[\\s._·-])(?:(?:Part|Pt)[ ._-]*\\d+|\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*\u90E8\u5206)(?=$|[\\s._·-])`, "gi"), " ");
+    return String(value || "").replace(STRIP_PART_MARKERS_RE, " ");
   }
   function normalizeBracketTitle(value) {
     let title = toSimplified(String(value || "")).normalize("NFKC").trim();
     title = title.replace(/^\s*(?:19|20)\d{2}(?:[年./_-]\d{1,2}(?:[月./_-]\d{1,2}(?:日)?)?)?\s*/, "");
     const embeddedYear = title.match(YEAR);
     if (embeddedYear?.index >= 2) title = title.slice(0, embeddedYear.index);
-    const season = title.match(new RegExp(`^(.*?\\s+(?:${CHINESE_SEASON_PATTERN}|Season\\s*\\d+)).*$`, "i"));
+    const season = title.match(BRACKET_SEASON_TAIL_RE);
     if (season) title = season[1];
-    title = title.replace(new RegExp(`\\s+\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*[\u671F\u96C6\u8BDD\u8A71].*$`), "");
+    title = title.replace(BRACKET_EPISODE_TAIL_RE, "");
     title = title.replace(/\s+S\d{1,3}(?:E\d{1,5})?.*$/i, "").replace(/\s+\d{4}$/, "");
     title = stripPartMarkers(title);
     return trimVarietyTitleSuffix(title);
@@ -14463,7 +14580,7 @@ ${end.comment}` : end.comment;
     const text2 = String(value || "").normalize("NFKC");
     const explicit = text2.match(/(?:^|[^A-Za-z0-9])S(\d{1,3})(?=(?:E\d+)?(?:$|[^A-Za-z0-9]))/i) || text2.match(/\bSeason\s*(\d{1,3})\b/i);
     if (explicit) return Number(explicit[1]);
-    const named = text2.match(new RegExp(`(?:\u7B2C\\s*)?([${CHINESE_NUMBER_PATTERN}]+)\\s*\u5B63`));
+    const named = text2.match(NAMED_SEASON_RE);
     return named ? chineseInteger2(named[1]) : null;
   }
   function inferTitle(value, mappings) {
@@ -14475,13 +14592,13 @@ ${end.comment}` : end.comment;
     const year = stem.match(YEAR);
     if (year?.index >= 2) stem = stem.slice(0, year.index);
     const aliasSource = audioAliasWordSource(mappings);
-    const token = stem.match(new RegExp(`\\b(?:S\\d{1,3}(?:E\\d{1,5})?|Season\\s*\\d+|EP?\\d{1,5}|Complete|4320p|2160p|1440p|1080p|720p|WEB[- ]?DL|WEBRip|Blu[- ]?Ray|REMUX|HDTV|H[ .]?26[45]|HEVC|AVC|DDP?|AAC|FLAC|AV3A|HDR10\\+?|DoVi|DV${aliasSource ? `|${aliasSource}` : ""})\\b|${CHINESE_SEASON_PATTERN}`, "i"));
+    const token = stem.match(inferTitleTokenRegex(aliasSource));
     if (token?.index >= 2) stem = stem.slice(0, token.index);
     const chineseLead = stem.match(/^([\u3400-\u9fff][\u3400-\u9fff\s·]{1,70}?)(?=\s+[A-Za-z])/);
     if (chineseLead) stem = chineseLead[1];
     stem = stem.replace(/\[[^\]]*]|\([^)]*\)|【[^】]*】/g, " ");
     stem = stripPartMarkers(stem);
-    stem = stem.replace(new RegExp(`(?:${CHINESE_SEASON_PATTERN}|\u7B2C\\s*\\d+\\s*[\u671F\u96C6]|\\d{4}[.\\-]\\d{1,2}[.\\-]\\d{1,2}|\\d{8}|EP?\\s*\\d+|Part\\s*\\d+)\\s*$`, "gi"), " ");
+    stem = stem.replace(INFER_TITLE_TAIL_RE, " ");
     stem = stem.replace(/[\s([{【._-]+$/g, " ");
     return trimVarietyTitleSuffix(toSimplified(stem.replace(/\s+/g, " ").trim()));
   }
@@ -14586,14 +14703,14 @@ ${end.comment}` : end.comment;
       const endEpisode = Number(match[2] || 0);
       return { season: season2, episode, endEpisode, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}${endEpisode ? `-E${String(endEpisode).padStart(2, "0")}` : ""}` };
     }
-    match = text2.match(new RegExp(`\u7B2C\\s*([${CHINESE_NUMBER_PATTERN}]+)\\s*(?:[\u671F\u96C6\u8BDD\u8A71])?\\s*[-~\u5230\u81F3]\\s*(?:\u7B2C\\s*)?([${CHINESE_NUMBER_PATTERN}]+)\\s*[\u671F\u96C6\u8BDD\u8A71]`));
+    match = text2.match(CN_EPISODE_RANGE_RE);
     if (match) {
       const season2 = Number(fallbackSeason || 1);
       const episode = chineseInteger2(match[1]);
       const endEpisode = chineseInteger2(match[2]);
       if (episode > 0 && endEpisode > 0) return { season: season2, episode, endEpisode, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}-E${String(endEpisode).padStart(2, "0")}` };
     }
-    match = text2.match(new RegExp(`(?:\u7B2C\\s*)?([${CHINESE_NUMBER_PATTERN}]+)\\s*\u5B63[^\\d\\u3400-\\u9fffA-Za-z]{0,8}\u7B2C\\s*([${CHINESE_NUMBER_PATTERN}]+)\\s*[\u671F\u96C6\u8BDD\u8A71]`));
+    match = text2.match(CN_SEASON_EPISODE_PAIR_RE);
     if (match) {
       const season2 = chineseInteger2(match[1]);
       const episode = chineseInteger2(match[2]);
@@ -14605,7 +14722,7 @@ ${end.comment}` : end.comment;
       const episode = Number(match[2]);
       return { season: season2, episode, endEpisode: 0, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
     }
-    match = text2.match(new RegExp(`\u7B2C\\s*([${CHINESE_NUMBER_PATTERN}]+)\\s*[\u671F\u96C6\u8BDD\u8A71]`));
+    match = text2.match(CN_EPISODE_RE);
     if (match) {
       const season2 = Number(fallbackSeason || 1);
       const episode = chineseInteger2(match[1]);
@@ -14618,17 +14735,17 @@ ${end.comment}` : end.comment;
       return { season: season2, episode, endEpisode: 0, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
     }
     const seasonOnly = text2.match(/(?:Season\s*|\bS)(\d{1,3})(?:\s*季)?\b/i);
-    const namedSeason = seasonOnly ? null : text2.match(new RegExp(`(?:\u7B2C\\s*)?([${CHINESE_NUMBER_PATTERN}]+)\\s*\u5B63`));
+    const namedSeason = seasonOnly ? null : text2.match(NAMED_SEASON_RE);
     const season = seasonOnly ? Number(seasonOnly[1]) : namedSeason ? chineseInteger2(namedSeason[1]) : Number(fallbackSeason || 1);
     return { season, episode: 0, endEpisode: 0, seasonEpisode: "" };
   }
   function parseEpisodeHint(value, fallbackSeason = 1) {
     const parsed = parseSeasonEpisode(value, fallbackSeason);
     const text2 = String(value || "");
-    const dateMatch = text2.match(new RegExp("(?<!\\d)((?:19|20)\\d{2})[.\\-_\u5E74](\\d{1,2})[.\\-_\u6708](\\d{1,2})(?:\u65E5)?(?!\\d)")) || text2.match(new RegExp("(?<!\\d)((?:19|20)\\d{2})(\\d{2})(\\d{2})(?!\\d)"));
+    const dateMatch = text2.match(EPISODE_HINT_DATE_RE) || text2.match(EPISODE_HINT_COMPACT_DATE_RE);
     const date = dateMatch ? `${dateMatch[1]}-${String(dateMatch[2]).padStart(2, "0")}-${String(dateMatch[3]).padStart(2, "0")}` : "";
     const part = episodePartOrder(text2);
-    const fraction = text2.match(new RegExp("(?<!\\d)(\\d{1,4})[._-](\\d)(?!\\d)"));
+    const fraction = text2.match(EPISODE_HINT_FRACTION_RE);
     const absolute = Number(text2.match(/(?:^|[ ._\-[【])(?:EP?|第)?\s*(\d{1,4})\s*(?:期|集)?(?=$|[ ._\-\]】)])/i)?.[1] || 0);
     const specialKinds = [];
     if (isSpecialEpisodeHint(text2)) specialKinds.push("special");
@@ -14713,7 +14830,7 @@ ${end.comment}` : end.comment;
       strongKeywords: [.../* @__PURE__ */ new Set([...keywords, ...identities])],
       contextualKeywords,
       identityKinds: identities,
-      seasonMarkers: [...text2.matchAll(new RegExp(`\u7B2C\\s*([${CHINESE_NUMBER_PATTERN}]+)\\s*\u5B63|\\bS(\\d{1,3})`, "gi"))].map((match) => match[2] ? Number(match[2]) : chineseInteger2(match[1])).filter((number) => Number.isFinite(number) && number >= 0)
+      seasonMarkers: [...text2.matchAll(SEASON_MARKERS_RE)].map((match) => match[2] ? Number(match[2]) : chineseInteger2(match[1])).filter((number) => Number.isFinite(number) && number >= 0)
     };
   }
   function hasNamedSeasonMarker(value) {
@@ -15157,11 +15274,11 @@ ${end.comment}` : end.comment;
   }
   function distinctiveEpisodeLabel(value) {
     let text2 = toSimplified(String(value || "")).normalize("NFKC").replace(/\.[^.]+$/, " ");
-    text2 = text2.replace(new RegExp("(?<!\\d)(?:19|20)\\d{2}[.\\-_/\u5E74][01]?\\d[.\\-_/\u6708][0-3]?\\d\u65E5?(?!\\d)", "g"), " ");
-    text2 = text2.replace(new RegExp("(?<!\\d)(?:19|20)\\d{2}[01]\\d[0-3]\\d(?!\\d)", "g"), " ");
+    text2 = text2.replace(LOOSE_DATE_DASHED_RE, " ");
+    text2 = text2.replace(LOOSE_DATE_COMPACT_RE, " ");
     text2 = text2.replace(/(?:^|[^A-Za-z0-9])S\d{1,3}(?:[\s._-]*(?:E|EP)\d{1,4})?(?=$|[^A-Za-z0-9])/gi, " ");
     text2 = text2.replace(/\bSeason\s*\d{1,3}\b/gi, " ");
-    text2 = text2.replace(new RegExp(`\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*[\u5B63\u671F\u96C6\u8BDD\u8A71]`, "g"), " ");
+    text2 = text2.replace(CN_SEASON_UNIT_TAIL_RE, " ");
     text2 = text2.replace(/(?:^|[^A-Za-z0-9])(?:Part|Pt)[\s._-]*(?:\d{1,3}|[A-H])(?=$|[^A-Za-z0-9])/gi, " ");
     text2 = text2.replace(new RegExp("(?<![\\u4e00-\\u9fffA-Za-z])(?:\u4E0A|\u4E2D|\u4E0B)(?![\\u4e00-\\u9fffA-Za-z])", "g"), " ").replace(/(?:上|中|下)\s*$/g, " ");
     text2 = text2.replace(/\d+/g, " ");
@@ -15331,7 +15448,7 @@ ${end.comment}` : end.comment;
     return /(?:上\s*(?:[&+＋/／、,，和及]|and)\s*下|上下(?:篇|集|期|部|半场)?|上\s*下|下\s*(?:[&+＋/／、,，和及]|and)\s*上|下上(?:篇|集|期|部|半场)?|(?:Part|Pt)[\s._-]*1\s*(?:[&+＋/／、,，和及]|and|-)\s*(?:Part|Pt)?[\s._-]*2)/i.test(text2);
   }
   function normalizedEpisodeText(value) {
-    return toSimplified(String(value || "")).normalize("NFKC").replace(/\.[^.]+$/, " ").replace(new RegExp("(?<!\\d)(?:19|20)\\d{2}[.\\-_/\u5E74][01]?\\d[.\\-_/\u6708][0-3]?\\d\u65E5?(?!\\d)", "g"), " ").replace(new RegExp("(?<!\\d)(?:19|20)\\d{2}[01]\\d[0-3]\\d(?!\\d)", "g"), " ").replace(/(?:^|[^A-Za-z0-9])S\d{1,3}[\s._-]*(?:E|EP)\d{1,4}(?=$|[^A-Za-z0-9])/gi, " ").replace(/[^A-Za-z0-9\u4e00-\u9fff]+/g, "").toLocaleLowerCase();
+    return toSimplified(String(value || "")).normalize("NFKC").replace(/\.[^.]+$/, " ").replace(LOOSE_DATE_DASHED_RE, " ").replace(LOOSE_DATE_COMPACT_RE, " ").replace(/(?:^|[^A-Za-z0-9])S\d{1,3}[\s._-]*(?:E|EP)\d{1,4}(?=$|[^A-Za-z0-9])/gi, " ").replace(/[^A-Za-z0-9\u4e00-\u9fff]+/g, "").toLocaleLowerCase();
   }
   function regularEpisodeByName(entry2, episodes) {
     const sourceText = normalizedEpisodeText(entry2.file.name);
@@ -16088,12 +16205,12 @@ ${end.comment}` : end.comment;
   async function searchTmdbCandidates(tmdb, fields, options = {}) {
     const mediaType = fields.mediaType === "unknown" ? "" : fields.mediaType;
     const runSearch = async (searchOptions) => {
-      const results2 = [];
       const queries = [...tmdbSearchQueries(options.sourceTitle || fields.title), ...tmdbSearchQueries(fields.title)].filter((query, index, items) => items.findIndex((item) => item.toLocaleLowerCase() === query.toLocaleLowerCase()) === index);
-      for (const query of queries) {
-        const batch = searchOptions ? await tmdb.search(query, mediaType, searchOptions) : await tmdb.search(query, mediaType);
-        for (const candidate of batch || []) results2.push(candidate);
-      }
+      // 多组查询词 2 并发（TMDB 限流宽松）：串行时一个标题最多 8 个查询逐个等，
+      // 是整理预览"识别媒体"阶段的主要等待。
+      const batches = await mapLimit(queries, 2, (query) => (searchOptions ? tmdb.search(query, mediaType, searchOptions) : tmdb.search(query, mediaType)), { signal: options.signal });
+      const results2 = [];
+      for (const batch of batches || []) for (const candidate of batch || []) results2.push(candidate);
       return results2;
     };
     let results = await runSearch(fields.year ? { year: fields.year } : void 0);
@@ -17295,12 +17412,13 @@ ${end.comment}` : end.comment;
   async function collectEmptyFolders(api, currentDir, options = {}) {
     const allEmptyFolders = [];
     let totalScanned = 0;
+    let pendingFolders = 0;
     async function checkFolder(folder) {
       if (options.signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
       try {
         const result2 = await api.listAll(String(folder.id), { signal: options.signal });
         totalScanned += 1;
-        options.onProgress?.(totalScanned, totalScanned, "\u626B\u63CF\u6587\u4EF6\u5939");
+        options.onProgress?.(totalScanned, Math.max(1, totalScanned + pendingFolders), "\u626B\u63CF\u6587\u4EF6\u5939");
         const subFolders = result2.filter((f2) => Number(f2.type) === 1);
         const files2 = result2.filter((f2) => Number(f2.type) === 0);
         if (files2.length > 0) {
@@ -17313,7 +17431,9 @@ ${end.comment}` : end.comment;
         let allChildrenEmpty = true;
         let maxChildDepth = 0;
         for (const subFolder of subFolders) {
+          pendingFolders += 1;
           const childResult = await checkFolder(subFolder);
+          pendingFolders -= 1;
           if (!childResult.isEmpty) {
             allChildrenEmpty = false;
           }
@@ -17336,7 +17456,12 @@ ${end.comment}` : end.comment;
     const topFolders = files.filter((file) => Number(file.type) === 1);
     if (!topFolders.length) return [];
     await mapLimit(topFolders, CHECK_CONCURRENCY, async (folder) => {
-      await checkFolder(folder);
+      pendingFolders += 1;
+      try {
+        await checkFolder(folder);
+      } finally {
+        pendingFolders -= 1;
+      }
     }, { signal: options.signal });
     allEmptyFolders.sort((a2, b) => a2.depth - b.depth);
     return allEmptyFolders;
@@ -18160,7 +18285,7 @@ ${end.comment}` : end.comment;
     const exportRows = state.items.map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${Number(item.type) === 1 ? "\u6587\u4EF6\u5939\uFF08\u9012\u5F52\uFF09" : "\u6587\u4EF6"}</td></tr>`).join("");
     const generatedLinks = state.artifacts.length ? `<div class="fastlink-results">${state.artifacts.map((artifact, index) => `<section class="fastlink-result-card"><div><strong>${escapeHtml(artifact.item.name)}</strong><span>${artifact.fileCount} \u4E2A\u6587\u4EF6</span></div><textarea readonly aria-label="${escapeHtml(artifact.item.name)} \u79D2\u4F20\u94FE\u63A5">${escapeHtml(artifact.link || "")}</textarea><button class="button" data-action="fastlink-copy-link" data-index="${index}">${icon("copy", 15)}\u590D\u5236\u94FE\u63A5</button></section>`).join("")}</div>` : "";
     const exportPane = state.items.length ? `${notice("\u6BCF\u4E2A\u9876\u5C42\u9879\u76EE\u4F1A\u5206\u522B\u751F\u6210\u9879\u76EE\u683C\u5F0F\u7684 JSON \u4E0E 123FLCPV2 \u94FE\u63A5\uFF0C\u5BFC\u51FA\u4E0D\u4F1A\u4FEE\u6539\u6E90\u6587\u4EF6\u3002", "", "download")}<div class="table-wrap"><table><thead><tr><th>\u9876\u5C42\u9879\u76EE</th><th>\u8303\u56F4</th></tr></thead><tbody>${exportRows}</tbody></table></div><div class="button-row"><button class="button" data-action="fastlink-secondary-generate">${icon("link", 15)}\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\uFF08\u77ED\u94FE\uFF09</button><button class="button" data-action="fastlink-secondary-save-link">${icon("download", 15)}\u628A\u5DF2\u751F\u6210\u94FE\u63A5\u4FDD\u5B58\u5230\u4E91\u76D8</button></div>${state.artifacts.length ? `${notice(`\u5DF2\u5BFC\u51FA ${state.artifacts.length} \u4E2A\u79D2\u4F20\u6587\u4EF6\uFF0C\u5171\u5305\u542B ${state.fileCount} \u4E2A\u4E91\u76D8\u6587\u4EF6\u3002`, "success", "check")}${generatedLinks}` : ""}` : notice("\u5BFC\u51FA\u9700\u8981\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u4E00\u4E2A\u6216\u591A\u4E2A\u6587\u4EF6\u3001\u6587\u4EF6\u5939\u3002", "warning", "alert");
-    const importPane = `${notice("\u652F\u6301 123FastLink JSON\u3001V1/V2 \u79D2\u4F20\u6587\u672C\u3001.123share \u4E0E\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE\uFF08\u81EA\u52A8\u8BC6\u522B\uFF09\uFF1B\u6587\u4EF6\u4F1A\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55\u5E76\u4FDD\u7559\u539F\u76EE\u5F55\u7ED3\u6784\u3002", "", "import")}<div class="button-row"><button class="button" data-action="fastlink-secondary-from-file">${icon("folderOpen", 15)}\u4ECE\u52FE\u9009\u7684\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58</button><button class="button" data-action="fastlink-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u672C\u5730\u79D2\u4F20\u6587\u4EF6</button></div><span class="footer-note">${state.importFile ? `\u5DF2\u9009\u62E9\uFF1A${escapeHtml(state.importFileName || "")}\uFF08${formatBytes(state.importFileSize)}\uFF09\u00B7 \u70B9\u300C\u5F00\u59CB\u8F6C\u5B58\u300D\u65F6\u6D41\u5F0F\u8BFB\u53D6\uFF0C\u4E0D\u6574\u8BFB\u8FDB\u5185\u5B58` : escapeHtml(state.importFileName || "\u672A\u9009\u62E9\u672C\u5730\u6587\u4EF6")}</span>${state.importFile ? `<button class="button compact" data-action="fastlink-import-file-clear">\u6E05\u9664\u6587\u4EF6</button>` : ""}<input id="fastlink-file" type="file" accept=".json,.txt,.123fastlink,.123share,application/json,text/plain" hidden>${state.input && state.input.length > 2000000 ? `<span class="footer-note">\u7C98\u8D34\u5185\u5BB9\u8F83\u5927\uFF08${formatBytes(state.input.length)}\uFF09\uFF0C\u5DF2\u4FDD\u7559\u4F46\u4E0D\u56DE\u663E\uFF0C\u53EF\u76F4\u63A5\u5F00\u59CB\u8F6C\u5B58</span>` : ""}<div class="editor-surface"><textarea id="fastlink-input" placeholder="\u7C98\u8D34\u79D2\u4F20 JSON\u3001\u94FE\u63A5\u3001.123share \u6216\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE">${state.input && state.input.length > 2000000 ? "" : escapeHtml(state.input || "")}</textarea></div>`;
+    const importPane = `${notice("\u652F\u6301 123FastLink JSON\u3001V1/V2 \u79D2\u4F20\u6587\u672C\u3001.123share \u4E0E\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE\uFF08\u81EA\u52A8\u8BC6\u522B\uFF09\uFF1B\u6587\u4EF6\u4F1A\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55\u5E76\u4FDD\u7559\u539F\u76EE\u5F55\u7ED3\u6784\u3002", "", "import")}<div class="button-row"><button class="button" data-action="fastlink-secondary-from-file">${icon("folderOpen", 15)}\u4ECE\u52FE\u9009\u7684\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58</button><button class="button" data-action="fastlink-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u672C\u5730\u79D2\u4F20\u6587\u4EF6</button></div><span class="footer-note">${state.importFile ? `\u5DF2\u9009\u62E9\uFF1A${escapeHtml(state.importFileName || "")}\uFF08${formatBytes(state.importFileSize)}\uFF09\u00B7 \u70B9\u300C\u5F00\u59CB\u8F6C\u5B58\u300D\u65F6\u6D41\u5F0F\u8BFB\u53D6\uFF0C\u4E0D\u6574\u8BFB\u8FDB\u5185\u5B58` : escapeHtml(state.importFileName || "\u672A\u9009\u62E9\u672C\u5730\u6587\u4EF6")}</span>${state.importFile ? `<button class="button compact" data-action="fastlink-import-file-clear">\u6E05\u9664\u6587\u4EF6</button>` : ""}<input id="fastlink-file" type="file" accept=".json,.txt,.123fastlink,.123share,application/json,text/plain" hidden>${state.input && state.input.length > 2000000 ? `<span class="footer-note">\u7C98\u8D34\u5185\u5BB9\u8F83\u5927\uFF08${formatBytes(stringByteSize(state.input))}\uFF09\uFF0C\u5DF2\u4FDD\u7559\u4F46\u4E0D\u56DE\u663E\uFF0C\u53EF\u76F4\u63A5\u5F00\u59CB\u8F6C\u5B58</span>` : ""}<div class="editor-surface"><textarea id="fastlink-input" placeholder="\u7C98\u8D34\u79D2\u4F20 JSON\u3001\u94FE\u63A5\u3001.123share \u6216\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE">${state.input && state.input.length > 2000000 ? "" : escapeHtml(state.input || "")}</textarea></div>`;
     const publicPane = `${notice("\u8F93\u5165 123 \u4E91\u76D8\u5206\u4EAB\u94FE\u63A5\uFF0C\u9012\u5F52\u8BFB\u53D6\u5176\u4E2D\u7684\u6587\u4EF6\u5E76\u4E0B\u8F7D\u53EF\u76F4\u63A5\u8F6C\u5B58\u7684\u6807\u51C6 JSON\uFF1B\u540C\u65F6\u4FDD\u7559 123FLCPV2 \u94FE\u63A5\u4F9B\u590D\u5236\u3002", "", "share")}<label class="field"><span>\u5206\u4EAB\u94FE\u63A5 / Key</span><input id="fastlink-public-input" value="${escapeHtml(state.publicInput || "")}" placeholder="\u652F\u6301 www.123865.com/s/... \u4E0E share.123pan.cn/123pan/..."></label><label class="field"><span>\u63D0\u53D6\u7801\uFF08\u53EF\u9009\uFF0C\u94FE\u63A5\u5DF2\u5305\u542B\u65F6\u65E0\u9700\u586B\u5199\uFF09</span><input id="fastlink-public-password" value="${escapeHtml(state.publicPassword || "")}"></label>`;
     const batchPane = `${notice("\u6BCF\u884C\u4E00\u4E2A\u5206\u4EAB\u94FE\u63A5\u3001Key \u6216\u5E26\u63D0\u53D6\u7801\u7684\u6587\u672C\uFF1B\u6BCF\u4E2A\u5206\u4EAB\u4F1A\u72EC\u7ACB\u4E0B\u8F7D\u4E00\u4E2A\u6807\u51C6 JSON\u3002", "", "share")}<div class="editor-surface"><textarea id="fastlink-public-batch" placeholder="https://www.123865.com/s/xxxx?pwd=ABCD&#10;xxxx \u63D0\u53D6\u7801:ABCD">${escapeHtml(state.publicBatch || "")}</textarea></div>`;
     const splitPane = `${notice("\u652F\u6301\u9879\u76EE JSON\u3001123FLCPV2 \u94FE\u63A5\u548C\u65E7\u7248 V1/V2 \u6587\u672C\u3002\u6309\u76EE\u5F55\u5C42\u7EA7\u4F1A\u4E3A\u6BCF\u4E2A\u76EE\u5F55\u7EC4\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\uFF0C\u6309\u6570\u91CF\u4F1A\u6309\u6761\u76EE\u5207\u5206\u3002", "", "download")}<div class="button-row"><button class="button" data-action="fastlink-split-file-open">${icon("folderOpen", 15)}\u9009\u62E9 JSON</button><span>${escapeHtml(state.splitFileName || "\u4E5F\u53EF\u4EE5\u76F4\u63A5\u7C98\u8D34")}</span><input id="fastlink-split-file" type="file" accept=".json,.txt,.123fastlink" hidden></div><div class="editor-surface"><textarea id="fastlink-split-input" placeholder="\u7C98\u8D34 JSON \u6216\u79D2\u4F20\u94FE\u63A5">${escapeHtml(state.splitInput || "")}</textarea></div><div class="inline-fields"><label class="field"><span>\u62C6\u5206\u65B9\u5F0F</span><select id="fastlink-split-method"><option value="folder" ${state.splitMethod === "folder" ? "selected" : ""}>\u6309\u76EE\u5F55\u5C42\u7EA7</option><option value="count" ${state.splitMethod === "count" ? "selected" : ""}>\u6309\u6587\u4EF6\u6570\u91CF</option></select></label><label class="field"><span>${state.splitMethod === "count" ? "\u6BCF\u4EFD\u6587\u4EF6\u6570" : "\u76EE\u5F55\u5C42\u6570"}</span><input id="fastlink-split-amount" type="number" min="1" value="${Math.max(1, Number(state.splitAmount) || 1)}"></label></div>`;
@@ -18194,10 +18319,10 @@ ${end.comment}` : end.comment;
     const nav = `<div class="fastlink-tool-grid">${tools.map(([key, label, iconName]) => `<button class="button tool-button ${tool === key ? "active" : ""}" data-action="fastlink-tool" data-tool="${key}">${icon(iconName, 14)}${label}</button>`).join("")}</div>`;
     let pane = state.picker ? renderFolderPicker(ui, state.picker) : tool === "export" ? exportPane : tool === "import" ? importPane : tool === "public" ? publicPane : tool === "batch" ? batchPane : tool === "split" ? splitPane : tool === "convert" ? convertPane : tool === "filters" ? filterPane : tool === "library" ? libraryPaneWrapped : settingsPane;
     const modeToolbar = `<div class="mode-toolbar"><div class="segmented"><button data-action="fastlink-mode" data-mode="import" class="${tool === "import" ? "active" : ""}">${icon("import", 15)}\u5BFC\u5165</button><button data-action="fastlink-mode" data-mode="export" class="${tool === "export" ? "active" : ""}">${icon("download", 15)}\u5BFC\u51FA</button></div></div>`;
-    const scanProgress = readFastlinkScanCheckpoint();
-    const shareProgress = readFastlinkShareCheckpoint();
-    const scanSalvageCard = scanProgress ? `${notice(`\u4E0A\u6B21\u79D2\u4F20\u626B\u63CF\u672A\u5B8C\u6210\uFF0C\u5DF2\u4FDD\u5B58 ${scanProgress.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6${state.salvage && state.salvage.flow !== "public" && state.salvage.flow !== "publicBatch" ? `\uFF08${escapeHtml(state.salvage.reason)}\uFF09` : ""}\uFF1B\u5BF9\u540C\u6837\u7684\u9009\u62E9\u518D\u6B21\u5BFC\u51FA\u4F1A\u81EA\u52A8\u7EED\u63A5\u3002`, "warning", "alert")}<div class="button-row"><button class="button compact" data-action="fastlink-resume-scan">\u7EE7\u7EED\u626B\u63CF</button><button class="button compact" data-action="fastlink-salvage-export">\u5BFC\u51FA\u5DF2\u626B\u63CF\u90E8\u5206</button><button class="button compact" data-action="fastlink-salvage-discard">\u653E\u5F03\u8FDB\u5EA6</button></div>` : "";
-    const shareSalvageCard = shareProgress ? `${notice(`\u4E0A\u6B21\u5206\u4EAB\u626B\u63CF\u672A\u5B8C\u6210\uFF0C\u5DF2\u4FDD\u5B58 ${shareProgress.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6${shareProgress.batch ? `\uFF08\u6279\u91CF\u89E3\u6790\uFF1A\u5DF2\u5B8C\u6210 ${Number(shareProgress.batch.done) || 0}/${shareProgress.batch.lines.length} \u884C\uFF09` : ""}${state.salvage && (state.salvage.flow === "public" || state.salvage.flow === "publicBatch") ? `\uFF08${escapeHtml(state.salvage.reason)}\uFF09` : ""}\uFF1B\u540C\u6837\u5185\u5BB9\u518D\u6B21\u751F\u6210\u4F1A\u81EA\u52A8\u7EED\u63A5\u3002`, "warning", "alert")}<div class="button-row"><button class="button compact" data-action="fastlink-share-resume">\u7EE7\u7EED\u626B\u63CF</button><button class="button compact" data-action="fastlink-share-salvage-export">\u5BFC\u51FA\u5DF2\u626B\u63CF\u90E8\u5206</button><button class="button compact" data-action="fastlink-share-salvage-discard">\u653E\u5F03\u8FDB\u5EA6</button></div>` : "";
+    // 断点概要走 syncFastlinkCheckpointSummary() 维护的缓存（大断点全量读存储太贵），首次渲染兜底同步一次
+    const summary = state.checkpointSummary || (ui.syncFastlinkCheckpointSummary(), state.checkpointSummary);
+    const scanSalvageCard = summary.scanCount ? `${notice(`\u4E0A\u6B21\u79D2\u4F20\u626B\u63CF\u672A\u5B8C\u6210\uFF0C\u5DF2\u4FDD\u5B58 ${summary.scanCount} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6${state.salvage && state.salvage.flow !== "public" && state.salvage.flow !== "publicBatch" ? `\uFF08${escapeHtml(state.salvage.reason)}\uFF09` : ""}\uFF1B\u5BF9\u540C\u6837\u7684\u9009\u62E9\u518D\u6B21\u5BFC\u51FA\u4F1A\u81EA\u52A8\u7EED\u63A5\u3002`, "warning", "alert")}<div class="button-row"><button class="button compact" data-action="fastlink-resume-scan">\u7EE7\u7EED\u626B\u63CF</button><button class="button compact" data-action="fastlink-salvage-export">\u5BFC\u51FA\u5DF2\u626B\u63CF\u90E8\u5206</button><button class="button compact" data-action="fastlink-salvage-discard">\u653E\u5F03\u8FDB\u5EA6</button></div>` : "";
+    const shareSalvageCard = summary.shareCount ? `${notice(`\u4E0A\u6B21\u5206\u4EAB\u626B\u63CF\u672A\u5B8C\u6210\uFF0C\u5DF2\u4FDD\u5B58 ${summary.shareCount} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6${summary.shareBatchTotal ? `\uFF08\u6279\u91CF\u89E3\u6790\uFF1A\u5DF2\u5B8C\u6210 ${summary.shareBatchDone}/${summary.shareBatchTotal} \u884C\uFF09` : ""}${state.salvage && (state.salvage.flow === "public" || state.salvage.flow === "publicBatch") ? `\uFF08${escapeHtml(state.salvage.reason)}\uFF09` : ""}\uFF1B\u540C\u6837\u5185\u5BB9\u518D\u6B21\u751F\u6210\u4F1A\u81EA\u52A8\u7EED\u63A5\u3002`, "warning", "alert")}<div class="button-row"><button class="button compact" data-action="fastlink-share-resume">\u7EE7\u7EED\u626B\u63CF</button><button class="button compact" data-action="fastlink-share-salvage-export">\u5BFC\u51FA\u5DF2\u626B\u63CF\u90E8\u5206</button><button class="button compact" data-action="fastlink-share-salvage-discard">\u653E\u5F03\u8FDB\u5EA6</button></div>` : "";
     const body = `${scanSalvageCard}${shareSalvageCard}${nav}${["export", "import"].includes(tool) ? modeToolbar : ""}<div class="fastlink-pane">${pane}</div>${state.artifacts.length && !["export", "import"].includes(tool) ? generatedLinks : ""}`;
     const action = tool === "export" ? `<button class="button primary" data-action="fastlink-export" ${state.items.length ? "" : "disabled"}>${icon("download", 15)}\u5BFC\u51FA ${state.items.length || ""}</button>` : tool === "import" ? `<button class="button primary" data-action="fastlink-import" ${state.importFile || String(state.input || "").trim() ? "" : "disabled"}>${icon("import", 15)}\u5F00\u59CB\u8F6C\u5B58</button>` : tool === "public" ? `<button class="button primary" data-action="fastlink-public-generate">${icon("download", 15)}\u751F\u6210 JSON \u6587\u4EF6</button>` : tool === "batch" ? `<button class="button primary" data-action="fastlink-public-batch">${icon("share", 15)}\u6279\u91CF\u751F\u6210</button>` : tool === "split" ? `<button class="button primary" data-action="fastlink-split">${icon("download", 15)}\u5F00\u59CB\u62C6\u5206</button>` : tool === "convert" ? `<button class="button primary" data-action="fastlink-convert">${icon("settings", 15)}\u5F00\u59CB\u8F6C\u6362</button>` : tool === "filters" || tool === "settings" ? `<button class="button primary" data-action="fastlink-settings-save">\u4FDD\u5B58\u8BBE\u7F6E</button>` : tool === "library" ? `<button class="button primary" data-action="library-refresh" ${state.library?.loading ? "disabled" : ""}>\u5237\u65B0\u5F71\u5E93</button>` : "";
     return dialogFrame(ui, {
@@ -18683,7 +18808,7 @@ ${end.comment}` : end.comment;
     const draft = ui.settings.draft;
     if (ui.settings.picker) return renderFolderPicker(ui);
     if (ui.settings.tab === "general") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("settings", 17)}</span><div><h3>\u5916\u89C2\u4E0E\u4EFB\u52A1</h3><p>\u4E3B\u9898\u4F1A\u5E94\u7528\u5230\u6240\u6709\u52A9\u624B\u5F39\u7A97\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u4E3B\u9898</span><select data-config="appearance.theme"><option value="system" ${draft.appearance.theme === "system" ? "selected" : ""}>\u8DDF\u968F\u7CFB\u7EDF</option><option value="light" ${draft.appearance.theme === "light" ? "selected" : ""}>\u6D45\u8272</option><option value="dark" ${draft.appearance.theme === "dark" ? "selected" : ""}>\u6DF1\u8272</option></select></label><label class="check-line"><input type="checkbox" data-config="appearance.compactRows" ${draft.appearance.compactRows ? "checked" : ""}>\u4F7F\u7528\u7D27\u51D1\u8868\u683C\u884C</label></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("waveform", 17)}</span><div><h3>\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B</h3><p>\u4EC5\u5728\u6D4F\u89C8\u5668\u672C\u5730\u901A\u8FC7 123 \u76F4\u94FE\u3001Range \u5206\u6BB5\u548C MediaInfo WASM \u89E3\u6790\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u5A92\u4F53\u5185\u5BB9\u3002</p></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("share", 17)}</span><div><h3>\u5206\u4EAB\u4E0E\u79D2\u4F20</h3><p>\u53EF\u5728\u5206\u4EAB\u521B\u5EFA\u6210\u529F\u540E\u76F4\u63A5\u53D1\u9001\u5230\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\uFF0C\u7531\u670D\u52A1\u751F\u6210\u5E76\u63A8\u9001\u6295\u7A3F\u8349\u7A3F\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u5206\u4EAB\u5230\u671F\u65F6\u95F4</span><input data-config="share.expiration" value="${escapeHtml(draft.share.expiration)}"></label><label class="field"><span>\u968F\u673A\u53E3\u4EE4\u957F\u5EA6</span><input type="number" min="1" max="8" data-config="share.passwordLength" value="${draft.share.passwordLength}"></label><label class="check-line full"><input type="checkbox" data-config="share.autoSubmitEnabled" ${draft.share.autoSubmitEnabled ? "checked" : ""}>\u5206\u4EAB\u540E\u81EA\u52A8\u63A8\u9001\u5230\u6295\u7A3F\u673A\u5668\u4EBA</label><label class="field full"><span>\u6295\u7A3F\u5730\u5740</span><input data-config="share.submissionUrl" value="${escapeHtml(draft.share.submissionUrl || "")}" placeholder="\u8BF7\u8F93\u5165\u5B8C\u6574\u6295\u7A3F\u63A5\u53E3\u5730\u5740"><small>\u811A\u672C\u4F1A\u5411\u6B64\u5730\u5740\u53D1\u9001 POST \u8BF7\u6C42\uFF1B\u53EF\u586B\u5199 123Cloud \u6216\u5176\u4ED6\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\u7684\u5B8C\u6574\u63A5\u53E3\u5730\u5740\u3002</small></label><label class="field full"><span>\u5F71\u5E93\u63A5\u53E3\u5730\u5740\uFF08123Cloud \u5BA2\u6237\u7AEF\uFF09</span><input data-config="share.libraryUrl" value="${escapeHtml(draft.share.libraryUrl || "")}" placeholder="\u4F8B\u5982 http://127.0.0.1:62156\uFF0C\u53EF\u5E26 ?token="><small>\u586B\u5BA2\u6237\u7AEF\u5730\u5740\u5373\u53EF\uFF0C\u7AEF\u53E3\u770B\u5BA2\u6237\u7AEF\u300C\u8BBE\u7F6E \u2192 \u670D\u52A1\u7AEF\u53E3\u300D\uFF08\u540C\u6295\u7A3F\u7AEF\u53E3\uFF09\uFF1B\u54EA\u91CC\u80FD\u8FDE\u4E0A\u5C31\u586B\u54EA\u91CC\uFF0C\u7528\u4E8E\u79D2\u4F20\u5DE5\u5177\u7BB1\u7684\u300C\u5F71\u5E93\u641C\u7D22\u300D\u3002</small></label><label class="field"><span>\u5F71\u5E93\u8BBF\u95EE\u4EE4\u724C</span><input data-config="share.libraryToken" value="${escapeHtml(draft.share.libraryToken || "")}" placeholder="\u5BA2\u6237\u7AEF\u300C\u5F71\u5E93\uFF0D\u5F71\u5E93\u8BBE\u7F6E\u300D\u91CC\u751F\u6210\uFF0C\u672A\u8BBE\u7F6E\u53EF\u7559\u7A7A"></label></div></div></div>`;
-    if (ui.settings.tab === "tmdb") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("cloud", 17)}</span><div><h3>TMDB \u8FDE\u63A5</h3><p>\u7528\u4E8E\u5A92\u4F53\u6D77\u62A5\u3001\u6807\u9898\u3001\u5E74\u4EFD\u548C\u5267\u96C6\u4FE1\u606F\u3002</p></div></div>${notice("\u4EE5 ey \u5F00\u5934\u7684\u503C\u6309 Read Access Token \u4F7F\u7528\uFF0C\u5176\u4ED6\u503C\u6309 v3 API Key \u4F7F\u7528\u3002\u51ED\u636E\u4EC5\u53D1\u9001\u5230 TMDB\u3002", "", "cloud")}<div class="form-card"><div class="form-grid"><label class="field full"><span>API Key / Read Access Token</span><input type="password" autocomplete="off" data-config="tmdb.credential" value="${escapeHtml(draft.tmdb.credential)}"></label><label class="field"><span>\u8BED\u8A00</span><input data-config="tmdb.language" value="${escapeHtml(draft.tmdb.language)}"></label><label class="field"><span>\u5730\u533A</span><input data-config="tmdb.region" value="${escapeHtml(draft.tmdb.region)}"></label></div></div><button class="button" data-action="tmdb-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>`;
+    if (ui.settings.tab === "tmdb") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("cloud", 17)}</span><div><h3>TMDB \u8FDE\u63A5</h3><p>\u7528\u4E8E\u5A92\u4F53\u6D77\u62A5\u3001\u6807\u9898\u3001\u5E74\u4EFD\u548C\u5267\u96C6\u4FE1\u606F\u3002</p></div></div>${notice("\u4EE5 ey \u5F00\u5934\u7684\u503C\u6309 Read Access Token \u4F7F\u7528\uFF0C\u5176\u4ED6\u503C\u6309 v3 API Key \u4F7F\u7528\u3002\u65E0\u6CD5\u76F4\u8FDE TMDB \u65F6\u53EF\u586B\u5199\u4E0B\u65B9\u7684\u7B2C\u4E09\u65B9\u66FF\u4EE3\u6E90\uFF08\u81EA\u5EFA\u53CD\u4EE3/\u955C\u50CF\u5730\u5740\uFF0C\u586B\u5230\u542B /3 \u4E3A\u6B62\uFF1B\u53EA\u586B\u57DF\u540D\u4F1A\u81EA\u52A8\u8865 /3\uFF0Chttps:// \u524D\u7F00\u53EF\u7701\u7565\uFF09\uFF0C\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9\u6E90\u3002", "", "cloud")}<div class="form-card"><div class="form-grid"><label class="field full"><span>API Key / Read Access Token</span><input type="password" autocomplete="off" data-config="tmdb.credential" value="${escapeHtml(draft.tmdb.credential)}"></label><label class="field full"><span>TMDB \u66FF\u4EE3\u6E90\uFF08\u65E0\u6CD5\u76F4\u8FDE\u65F6\u4F7F\u7528\uFF09</span><input data-config="tmdb.apiBase" value="${escapeHtml(draft.tmdb.apiBase || "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9 api.themoviedb.org" spellcheck="false" autocomplete="off"></label><label class="field"><span>\u8BED\u8A00</span><input data-config="tmdb.language" value="${escapeHtml(draft.tmdb.language)}"></label><label class="field"><span>\u5730\u533A</span><input data-config="tmdb.region" value="${escapeHtml(draft.tmdb.region)}"></label></div></div><button class="button" data-action="tmdb-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>`;
     if (ui.settings.tab === "library") return renderLibrary(ui);
     if (ui.settings.tab === "naming") return renderNaming(ui);
     return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("save", 17)}</span><div><h3>\u914D\u7F6E\u5907\u4EFD</h3><p>\u5BFC\u51FA\u6587\u4EF6\u9ED8\u8BA4\u4E0D\u5305\u542B TMDB \u51ED\u636E\u3002</p></div></div>${notice("\u9700\u8981\u8FC1\u79FB\u51ED\u636E\u65F6\u53EF\u4E34\u65F6\u52FE\u9009\uFF0C\u5BFC\u51FA\u540E\u8BF7\u59A5\u5584\u4FDD\u7BA1\u3002", "", "alert")}<div class="form-card"><label class="check-line"><input id="backup-secrets" type="checkbox">\u5BFC\u51FA\u65F6\u5305\u542B TMDB \u51ED\u636E</label><div class="button-row"><button class="button" data-action="config-export">${icon("download", 15)}\u5BFC\u51FA\u914D\u7F6E</button><button class="button" data-action="config-import">${icon("import", 15)}\u5BFC\u5165\u914D\u7F6E</button><button class="button danger" data-action="config-reset">${icon("trash", 15)}\u6062\u590D\u9ED8\u8BA4</button><input id="config-file" type="file" accept="application/json" hidden></div></div></div>`;
@@ -19903,6 +20028,11 @@ ${end.comment}` : end.comment;
         this.state.result = null;
         this.render();
         const items = await this.bridge.selectedItems(void 0, snapshot);
+        // fileInfos 对补查失败的文件只会在控制台告警并丢弃；这里把"勾选了 N 项却只拿到
+        // M 项"的情况提示出来，避免批量重命名/分享静默少处理文件还显示全部成功。
+        if (!snapshot.selectAll && snapshot.selectedIds.size > items.length) {
+          this.toast(`${snapshot.selectedIds.size - items.length} \u9879\u6587\u4EF6\u4FE1\u606F\u8BFB\u53D6\u5931\u8D25\uFF0C\u5DF2\u81EA\u672C\u6B21\u64CD\u4F5C\u4E2D\u8DF3\u8FC7\uFF1B\u53EF\u5237\u65B0\u5217\u8868\u540E\u91CD\u8BD5`, "warning");
+        }
         if (!items.length && !["fastlink", "fastlinkImport"].includes(command)) throw new Error("\u8BF7\u5148\u5728\u6587\u4EF6\u5217\u8868\u4E2D\u9009\u62E9\u9879\u76EE");
         this.commandContext = { command, items: items.map((item) => ({ ...item })), currentDir: snapshot.currentDir, selection: snapshot };
         if (command === "rename") await this.openRename(items);
@@ -20675,6 +20805,7 @@ ${end.comment}` : end.comment;
         picker: null,
         library: librarySearchState()
       };
+      this.syncFastlinkCheckpointSummary();
       this.state.view = "fastlink";
       this.render();
       if (singleFile && (autoImport || isSeedLikeName(items[0].name))) {
@@ -20709,6 +20840,7 @@ ${end.comment}` : end.comment;
         this.fastlink.fileCount = artifacts.reduce((sum, artifact) => sum + artifact.fileCount, 0);
         for (const artifact of artifacts) downloadText(filenameSafe(artifact.filename), artifact.text);
         this.toast(`\u5DF2\u6309 ${artifacts.length} \u4E2A\u9876\u5C42\u9879\u76EE\u5206\u522B\u5BFC\u51FA`, "success");
+        this.syncFastlinkCheckpointSummary();
         if (this.completeFastlinkTask(outcome.task, artifacts)) return;
         this.render();
       } catch (error) {
@@ -20725,6 +20857,7 @@ ${end.comment}` : end.comment;
         fileCount: state.files.length,
         reason: error?.name === "AbortError" ? "\u626B\u63CF\u5DF2\u53D6\u6D88" : String(error?.message || "\u626B\u63CF\u4E2D\u65AD")
       };
+      this.syncFastlinkCheckpointSummary();
       this.render();
       return true;
     }
@@ -20742,6 +20875,7 @@ ${end.comment}` : end.comment;
       const artifact = buildFastlinkPublicArtifact(files, { shareKey: state.shareKey, sharePwd: state.sharePwd || "" }, this.fastlinkExportOptions());
       downloadText(filenameSafe(artifact.filename), artifact.text);
       clearFastlinkShareCheckpoint();
+      this.syncFastlinkCheckpointSummary();
       this.fastlink.salvage = null;
       this.fastlink.artifacts = [artifact];
       this.fastlink.fileCount = artifact.fileCount;
@@ -20750,6 +20884,7 @@ ${end.comment}` : end.comment;
     }
     discardFastlinkShareScanProgress() {
       clearFastlinkShareCheckpoint();
+      this.syncFastlinkCheckpointSummary();
       this.fastlink.salvage = null;
       this.toast("\u5DF2\u653E\u5F03\u4E0A\u6B21\u626B\u63CF\u8FDB\u5EA6", "info");
       this.render();
@@ -20765,6 +20900,7 @@ ${end.comment}` : end.comment;
       const artifacts = await this.runTask((signal) => buildFastlinkSalvage(this.api, state, { signal, ...this.fastlinkExportOptions() }));
       for (const artifact of artifacts) downloadText(filenameSafe(artifact.filename), artifact.text);
       clearFastlinkScanCheckpoint();
+      this.syncFastlinkCheckpointSummary();
       this.fastlink.salvage = null;
       this.fastlink.artifacts = artifacts;
       this.fastlink.fileCount = artifacts.reduce((sum, artifact) => sum + artifact.fileCount, 0);
@@ -20773,9 +20909,22 @@ ${end.comment}` : end.comment;
     }
     discardFastlinkScanProgress() {
       clearFastlinkScanCheckpoint();
+      this.syncFastlinkCheckpointSummary();
       this.fastlink.salvage = null;
       this.toast("\u5DF2\u653E\u5F03\u4E0A\u6B21\u626B\u63CF\u8FDB\u5EA6", "info");
       this.render();
+    }
+    // 断点概要缓存：扫描断点可能好几 MB，不能在 renderFastlink 里每次渲染都全量读存储；
+    // 断点只在打开面板与导出/抢救/放弃这几个时机发生变化，变化处调用本方法刷新。
+    syncFastlinkCheckpointSummary() {
+      const scan = readFastlinkScanCheckpoint();
+      const share = readFastlinkShareCheckpoint();
+      this.fastlink.checkpointSummary = {
+        scanCount: scan?.files?.length || 0,
+        shareCount: share?.files?.length || 0,
+        shareBatchDone: Number(share?.batch?.done) || 0,
+        shareBatchTotal: Array.isArray(share?.batch?.lines) ? share.batch.lines.length : 0
+      };
     }
     async restoreFastlink() {
       const file = this.fastlink.importFile || null;
@@ -20960,6 +21109,7 @@ ${end.comment}` : end.comment;
         this.fastlink.fileCount = artifact.fileCount;
         if (this.completeFastlinkTask(outcome.task, artifact)) return;
         this.toast("\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210\uFF0C\u53EF\u590D\u5236\u6216\u76F4\u63A5\u5206\u4EAB", "success");
+        this.syncFastlinkCheckpointSummary();
         this.render();
       } catch (error) {
         if (this.offerFastlinkSalvage("secondaryExport", error)) return;
@@ -21042,6 +21192,7 @@ ${end.comment}` : end.comment;
         this.fastlink.fileCount = artifact.fileCount;
         downloadText(filenameSafe(artifact.filename), artifact.text);
         this.toast(`\u5DF2\u751F\u6210 ${artifact.filename}`, "success");
+        this.syncFastlinkCheckpointSummary();
         this.render();
       } catch (error) {
         if (this.offerFastlinkSalvage("public", error)) return;
@@ -21103,6 +21254,7 @@ ${end.comment}` : end.comment;
       this.fastlink.artifacts = artifacts;
       this.fastlink.fileCount = artifacts.reduce((sum, item) => sum + item.fileCount, 0);
       this.toast(`\u5DF2\u751F\u6210 ${artifacts.length} \u4E2A\u79D2\u4F20\u6587\u4EF6`, "success");
+      this.syncFastlinkCheckpointSummary();
       this.render();
     }
     async splitFastlinkFile() {
@@ -22342,7 +22494,8 @@ ${end.comment}` : end.comment;
       this.configStore.set(this.settings.draft);
       try {
         await this.tmdb.test();
-        this.toast("TMDB \u8FDE\u63A5\u6210\u529F", "success");
+        const base = this.tmdb.apiBase();
+        this.toast(base === API_BASE ? "TMDB \u8FDE\u63A5\u6210\u529F" : `TMDB \u8FDE\u63A5\u6210\u529F\uFF08\u66FF\u4EE3\u6E90\uFF1A${base}\uFF09`, "success");
       } finally {
         this.configStore.set(previous);
       }
@@ -22912,10 +23065,8 @@ ${end.comment}` : end.comment;
         console.error("[123 \u52A9\u624B] \u542F\u52A8\u5931\u8D25", error);
       }
     };
-    if (isOfficialPanPortalHost()) {
-      installShareMessageInterceptor(pageWindow);
-      installOfficialShareTokenCleaner(document);
-    }
+    // 分享文案拦截/口令清理只在 start() 内安装一次（@run-at document-start 时
+    // documentElement 已存在，start() 会同步执行，无需在外层提前装一遍）。
     if (document.documentElement) start();
     else if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
     else start();
