@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.4
+// @version      1.3.5
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -14683,61 +14683,86 @@ ${end.comment}` : end.comment;
   }
   function parseSeasonEpisode(value, fallbackSeason = 1) {
     const text2 = String(value || "");
+    // tokenStart/tokenLength 记录命中的原文片段：整理预览按这段高亮季集编号，供人工核对
+    const span = (hit) => ({ tokenStart: hit.index, tokenLength: hit[0].length });
     let match = text2.match(/\bS(\d{1,3})[ ._-]*E(\d{1,5})(?:[ ._-]*(?:E|-E?)(\d{1,5}))?/i);
     if (match) {
       const season2 = Number(match[1]);
       const episode = Number(match[2]);
       const endEpisode = Number(match[3] || 0);
-      return { season: season2, episode, endEpisode, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}${endEpisode ? `-E${String(endEpisode).padStart(2, "0")}` : ""}` };
+      return { season: season2, episode, endEpisode, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}${endEpisode ? `-E${String(endEpisode).padStart(2, "0")}` : ""}` };
     }
     match = text2.match(/(?:^|[ ._\-[【])(\d{1,3})x(\d{1,5})(?=$|[ ._\-\]】)])/i);
     if (match) {
       const season2 = Number(match[1]);
       const episode = Number(match[2]);
-      return { season: season2, episode, endEpisode: 0, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
+      return { season: season2, episode, endEpisode: 0, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
     }
     match = text2.match(/(?:^|[ ._\-[【])(?:E|EP|Episode)\s*(\d{1,5})\s*[-~到至]\s*(?:E|EP|Episode)?\s*(\d{1,5})(?=$|[ ._\-\]】)])/i);
     if (match) {
       const season2 = Number(fallbackSeason || 1);
       const episode = Number(match[1]);
       const endEpisode = Number(match[2] || 0);
-      return { season: season2, episode, endEpisode, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}${endEpisode ? `-E${String(endEpisode).padStart(2, "0")}` : ""}` };
+      return { season: season2, episode, endEpisode, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}${endEpisode ? `-E${String(endEpisode).padStart(2, "0")}` : ""}` };
     }
     match = text2.match(CN_EPISODE_RANGE_RE);
     if (match) {
       const season2 = Number(fallbackSeason || 1);
       const episode = chineseInteger2(match[1]);
       const endEpisode = chineseInteger2(match[2]);
-      if (episode > 0 && endEpisode > 0) return { season: season2, episode, endEpisode, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}-E${String(endEpisode).padStart(2, "0")}` };
+      if (episode > 0 && endEpisode > 0) return { season: season2, episode, endEpisode, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}-E${String(endEpisode).padStart(2, "0")}` };
     }
     match = text2.match(CN_SEASON_EPISODE_PAIR_RE);
     if (match) {
       const season2 = chineseInteger2(match[1]);
       const episode = chineseInteger2(match[2]);
-      if (season2 >= 0 && episode > 0) return { season: season2, episode, endEpisode: 0, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
+      if (season2 >= 0 && episode > 0) return { season: season2, episode, endEpisode: 0, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
     }
     match = text2.match(/(?:Season|第)\s*(\d{1,3})\s*(?:季)?[^\d]{0,8}(?:Episode|Ep|E|第)\s*(\d{1,5})/i);
     if (match) {
       const season2 = Number(match[1]);
       const episode = Number(match[2]);
-      return { season: season2, episode, endEpisode: 0, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
+      return { season: season2, episode, endEpisode: 0, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
     }
     match = text2.match(CN_EPISODE_RE);
     if (match) {
       const season2 = Number(fallbackSeason || 1);
       const episode = chineseInteger2(match[1]);
-      if (episode > 0) return { season: season2, episode, endEpisode: 0, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
+      if (episode > 0) return { season: season2, episode, endEpisode: 0, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
     }
     match = text2.match(/(?:^|[ ._\-[【])(EP?|第)\s*(\d{1,5})(?:\s*[集期])?(?=$|[ ._\-\]】)])/i);
     if (match) {
       const season2 = Number(fallbackSeason || 1);
       const episode = Number(match[2]);
-      return { season: season2, episode, endEpisode: 0, seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
+      return { season: season2, episode, endEpisode: 0, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
     }
     const seasonOnly = text2.match(/(?:Season\s*|\bS)(\d{1,3})(?:\s*季)?\b/i);
     const namedSeason = seasonOnly ? null : text2.match(NAMED_SEASON_RE);
     const season = seasonOnly ? Number(seasonOnly[1]) : namedSeason ? chineseInteger2(namedSeason[1]) : Number(fallbackSeason || 1);
     return { season, episode: 0, endEpisode: 0, seasonEpisode: "" };
+  }
+  // 整理预览的季集高亮：seasonTokenRange 找出识别命中的原文片段（掐掉正则捎带的边界符），
+  // markSeasonEpisodeHtml/markSeasonEpisodeValueHtml 把片段包成 <mark class="se-token">，其余文本照常转义。
+  function seasonTokenRange(text2, fallbackSeason = 1) {
+    const source = String(text2 || "");
+    const parsed = parseSeasonEpisode(source, fallbackSeason);
+    if (!parsed.seasonEpisode || typeof parsed.tokenStart !== "number" || !(parsed.tokenLength > 0)) return null;
+    let start = parsed.tokenStart;
+    let end = parsed.tokenStart + parsed.tokenLength;
+    while (start < end && /[ ._\[【（(]/.test(source[start])) start += 1;
+    while (end > start && /[ ._\-\]】）)~～]/.test(source[end - 1])) end -= 1;
+    return end - start >= 2 ? { start, end } : null;
+  }
+  function markSeasonEpisodeHtml(text2, range) {
+    const source = String(text2 ?? "");
+    if (!range || !(range.start >= 0) || !(range.end > range.start) || range.end > source.length) return escapeHtml(source);
+    return `${escapeHtml(source.slice(0, range.start))}<mark class="se-token">${escapeHtml(source.slice(range.start, range.end))}</mark>${escapeHtml(source.slice(range.end))}`;
+  }
+  function markSeasonEpisodeValueHtml(text2, value) {
+    const token = String(value || "").trim();
+    if (!token) return escapeHtml(String(text2 ?? ""));
+    const index = String(text2 ?? "").toLowerCase().indexOf(token.toLowerCase());
+    return markSeasonEpisodeHtml(text2, index < 0 ? null : { start: index, end: index + token.length });
   }
   function parseEpisodeHint(value, fallbackSeason = 1) {
     const parsed = parseSeasonEpisode(value, fallbackSeason);
@@ -18545,7 +18570,11 @@ ${end.comment}` : end.comment;
     const pages = Math.max(1, Math.ceil(group.files.length / ORGANIZE_FILE_PAGE_SIZE));
     const page = Math.min(Math.max(1, Number(ui.organize.filePages?.[group.id]) || 1), pages);
     const visible = group.files.slice((page - 1) * ORGANIZE_FILE_PAGE_SIZE, page * ORGANIZE_FILE_PAGE_SIZE);
-    const rows = visible.map((file) => `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${escapeHtml(file.relativePath || file.name)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${escapeHtml(file.targetPath)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></div>`).join("");
+    const rows = visible.map((file) => {
+      const sourceName = String(file.relativePath || file.name);
+      const seasonToken = file.fields.mediaType === "tv" ? seasonTokenRange(sourceName) : null;
+      return `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${markSeasonEpisodeHtml(sourceName, seasonToken)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><span class="name-stack"><span class="name-mirror" aria-hidden="true">${markSeasonEpisodeValueHtml(file.newName, file.fields.seasonEpisode)}</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></span></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${markSeasonEpisodeValueHtml(file.targetPath, file.fields.seasonEpisode)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></div>`;
+    }).join("");
     return `<section class="detail-section file-section"><div class="section-title"><div>${icon("list", 17)}<h4>\u6587\u4EF6\u4E0E\u76EE\u6807\u8DEF\u5F84</h4></div><span>${group.files.length} \u9879</span></div><div class="organize-files">${rows}</div>${organizePager("organize-file-page", page, group.files.length, ORGANIZE_FILE_PAGE_SIZE)}</section>`;
   }
   function detailPane(ui, group) {
@@ -18868,6 +18897,7 @@ ${end.comment}` : end.comment;
     --success:#248a3d; --success-soft:rgba(52,199,89,.15);
     --warning:#c25e00; --warning-soft:rgba(255,149,0,.16);
     --danger:#d70015; --danger-soft:rgba(255,59,48,.12);
+    --mark-soft:rgba(255,204,0,.45);
     /* 模糊 */
     --blur-sm:14px; --blur:22px; --blur-strong:32px;
     /* 透镜与光泽 */
@@ -18927,6 +18957,7 @@ ${end.comment}` : end.comment;
     --success:#30d158; --success-soft:rgba(48,209,88,.18);
     --warning:#ff9f0a; --warning-soft:rgba(255,159,10,.18);
     --danger:#ff453a; --danger-soft:rgba(255,69,58,.18);
+    --mark-soft:rgba(255,214,10,.32);
     --blur-sm:15px; --blur:24px; --blur-strong:36px;
     --glass-lens:linear-gradient(160deg,rgba(255,255,255,.16),rgba(255,255,255,.03) 46%,rgba(255,255,255,.08));
     --sheen:radial-gradient(140% 80% at 50% -14%,rgba(255,255,255,.17),rgba(255,255,255,0) 56%),linear-gradient(180deg,rgba(255,255,255,.10) 0%,rgba(255,255,255,.02) 30%,rgba(255,255,255,.02) 72%,rgba(255,255,255,.06) 100%);
@@ -19239,6 +19270,11 @@ ${end.comment}` : end.comment;
   .episode-select { min-height:30px; font-size:10px; }
   .name-field { min-width:0; }
   .name-field textarea { min-width:0; max-width:100%; min-height:68px; max-height:140px; field-sizing:content; font-size:11px; overflow-wrap:break-word; word-break:normal; }
+  /* 新文件名季集高亮：镜像层叠在 textarea 上方，文字全透明只留季集底色，盒模型/字体必须与 textarea 逐项一致 */
+  .name-stack { position:relative; display:block; min-width:0; }
+  .name-mirror { position:absolute; inset:0; padding:9px 12px; border:1px solid transparent; border-radius:var(--radius-sm); font-size:11px; line-height:1.55; white-space:pre-wrap; overflow-wrap:break-word; word-break:normal; color:transparent; overflow:hidden; pointer-events:none; }
+  mark.se-token { color:inherit; background:var(--mark-soft); border-radius:3px; padding:0 1px; }
+  .name-mirror mark.se-token { color:transparent; padding:0; }
   /* —— 设置 —— */
   .settings-layout { height:100%; display:grid; grid-template-columns:210px minmax(0,1fr); }
   .settings-nav { display:grid; align-content:start; gap:3px; padding:12px 10px; background:var(--glass-soft); backdrop-filter:blur(var(--blur-sm)); -webkit-backdrop-filter:blur(var(--blur-sm)); border-right:1px solid color-mix(in srgb,var(--glass-border) 72%,transparent); position:relative; z-index:1; }
@@ -19800,6 +19836,8 @@ ${end.comment}` : end.comment;
       this.root.addEventListener("click", (event) => this.handleClick(event));
       this.root.addEventListener("change", (event) => this.handleChange(event));
       this.root.addEventListener("input", (event) => this.handleInput(event));
+      // scroll 不冒泡，用捕获阶段接住新文件名 textarea 的滚动，同步高亮镜像层
+      this.root.addEventListener("scroll", (event) => this.syncOrganizeNameMirrorScroll(event.target), true);
       this.root.addEventListener("compositionend", (event) => this.handleCompositionEnd(event));
       this.root.addEventListener("keydown", (event) => this.handleKeydown(event));
       this.root.addEventListener("dragstart", (event) => this.handleDragStart(event));
@@ -21467,15 +21505,33 @@ ${end.comment}` : end.comment;
         }
       }
     }
+    updateOrganizeNameMirror(textarea, value, seasonEpisode) {
+      const mirror = textarea?.closest?.(".name-stack")?.querySelector(".name-mirror");
+      if (!mirror) return;
+      const html = markSeasonEpisodeValueHtml(String(value ?? textarea.value ?? ""), seasonEpisode);
+      if (mirror.innerHTML !== html) mirror.innerHTML = html;
+      mirror.scrollTop = textarea.scrollTop || 0;
+      mirror.scrollLeft = textarea.scrollLeft || 0;
+    }
+    syncOrganizeNameMirrorScroll(textarea) {
+      if (!textarea?.matches?.("[data-organize-name]")) return;
+      const mirror = textarea.closest(".name-stack")?.querySelector(".name-mirror");
+      if (!mirror) return;
+      mirror.scrollTop = textarea.scrollTop;
+      mirror.scrollLeft = textarea.scrollLeft;
+    }
     refreshOrganizeDraftDom(group) {
       if (!group || this.state.view !== "organize") return;
       for (const file of group.files || []) {
         const row = this.root?.querySelector(`[data-file-row="${cssEscape(file.id)}"]`);
         if (!row) continue;
         const name = row.querySelector("[data-organize-name]");
-        if (name && document.activeElement !== name) name.value = file.newName || "";
+        if (name && document.activeElement !== name) {
+          name.value = file.newName || "";
+          this.updateOrganizeNameMirror(name, file.newName, file.fields?.seasonEpisode);
+        }
         const path = row.querySelector(".target-file strong");
-        if (path) path.textContent = file.targetPath || "";
+        if (path) path.innerHTML = markSeasonEpisodeValueHtml(file.targetPath || "", file.fields?.seasonEpisode);
         const episodeLabel = row.querySelector(".source-file small");
         if (episodeLabel && file.fields?.mediaType === "tv") episodeLabel.textContent = file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6";
         const episodeSelect = row.querySelector("[data-episode-file]");
@@ -21648,7 +21704,8 @@ ${end.comment}` : end.comment;
       const row = target.closest("[data-file-row]");
       const path = row?.querySelector(".target-file strong");
       const status = row?.querySelector(".target-file small");
-      if (path) path.textContent = task.targetPath;
+      if (path) path.innerHTML = markSeasonEpisodeValueHtml(task.targetPath || "", task.fields?.seasonEpisode);
+      this.updateOrganizeNameMirror(target, value, task.fields?.seasonEpisode);
       if (status) {
         status.textContent = task.matched ? `\u5DF2\u6821\u51C6 ${task.fields.seasonEpisode}` : value !== task.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8";
         status.className = task.matched ? "success" : "";

@@ -348,7 +348,7 @@ test("refreshOrganizeGroupTargets：旁挂字幕跟随策略后的主文件季�
 
 test("normalizeTmdbMedia 与模板回归：默认配置模板可渲染策略后的季集", () => {
   assert.equal(isVideoFile("测试 S01E01.mkv"), true);
-  assert.deepEqual(plain(parseSeasonEpisode("测试剧 S01E02.mkv", 1)), { season: 1, episode: 2, endEpisode: 0, seasonEpisode: "S01E02" });
+  assert.deepEqual(plain(parseSeasonEpisode("测试剧 S01E02.mkv", 1)), { season: 1, episode: 2, endEpisode: 0, tokenStart: 4, tokenLength: 6, seasonEpisode: "S01E02" });
 });
 
 await chain;
