@@ -107,12 +107,12 @@ onBeforeUnmount(() => {
   position: relative;
   padding: 4px;
   gap: 2px;
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-control);
   background: var(--surface-input);
   border: 1px solid var(--glass-border-2);
   box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.18), 0 4px 14px rgba(0, 0, 0, 0.12);
-  -webkit-backdrop-filter: blur(var(--glass-blur-2)) saturate(1.4);
-  backdrop-filter: blur(var(--glass-blur-2)) saturate(1.4);
+  -webkit-backdrop-filter: blur(var(--glass-blur-2)) saturate(1.25);
+  backdrop-filter: blur(var(--glass-blur-2)) saturate(1.25);
   width: fit-content;
   max-width: 100%;
   overflow-x: auto;
@@ -146,9 +146,9 @@ onBeforeUnmount(() => {
   top: 4px;
   left: 0;
   height: calc(100% - 8px);
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-control);
   background: var(--grad-accent);
-  box-shadow: 0 6px 16px rgba(124, 92, 255, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.42);
+  box-shadow: 0 2px 9px rgba(124, 92, 255, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.42);
   transition: transform var(--transition-slow), width var(--transition-slow);
   pointer-events: none;
   z-index: 0;
@@ -163,14 +163,14 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 16px;
+  padding: 6px 14px;
   border: none;
   background: transparent;
   color: var(--text-muted);
   font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.01em;
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-control);
   cursor: pointer;
   white-space: nowrap;
   transition: color 0.2s ease, background-color 0.2s ease;
@@ -180,7 +180,7 @@ onBeforeUnmount(() => {
 }
 
 .segmented--sm .segmented-btn {
-  padding: 6px 12px;
+  padding: 5px 10px;
   font-size: 12px;
 }
 

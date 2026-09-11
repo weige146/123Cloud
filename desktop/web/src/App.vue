@@ -112,7 +112,9 @@ function toggleRail() {
   railCollapsed.value = !railCollapsed.value;
 }
 
-const mobileDock = computed(() => [navigation[0], navigation[1], navigation[2], navigation[3]]);
+// 取导航前 4 项做移动端底部停靠。用 slice 而不是 navigation[0..3] 硬编码索引 ——
+// 索引写法与「设置按钮误用 navigation[3]」是同一类耦合，导航顺序一变就静默错位。
+const mobileDock = computed(() => navigation.slice(0, 4));
 
 const morePages = computed(() => navigation.flatMap((item) => item.children || [{ label: item.label, path: item.path, icon: item.icon }]));
 
@@ -120,8 +122,11 @@ function isActive(item: NavigationItem) {
   return item.routes.includes(route.path);
 }
 
-function isChildActive(item: NavigationItem, child: { path: string }) {
-  return item.routes.includes(child.path);
+// 注意：判据必须是「子项自己的路径 === 当前路由」。
+// 早期写成 item.routes.includes(child.path)，而 item.routes 装的是整组路由，
+// 于是同组子项会一起高亮（如「投稿机器人 / 投稿展示」同时点亮）。
+function isChildActive(child: { path: string }) {
+  return route.path === child.path;
 }
 
 function isGroupActive(group: NavigationItem) {
@@ -208,7 +213,7 @@ watch(isPublicPage, (isPublic) => {
                   :key="child.path"
                   type="button"
                   class="nav-item"
-                  :class="{ active: isChildActive(group, child) }"
+                  :class="{ active: isChildActive(child) }"
                   @click="navigate(child.path)"
                 >
                   <v-icon :icon="child.icon" size="18" />
@@ -220,7 +225,7 @@ watch(isPublicPage, (isPublic) => {
             <button
               type="button"
               class="nav-item"
-              :class="{ active: isActive(navigation[3]) }"
+              :class="{ active: route.path === '/admin/settings' }"
               title="设置"
               @click="navigate('/admin/settings')"
             >

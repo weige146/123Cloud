@@ -30,14 +30,14 @@
   --surface-input: rgba(10, 12, 24, 0.45);
   --surface-strong: rgba(13, 15, 28, 0.78);
   --surface-border: rgba(255, 255, 255, 0.17);
-  --surface-filter: blur(22px) saturate(1.55);
+  --surface-filter: blur(10px) saturate(1.25);
   --surface-sheen: linear-gradient(135deg, rgba(255, 255, 255, 0.09) 0%, rgba(255, 255, 255, 0.015) 42%, rgba(255, 255, 255, 0) 60%);
   --surface-shadow: 0 18px 46px rgba(2, 4, 16, 0.38);
 
   /* Overlays (menus / dialogs) */
   --overlay-surface: rgba(17, 19, 36, 0.78);
   --overlay-border: rgba(255, 255, 255, 0.16);
-  --overlay-filter: blur(30px) saturate(1.6);
+  --overlay-filter: blur(14px) saturate(1.3);
   --shadow-overlay: 0 32px 90px rgba(0, 0, 0, 0.55);
 
   /* Borders */
@@ -77,11 +77,11 @@
   --glass-border-2: rgba(255, 255, 255, 0.15);
   --glass-border-3: rgba(255, 255, 255, 0.1);
   --glass-highlight: rgba(255, 255, 255, 0.4);
-  --glass-blur: 28px;
-  --glass-blur-2: 18px;
-  --glass-blur-3: 10px;
-  --glass-blur-heavy: 40px;
-  --glass-saturate: 1.65;
+  --glass-blur: 10px;
+  --glass-blur-2: 8px;
+  --glass-blur-3: 6px;
+  --glass-blur-heavy: 16px;
+  --glass-saturate: 1.25;
 
   /* Chrome */
   --sidebar-bg: rgba(13, 15, 30, 0.55);
@@ -96,12 +96,13 @@
   --mesh-glow-2: rgba(76, 201, 240, 0.45);
   --mesh-glow-3: rgba(244, 114, 182, 0.36);
 
-  /* Radii */
-  --radius-sm: 8px;
-  --radius-control: 12px;
-  --radius-md: 14px;
-  --radius-surface: 20px;
-  --radius-dialog: 24px;
+  /* Radii —— 桌面软件的窗口与控件圆角比网页克制得多，
+     这一档整体收紧；--radius-pill 只留给 chip / badge / 滚动条这类小元素 */
+  --radius-sm: 6px;
+  --radius-control: 8px;
+  --radius-md: 10px;
+  --radius-surface: 10px;
+  --radius-dialog: 12px;
   --radius-pill: 999px;
 
   /* Elevation */
@@ -141,13 +142,13 @@
   --surface-input: rgba(255, 255, 255, 0.6);
   --surface-strong: rgba(255, 255, 255, 0.8);
   --surface-border: rgba(255, 255, 255, 0.85);
-  --surface-filter: blur(22px) saturate(1.5);
+  --surface-filter: blur(10px) saturate(1.2);
   --surface-sheen: linear-gradient(135deg, rgba(255, 255, 255, 0.85) 0%, rgba(255, 255, 255, 0.25) 45%, rgba(255, 255, 255, 0) 65%);
   --surface-shadow: 0 18px 44px rgba(84, 76, 160, 0.16);
 
   --overlay-surface: rgba(255, 255, 255, 0.82);
   --overlay-border: rgba(120, 116, 180, 0.22);
-  --overlay-filter: blur(30px) saturate(1.55);
+  --overlay-filter: blur(14px) saturate(1.25);
   --shadow-overlay: 0 32px 80px rgba(84, 76, 160, 0.25);
 
   --border: rgba(28, 32, 54, 0.1);
@@ -340,8 +341,8 @@ a:hover { color: var(--link-hover); }
   z-index: 1;
   display: flex;
   height: 100dvh;
-  padding: 14px;
-  gap: 14px;
+  padding: 10px;
+  gap: 10px;
 }
 
 /* Draggable strip for hiddenInset traffic lights */
@@ -400,8 +401,8 @@ a:hover { color: var(--link-hover); }
 .side-rail__brand {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 52px 18px 18px;
+  gap: 10px;
+  padding: 44px 14px 14px;
   color: inherit;
   border: 0;
   background: transparent;
@@ -421,7 +422,7 @@ a:hover { color: var(--link-hover); }
   font-weight: 800;
   color: #fff;
   background: var(--grad-accent);
-  box-shadow: 0 8px 20px rgba(124, 92, 255, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  box-shadow: 0 4px 12px rgba(124, 92, 255, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.5);
   letter-spacing: -0.04em;
 }
 
@@ -437,7 +438,7 @@ a:hover { color: var(--link-hover); }
 .side-rail__nav {
   flex: 1;
   overflow-y: auto;
-  padding: 6px 12px 12px;
+  padding: 4px 10px 10px;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -449,7 +450,7 @@ a:hover { color: var(--link-hover); }
   text-transform: uppercase;
   letter-spacing: 0.16em;
   color: var(--text-muted);
-  padding: 14px 10px 6px;
+  padding: 12px 8px 4px;
 }
 
 .nav-item {
@@ -457,13 +458,13 @@ a:hover { color: var(--link-hover); }
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 9px 12px;
+  padding: 7px 10px;
   border: 1px solid transparent;
   border-radius: var(--radius-control);
   background: transparent;
   color: var(--text-secondary);
   font: inherit;
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 550;
   cursor: pointer;
   transition: background var(--transition), color var(--transition), border-color var(--transition), transform var(--transition);
@@ -472,10 +473,10 @@ a:hover { color: var(--link-hover); }
 .nav-item .v-icon { opacity: 0.75; }
 .nav-item:hover { background: var(--bg-hover); color: var(--text-primary); }
 .nav-item.active {
-  background: linear-gradient(130deg, rgba(124, 92, 255, 0.26), rgba(76, 201, 240, 0.12));
-  border-color: rgba(124, 92, 255, 0.32);
+  background: var(--accent-soft);
+  border-color: rgba(124, 92, 255, 0.3);
   color: var(--text-primary);
-  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 6px 16px rgba(124, 92, 255, 0.16);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
 }
 .nav-item.active .v-icon { opacity: 1; color: var(--accent-2); }
 .nav-item .nav-dot {
@@ -487,7 +488,7 @@ a:hover { color: var(--link-hover); }
 }
 
 .side-rail__footer {
-  padding: 12px;
+  padding: 10px;
   border-top: 1px solid var(--border);
   display: flex;
   align-items: center;
@@ -517,9 +518,9 @@ a:hover { color: var(--link-hover); }
 
 .page-body {
   /* 大窗口时内容随窗口伸展（放大约至 1920px 封顶），不再固定 1180px 留死空隙 */
-  max-width: clamp(1180px, calc(100vw - 56px), 1920px);
+  max-width: clamp(1180px, calc(100vw - 48px), 1920px);
   margin: 0 auto;
-  padding: 30px 34px 44px;
+  padding: 22px 24px 32px;
 }
 
 /* ============================================================
@@ -681,7 +682,7 @@ a:hover { color: var(--link-hover); }
   place-items: center;
   color: #fff;
   background: var(--grad-accent);
-  box-shadow: 0 10px 26px rgba(124, 92, 255, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  box-shadow: 0 4px 12px rgba(124, 92, 255, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.45);
 }
 .page-hero-text { flex: 1; min-width: 0; position: relative; }
 .page-hero-title { font-size: 19px; font-weight: 700; letter-spacing: -0.02em; }
@@ -714,7 +715,7 @@ a:hover { color: var(--link-hover); }
   place-items: center;
   color: #fff;
   background: var(--grad-accent);
-  box-shadow: 0 8px 18px rgba(124, 92, 255, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  box-shadow: 0 3px 10px rgba(124, 92, 255, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.4);
 }
 .stat-tile-body { min-width: 0; }
 .stat-tile-label {
@@ -805,7 +806,7 @@ a:hover { color: var(--link-hover); }
   place-items: center;
   color: #fff;
   background: var(--grad-accent);
-  box-shadow: 0 6px 14px rgba(124, 92, 255, 0.28);
+  box-shadow: 0 3px 10px rgba(124, 92, 255, 0.22);
   flex: 0 0 34px;
 }
 
@@ -821,9 +822,9 @@ a:hover { color: var(--link-hover); }
   align-items: center;
   justify-content: center;
   gap: 7px;
-  height: 38px;
-  padding: 0 18px;
-  border-radius: var(--radius-pill);
+  height: 34px;
+  padding: 0 14px;
+  border-radius: var(--radius-control);
   border: 1px solid var(--glass-border-2);
   background: var(--glass-bg-1);
   -webkit-backdrop-filter: blur(var(--glass-blur-2)) saturate(1.4);
@@ -855,7 +856,7 @@ a:hover { color: var(--link-hover); }
   border: 1px solid rgba(124, 92, 255, 0.55);
   background: var(--grad-accent);
   color: #fff;
-  box-shadow: 0 10px 24px rgba(124, 92, 255, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  box-shadow: 0 4px 12px rgba(124, 92, 255, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.45);
 }
 .lq-btn--primary:hover { filter: brightness(1.07); }
 .lq-btn--danger {
@@ -866,6 +867,9 @@ a:hover { color: var(--link-hover); }
 .lq-btn--ghost { background: transparent; box-shadow: none; }
 .lq-btn--sm { height: 31px; padding: 0 13px; font-size: 12px; }
 
+/* ⚠️ 下面这套 .segmented* 是**失效的重复定义**：分段控件真正的样式在
+   components/SegmentedTabs.vue 的 <style scoped> 里，组件样式在 liquid.css 之后加载，
+   同特异性下后者胜出 —— 改这里不会有任何视觉效果，要改请去组件里改。 */
 .segmented {
   display: inline-flex;
   gap: 4px;
@@ -1376,7 +1380,7 @@ a:hover { color: var(--link-hover); }
   place-items: center;
   color: #fff;
   background: var(--grad-accent);
-  box-shadow: 0 6px 14px rgba(124, 92, 255, 0.28);
+  box-shadow: 0 3px 10px rgba(124, 92, 255, 0.22);
 }
 .filename, .source-row {
   font-family: var(--font-mono);
@@ -1482,8 +1486,8 @@ a:hover { color: var(--link-hover); }
 }
 
 .v-btn {
-  border-radius: var(--radius-pill) !important;
-  font-weight: 620 !important;
+  border-radius: var(--radius-control) !important;
+  font-weight: 600 !important;
   letter-spacing: 0 !important;
   text-transform: none !important;
   transition: transform var(--transition), box-shadow var(--transition), background var(--transition), border-color var(--transition) !important;
@@ -1491,15 +1495,30 @@ a:hover { color: var(--link-hover); }
 .v-btn:not(.v-btn--icon):not(.v-btn--variant-text):not(.v-btn--variant-plain):not(.v-btn--variant-tonal) {
   box-shadow: var(--shadow-sm), inset 0 1px 0 var(--glass-highlight) !important;
 }
-.v-btn:not(.v-btn--icon):active { transform: scale(0.97); }
-.v-btn--variant-elevated,
-.v-btn--variant-flat {
+.v-btn:not(.v-btn--icon):active { transform: scale(0.98); }
+/* 默认按钮 = 中性表面。Vuetify 里 v-btn 默认就是 variant="flat"，
+   早期这里把「所有」flat / elevated 按钮一律刷成主色渐变 + 紫色发光，
+   于是界面上每个按钮看起来都是主按钮，反而没有了主次。
+   现在只有显式声明了颜色的按钮（Vuetify 会输出 bg-* 类）才吃自己的颜色。 */
+.v-btn--variant-elevated:not([class*="bg-"]),
+.v-btn--variant-flat:not([class*="bg-"]) {
+  background: var(--glass-bg-2) !important;
+  color: var(--text-primary) !important;
+  box-shadow: inset 0 1px 0 var(--glass-highlight) !important;
+}
+.v-btn--variant-elevated:not([class*="bg-"]):hover,
+.v-btn--variant-flat:not([class*="bg-"]):hover {
+  background: var(--bg-hover) !important;
+}
+/* 主按钮：保留品牌渐变，但收掉大范围紫色外发光 */
+.v-btn--variant-elevated.bg-primary,
+.v-btn--variant-flat.bg-primary {
   background: var(--grad-accent) !important;
   color: #fff !important;
-  box-shadow: 0 10px 24px rgba(124, 92, 255, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.45) !important;
+  box-shadow: 0 4px 14px rgba(124, 92, 255, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.4) !important;
 }
-.v-btn--variant-elevated:hover,
-.v-btn--variant-flat:hover { filter: brightness(1.06); }
+.v-btn--variant-elevated.bg-primary:hover,
+.v-btn--variant-flat.bg-primary:hover { filter: brightness(1.06); }
 .v-btn--variant-outlined {
   border: 1px solid var(--glass-border-2) !important;
   background: var(--glass-bg-2) !important;
