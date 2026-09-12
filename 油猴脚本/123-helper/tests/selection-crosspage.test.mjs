@@ -99,3 +99,16 @@ function makeState(selected = [], unselected = [], selectAll = false) {
 }
 
 console.log("selection-crosspage: all", 10, "cases passed");
+
+// 10. 删除文件后「重命名/整理」按钮残留修复（shouldClearStaleSelection，1.3.7）：
+// 计数文本消失（hostCount=null）且可见行无任何勾选 = 官方已清空选中，应清空本地残留。
+const shouldClear = context.shouldClearStaleSelection;
+assert.equal(typeof shouldClear, "function");
+// 10a. 删除全部选中文件：计数文本消失、行已不在 DOM、可见行全部未勾选 → 清空。
+assert.equal(shouldClear(makeState(["a", "b"]), new Map([["c", false], ["d", false]]), null), true);
+// 10b. 可见行仍有勾选（只是计数文本没读到）→ 不清空。
+assert.equal(shouldClear(makeState(["a", "ghost"]), new Map([["a", true]]), null), false);
+// 10c. 全选模式 → 不清空（unselectedIds 语义由 reconcile 维护）。
+assert.equal(shouldClear(makeState([], [], true), new Map([["c", false]]), null), false);
+// 10d. 计数存在（哪怕是滞后旧值）→ 交给 reconcile 的收缩信号，不清空。
+assert.equal(shouldClear(makeState(["a", "b"]), new Map([["c", false]]), 2), false);
