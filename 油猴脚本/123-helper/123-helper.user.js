@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.7
+// @version      1.3.8
 // @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类，整理与重命名操作记录按文件夹归档、错整一键还原）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -17622,6 +17622,27 @@ ${end.comment}` : end.comment;
     }
     return [...groups.entries()].map(([name, recordRows]) => ({ name, kind: "rename", rows: recordRows }));
   }
+  // 重命名历史条目名：单目录直接用目录名，多目录用「N 个目录」，都查不到退回「批量重命名」。
+  // 只叫「批量重命名」的话历史下拉里每条长得一样，只能靠日期猜是哪次操作。
+  function renameHistoryLabel(succeeded, dirNames = {}) {
+    const names = [];
+    for (const item of succeeded || []) {
+      const name = String(dirNames[String(item.parentId || item.parentFileId || "0")] || "").trim();
+      if (name && !names.includes(name)) names.push(name);
+    }
+    if (names.length === 1) return names[0];
+    return names.length > 1 ? `${names.length} 个目录` : "批量重命名";
+  }
+  // 重命名历史按当前目录过滤：历史是全局存的，恢复列表只该看到当前文件夹里发生过的
+  // 重命名，别的文件夹的操作混进来会让人误以为改过这里。条目要求带 targets 且全部
+  // 落在当前目录（老记录的 targets 里也存了 parentId，一样能过滤）。
+  function filterRenameHistoryForDir(history, dirId) {
+    const wanted = String(dirId || "0");
+    return (history || []).filter((entry) => {
+      const targets = Array.isArray(entry?.targets) ? entry.targets : [];
+      return targets.length > 0 && targets.every((item) => String(item?.parentId || "0") === wanted);
+    });
+  }
   // 同名合并：记录名相同并入既有记录，行按文件 id 覆盖（新状态取代旧还原信息）
   function mergeRecordsIntoStore(store, groups, meta = {}) {
     const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -19067,11 +19088,31 @@ ${end.comment}` : end.comment;
     if (changedCount) changedCount.textContent = String(changed.length);
     if (execute) execute.disabled = !changed.length || state.errors.length > 0;
   }
+  // 重命名历史明细页：改动点逐行列出（改名前 → 改名后），页面本身就是恢复预览，
+  // 恢复按钮也在本页 —— 恢复 = 按文件 id 把「改名后」改回「改名前」。
+  function renderRenameRestore(ui, entry) {
+    const targets = Array.isArray(entry.targets) ? entry.targets : [];
+    const rows = targets.map((item) => `<tr><td>${escapeHtml(item.name || "")}</td><td>${escapeHtml(item.newName || "")}</td></tr>`).join("");
+    const body = `<section class="rename-preview"><div class="pane-toolbar"><strong class="pane-title">${escapeHtml(entry.name || "重命名记录")}</strong><span class="pane-count">${targets.length}</span><span class="footer-note">恢复会把「改名后」逐个改回「改名前」，全部成功才销掉这条记录</span></div><div class="table-wrap flush"><table><thead><tr><th>改名前</th><th>改名后</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+    const footer = `<span class="footer-note">${escapeHtml(formatLocalDateTime(entry.createdAt))} 的改动</span><div class="footer-actions"><button class="button" data-action="rename-restore-back">${icon("arrowLeft", 15)}返回</button><button class="button primary" data-action="rename-undo">${icon("restart", 15)}确认恢复 ${targets.length} 项</button><button class="button" data-action="close">取消</button></div>`;
+    return dialogFrame(ui, {
+      title: "恢复重命名",
+      subtitle: `${targets.length} 个改动点`,
+      iconName: "restart",
+      metrics: [metric("改动", String(targets.length), "rename")],
+      body,
+      footer,
+      className: "workbench-window",
+      contentClass: "workbench-content"
+    });
+  }
   function renderRename(ui) {
     const state = ui.rename;
     const changed = state.preview.filter((item) => item.changed);
     const presets = ui.config.rename.presets || [];
-    const history = ui.config.rename.history || [];
+    const restoreEntry = state.restoreId ? (ui.config.rename.history || []).find((entry) => entry.id === state.restoreId) : null;
+    if (restoreEntry) return renderRenameRestore(ui, restoreEntry);
+    const history = filterRenameHistoryForDir(ui.config.rename.history, ui.commandContext?.currentDir || state.targets[0]?.parentId || state.targets[0]?.parentFileId || "0");
     const error = renameErrors(state);
     const rules = state.rules.map((rule, index) => `<section class="rule-row">
     <div class="rule-head"><span class="rule-index">${index + 1}</span><strong>${escapeHtml(RULE_TYPES.find((item) => item.value === rule.type)?.label || rule.type)}</strong><div class="row-actions"><button class="icon-button" data-action="rename-rule-up" data-id="${rule.id}" title="\u4E0A\u79FB">${icon("arrowUp", 15)}</button><button class="icon-button" data-action="rename-rule-down" data-id="${rule.id}" title="\u4E0B\u79FB">${icon("arrowDown", 15)}</button><button class="icon-button danger" data-action="rename-remove-rule" data-id="${rule.id}" title="\u5220\u9664">${icon("trash", 15)}</button></div></div>
@@ -19082,7 +19123,7 @@ ${end.comment}` : end.comment;
     <aside class="rename-rules"><div class="pane-toolbar"><strong class="pane-title">\u89C4\u5219\u94FE</strong><span class="pane-count">${state.rules.length}</span><span class="spacer"></span><select id="rename-rule-type" aria-label="\u89C4\u5219\u7C7B\u578B">${RULE_TYPES.map((item) => `<option value="${item.value}">${escapeHtml(item.label)}</option>`).join("")}</select><button class="button primary" data-action="rename-add-rule">${icon("plus", 15)}\u6DFB\u52A0</button></div><div class="rule-list">${rules}</div></aside>
     <section class="rename-preview"><div class="pane-toolbar"><strong class="pane-title">\u6587\u4EF6\u9884\u89C8</strong><span class="pane-count">${state.targets.length}</span><label class="check-line"><input id="rename-keep-extension" type="checkbox" ${state.keepExtension ? "checked" : ""}>\u4FDD\u7559\u6269\u5C55\u540D</label><span class="spacer"></span><select id="rename-preset" aria-label="\u5E38\u7528\u7EC4\u5408"><option value="">\u5E38\u7528\u7EC4\u5408</option>${presets.map((preset) => `<option value="${preset.id}">${escapeHtml(preset.name)}</option>`).join("")}</select><button class="button" data-action="rename-load-preset">\u8F7D\u5165</button><button class="icon-button danger" data-action="rename-delete-preset" title="\u5220\u9664\u6240\u9009\u5E38\u7528\u7EC4\u5408" ${presets.length ? "" : "disabled"}>${icon("trash", 15)}</button><button class="button" data-action="rename-save-preset">${icon("save", 15)}\u4FDD\u5B58</button></div><div data-rename-errors>${error}</div><div class="table-wrap flush"><table><thead><tr><th>\u539F\u540D\u79F0</th><th>\u65B0\u540D\u79F0</th><th>\u7C7B\u578B</th></tr></thead><tbody data-rename-preview-rows>${rows}</tbody></table></div></section>
   </div>`;
-    const footer = `<span class="footer-note">\u4EC5\u5904\u7406\u5F53\u524D\u9009\u4E2D\u7684 ${state.targets.length} \u4E2A\u9879\u76EE\uFF0C\u6587\u4EF6\u5939\u4E0D\u4F1A\u5C55\u5F00</span><div class="footer-actions"><select id="rename-history" title="\u9009\u62E9\u8981\u6062\u590D\u7684\u91CD\u547D\u540D\u8BB0\u5F55" ${history.length ? "" : "disabled"}>${history.map((entry2, index) => `<option value="${escapeHtml(entry2.id)}">${escapeHtml(entry2.name || `\u91CD\u547D\u540D ${index + 1}`)} \xB7 ${escapeHtml(formatLocalDateTime(entry2.createdAt).slice(0, 10))}</option>`).join("")}</select><button class="button" data-action="rename-undo" ${history.length ? "" : "disabled"}>${icon("restart", 15)}\u6062\u590D</button><button class="icon-button danger" data-action="rename-clear-history" title="\u6E05\u7A7A\u91CD\u547D\u540D\u5386\u53F2" ${history.length ? "" : "disabled"}>${icon("trash", 15)}</button><button class="button" data-action="close">\u53D6\u6D88</button><button class="button primary" data-action="rename-execute" ${changed.length && !state.errors.length ? "" : "disabled"}>${icon("check", 15)}\u6267\u884C\u91CD\u547D\u540D</button></div>`;
+    const footer = `<span class="footer-note">\u4EC5\u5904\u7406\u5F53\u524D\u9009\u4E2D\u7684 ${state.targets.length} \u4E2A\u9879\u76EE\uFF0C\u6587\u4EF6\u5939\u4E0D\u4F1A\u5C55\u5F00</span><div class="footer-actions"><div class="history-menu"><button class="button history-toggle" data-action="rename-history-toggle" title="\u9009\u62E9\u8981\u6062\u590D\u7684\u91CD\u547D\u540D\u8BB0\u5F55" ${history.length ? "" : "disabled"}>${icon("restart", 15)}<span class="history-toggle-label">${history.length ? `\u91CD\u547D\u540D\u8BB0\u5F55 ${history.length} \u6761` : "\u65E0\u91CD\u547D\u540D\u8BB0\u5F55"}</span>${icon("chevronDown", 14)}</button>${state.historyOpen && history.length ? `<div class="history-popup">${history.map((entry2, index) => `<button class="history-item" data-action="rename-history-open" data-id="${escapeHtml(entry2.id)}"><span class="history-item-name">${escapeHtml(entry2.name || `\u91CD\u547D\u540D ${index + 1}`)}</span><span class="history-item-meta">${(entry2.targets || []).length} \u9879 \xB7 ${escapeHtml(formatLocalDateTime(entry2.createdAt).slice(0, 16))}</span></button>`).join("")}</div>` : ""}</div><button class="icon-button danger" data-action="rename-clear-history" title="\u6E05\u7A7A\u91CD\u547D\u540D\u5386\u53F2" ${history.length ? "" : "disabled"}>${icon("trash", 15)}</button><button class="button" data-action="close">\u53D6\u6D88</button><button class="button primary" data-action="rename-execute" ${changed.length && !state.errors.length ? "" : "disabled"}>${icon("check", 15)}\u6267\u884C\u91CD\u547D\u540D</button></div>`;
     return dialogFrame(ui, {
       title: "\u6279\u91CF\u91CD\u547D\u540D",
       subtitle: `${state.targets.length} \u4E2A\u9009\u4E2D\u9879\u76EE`,
@@ -19538,6 +19579,13 @@ ${end.comment}` : end.comment;
   .pane-title { flex:0 0 auto; color:var(--text); font-size:13px; font-weight:600; letter-spacing:0; }
   .pane-toolbar .check-line { flex:0 0 auto; white-space:nowrap; }
   #rename-preset { width:min(220px,34vw); flex:0 1 220px; }
+  .history-menu { position:relative; }
+  .history-toggle .history-toggle-label { max-width:38vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .history-popup { position:absolute; bottom:calc(100% + 8px); right:0; z-index:40; display:flex; flex-direction:column; gap:2px; min-width:280px; max-width:72vw; max-height:46vh; overflow:auto; padding:6px; background:var(--glass-strong); backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px); border:1px solid var(--glass-border); border-radius:var(--radius-sm); box-shadow:0 12px 32px rgba(16,34,64,.22); }
+  .history-item { display:flex; flex-direction:column; gap:2px; padding:8px 10px; border:0; border-radius:9px; background:transparent; color:var(--text); font:inherit; text-align:left; cursor:pointer; }
+  .history-item:hover { background:color-mix(in srgb, var(--text) 10%, transparent); }
+  .history-item-name { font-size:12px; font-weight:600; overflow-wrap:anywhere; }
+  .history-item-meta { font-size:11px; color:var(--muted); }
   .editor-surface { position:relative; margin:16px; padding:16px; background:var(--glass); backdrop-filter:blur(var(--blur-sm)); -webkit-backdrop-filter:blur(var(--blur-sm)); border:1px solid var(--glass-border); border-radius:var(--radius-sm); box-shadow:var(--shadow-sm); }
   .editor-surface textarea { min-height:300px; font-family:var(--font-mono); font-size:12px; }
   .result-summary { display:flex; gap:10px; padding:16px 16px 0; }
@@ -20964,7 +21012,7 @@ ${end.comment}` : end.comment;
     }
     async openRename(items) {
       const targets = items.map((item) => ({ ...item }));
-      this.rename = { items, targets, keepExtension: true, rules: [defaultRule("replace")], preview: [], errors: [], existing: {}, folderName: null };
+      this.rename = { items, targets, keepExtension: true, rules: [defaultRule("replace")], preview: [], errors: [], existing: {}, folderName: null, restoreId: null, historyOpen: false };
       await this.updateRenamePreview(false);
       this.state.view = "rename";
       this.render();
@@ -21041,20 +21089,21 @@ ${end.comment}` : end.comment;
         const batch = await this.renameTargetsSafely(targets, signal, "\u6279\u91CF\u91CD\u547D\u540D", { verify: true });
         const succeeded = batch.details.filter((item) => item.status === "success");
         if (succeeded.length) {
+          // 先查父目录名：重命名历史与操作记录的命名共用；单条查询失败只丢命名、不影响结果
+          const parentIds = [...new Set(succeeded.map((item) => String(item.parentId || item.parentFileId || "0")).filter((id) => id && id !== "0"))];
+          const dirNames = {};
+          await mapLimit(parentIds, 4, async (parentId) => {
+            try {
+              const [entry] = await this.api.fileInfos([parentId], signal);
+              if (entry) dirNames[parentId] = entry.name;
+            } catch {}
+          });
           this.config = this.configStore.update((config) => {
-            config.rename.history.unshift({ id: uniqueId("history"), name: "\u6279\u91CF\u91CD\u547D\u540D", createdAt: (/* @__PURE__ */ new Date()).toISOString(), targets: succeeded.map((item) => ({ id: item.id, parentId: item.parentId || item.parentFileId, name: item.name, newName: item.newName })) });
+            config.rename.history.unshift({ id: uniqueId("history"), name: renameHistoryLabel(succeeded, dirNames), createdAt: (/* @__PURE__ */ new Date()).toISOString(), targets: succeeded.map((item) => ({ id: item.id, parentId: item.parentId || item.parentFileId, name: item.name, newName: item.newName })) });
             config.rename.history = config.rename.history.slice(0, 50);
           });
           // 同步并入操作记录（按所在目录名聚合，同名合并）；失败只提示不影响重命名结果
           try {
-            const parentIds = [...new Set(succeeded.map((item) => String(item.parentId || item.parentFileId || "0")).filter((id) => id && id !== "0"))];
-            const dirNames = {};
-            await mapLimit(parentIds, 4, async (parentId) => {
-              try {
-                const [entry] = await this.api.fileInfos([parentId], signal);
-                if (entry) dirNames[parentId] = entry.name;
-              } catch {}
-            });
             const store = loadOperationRecords();
             mergeRecordsIntoStore(store, buildRenameRecordGroups(succeeded, dirNames), { modeLabel: "\u6279\u91CF\u91CD\u547D\u540D", scopeLabel: "" });
             if (!saveOperationRecords(store)) this.toast("\u64CD\u4F5C\u8BB0\u5F55\u4FDD\u5B58\u5931\u8D25\uFF1A\u811A\u672C\u5B58\u50A8\u5199\u5165\u672A\u6210\u529F", "warning");
@@ -21141,8 +21190,7 @@ ${end.comment}` : end.comment;
       return options.verify ? this.verifyRenameBatch(batch, targets, signal) : batch;
     }
     async undoRename() {
-      const selectedId = this.root.querySelector("#rename-history")?.value;
-      const history = this.config.rename.history?.find((item) => item.id === selectedId) || this.config.rename.history?.[0];
+      const history = this.config.rename.history?.find((item) => item.id === this.rename?.restoreId);
       if (!history) return;
       const result2 = await this.runTask(async (signal) => {
         const targets = history.targets.map((item) => ({ id: item.id, parentId: item.parentId, name: item.newName, newName: item.name }));
@@ -21152,6 +21200,7 @@ ${end.comment}` : end.comment;
       if (result2.fail === 0) this.config = this.configStore.update((config) => {
         config.rename.history = config.rename.history.filter((item) => item.id !== history.id);
       });
+      if (this.rename) this.rename.restoreId = null;
       this.bridge.refresh();
       this.setResult("\u6062\u590D\u6587\u4EF6\u540D\u7ED3\u679C", result2);
     }
@@ -22483,6 +22532,20 @@ ${end.comment}` : end.comment;
           this.render();
         },
         "rename-execute": () => this.executeRename(),
+        "rename-restore-back": () => {
+          if (this.rename) this.rename.restoreId = null;
+          this.render();
+        },
+        "rename-history-toggle": () => {
+          if (this.rename) this.rename.historyOpen = !this.rename.historyOpen;
+          this.render();
+        },
+        "rename-history-open": (control) => {
+          if (!this.rename) return;
+          this.rename.restoreId = control.dataset.id || null;
+          this.rename.historyOpen = false;
+          this.render();
+        },
         "rename-undo": () => this.undoRename(),
         "records-toggle": (control) => {
           const name = control.dataset.name;
@@ -23220,6 +23283,14 @@ ${end.comment}` : end.comment;
     async handleClick(event) {
       const control = event.target.closest("[data-action]");
       const action = control?.dataset.action;
+      // 点弹层外任意位置收起历史下拉；点其他动作也顺手收起，避免弹层挂在页面上
+      if (this.rename?.historyOpen && action !== "rename-history-toggle") {
+        this.rename.historyOpen = false;
+        if (!action) {
+          this.render();
+          return;
+        }
+      }
       if (!action) return;
       const handler = this.actionHandlers[action];
       if (!handler) return;

@@ -24,6 +24,8 @@ globalThis.__records = {
   operationRecordNameForTask,
   buildOrganizeRecordGroups,
   buildRenameRecordGroups,
+  renameHistoryLabel,
+  filterRenameHistoryForDir,
   mergeRecordsIntoStore,
   classifyRecordRows,
   planRecordRestore,
@@ -39,6 +41,8 @@ const {
   operationRecordNameForTask,
   buildOrganizeRecordGroups,
   buildRenameRecordGroups,
+  renameHistoryLabel,
+  filterRenameHistoryForDir,
   mergeRecordsIntoStore,
   classifyRecordRows,
   planRecordRestore,
@@ -255,6 +259,28 @@ test("buildRenameRecordGroups：按所在目录名分组，取不到目录名退
   assert.deepEqual(plain(groups.map((group) => group.name)), ["文档目录", "目录 p2"]);
   assert.equal(groups[0].rows.length, 2);
   assert.equal(groups[0].kind, "rename");
+});
+
+test("renameHistoryLabel：单目录用目录名，多目录用 N 个目录，查不到退回批量重命名", () => {
+  assert.equal(renameHistoryLabel([{ parentId: "p1" }, { parentId: "p1" }], { p1: "媒体库" }), "媒体库");
+  assert.equal(renameHistoryLabel([{ parentId: "p1" }, { parentFileId: "p2" }], { p1: "媒体库", p2: "剧集" }), "2 个目录");
+  assert.equal(renameHistoryLabel([{ parentId: "p1" }], {}), "批量重命名");
+  assert.equal(renameHistoryLabel([], {}), "批量重命名");
+});
+
+test("filterRenameHistoryForDir：只留当前目录的记录，跨目录条目整条剔除，空 targets 剔除", () => {
+  const history = [
+    { id: "h1", targets: [{ parentId: "d1" }, { parentId: "d1" }] },
+    { id: "h2", targets: [{ parentId: "d2" }] },
+    { id: "h3", targets: [{ parentId: "d1" }, { parentId: "d2" }] },
+    { id: "h4", targets: [] },
+    { id: "h5" }
+  ];
+  const filtered = filterRenameHistoryForDir(history, "d1");
+  assert.deepEqual(filtered.map((entry) => entry.id), ["h1"]);
+  assert.deepEqual(filterRenameHistoryForDir(history, "d2").map((entry) => entry.id), ["h2"]);
+  assert.deepEqual(filterRenameHistoryForDir([], "d1"), []);
+  assert.deepEqual(filterRenameHistoryForDir(history, "").map((entry) => entry.id), []);
 });
 
 await chain;
