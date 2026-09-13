@@ -67,6 +67,7 @@ from .submission import (
     handle_pending_submission_input,
     handle_submission_callback,
     list_submission_drafts,
+    normalize_web_share_url,
     parse_fastlink,
     send_telegram_text,
     start_telegram_client,
@@ -1594,7 +1595,9 @@ async def submit_submission(request: SubmissionSubmitRequest) -> Dict[str, Any]:
                 "provider": "123pan",
                 "title": str(item.name or "").strip(),
                 "url": url,
-                "cleanUrl": url.split("?")[0] if "?" in url else url,
+                # cleanUrl 必须保留 ?pwd= 查询串：草稿正文与"网盘"按钮都渲染 cleanUrl，
+                # 剥掉查询串 pushed 草稿就没了提取码（老文本路径的 cleanUrl 一直带着 pwd）
+                "cleanUrl": normalize_web_share_url(url),
                 "password": password,
             })
         if not link_dicts:

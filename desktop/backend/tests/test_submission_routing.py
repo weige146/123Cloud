@@ -94,6 +94,23 @@ class SubmissionRoutingTests(unittest.TestCase):
         submitted_links = submit.await_args.args[1]
         self.assertEqual([item["cleanUrl"] for item in submitted_links], ["https://www.123pan.com/s/own1"])
 
+    def test_direct_links_keep_pwd_in_clean_url(self):
+        """油猴分享直投：cleanUrl 必须保留 ?pwd= —— 草稿正文与网盘按钮都渲染 cleanUrl，剥掉查询串推送出去就没提取码了。"""
+        submit = AsyncMock(return_value={"draftCount": 1})
+        request = main.SubmissionSubmitRequest(links=[main.SubmissionLinkItem(
+            name="剧集合集",
+            url="https://www.123865.com/s/RWJUVv-KDgTv?pwd=FQW3",
+        )])
+        with patch.object(main, "submit_submission_links", submit):
+            result = asyncio.run(main.submit_submission(request))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["draftCount"], 1)
+        submitted_links = submit.await_args.args[1]
+        self.assertEqual(submitted_links[0]["cleanUrl"], "https://www.123865.com/s/RWJUVv-KDgTv?pwd=FQW3")
+        self.assertEqual(submitted_links[0]["password"], "FQW3")
+        self.assertIn("pwd=FQW3", str(submit.await_args.kwargs["source_text"]))
+
     def test_gsb_share_uses_canonical_official_origin_for_copy(self):
         enqueue = AsyncMock(return_value={"id": "copy-1"})
         with patch.object(main.pan123, "get_share_info", AsyncMock(return_value={
