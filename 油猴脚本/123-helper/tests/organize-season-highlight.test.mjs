@@ -24,13 +24,13 @@ globalThis.__highlight = {
   parseSeasonEpisode,
   seasonTokenRange,
   markSeasonEpisodeHtml,
-  markSeasonEpisodeValueHtml
+  markSeasonEpisodeHtml
 };
 `;
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException, structuredClone };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { parseSeasonEpisode, seasonTokenRange, markSeasonEpisodeHtml, markSeasonEpisodeValueHtml } = sandbox.__highlight;
+const { parseSeasonEpisode, seasonTokenRange, markSeasonEpisodeHtml } = sandbox.__highlight;
 
 let passed = 0;
 let chain = Promise.resolve();
@@ -84,18 +84,37 @@ test("markSeasonEpisodeHtml：片段包 mark，其余文本转义", () => {
   assert.equal(markSeasonEpisodeHtml("普通<名>.mkv", null), "普通&lt;名&gt;.mkv");
 });
 
-test("markSeasonEpisodeValueHtml：按最终季集值大小写不敏感命中", () => {
+test("markSeasonEpisodeHtml：按最终季集值大小写不敏感命中", () => {
   assert.equal(
-    markSeasonEpisodeValueHtml("show s01e02.mkv", "S01E02"),
+    markSeasonEpisodeHtml("show s01e02.mkv", "S01E02"),
     "show <mark class=\"se-token\">s01e02</mark>.mkv"
   );
-  assert.equal(markSeasonEpisodeValueHtml("电影.2023.mkv", ""), "电影.2023.mkv");
-  assert.equal(markSeasonEpisodeValueHtml("电影.2023.mkv", "S01E02"), "电影.2023.mkv");
+  assert.equal(markSeasonEpisodeHtml("电影.2023.mkv", ""), "电影.2023.mkv");
+  assert.equal(markSeasonEpisodeHtml("电影.2023.mkv", "S01E02"), "电影.2023.mkv");
   // 目标路径里的 Season 目录不带季集编号，保持原样；文件名部分命中
   assert.equal(
-    markSeasonEpisodeValueHtml("剧名 (2020)/Season 1/剧名 S01E01.mkv", "S01E01"),
+    markSeasonEpisodeHtml("剧名 (2020)/Season 1/剧名 S01E01.mkv", "S01E01"),
     "剧名 (2020)/Season 1/剧名 <mark class=\"se-token\">S01E01</mark>.mkv"
   );
+});
+
+// 新文件名镜像层与 textarea 不可能逐像素同步换行（WebKit textarea 与 span 排版算法有差异），
+// 两套文字同时可见必然叠出重影：CSS 必须保证任一时刻只显示一套——
+// 非聚焦时 textarea 文字透明、只看镜像高亮；.editing（聚焦）时镜像隐藏、textarea 文字现形。
+test("CSS：新文件名双渲染互斥，防止季集红字重影", () => {
+  const css = lines.join("\n");
+  const rule = (fragment) => {
+    const line = css.split("\n").find((item) => item.includes(fragment));
+    assert.ok(line, `missing css rule: ${fragment}`);
+    return line;
+  };
+  const mirror = rule(".name-mirror {");
+  const textarea = rule(".name-field textarea {");
+  assert.match(mirror, /color:var\(--text\)/);
+  assert.match(rule(".name-stack.editing .name-mirror {"), /visibility:hidden/);
+  assert.match(textarea, /color:transparent/);
+  assert.match(textarea, /caret-color:var\(--text\)/);
+  assert.match(rule(".name-stack.editing textarea {"), /color:var\(--text\)/);
 });
 
 await chain;

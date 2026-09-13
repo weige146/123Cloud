@@ -14816,7 +14816,8 @@ ${end.comment}` : end.comment;
     return { season, episode: 0, endEpisode: 0, seasonEpisode: "" };
   }
   // 整理预览的季集高亮：seasonTokenRange 找出识别命中的原文片段（掐掉正则捎带的边界符），
-  // markSeasonEpisodeHtml/markSeasonEpisodeValueHtml 把片段包成 <mark class="se-token">，其余文本照常转义。
+  // markSeasonEpisodeHtml 统一负责包 <mark class="se-token">：token 传 {start,end} 原文区间
+  // （原文件名按识别片段），或字符串（新文件名/目标路径按最终 SxxEyy 值大小写不敏感查找），其余文本照常转义。
   function seasonTokenRange(text2, fallbackSeason = 1) {
     const source = String(text2 || "");
     const parsed = parseSeasonEpisode(source, fallbackSeason);
@@ -14827,16 +14828,16 @@ ${end.comment}` : end.comment;
     while (end > start && /[ ._\-\]】）)~～]/.test(source[end - 1])) end -= 1;
     return end - start >= 2 ? { start, end } : null;
   }
-  function markSeasonEpisodeHtml(text2, range) {
+  function markSeasonEpisodeHtml(text2, token) {
     const source = String(text2 ?? "");
+    let range = token;
+    if (typeof token === "string") {
+      const trimmed = token.trim();
+      const index = trimmed ? source.toLowerCase().indexOf(trimmed.toLowerCase()) : -1;
+      range = index < 0 ? null : { start: index, end: index + trimmed.length };
+    }
     if (!range || !(range.start >= 0) || !(range.end > range.start) || range.end > source.length) return escapeHtml(source);
     return `${escapeHtml(source.slice(0, range.start))}<mark class="se-token">${escapeHtml(source.slice(range.start, range.end))}</mark>${escapeHtml(source.slice(range.end))}`;
-  }
-  function markSeasonEpisodeValueHtml(text2, value) {
-    const token = String(value || "").trim();
-    if (!token) return escapeHtml(String(text2 ?? ""));
-    const index = String(text2 ?? "").toLowerCase().indexOf(token.toLowerCase());
-    return markSeasonEpisodeHtml(text2, index < 0 ? null : { start: index, end: index + token.length });
   }
   function parseEpisodeHint(value, fallbackSeason = 1) {
     const parsed = parseSeasonEpisode(value, fallbackSeason);
@@ -17541,8 +17542,19 @@ ${end.comment}` : end.comment;
   function clearOperationRecords() {
     checkpointStorageRemove(OPERATION_RECORDS_KEY);
   }
+  // 列表按更新时间倒序（最近整理的排最前），时间相同退回名称自然排序
   function sortedRecordNames(store) {
-    return Object.keys(store?.records || {}).sort((left, right) => naturalCompare(left, right));
+    return Object.keys(store?.records || {}).sort((left, right) => {
+      const byTime = String(store.records[right]?.updatedAt || "").localeCompare(String(store.records[left]?.updatedAt || ""));
+      return byTime || naturalCompare(left, right);
+    });
+  }
+  // ISO 时间戳按浏览器本地时区渲染成 YYYY-MM-DD HH:mm；存储里仍是 UTC ISO，只影响显示
+  function formatLocalDateTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
   // 记录名 = 刮削媒体文件夹名（如「剧名 (2024)」）；原地整理拿不到时退回
   // 目标路径里除 Season 目录外最深一层，再退回来源文件夹名。
@@ -18240,13 +18252,17 @@ ${end.comment}` : end.comment;
     });
   }
   function submissionFailure(payload, expected) {
-    const backendError = String(payload?.error || "").trim();
-    if (backendError) return backendError;
+    // 草稿数达标即视为成功：sentCount 不再一票否决——Bot 未配置/推送失败时
+    // 草稿仍会全部入库（客户端「投稿草稿」可见、可手动发布），此前在这里误报。
     const drafts = Number(payload?.draftCount);
-    if (!Number.isFinite(drafts) || drafts !== expected) return `\u6295\u7A3F\u670D\u52A1\u8FD4\u56DE\u8349\u7A3F\u6570 ${Number.isFinite(drafts) ? drafts : "\u672A\u77E5"}\uFF0C\u9884\u671F ${expected}`;
-    const sent = Number(payload?.sentCount);
-    if (!Number.isFinite(sent) || sent !== expected) return `\u6295\u7A3F\u670D\u52A1\u4EC5\u63A8\u9001 ${Number.isFinite(sent) ? sent : "\u672A\u77E5"}/${expected} \u4EFD\u8349\u7A3F\u5230 Bot`;
-    if (payload?.ok !== true) return "\u6295\u7A3F\u670D\u52A1\u672A\u786E\u8BA4\u6295\u7A3F\u6210\u529F";
+    if (payload?.ok !== true) {
+      const backendError = String(payload?.error || "").trim();
+      return backendError || "\u6295\u7A3F\u670D\u52A1\u672A\u786E\u8BA4\u6295\u7A3F\u6210\u529F";
+    }
+    if (!Number.isFinite(drafts) || drafts !== expected) {
+      const backendError = String(payload?.error || "").trim();
+      return backendError || `\u6295\u7A3F\u670D\u52A1\u8FD4\u56DE\u8349\u7A3F\u6570 ${Number.isFinite(drafts) ? drafts : "\u672A\u77E5"}\uFF0C\u9884\u671F ${expected}`;
+    }
     return "";
   }
   // ===== 影库搜索（123Cloud 客户端影库接口）=====
@@ -18456,14 +18472,24 @@ ${end.comment}` : end.comment;
       let processed = 0;
       for (const batch of chunk(entries, 10)) {
         if (options.signal?.aborted) throw abortError3();
-        const text2 = batch.map((item) => `\u{1F3AC}\uFF1A${item.name || ""}
-\u{1F517}\uFF1A${item.url || ""}`).join("\n\n");
         try {
           const payload = await this.request(endpoint, {
             method: "POST",
-            body: { text: text2 },
+            // 结构化直投：链接数组直接给客户端后端扫成草稿（跳过归属判断，快一倍）；
+            // 老后端不认识 links 字段时会返回 400，此时回退拼接文本形式。
+            body: { links: batch.map((item) => ({ name: item.name || "", url: item.url || "" })) },
             signal: options.signal,
             timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS
+          }).catch(async (error) => {
+            const message = String(error?.message || "");
+            if (!/HTTP 4\d\d|没有可以处理的链接/.test(message)) throw error;
+            const text2 = batch.map((item) => `\u{1F3AC}\uFF1A${item.name || ""}\n\u{1F517}\uFF1A${item.url || ""}`).join("\n\n");
+            return this.request(endpoint, {
+              method: "POST",
+              body: { text: text2 },
+              signal: options.signal,
+              timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS
+            });
           });
           const failure = submissionFailure(payload, batch.length);
           for (const item of batch) results.push({ item, status: failure ? "failed" : "success", message: failure, response: payload });
@@ -18873,7 +18899,7 @@ ${end.comment}` : end.comment;
     const rows = visible.map((file) => {
       const sourceName = String(file.relativePath || file.name);
       const seasonToken = file.fields.mediaType === "tv" ? seasonTokenRange(sourceName) : null;
-      return `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${markSeasonEpisodeHtml(sourceName, seasonToken)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><span class="name-stack"><span class="name-mirror" aria-hidden="true">${markSeasonEpisodeValueHtml(file.newName, file.fields.seasonEpisode)}</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></span></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${markSeasonEpisodeValueHtml(file.targetPath, file.fields.seasonEpisode)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></div>`;
+      return `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${markSeasonEpisodeHtml(sourceName, seasonToken)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><span class="name-stack"><span class="name-mirror" aria-hidden="true">${markSeasonEpisodeHtml(file.newName, file.fields.seasonEpisode)}</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></span></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${markSeasonEpisodeHtml(file.targetPath, file.fields.seasonEpisode)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></div>`;
     }).join("");
     return `<section class="detail-section file-section"><div class="section-title"><div>${icon("list", 17)}<h4>\u6587\u4EF6\u4E0E\u76EE\u6807\u8DEF\u5F84</h4></div><span>${group.files.length} \u9879</span></div><div class="organize-files">${rows}</div>${organizePager("organize-file-page", page, group.files.length, ORGANIZE_FILE_PAGE_SIZE)}</section>`;
   }
@@ -18954,7 +18980,8 @@ ${end.comment}` : end.comment;
       const checkedMap = records.checked?.[name] || {};
       const selectedCount = (record.rows || []).filter((row) => checkedMap[String(row.id)] !== false).length;
       const discardedCount = (record.rows || []).filter((row) => row.discarded).length;
-      const head = `<div class="record-head" data-action="records-toggle" data-name="${escapeHtml(name)}"><span class="record-caret">${icon(expanded ? "chevronDown" : "chevronRight", 15)}</span><div class="record-title"><strong>${escapeHtml(name)}</strong><small>${escapeHtml([record.kind === "rename" ? "\u6279\u91CF\u91CD\u547D\u540D" : record.modeLabel || "\u5A92\u4F53\u6574\u7406", record.scopeLabel || "", record.updatedAt ? `\u66F4\u65B0 ${String(record.updatedAt).slice(0, 16).replace("T", " ")}` : ""].filter(Boolean).join(" \xB7 "))}</small></div><span class="chip">${record.rows.length} \u9879</span>${discardedCount ? `<span class="chip warning">\u56DE\u6536\u7AD9 ${discardedCount}</span>` : ""}${record.truncated ? `<span class="chip warning">\u5DF2\u622A\u65AD</span>` : ""}</div>`;
+      const updatedText = formatLocalDateTime(record.updatedAt);
+      const head = `<div class="record-head" data-action="records-toggle" data-name="${escapeHtml(name)}"><span class="record-caret">${icon(expanded ? "chevronDown" : "chevronRight", 15)}</span><div class="record-title"><strong>${escapeHtml(name)}</strong><small>${escapeHtml([record.kind === "rename" ? "\u6279\u91CF\u91CD\u547D\u540D" : record.modeLabel || "\u5A92\u4F53\u6574\u7406", record.scopeLabel || "", updatedText ? `\u66F4\u65B0 ${updatedText}` : ""].filter(Boolean).join(" \xB7 "))}</small></div><span class="chip">${record.rows.length} \u9879</span>${discardedCount ? `<span class="chip warning">\u56DE\u6536\u7AD9 ${discardedCount}</span>` : ""}${record.truncated ? `<span class="chip warning">\u5DF2\u622A\u65AD</span>` : ""}</div>`;
       if (!expanded) return `<section class="record-card">${head}</section>`;
       const rows = (record.rows || []).map((row) => `<tr><td class="record-check-cell"><input type="checkbox" data-record-check="1" data-name="${escapeHtml(name)}" data-row="${escapeHtml(row.id)}" ${checkedMap[String(row.id)] !== false ? "checked" : ""}></td><td>${escapeHtml(row.name)}</td><td class="${row.newName && row.newName !== row.name ? "success" : "muted"}">${escapeHtml(row.newName || "\u2014")}</td><td>${escapeHtml(row.targetPath || "\u2014")}</td><td>${escapeHtml(recordInfoText(row) || "\u2014")}</td><td>${recordRowStatusBadge(row)}</td></tr>`).join("");
       const actions = `<div class="record-actions"><button class="button compact" data-action="records-check-all" data-name="${escapeHtml(name)}" data-on="true">\u5168\u9009</button><button class="button compact" data-action="records-check-all" data-name="${escapeHtml(name)}" data-on="false">\u6E05\u9009</button><span class="spacer"></span><span class="footer-note">\u5DF2\u9009 ${selectedCount} / ${record.rows.length}</span><button class="button primary compact" data-action="records-restore" data-name="${escapeHtml(name)}">${icon("archiveRestore", 14)}\u8FD8\u539F\u6240\u9009</button><button class="icon-button danger" data-action="records-delete" data-name="${escapeHtml(name)}" title="\u5220\u9664\u8FD9\u6761\u8BB0\u5F55">${icon("trash", 15)}</button></div>`;
@@ -19055,7 +19082,7 @@ ${end.comment}` : end.comment;
     <aside class="rename-rules"><div class="pane-toolbar"><strong class="pane-title">\u89C4\u5219\u94FE</strong><span class="pane-count">${state.rules.length}</span><span class="spacer"></span><select id="rename-rule-type" aria-label="\u89C4\u5219\u7C7B\u578B">${RULE_TYPES.map((item) => `<option value="${item.value}">${escapeHtml(item.label)}</option>`).join("")}</select><button class="button primary" data-action="rename-add-rule">${icon("plus", 15)}\u6DFB\u52A0</button></div><div class="rule-list">${rules}</div></aside>
     <section class="rename-preview"><div class="pane-toolbar"><strong class="pane-title">\u6587\u4EF6\u9884\u89C8</strong><span class="pane-count">${state.targets.length}</span><label class="check-line"><input id="rename-keep-extension" type="checkbox" ${state.keepExtension ? "checked" : ""}>\u4FDD\u7559\u6269\u5C55\u540D</label><span class="spacer"></span><select id="rename-preset" aria-label="\u5E38\u7528\u7EC4\u5408"><option value="">\u5E38\u7528\u7EC4\u5408</option>${presets.map((preset) => `<option value="${preset.id}">${escapeHtml(preset.name)}</option>`).join("")}</select><button class="button" data-action="rename-load-preset">\u8F7D\u5165</button><button class="icon-button danger" data-action="rename-delete-preset" title="\u5220\u9664\u6240\u9009\u5E38\u7528\u7EC4\u5408" ${presets.length ? "" : "disabled"}>${icon("trash", 15)}</button><button class="button" data-action="rename-save-preset">${icon("save", 15)}\u4FDD\u5B58</button></div><div data-rename-errors>${error}</div><div class="table-wrap flush"><table><thead><tr><th>\u539F\u540D\u79F0</th><th>\u65B0\u540D\u79F0</th><th>\u7C7B\u578B</th></tr></thead><tbody data-rename-preview-rows>${rows}</tbody></table></div></section>
   </div>`;
-    const footer = `<span class="footer-note">\u4EC5\u5904\u7406\u5F53\u524D\u9009\u4E2D\u7684 ${state.targets.length} \u4E2A\u9879\u76EE\uFF0C\u6587\u4EF6\u5939\u4E0D\u4F1A\u5C55\u5F00</span><div class="footer-actions"><select id="rename-history" title="\u9009\u62E9\u8981\u6062\u590D\u7684\u91CD\u547D\u540D\u8BB0\u5F55" ${history.length ? "" : "disabled"}>${history.map((entry2, index) => `<option value="${escapeHtml(entry2.id)}">${escapeHtml(entry2.name || `\u91CD\u547D\u540D ${index + 1}`)} \xB7 ${escapeHtml(String(entry2.createdAt || "").slice(0, 10))}</option>`).join("")}</select><button class="button" data-action="rename-undo" ${history.length ? "" : "disabled"}>${icon("restart", 15)}\u6062\u590D</button><button class="icon-button danger" data-action="rename-clear-history" title="\u6E05\u7A7A\u91CD\u547D\u540D\u5386\u53F2" ${history.length ? "" : "disabled"}>${icon("trash", 15)}</button><button class="button" data-action="close">\u53D6\u6D88</button><button class="button primary" data-action="rename-execute" ${changed.length && !state.errors.length ? "" : "disabled"}>${icon("check", 15)}\u6267\u884C\u91CD\u547D\u540D</button></div>`;
+    const footer = `<span class="footer-note">\u4EC5\u5904\u7406\u5F53\u524D\u9009\u4E2D\u7684 ${state.targets.length} \u4E2A\u9879\u76EE\uFF0C\u6587\u4EF6\u5939\u4E0D\u4F1A\u5C55\u5F00</span><div class="footer-actions"><select id="rename-history" title="\u9009\u62E9\u8981\u6062\u590D\u7684\u91CD\u547D\u540D\u8BB0\u5F55" ${history.length ? "" : "disabled"}>${history.map((entry2, index) => `<option value="${escapeHtml(entry2.id)}">${escapeHtml(entry2.name || `\u91CD\u547D\u540D ${index + 1}`)} \xB7 ${escapeHtml(formatLocalDateTime(entry2.createdAt).slice(0, 10))}</option>`).join("")}</select><button class="button" data-action="rename-undo" ${history.length ? "" : "disabled"}>${icon("restart", 15)}\u6062\u590D</button><button class="icon-button danger" data-action="rename-clear-history" title="\u6E05\u7A7A\u91CD\u547D\u540D\u5386\u53F2" ${history.length ? "" : "disabled"}>${icon("trash", 15)}</button><button class="button" data-action="close">\u53D6\u6D88</button><button class="button primary" data-action="rename-execute" ${changed.length && !state.errors.length ? "" : "disabled"}>${icon("check", 15)}\u6267\u884C\u91CD\u547D\u540D</button></div>`;
     return dialogFrame(ui, {
       title: "\u6279\u91CF\u91CD\u547D\u540D",
       subtitle: `${state.targets.length} \u4E2A\u9009\u4E2D\u9879\u76EE`,
@@ -19413,7 +19440,7 @@ ${end.comment}` : end.comment;
   .spacer { flex:1; }
   /* —— 表单 —— */
   .field { min-width:0; display:grid; gap:5px; }
-  .field > span,.target-file > span { color:var(--muted); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.02em; }
+  .field > span:not(.name-mirror),.target-file > span { color:var(--muted); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.02em; }
   input[type="text"],input[type="search"],input[type="password"],input[type="number"],input:not([type]),select,textarea { width:100%; min-height:38px; padding:9px 12px; color:var(--text); background:var(--glass-strong); border:1px solid var(--glass-border); border-radius:var(--radius-sm); outline:none; box-shadow:var(--shadow-sm); transition:border-color var(--dur-fast) ease,box-shadow var(--dur-fast) ease,background var(--dur-fast) ease; }
   textarea { min-height:92px; resize:vertical; line-height:1.55; }
   input:focus,select:focus,textarea:focus { border-color:var(--accent); box-shadow:var(--ring),var(--shadow-sm); background:var(--glass); }
@@ -19606,10 +19633,14 @@ ${end.comment}` : end.comment;
   .source-file small,.target-file small { color:var(--muted); font-size:10px; }
   .episode-select { min-height:30px; font-size:10px; }
   .name-field { min-width:0; }
-  .name-field textarea { min-width:0; max-width:100%; min-height:68px; max-height:140px; field-sizing:content; font-size:11px; overflow-wrap:break-word; word-break:normal; }
-  /* 新文件名季集高亮：镜像层叠在 textarea 上方，文字全透明只把季集片段描成红字，盒模型/字体必须与 textarea 逐项一致 */
+  /* 新文件名季集高亮：镜像层显示带红字高亮的文件名，textarea 文字透明只留光标。
+     WebKit 的 textarea 与 span 换行算法无法保证逐像素一致，两套文字同时可见必然出重影，
+     所以任一时刻只显示一套：非聚焦看镜像（供人工核对），聚焦编辑时隐藏镜像、textarea 文字现形 */
   .name-stack { position:relative; display:block; min-width:0; }
-  .name-mirror { position:absolute; inset:0; padding:9px 12px; border:1px solid transparent; border-radius:var(--radius-sm); font-size:11px; line-height:1.55; white-space:pre-wrap; overflow-wrap:break-word; word-break:normal; color:transparent; overflow:hidden; pointer-events:none; }
+  .name-mirror { position:absolute; inset:0; padding:9px 12px; border:1px solid transparent; border-radius:var(--radius-sm); font-size:11px; line-height:1.55; white-space:pre-wrap; overflow-wrap:break-word; word-break:break-all; color:var(--text); overflow:hidden; pointer-events:none; text-transform:none; letter-spacing:normal; font-weight:inherit; }
+  .name-stack.editing .name-mirror { visibility:hidden; }
+  .name-field textarea { min-width:0; max-width:100%; min-height:68px; max-height:140px; field-sizing:content; font-size:11px; overflow-wrap:break-word; word-break:break-all; color:transparent; caret-color:var(--text); }
+  .name-stack.editing textarea { color:var(--text); }
   mark.se-token { color:var(--danger); background:none; padding:0; }
   /* —— 操作记录 —— */
   .chip.warning { color:var(--warning); background:var(--warning-soft); }
@@ -20191,6 +20222,14 @@ ${end.comment}` : end.comment;
       this.root.addEventListener("input", (event) => this.handleInput(event));
       // scroll 不冒泡，用捕获阶段接住新文件名 textarea 的滚动，同步高亮镜像层
       this.root.addEventListener("scroll", (event) => this.syncOrganizeNameMirrorScroll(event.target), true);
+      // 新文件名双渲染切换：聚焦编辑时隐藏镜像、textarea 文字现形，失焦后回到高亮镜像，
+      // 避免两套排版同时可见叠出重影
+      this.root.addEventListener("focusin", (event) => {
+        if (event.target?.matches?.("[data-organize-name]")) event.target.closest(".name-stack")?.classList.add("editing");
+      });
+      this.root.addEventListener("focusout", (event) => {
+        if (event.target?.matches?.("[data-organize-name]")) event.target.closest(".name-stack")?.classList.remove("editing");
+      });
       this.root.addEventListener("compositionend", (event) => this.handleCompositionEnd(event));
       this.root.addEventListener("keydown", (event) => this.handleKeydown(event));
       this.root.addEventListener("dragstart", (event) => this.handleDragStart(event));
@@ -21018,7 +21057,7 @@ ${end.comment}` : end.comment;
             });
             const store = loadOperationRecords();
             mergeRecordsIntoStore(store, buildRenameRecordGroups(succeeded, dirNames), { modeLabel: "\u6279\u91CF\u91CD\u547D\u540D", scopeLabel: "" });
-            saveOperationRecords(store);
+            if (!saveOperationRecords(store)) this.toast("\u64CD\u4F5C\u8BB0\u5F55\u4FDD\u5B58\u5931\u8D25\uFF1A\u811A\u672C\u5B58\u50A8\u5199\u5165\u672A\u6210\u529F", "warning");
           } catch (error) {
             this.toast(`\u64CD\u4F5C\u8BB0\u5F55\u4FDD\u5B58\u5931\u8D25\uFF1A${error.message}`, "warning");
           }
@@ -21155,13 +21194,21 @@ ${end.comment}` : end.comment;
           });
         } catch (error) {
           if (error?.name === "AbortError") throw error;
-          submissions = successful.map((item) => ({ item, status: "failed", message: error.message || "\u6295\u7A3F\u8BF7\u6C42\u5931\u8D25" }));
+          const raw = error.message || "\u6295\u7A3F\u8BF7\u6C42\u5931\u8D25";
+          // 超时/断连时服务端可能已经生成草稿，文案不写死"失败"，引导去客户端确认
+          const message = /\u8D85\u65F6|\u65E0\u6CD5\u8FDE\u63A5/.test(raw)
+            ? `${raw}\uFF08\u7ED3\u679C\u672A\u77E5\uFF0C\u8BF7\u5230\u5BA2\u6237\u7AEF\u300C\u6295\u7A3F\u8349\u7A3F\u300D\u786E\u8BA4\uFF0C\u52FF\u76F2\u76EE\u91CD\u590D\u63D0\u4EA4\uFF09`
+            : raw;
+          submissions = successful.map((item) => ({ item, status: "failed", message }));
         }
         successful.forEach((item, index) => {
           const submission = submissions[index];
           if (submission?.status === "success") {
             item.submissionStatus = "success";
-            item.message = "\u6295\u7A3F\u8349\u7A3F\u5DF2\u63A8\u9001";
+            const backendNote = String(submission?.response?.error || "").trim();
+            item.message = backendNote
+              ? `\u8349\u7A3F\u5DF2\u751F\u6210\uFF08Bot \u63A8\u9001\u5F02\u5E38\uFF0C\u53EF\u5230\u5BA2\u6237\u7AEF\u300C\u6295\u7A3F\u8349\u7A3F\u300D\u624B\u52A8\u53D1\u5E03\uFF09\uFF1A${backendNote}`
+              : "\u6295\u7A3F\u8349\u7A3F\u5DF2\u63A8\u9001";
             return;
           }
           item.status = "failed";
@@ -21894,7 +21941,7 @@ ${end.comment}` : end.comment;
     updateOrganizeNameMirror(textarea, value, seasonEpisode) {
       const mirror = textarea?.closest?.(".name-stack")?.querySelector(".name-mirror");
       if (!mirror) return;
-      const html = markSeasonEpisodeValueHtml(String(value ?? textarea.value ?? ""), seasonEpisode);
+      const html = markSeasonEpisodeHtml(String(value ?? textarea.value ?? ""), seasonEpisode);
       if (mirror.innerHTML !== html) mirror.innerHTML = html;
       mirror.scrollTop = textarea.scrollTop || 0;
       mirror.scrollLeft = textarea.scrollLeft || 0;
@@ -21917,7 +21964,7 @@ ${end.comment}` : end.comment;
           this.updateOrganizeNameMirror(name, file.newName, file.fields?.seasonEpisode);
         }
         const path = row.querySelector(".target-file strong");
-        if (path) path.innerHTML = markSeasonEpisodeValueHtml(file.targetPath || "", file.fields?.seasonEpisode);
+        if (path) path.innerHTML = markSeasonEpisodeHtml(file.targetPath || "", file.fields?.seasonEpisode);
         const episodeLabel = row.querySelector(".source-file small");
         if (episodeLabel && file.fields?.mediaType === "tv") episodeLabel.textContent = file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6";
         const episodeSelect = row.querySelector("[data-episode-file]");
@@ -22166,7 +22213,7 @@ ${end.comment}` : end.comment;
         if (nextRecord) {
           nextRecord.rows = nextRecord.rows.filter((row) => !settledIds.has(String(row.id)));
           if (!nextRecord.rows.length) delete store.records[name];
-          saveOperationRecords(store);
+          if (!saveOperationRecords(store)) this.toast("\u64CD\u4F5C\u8BB0\u5F55\u4FDD\u5B58\u5931\u8D25\uFF1A\u811A\u672C\u5B58\u50A8\u5199\u5165\u672A\u6210\u529F", "warning");
         }
         records.store = store;
         return { ...batchResult(details, []), settled: settledIds.size };
@@ -22193,7 +22240,7 @@ ${end.comment}` : end.comment;
             const groups = buildOrganizeRecordGroups(snapshot, outcome.rows, anchors);
             const store = loadOperationRecords();
             mergeRecordsIntoStore(store, groups, { modeLabel: snapshot.mode.location === "inPlace" ? "\u539F\u5730\u6574\u7406" : "\u6574\u7406\u5165\u5A92\u4F53\u5E93", scopeLabel: scopeName });
-            saveOperationRecords(store);
+            if (!saveOperationRecords(store)) this.toast("\u64CD\u4F5C\u8BB0\u5F55\u4FDD\u5B58\u5931\u8D25\uFF1A\u811A\u672C\u5B58\u50A8\u5199\u5165\u672A\u6210\u529F", "warning");
           } catch (error) {
             this.toast(`\u64CD\u4F5C\u8BB0\u5F55\u4FDD\u5B58\u5931\u8D25\uFF1A${error.message}`, "warning");
           }
@@ -22243,7 +22290,7 @@ ${end.comment}` : end.comment;
       const row = target.closest("[data-file-row]");
       const path = row?.querySelector(".target-file strong");
       const status = row?.querySelector(".target-file small");
-      if (path) path.innerHTML = markSeasonEpisodeValueHtml(task.targetPath || "", task.fields?.seasonEpisode);
+      if (path) path.innerHTML = markSeasonEpisodeHtml(task.targetPath || "", task.fields?.seasonEpisode);
       this.updateOrganizeNameMirror(target, value, task.fields?.seasonEpisode);
       if (status) {
         status.textContent = task.matched ? `\u5DF2\u6821\u51C6 ${task.fields.seasonEpisode}` : value !== task.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8";
@@ -22464,7 +22511,7 @@ ${end.comment}` : end.comment;
             onAccept: () => {
               const store = this.records?.store || loadOperationRecords();
               if (store.records) delete store.records[name];
-              saveOperationRecords(store);
+              if (!saveOperationRecords(store)) this.toast("\u64CD\u4F5C\u8BB0\u5F55\u4FDD\u5B58\u5931\u8D25\uFF1A\u811A\u672C\u5B58\u50A8\u5199\u5165\u672A\u6210\u529F", "warning");
               if (this.records) {
                 this.records.store = store;
                 if (this.records.expanded === name) this.records.expanded = "";

@@ -28,7 +28,8 @@ globalThis.__records = {
   classifyRecordRows,
   planRecordRestore,
   resolveRecordAnchors,
-  sortedRecordNames
+  sortedRecordNames,
+  formatLocalDateTime
 };
 `;
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException, structuredClone };
@@ -42,7 +43,8 @@ const {
   classifyRecordRows,
   planRecordRestore,
   resolveRecordAnchors,
-  sortedRecordNames
+  sortedRecordNames,
+  formatLocalDateTime
 } = sandbox.__records;
 
 let passed = 0;
@@ -109,9 +111,28 @@ test("mergeRecordsIntoStore：同名合并按文件 id 覆盖旧行，行按文�
   // 文件 2 的新行覆盖旧行
   assert.equal(record.rows.find((row) => row.id === "2").newName, "A2.mkv");
   assert.equal(record.modeLabel, "原地整理");
-  // 不同名 → 新记录
+  // 不同名 → 新记录（列表顺序单独测，两次 merge 的 updatedAt 可能同毫秒）
   mergeRecordsIntoStore(store, [{ name: "剧 B", kind: "organize", rows: [{ id: "9", name: "x.mkv", newName: "X.mkv", parentId: "p" }] }], {});
-  assert.deepEqual(sortedRecordNames(store), ["剧 A", "剧 B"]);
+  assert.deepEqual(Object.keys(store.records).sort(), ["剧 A", "剧 B"]);
+});
+
+test("sortedRecordNames：按更新时间倒序，最近整理的排最前，时间相同退回名称自然排序", () => {
+  const store = { version: 1, records: {
+    "b 剧": { name: "b 剧", kind: "organize", updatedAt: "2026-01-01T00:00:00.000Z", rows: [] },
+    "a 剧": { name: "a 剧", kind: "organize", updatedAt: "2026-01-01T00:00:00.000Z", rows: [] },
+    "新剧": { name: "新剧", kind: "organize", updatedAt: "2026-02-01T00:00:00.000Z", rows: [] },
+    "旧剧": { name: "旧剧", kind: "organize", updatedAt: "", rows: [] }
+  } };
+  assert.deepEqual(sortedRecordNames(store), ["新剧", "a 剧", "b 剧", "旧剧"]);
+});
+
+test("formatLocalDateTime：ISO 按本地时区渲染 YYYY-MM-DD HH:mm，非法值返回空串", () => {
+  const date = new Date("2026-09-13T04:05:00.000Z");
+  const pad = (value) => String(value).padStart(2, "0");
+  const expected = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  assert.equal(formatLocalDateTime("2026-09-13T04:05:00.000Z"), expected);
+  assert.equal(formatLocalDateTime("not-a-date"), "");
+  assert.equal(formatLocalDateTime(""), "");
 });
 
 test("mergeRecordsIntoStore：记录数超上限淘汰最旧，单记录行数超限截断并标注", () => {
