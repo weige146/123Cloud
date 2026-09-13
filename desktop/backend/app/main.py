@@ -961,33 +961,51 @@ async def route_submission_text(
     submission_links: List[Dict[str, Any]] = []
     if links:
         current_uid = await current_pan123_uid()
+        pan_links = [link for link in links if str(link.get("provider") or "") == "123pan"]
         for link in links:
-            provider = str(link.get("provider") or "")
-            if provider != "123pan":
+            if str(link.get("provider") or "") != "123pan":
                 submission_links.append(link)
-                continue
+
+        # 归属判断要逐条打 123 官方分享接口（网络往返），并发查询代替串行，
+        # 否则一批 10 条要排队等 10 次往返——这就是"点分享后客户端处理很慢"的主因。
+        async def classify_pan123_share(link: Dict[str, Any]) -> tuple:
+            """返回 ("draft", link) / ("transfer", link, canonical, password, info) / ("fail", link, 原因)。"""
             share_url = str(link.get("cleanUrl") or link.get("url") or "")
             try:
                 if not current_uid:
                     raise RuntimeError("123 云盘尚未授权登录，无法判断分享归属；请先到设置页完成授权")
                 parsed_share = parse_pan123_share_url(share_url)
                 canonical_share_url = f"{parsed_share['origin']}/s/{parsed_share['shareKey']}"
-                info = await pan123.get_share_info(canonical_share_url)
+                info = await asyncio.wait_for(pan123.get_share_info(canonical_share_url), timeout=30.0)
                 if info.get("expired"):
                     raise ValueError("分享已过期")
                 share_owner_user_id = safe_int(info.get("userId"))
                 if not share_owner_user_id:
                     raise ValueError("分享详情未返回 UserID")
                 if share_owner_user_id == current_uid:
-                    submission_links.append(link)
-                    continue
+                    return ("draft", link)
                 password = explicit_pan123_share_password(link, allow_source_fallback=web_link_count == 1)
                 if info.get("hasPassword") and not password:
                     raise ValueError("分享需要提取码，链接里没有找到")
-                await transfer_service.enqueue_pan123_share_copy(canonical_share_url, password, info, source_label)
-                transfers += 1
+                return ("transfer", link, canonical_share_url, password, info)
             except Exception as error:
-                failures.append(f"{share_url}：{error}")
+                return ("fail", link, f"{share_url}：{error}")
+
+        classified = await asyncio.gather(*(classify_pan123_share(link) for link in pan_links))
+        # 入队保持串行：搬运任务服务有去重/暂停窗口等状态，逐条入队最稳（本身是本地操作，很快）
+        for item in classified:
+            if item[0] == "draft":
+                submission_links.append(item[1])
+            elif item[0] == "transfer":
+                _, _link, canonical_share_url, password, info = item
+                try:
+                    await transfer_service.enqueue_pan123_share_copy(canonical_share_url, password, info, source_label)
+                    transfers += 1
+                except Exception as error:
+                    share_url = str(_link.get("cleanUrl") or _link.get("url") or "")
+                    failures.append(f"{share_url}：{error}")
+            else:
+                failures.append(item[2])
 
     share_links = extract_115_links(text)
     offline_links = extract_pan115_offline_links(text)
@@ -1122,10 +1140,18 @@ class SessionResponse(BaseModel):
     loginExpired: bool = False
 
 
+class SubmissionLinkItem(BaseModel):
+    name: str = ""
+    url: str = ""
+    password: str = ""
+
+
 class SubmissionSubmitRequest(BaseModel):
     text: str = ""
     title: str = ""
     shareUrl: str = ""
+    # 结构化直通：123 助手分享时直接传链接数组，跳过归属判断（100% 自己的分享场景）
+    links: Optional[List[SubmissionLinkItem]] = None
     targetUserId: Optional[int] = None
 
 
@@ -1549,6 +1575,56 @@ async def cancel_telegram_session(request: TelegramSessionCancelRequest) -> Dict
 
 @app.post("/api/submission/submit")
 async def submit_submission(request: SubmissionSubmitRequest) -> Dict[str, Any]:
+    # 结构化直通：油猴分享进来的是自己的 123 分享链接数组，跳过归属判断
+    # （省掉每条一次 get_share_info 官方接口往返），直接扫成投稿草稿并推送。
+    if request.links:
+        link_dicts: List[Dict[str, Any]] = []
+        for item in request.links[:10]:
+            url = str(item.url or "").strip()
+            if not url:
+                continue
+            password = str(item.password or "").strip()
+            if not password:
+                try:
+                    query = parse_qs(urlparse(url).query)
+                    password = str((query.get("pwd") or [""])[0]).strip()
+                except (TypeError, ValueError):
+                    password = ""
+            link_dicts.append({
+                "provider": "123pan",
+                "title": str(item.name or "").strip(),
+                "url": url,
+                "cleanUrl": url.split("?")[0] if "?" in url else url,
+                "password": password,
+            })
+        if not link_dicts:
+            raise HTTPException(status_code=400, detail="links 里没有有效链接")
+        source_text = "\n".join(
+            "🎬：" + d["title"] + "\n🔗：" + d["url"] for d in link_dicts
+        )
+        try:
+            draft_result = await submit_submission_links(
+                store,
+                link_dicts,
+                "油猴分享直投",
+                source_text=source_text,
+                max_links=10,
+                target_user_id=request.targetUserId,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+        except Exception as error:
+            raise HTTPException(status_code=502, detail=str(error))
+        drafts = int(draft_result.get("draftCount") or 0)
+        if not drafts:
+            raise HTTPException(status_code=400, detail=str(draft_result.get("error") or "投稿草稿生成失败"))
+        payload: Dict[str, Any] = {"ok": True, "draftCount": drafts, **draft_result}
+        first_error = str(draft_result.get("error") or "").strip()
+        if first_error:
+            payload["error"] = first_error
+        logger.info("油猴分享直投：草稿 %d 条", drafts)
+        return payload
+
     text = str(request.text or "").strip()
     if not text:
         text = "\n".join(

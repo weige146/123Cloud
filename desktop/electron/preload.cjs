@@ -17,6 +17,9 @@ contextBridge.exposeInMainWorld("cloud123", {
   onBackendStatus: (callback) => {
     ipcRenderer.on("backend:status", (_event, payload) => callback(payload));
   },
+  onThemePreference: (callback) => {
+    ipcRenderer.on("theme:preference", (_event, value) => callback(value));
+  },
   getUpdateState: () => ipcRenderer.invoke("app:getUpdateState"),
   checkForUpdates: () => ipcRenderer.invoke("app:checkForUpdates"),
   installUpdate: () => ipcRenderer.invoke("app:installUpdate"),

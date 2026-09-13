@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -337,7 +338,11 @@ async def submit_submission_links(
     first_error = ""
     owner_chat = int(owner_chat_id or target)
     owner_user = int(owner_user_id or target)
-    for link in unique_submission_links(links)[: max(1, min(int(max_links or 10), 10))]:
+    pipeline_links = unique_submission_links(links)[: max(1, min(int(max_links or 10), 10))]
+
+    async def _process_link(link: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """单条链接全管线：解析 → 目录扫描 → TMDB → 草稿 → 推 Bot。返回 saved 草稿或 None。"""
+        nonlocal sent_count, first_error
         try:
             normalized = normalize_submission_link(link, source_text)
             if str(normalized.get("provider") or "") != "123fastlink":
@@ -373,12 +378,27 @@ async def submit_submission_links(
                         sent_count += 1
                     saved = save_submission_draft(store, saved)
                     saved = mark_submission_draft_sent(store, str(saved.get("id") or ""), sent_chunks, int(preview.get("firstMessageId") or 0))
-                    await cleanup_stale_submission_drafts(store, bot_token, saved)
                 except Exception as error:
                     first_error = first_error or f"投稿机器人发送失败：{error}"
-            drafts.append(saved)
+            return saved
         except Exception as error:
             first_error = first_error or str(error)
+            return None
+
+    # 有界并发：每条链接的目录扫描/TMDB/Bot 推送都是网络往返，串行等待是累加的；
+    # 并发 4 让总耗时≈最慢一条。sqlite 写入在事件循环里本就串行执行，安全。
+    semaphore = asyncio.Semaphore(4)
+
+    async def _bounded(link: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        async with semaphore:
+            return await _process_link(link)
+
+    results = await asyncio.gather(*(_bounded(link) for link in pipeline_links))
+    saved_list = [item for item in results if item]
+    drafts.extend(saved_list)
+    if drafts and bot_token:
+        with contextlib.suppress(Exception):
+            await cleanup_stale_submission_drafts(store, bot_token, drafts[-1])
 
     if not drafts:
         raise ValueError(first_error or "投稿草稿生成失败")

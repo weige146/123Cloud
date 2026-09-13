@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, ipcMain, shell, dialog } = require("electron");
+const { app, BrowserWindow, Menu, ipcMain, shell, dialog, nativeTheme } = require("electron");
 const fs = require("fs");
 const path = require("path");
 const net = require("net");
@@ -6,6 +6,17 @@ const { BackendManager } = require("./backend.cjs");
 
 const DEV_URL = process.env.CLOUD123_DEV_URL || "";
 const isDev = Boolean(DEV_URL);
+
+// ===== 内存占用精简（Chromium 进程级开关）=====
+// process-per-site：主窗口与 OAuth 弹窗同源，合并进同一个渲染进程，
+// 少一个常驻 renderer（约省 60-120MB）。
+app.commandLine.appendSwitch("process-per-site");
+// 收紧渲染进程 V8 老生代上限（默认 ~4GB 按需增长，导致 RSS 虚高）：
+// 本应用最重的路径是影库整包 JSON 解析，768MB 足够并促使 GC 更勤快。
+app.commandLine.appendSwitch("js-flags", "--max-old-space-size=768");
+// 后台节流确保开启（窗口失焦时降计时器/动画频率）
+app.commandLine.appendSwitch("enable-features", "BackgroundThrottling");
+// 启动时清一次 Chromium 磁盘缓存（陈旧缓存只会白占磁盘，不影响登录态）
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -51,6 +62,8 @@ app.setPath("userData", stableDir);
 
 const backend = new BackendManager();
 let mainWindow = null;
+// 用户主动退出（Cmd+Q / 菜单退出 / 更新安装）时为 true；关窗保活时不拦截
+let isQuitting = false;
 let backendPort = 0;
 let dataDir = "";
 let fixedPort = null;
@@ -249,12 +262,62 @@ function createWindow() {
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
+  // 关窗保活（仅 macOS）：点红绿灯关闭只销毁窗口、释放渲染进程（~300MB），
+  // Python 后端与油猴脚本依赖的本机服务继续跑；点 Dock 图标由 activate 重建窗口。
+  // Cmd+Q / 菜单退出走 before-quit（isQuitting=true），不经过这里。
+  mainWindow.on("close", (event) => {
+    if (!isQuitting && process.platform === "darwin") {
+      event.preventDefault();
+      const win = mainWindow;
+      mainWindow = null;
+      // 同步 destroy 会让主进程崩溃（close 回调内销毁自身），必须错开一拍
+      setImmediate(() => {
+        try {
+          win?.destroy();
+          console.error("[123cloud] window destroyed to free renderer; backend keeps running");
+        } catch (error) {
+          console.error("[123cloud] window destroy failed:", error);
+        }
+      });
+    }
+  });
+}
+
+function broadcastThemePreference(value) {
+  nativeTheme.themeSource = value;
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send("theme:preference", value);
+  }
 }
 
 function buildMenu() {
+  const appearanceSubmenu = [
+    {
+      label: "跟随系统",
+      type: "radio",
+      checked: nativeTheme.themeSource === "system",
+      click: () => broadcastThemePreference("system"),
+    },
+    {
+      label: "浅色",
+      type: "radio",
+      checked: nativeTheme.themeSource === "light",
+      click: () => broadcastThemePreference("light"),
+    },
+    {
+      label: "深色",
+      type: "radio",
+      checked: nativeTheme.themeSource === "dark",
+      click: () => broadcastThemePreference("dark"),
+    },
+  ];
   const template = [
     ...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
     { role: "editMenu" },
+    {
+      label: "外观",
+      submenu: appearanceSubmenu,
+    },
     {
       label: "视图",
       submenu: [
@@ -437,6 +500,20 @@ app.on("second-instance", () => {
 app.whenReady().then(async () => {
   console.error("[123cloud] whenReady");
   dataDir = app.getPath("userData");
+  // 启动清一次 HTTP 磁盘缓存；此后每小时若窗口失焦再清（登录态在 cookie/后端，缓存可随时丢）
+  try {
+    const idleCacheSweep = () => {
+      if (mainWindow && !mainWindow.isFocused()) return; // 聚焦时不清，避免体感卡顿
+      for (const win of BrowserWindow.getAllWindows()) {
+        win.webContents.session.clearCache().catch(() => undefined);
+      }
+    };
+    idleCacheSweep();
+    const cacheTimer = setInterval(idleCacheSweep, 60 * 60 * 1000);
+    app.on("will-quit", () => clearInterval(cacheTimer));
+  } catch (error) {
+    console.error("[123cloud] cache sweep failed:", error);
+  }
   console.error("[123cloud] userData:", dataDir);
   migratePortConfigFile();
   registerIpc();
@@ -455,6 +532,8 @@ app.whenReady().then(async () => {
     }
     await backend.start({ port: backendPort, dataDir });
     console.error("[123cloud] backend ready");
+    // 外观菜单 radio 状态跟随 nativeTheme（菜单点击 / 系统外观变化都会触发）
+    nativeTheme.on("updated", () => buildMenu());
   } catch (error) {
     console.error("[123cloud] backend failed:", error);
     dialog.showErrorBox("123Cloud 后端启动失败", `${error}\n\n最近日志：\n${backend.lastLogLines(30)}`);
@@ -492,7 +571,13 @@ process.on("unhandledRejection", (reason) => {
 });
 
 app.on("window-all-closed", () => {
-  app.quit();
+  // macOS：关窗后服务保活（油猴脚本仍在用本机接口），Dock 点击 activate 重建窗口；
+  // 其他平台维持原行为：关窗即退出。
+  if (process.platform !== "darwin") app.quit();
+});
+
+app.on("before-quit", () => {
+  isQuitting = true;
 });
 
 app.on("before-quit", async (event) => {

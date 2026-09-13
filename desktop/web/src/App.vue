@@ -4,10 +4,8 @@ import { useRoute, useRouter } from "vue-router";
 import { useGlobalState } from "@/composables/useGlobalState";
 import { useResponsive } from "@/composables/useResponsive";
 import { useUpdater } from "@/composables/useUpdater";
+import { setTheme } from "@/composables/useTheme";
 import { displayName, formatBytes, normalizeAvatarUrl } from "@/utils/format";
-import AccountMenu from "@/components/AccountMenu.vue";
-import NavigationSearch from "@/components/NavigationSearch.vue";
-import ThemeSettingsMenu from "@/components/ThemeSettingsMenu.vue";
 import LiquidBackdrop from "@/components/LiquidBackdrop.vue";
 
 interface NavigationItem {
@@ -140,6 +138,10 @@ function navigate(path: string) {
 
 onMounted(() => {
   if (!isPublicPage.value) loadStatus();
+  // 原生菜单「外观」切换（Electron 菜单栏 → IPC），桌面端唯一外观入口
+  (window as unknown as {
+    cloud123?: { onThemePreference?: (callback: (value: "auto" | "light" | "dark") => void) => void };
+  }).cloud123?.onThemePreference?.((value) => setTheme(value));
   const desktopApi = (window as unknown as {
     cloud123?: { onBackendStatus?: (callback: (payload: { state: string }) => void) => void };
   }).cloud123;
@@ -173,10 +175,6 @@ watch(isPublicPage, (isPublic) => {
               <small>Toolkit</small>
             </span>
           </button>
-
-          <div class="side-rail__search">
-            <NavigationSearch v-if="!isMobile && !railCollapsed" />
-          </div>
 
           <nav class="side-rail__nav" aria-label="主导航">
             <template v-for="item in flatItems" :key="item.key">
@@ -235,24 +233,16 @@ watch(isPublicPage, (isPublic) => {
           </nav>
 
           <footer class="side-rail__footer">
-            <AccountMenu
-              :name="panName"
-              :meta="panMeta"
-              :avatar-url="avatarUrl"
-              :initials="avatarInitials"
-              :authenticated="Boolean(pan?.authenticated)"
-              :loading="state.loading"
-              :expired="panLoginExpired"
-              @refresh="loadStatus"
-            />
+            <span class="side-rail__avatar" :title="panMeta">
+              <img v-if="avatarUrl" :src="avatarUrl" alt="" />
+              <span v-else>{{ avatarInitials }}</span>
+            </span>
             <span class="side-rail__account" :class="{ 'login-expired': panLoginExpired }" :title="panMeta">
               <strong>{{ panName }}</strong>
               <small>{{ panLoginExpired ? "授权已失效" : pan?.authenticated ? "已连接" : "未授权" }}</small>
             </span>
             <span class="side-rail__spacer" />
-            <ThemeSettingsMenu button-class="rail-icon-button" />
             <v-btn
-              v-if="!isDesktop"
               icon="mdi-refresh"
               variant="text"
               class="rail-icon-button"
@@ -335,7 +325,6 @@ watch(isPublicPage, (isPublic) => {
     </template>
 
     <template v-else>
-      <div class="public-theme-trigger"><ThemeSettingsMenu /></div>
       <router-view v-slot="{ Component }">
         <transition name="fade" mode="out-in"><component :is="Component" /></transition>
       </router-view>
@@ -427,6 +416,22 @@ watch(isPublicPage, (isPublic) => {
 .side-rail__account small { font-size: 10.5px; color: var(--text-muted); }
 .side-rail__account.login-expired small { color: var(--warning); }
 .side-rail__spacer { flex: 1; }
+
+.side-rail__avatar {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  border-radius: 50%;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+}
+.side-rail__avatar img { width: 100%; height: 100%; object-fit: cover; }
 
 .rail-icon-button {
   color: var(--text-muted) !important;

@@ -38,79 +38,59 @@ const wrapperClass = computed(() => `page-hero page-hero--${props.group}`);
 </template>
 
 <style scoped>
+/* 桌面客户端页头：一行式（图标 + 标题 + 说明 + 状态 + 操作），无横幅卡片 */
 .page-hero {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 20px 22px;
-  border-radius: var(--radius-dialog);
-  border: 1px solid var(--glass-border-1);
-  background: linear-gradient(135deg, rgba(124, 92, 255, 0.15), rgba(76, 201, 240, 0.06) 55%, transparent),
-    var(--glass-bg-1);
-  -webkit-backdrop-filter: blur(var(--glass-blur-heavy)) saturate(var(--glass-saturate));
-  backdrop-filter: blur(var(--glass-blur-heavy)) saturate(var(--glass-saturate));
-  box-shadow: var(--surface-shadow), inset 0 1px 0 var(--glass-highlight);
-  overflow: hidden;
-  position: relative;
+  gap: 10px;
+  padding: 2px 2px 10px;
   flex-wrap: wrap;
   min-width: 0;
 }
 
-/* soft aurora halo in the corner */
-.page-hero::after {
-  content: "";
-  position: absolute;
-  right: -70px;
-  top: -90px;
-  width: 260px;
-  height: 260px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(124, 92, 255, 0.3), transparent 65%);
-  filter: blur(28px);
-  pointer-events: none;
-}
-.page-hero--pan115::after { background: radial-gradient(circle, rgba(76, 201, 240, 0.28), transparent 65%); }
-.page-hero--recognition::after { background: radial-gradient(circle, rgba(251, 191, 36, 0.22), transparent 65%); }
-.page-hero--media::after { background: radial-gradient(circle, rgba(244, 114, 182, 0.24), transparent 65%); }
-
 .page-hero-icon {
-  width: 48px;
-  height: 48px;
-  flex: 0 0 48px;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
   display: grid;
   place-items: center;
-  border-radius: 15px;
-  color: #fff;
-  background: var(--grad-accent);
-  box-shadow: 0 10px 26px rgba(124, 92, 255, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  border-radius: 7px;
+  color: var(--group-color, var(--accent));
+  background: var(--group-soft, var(--accent-soft));
+  border: 1px solid var(--group-border, var(--glass-border-2));
 }
 
-.page-hero--pan115 .page-hero-icon { background: linear-gradient(135deg, #0ea5e9, #4cc9f0); box-shadow: 0 10px 26px rgba(14, 165, 233, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.45); }
-.page-hero--recognition .page-hero-icon { background: linear-gradient(135deg, #f59e0b, #fbbf24); box-shadow: 0 10px 26px rgba(245, 158, 11, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.45); }
-.page-hero--media .page-hero-icon { background: linear-gradient(135deg, #ec4899, #f472b6); box-shadow: 0 10px 26px rgba(236, 72, 153, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.45); }
+.page-hero--pan115 .page-hero-icon { color: #4cc9f0; background: rgba(76, 201, 240, 0.12); border-color: rgba(76, 201, 240, 0.2); }
+.page-hero--recognition .page-hero-icon { color: #fbbf24; background: rgba(251, 191, 36, 0.12); border-color: rgba(251, 191, 36, 0.2); }
+.page-hero--media .page-hero-icon { color: #f472b6; background: rgba(244, 114, 182, 0.12); border-color: rgba(244, 114, 182, 0.2); }
 
-.page-hero-icon :deep(.v-icon) { font-size: 23px !important; }
+.page-hero-icon :deep(.v-icon) { font-size: 15px !important; }
 
 .page-hero-text {
-  flex: 1 1 340px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
   min-width: 0;
-  position: relative;
+  flex: 0 1 auto;
 }
 
 .page-hero-title {
   margin: 0;
   color: var(--text-primary);
-  font-size: 20px;
-  font-weight: 720;
-  line-height: 1.25;
-  letter-spacing: -0.02em;
+  font-size: 15.5px;
+  font-weight: 680;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
 }
 
 .page-hero-desc {
-  margin: 4px 0 0;
-  color: var(--text-secondary);
-  font-size: 12.5px;
-  line-height: 1.55;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .page-hero-title,
@@ -119,61 +99,50 @@ const wrapperClass = computed(() => `page-hero page-hero--${props.group}`);
   overflow-wrap: anywhere;
 }
 
-.page-hero-status,
+.page-hero-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
 .page-hero-actions {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
   min-width: 0;
-  position: relative;
-}
-
-.page-hero-actions {
   margin-left: auto;
   justify-content: flex-end;
 }
 
 .page-hero-actions :deep(.v-btn) {
-  min-height: 38px;
+  min-height: 32px;
 }
 
 .page-hero-meta {
+  flex-basis: 100%;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-top: 8px;
   font-size: 12px;
   color: var(--text-muted);
 }
 
 @media (max-width: 768px) {
-  .page-hero {
-    gap: 12px;
-    padding: 16px 18px;
-  }
+  .page-hero { gap: 8px; }
+  .page-hero-desc { display: none; }
 }
 
 @media (max-width: 480px) {
-  .page-hero {
-    flex-direction: column;
-    gap: 10px;
-  }
-
   .page-hero-actions {
     width: 100%;
     margin-left: 0;
   }
 
-  .page-hero-text {
-    flex: 0 1 auto;
-    width: 100%;
-  }
-
   .page-hero-actions :deep(.v-btn) {
     flex: 1 1 140px;
   }
-
-  .page-hero-title { font-size: 18px; }
 }
 </style>

@@ -44,42 +44,37 @@ const trendIcon = computed(() => (props.trend?.dir === "down" ? "mdi-trending-do
 <style scoped>
 .stat-tile {
   position: relative;
-  min-height: 78px;
-  padding: 15px 16px;
-  border-radius: var(--radius-surface);
-  border: 1px solid var(--glass-border-2);
-  background: var(--glass-bg-2);
-  -webkit-backdrop-filter: blur(var(--glass-blur-2)) saturate(var(--glass-saturate));
-  backdrop-filter: blur(var(--glass-blur-2)) saturate(var(--glass-saturate));
-  box-shadow: var(--shadow-sm), inset 0 1px 0 var(--glass-highlight);
+  min-height: 54px;
+  padding: 8px 13px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--glass-border-3);
+  background: var(--glass-bg-3);
   display: flex;
   align-items: center;
-  gap: 13px;
+  gap: 10px;
   overflow: hidden;
-  transition: transform var(--transition), border-color var(--transition), box-shadow var(--transition);
+  transition: border-color var(--transition);
 }
 
 .stat-tile:hover {
-  transform: translateY(-2px);
-  border-color: var(--glass-border-1);
-  box-shadow: var(--shadow-lift), inset 0 1px 0 var(--glass-highlight);
+  border-color: var(--glass-border-2);
 }
 
 .stat-tile-icon {
-  width: 40px;
-  height: 40px;
-  border-radius: 12px;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
   display: grid;
   place-items: center;
-  color: #fff;
+  color: var(--group-color, var(--accent));
   flex-shrink: 0;
-  background: var(--grad-accent);
-  box-shadow: 0 8px 18px rgba(124, 92, 255, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  background: var(--group-soft, var(--accent-soft));
+  border: 1px solid var(--glass-border-3);
 }
 
 .stat-tile-icon :deep(.v-icon) {
   color: inherit !important;
-  font-size: 20px !important;
+  font-size: 15px !important;
 }
 
 .stat-tile-body {
@@ -91,7 +86,7 @@ const trendIcon = computed(() => (props.trend?.dir === "down" ? "mdi-trending-do
 }
 
 .stat-tile-value {
-  font-size: 19px !important;
+  font-size: 15.5px !important;
   font-weight: 700;
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
@@ -105,10 +100,9 @@ const trendIcon = computed(() => (props.trend?.dir === "down" ? "mdi-trending-do
 }
 
 .stat-tile-label {
-  font-size: 10.5px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
   color: var(--text-muted);
 }
 
@@ -133,19 +127,19 @@ const trendIcon = computed(() => (props.trend?.dir === "down" ? "mdi-trending-do
 }
 
 /* Tone overrides */
-.stat-tile[data-tone="success"] .stat-tile-icon { background: var(--grad-success); box-shadow: 0 8px 18px rgba(16, 185, 129, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.4); }
+.stat-tile[data-tone="success"] .stat-tile-icon { color: var(--success); background: var(--success-soft); }
 .stat-tile[data-tone="success"] .stat-tile-value { color: var(--success); }
 .stat-tile[data-tone="success"] .stat-tile-trend { background: var(--success-soft); color: var(--success); }
 
-.stat-tile[data-tone="warning"] .stat-tile-icon { background: var(--grad-warning); box-shadow: 0 8px 18px rgba(245, 158, 11, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.4); }
+.stat-tile[data-tone="warning"] .stat-tile-icon { color: var(--warning); background: var(--warning-soft); }
 .stat-tile[data-tone="warning"] .stat-tile-value { color: var(--warning); }
 .stat-tile[data-tone="warning"] .stat-tile-trend { background: var(--warning-soft); color: var(--warning); }
 
-.stat-tile[data-tone="error"] .stat-tile-icon { background: var(--grad-error); box-shadow: 0 8px 18px rgba(244, 63, 94, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.4); }
+.stat-tile[data-tone="error"] .stat-tile-icon { color: var(--error); background: var(--error-soft); }
 .stat-tile[data-tone="error"] .stat-tile-value { color: var(--error); }
 .stat-tile[data-tone="error"] .stat-tile-trend { background: var(--error-soft); color: var(--error); }
 
-.stat-tile[data-tone="info"] .stat-tile-icon { background: var(--grad-info); box-shadow: 0 8px 18px rgba(59, 130, 246, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.4); }
+.stat-tile[data-tone="info"] .stat-tile-icon { color: var(--info); background: var(--info-soft); }
 .stat-tile[data-tone="info"] .stat-tile-value { color: var(--info); }
 .stat-tile[data-tone="info"] .stat-tile-trend { background: var(--info-soft); color: var(--info); }
 
