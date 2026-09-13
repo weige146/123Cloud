@@ -268,6 +268,16 @@ test("renameHistoryLabel：单目录用目录名，多目录用 N 个目录，�
   assert.equal(renameHistoryLabel([], {}), "批量重命名");
 });
 
+test("重命名记录名：根目录（id 0）显示「根目录」，不再叫「目录 0」", () => {
+  const groups = buildRenameRecordGroups([
+    { id: "9", parentId: "0", name: "虎猛警师 (1996) {tmdb-20762}", newName: "虎猛警师 (996) {tmdb-20762}", type: 0, size: 1 }
+  ], {});
+  assert.deepEqual(plain(groups.map((group) => group.name)), ["根目录"]);
+  assert.equal(groups[0].rows[0].parentId, "0");
+  assert.equal(renameHistoryLabel([{ parentId: "0" }], {}), "根目录");
+  assert.equal(renameHistoryLabel([{ parentId: "0" }, { parentId: "p1" }], { p1: "媒体库" }), "2 个目录");
+});
+
 test("filterRenameHistoryForDir：只留当前目录的记录，跨目录条目整条剔除，空 targets 剔除", () => {
   const history = [
     { id: "h1", targets: [{ parentId: "d1" }, { parentId: "d1" }] },

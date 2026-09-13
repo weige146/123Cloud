@@ -17597,12 +17597,19 @@ ${end.comment}` : end.comment;
     }
     return [...groups.entries()].map(([name, recordRows]) => ({ name, kind: "organize", rows: recordRows }));
   }
+  // 父目录显示名：根目录（id 0）不是可查询的目录条目（fileInfos 查不到），直接叫「根目录」，
+  // 不然分组兜底会渲染成「目录 0」。其余查 dirNames，查不到返回空串（分组退回「目录 id」、历史名退回「批量重命名」）。
+  function renameParentDirName(parentId, dirNames = {}) {
+    const id = String(parentId || "0");
+    if (id === "0") return "根目录";
+    return String(dirNames[id] || "").trim();
+  }
   // 批量重命名成功项 → 按所在目录名分组的记录行；dirNames: 父目录 id → 目录名
   function buildRenameRecordGroups(succeeded, dirNames = {}) {
     const groups = /* @__PURE__ */ new Map();
     for (const item of succeeded || []) {
       const parentId = String(item.parentId || item.parentFileId || "0");
-      const name = String(dirNames[parentId] || "").trim() || `目录 ${parentId}`;
+      const name = renameParentDirName(parentId, dirNames) || `目录 ${parentId}`;
       if (!groups.has(name)) groups.set(name, []);
       groups.get(name).push({
         id: String(item.id),
@@ -17622,12 +17629,12 @@ ${end.comment}` : end.comment;
     }
     return [...groups.entries()].map(([name, recordRows]) => ({ name, kind: "rename", rows: recordRows }));
   }
-  // 重命名历史条目名：单目录直接用目录名，多目录用「N 个目录」，都查不到退回「批量重命名」。
-  // 只叫「批量重命名」的话历史下拉里每条长得一样，只能靠日期猜是哪次操作。
+  // 重命名历史条目名：单目录直接用目录名（根目录就叫「根目录」），多目录用「N 个目录」，
+  // 都查不到退回「批量重命名」。只叫「批量重命名」的话历史下拉里每条长得一样，只能靠日期猜是哪次操作。
   function renameHistoryLabel(succeeded, dirNames = {}) {
     const names = [];
     for (const item of succeeded || []) {
-      const name = String(dirNames[String(item.parentId || item.parentFileId || "0")] || "").trim();
+      const name = renameParentDirName(item.parentId || item.parentFileId || "0", dirNames);
       if (name && !names.includes(name)) names.push(name);
     }
     if (names.length === 1) return names[0];
