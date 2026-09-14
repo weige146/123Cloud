@@ -18,22 +18,26 @@ const slice = (fromMarker, toMarker) => {
   return lines.slice(start, end).join("\n");
 };
 const store = new Map();
+const gmStore = new Map();
 const sandbox = {
   console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Symbol, Error,
   DOMException, BigInt, TextEncoder, TextDecoder, btoa: globalThis.btoa, atob: globalThis.atob,
-  location: { origin: "https://www.123pan.cn" },
+  location: { origin: "https://www.123pan.cn", hostname: "www.123pan.cn" },
+  URL,
   localStorage: {
     getItem: (key) => (store.has(key) ? store.get(key) : null),
     setItem: (key, value) => store.set(key, String(value)),
     removeItem: (key) => store.delete(key)
-  }
+  },
+  GM_setValue: (key, value) => gmStore.set(key, String(value)),
+  GM_getValue: (key, fallback) => (gmStore.has(key) ? gmStore.get(key) : fallback)
 };
 vm.createContext(sandbox);
 vm.runInContext([slice("// src/core/utils.js", "// src/api.js"), slice("// src/api.js", "// src/core/categories.js")].join("\n"), sandbox, { filename: "123-helper.user.js" });
 vm.runInContext(`
-globalThis.__sessionMod = { buildSessionExportPayload, parseSessionImportPayload, applySessionImportPayload };
+globalThis.__sessionMod = { buildSessionExportPayload, parseSessionImportPayload, applySessionImportPayload, resolveSessionImportPlan, completeSessionImport, consumePendingSessionHandoff, SESSION_HANDOFF_KEY };
 `, sandbox, { filename: "driver.js" });
-const { buildSessionExportPayload, parseSessionImportPayload, applySessionImportPayload } = sandbox.__sessionMod;
+const { buildSessionExportPayload, parseSessionImportPayload, applySessionImportPayload, resolveSessionImportPlan, completeSessionImport, consumePendingSessionHandoff, SESSION_HANDOFF_KEY } = sandbox.__sessionMod;
 
 // —— 1. 已登录：导出 localStorage 原始值并写回（往返一致） ——
 {
@@ -78,4 +82,65 @@ const { buildSessionExportPayload, parseSessionImportPayload, applySessionImport
   store.clear();
   assert.throws(() => buildSessionExportPayload(), /没有可导出/);
   console.log("ok 未登录导出：明确提示先登录");
+}
+
+// —— 5. 导入计划：网盘页直写；登录页/分享页记住并跳「来源网盘页」（无来源缺省 www.123pan.cn）——
+{
+  assert.deepEqual({ ...resolveSessionImportPlan("www.123pan.cn") }, { applyHere: true, target: "" });
+  assert.deepEqual({ ...resolveSessionImportPlan("yun.123pan.cn") }, { applyHere: true, target: "" });
+  assert.deepEqual({ ...resolveSessionImportPlan("user.123pan.cn", "https://yun.123pan.cn") }, { applyHere: false, target: "https://yun.123pan.cn" });
+  assert.equal(resolveSessionImportPlan("user.123pan.cn").target, "https://www.123pan.cn");
+  assert.equal(resolveSessionImportPlan("abc.mshare.123pan.cn", "https://evil.example.com").target, "https://www.123pan.cn", "非网盘域名的来源不采纳");
+  console.log("ok 导入计划：网盘页直写；其他页跳来源网盘页（白名单校验）");
+}
+
+// —— 6. 登录页拉取：不写本页（写了没用），跳来源网盘页自动写回登录 ——
+{
+  store.clear();
+  sandbox.location.hostname = "user.123pan.cn";
+  const plan = completeSessionImport("token-x|uuid-y", "https://yun.123pan.cn");
+  assert.equal(plan.applyHere, false, "登录页 localStorage 不承载网盘会话，不写入");
+  assert.equal(plan.target, "https://yun.123pan.cn", "跳转到推送来源的网盘页");
+  assert.equal(store.has("authorToken"), false);
+  assert.ok(gmStore.get(SESSION_HANDOFF_KEY)?.includes("token-x"), "会话暂存进油猴存储");
+
+  // 到达来源网盘页：消费接力 → 写入 + 清暂存；重复消费不再触发
+  assert.equal(consumePendingSessionHandoff("yun.123pan.cn"), true);
+  assert.equal(store.get("authorToken"), "token-x");
+  assert.equal(store.get("LoginUuid"), "uuid-y");
+  assert.equal(consumePendingSessionHandoff("yun.123pan.cn"), false);
+
+  // 已是同一会话（如页面自身已带凭据）→ 只清暂存、不重复刷新
+  gmStore.set(SESSION_HANDOFF_KEY, JSON.stringify({ authorToken: "token-x", loginUuid: "uuid-y", ts: Date.now() }));
+  assert.equal(consumePendingSessionHandoff("yun.123pan.cn"), false);
+  assert.equal(gmStore.get(SESSION_HANDOFF_KEY), "");
+  console.log("ok 登录页拉取：暂存并跳来源网盘页；写入/同会话跳过均正确");
+}
+
+// —— 7. 接力过期与入口防护：过期暂存不写入；非网盘页不消费 ——
+{
+  const stale = JSON.stringify({ authorToken: "old", loginUuid: "old-u", ts: Date.now() - 11 * 60 * 1000 });
+  sandbox.location.hostname = "www.123pan.cn";
+  gmStore.set(SESSION_HANDOFF_KEY, stale);
+  assert.equal(consumePendingSessionHandoff("www.123pan.cn"), false);
+  assert.equal(store.get("authorToken"), "token-x", "过期接力不应改写会话");
+  assert.equal(gmStore.get(SESSION_HANDOFF_KEY), "", "过期接力应清空");
+
+  sandbox.location.hostname = "user.123pan.cn";
+  gmStore.set(SESSION_HANDOFF_KEY, JSON.stringify({ authorToken: "t", loginUuid: "u", ts: Date.now() }));
+  assert.equal(consumePendingSessionHandoff("user.123pan.cn"), false);
+  sandbox.location.hostname = "www.123pan.cn";
+  console.log("ok 接力防护：过期不写入；只在网盘页消费");
+}
+
+// —— 8. 网盘页导入：直接写入，不走暂存 ——
+{
+  sandbox.location.hostname = "www.123pan.cn";
+  gmStore.clear();
+  const plan = completeSessionImport(JSON.stringify({ c123Session: 1, authorToken: "direct", LoginUuid: "direct-u" }));
+  assert.equal(plan.applyHere, true);
+  assert.equal(store.get("authorToken"), "direct");
+  assert.equal(gmStore.has(SESSION_HANDOFF_KEY), false, "网盘页导入不需要暂存");
+  sandbox.location.hostname = "www.123pan.cn";
+  console.log("ok 网盘页导入：直接写入不暂存");
 }

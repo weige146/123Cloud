@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.9
+// @version      1.3.11
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -859,6 +859,80 @@
       throw new Error(`\u5199\u5165\u767B\u5F55\u4F1A\u8BDD\u5931\u8D25\uFF1A${error?.message || error}`);
     }
     return parsed;
+  }
+  // 会话跨域接力：localStorage 按域名隔离，网盘登录态（authorToken/LoginUuid）只在各网盘页
+  // 域名（www/yun.*）生效——登录页 user.123pan.cn 写了自己读不到（登录页状态机也不认）。
+  // 登录页导入只把会话记住（油猴存储 GM_setValue 跨域名共享），之后打开任一网盘页由脚本
+  // 自动写回并刷新；网盘页导入则直接写入。
+  var SESSION_HANDOFF_KEY = "c123SessionHandoff";
+  var SESSION_HANDOFF_TTL = 10 * 60 * 1000;
+  function isPanSessionOrigin(hostname = location.hostname) {
+    const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
+    return /^(?:(?:www|yun)\.)?(?:123pan\.(?:com|cn)|123912\.com|123635\.com|123865\.com|123684\.com)$/.test(host);
+  }
+  // 网盘页（www/yun 各官方域名）导入直接写入；登录页 user.* / 分享页的 localStorage 不
+  // 承载网盘会话（实测写了刷新也没用），只记住会话并跳到「会话来源网盘页」（推送时记录
+  // 的 origin，缺省 www.123pan.cn）自动写回登录
+  function resolveSessionImportPlan(hostname = location.hostname, originHint = "") {
+    if (isPanSessionOrigin(hostname)) return { applyHere: true, target: "" };
+    let target = "https://www.123pan.cn";
+    const hint = String(originHint || "").trim().replace(/\/+$/, "");
+    if (hint && /^https?:\/\//i.test(hint)) {
+      try {
+        if (isPanSessionOrigin(new URL(hint).hostname)) target = hint;
+      } catch {}
+    }
+    return { applyHere: false, target };
+  }
+  function stashSessionHandoff(parsed, target = "") {
+    if (typeof GM_setValue !== "function") return false;
+    try {
+      GM_setValue(SESSION_HANDOFF_KEY, JSON.stringify({ authorToken: parsed.authorToken, loginUuid: parsed.loginUuid, target, ts: Date.now() }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function consumePendingSessionHandoff(hostname = location.hostname) {
+    const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
+    if (!isPanSessionOrigin(host) || typeof GM_getValue !== "function" || typeof GM_setValue !== "function") return false;
+    let parsed = null;
+    try {
+      const raw = GM_getValue(SESSION_HANDOFF_KEY, "");
+      if (!raw) return false;
+      parsed = JSON.parse(raw);
+    } catch {
+      return false;
+    }
+    if (!parsed?.authorToken || !parsed?.loginUuid || Date.now() - Number(parsed.ts || 0) > SESSION_HANDOFF_TTL) {
+      try { GM_setValue(SESSION_HANDOFF_KEY, ""); } catch {}
+      return false;
+    }
+    try {
+      if (globalThis.localStorage.getItem("authorToken") === String(parsed.authorToken) && globalThis.localStorage.getItem("LoginUuid") === String(parsed.loginUuid)) {
+        // 当前页已是该会话（如登录页官方跳转已把会话带过来），只清暂存、不用再刷
+        try { GM_setValue(SESSION_HANDOFF_KEY, ""); } catch {}
+        return false;
+      }
+      globalThis.localStorage.setItem("authorToken", String(parsed.authorToken));
+      globalThis.localStorage.setItem("LoginUuid", String(parsed.loginUuid));
+    } catch {
+      return false; // 写入失败保留暂存，下次进网盘页再试
+    }
+    try { GM_setValue(SESSION_HANDOFF_KEY, ""); } catch {}
+    return true;
+  }
+  // 返回形态：applyHere=已写入当前页刷新；target=会话已记住、跳到该网盘页自动登录；
+  // stashFailed=油猴存储不可用，只能提示用户到网盘页手动再导一次
+  function completeSessionImport(text2, originHint = "") {
+    const parsed = parseSessionImportPayload(text2);
+    const plan = resolveSessionImportPlan(location.hostname, originHint);
+    if (plan.applyHere) {
+      applySessionImportPayload(text2);
+      return { applyHere: true, target: "", stashFailed: false, parsed };
+    }
+    const stashFailed = !stashSessionHandoff(parsed, plan.target);
+    return { applyHere: false, target: stashFailed ? "" : plan.target, stashFailed, parsed };
   }
   // 秒传线路镜像域名：与 www.123865.com 同一套官方网盘接口（/b/api/*），维护者 2026-09-14
   // 实测 upload_request 16~24 线程可达 ~150 次/秒（123865 为 32 并发 85 次/秒）。
@@ -5404,32 +5478,42 @@
   var SETTINGS_MENU_LABEL = "\u6253\u5F00 123 \u52A9\u624B\u8BBE\u7F6E";
   var PURE_PAGE_MENU_LABEL = "\u5207\u6362\u9875\u9762\u7EAF\u51C0\u7248";
   var RECORDS_MENU_LABEL = "\u6253\u5F00 123 \u52A9\u624B\u64CD\u4F5C\u8BB0\u5F55";
-  var SESSION_EXPORT_MENU_LABEL = "\u5BFC\u51FA\u767B\u5F55\u4F1A\u8BDD\uFF08\u8DE8\u6D4F\u89C8\u5668\u590D\u7528\uFF09";
-  var SESSION_IMPORT_MENU_LABEL = "\u5BFC\u5165\u767B\u5F55\u4F1A\u8BDD\uFF08\u8DE8\u6D4F\u89C8\u5668\u590D\u7528\uFF09";
-  function registerSessionMenu() {
+  var SESSION_PUSH_MENU_LABEL = "\u63A8\u9001\u767B\u5F55\u4F1A\u8BDD\u5230\u5BA2\u6237\u7AEF\uFF08\u5B58\u6863\uFF09";
+  var SESSION_PULL_MENU_LABEL = "\u4ECE\u5BA2\u6237\u7AEF\u62C9\u53D6\u767B\u5F55\u4F1A\u8BDD\uFF08\u81EA\u52A8\u767B\u5F55\uFF09";
+  function registerSessionMenu(configGetter = () => ({})) {
     // 会话复用菜单不依赖面板：登录页/未登录状态也能用（其他浏览器导入会话免登录、不新增设备）
     if (typeof GM_registerMenuCommand !== "function") return [];
-    const exportMenu = GM_registerMenuCommand(SESSION_EXPORT_MENU_LABEL, () => {
-      try {
-        const payload = buildSessionExportPayload();
-        if (typeof GM_setClipboard === "function") GM_setClipboard(payload, "text");
-        alert("\u767B\u5F55\u4F1A\u8BDD\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F\u3002\n\u5728\u5176\u4ED6\u6D4F\u89C8\u5668\u7684\u6CB9\u7334\u83DC\u5355\u91CC\u9009\u300C\u5BFC\u5165\u767B\u5F55\u4F1A\u8BDD\u300D\u7C98\u8D34\u5373\u53EF\u590D\u7528\uFF0C\u4E0D\u4F1A\u65B0\u589E\u8BBE\u5907\u3002");
-      } catch (error) {
+    const pushMenu = GM_registerMenuCommand(SESSION_PUSH_MENU_LABEL, () => {
+      pushClientSession(configGetter()).then(() => {
+        alert("\u767B\u5F55\u4F1A\u8BDD\u5DF2\u63A8\u9001\u5230\u5BA2\u6237\u7AEF\u5B58\u6863\u3002\u5176\u4ED6\u6D4F\u89C8\u5668\u53EF\u7528\u300C\u4ECE\u5BA2\u6237\u7AEF\u62C9\u53D6\u767B\u5F55\u4F1A\u8BDD\u300D\u81EA\u52A8\u767B\u5F55\u3002");
+      }).catch((error) => {
         alert(error?.message || String(error));
-      }
+      });
     });
-    const importMenu = GM_registerMenuCommand(SESSION_IMPORT_MENU_LABEL, () => {
-      const text2 = prompt("\u7C98\u8D34\u5BFC\u51FA\u7684\u767B\u5F55\u4F1A\u8BDD\u5185\u5BB9\uFF08JSON \u6216 token|uuid\uFF09\uFF1A");
-      if (text2 === null) return;
-      try {
-        applySessionImportPayload(text2);
+    const pullMenu = GM_registerMenuCommand(SESSION_PULL_MENU_LABEL, () => {
+      pullClientSession(configGetter()).then((session) => {
+        if (!session) {
+          alert("\u5BA2\u6237\u7AEF\u8FD8\u6CA1\u6709\u5B58\u6863\u4F1A\u8BDD\uFF1A\u5148\u5728\u5DF2\u767B\u5F55\u7684\u6D4F\u89C8\u5668\u4E0A\u7528\u300C\u63A8\u9001\u767B\u5F55\u4F1A\u8BDD\u5230\u5BA2\u6237\u7AEF\u300D\u4E0A\u4F20\u4E00\u6B21\u3002");
+          return;
+        }
+        const plan = completeSessionImport(JSON.stringify({ c123Session: 1, authorToken: session.authorToken, LoginUuid: session.loginUuid }), session.origin || "");
+        if (plan.stashFailed) {
+          alert("\u6CB9\u7334\u6682\u5B58\u4E0D\u53EF\u7528\uFF0C\u8BF7\u5230\u7F51\u76D8\u9875\u91CD\u65B0\u5BFC\u5165\u3002");
+          return;
+        }
+        if (!plan.applyHere) {
+          const targetHost = (() => { try { return new URL(plan.target).hostname; } catch { return plan.target; } })();
+          alert("\u4F1A\u8BDD\u5DF2\u8BB0\u4F4F\u2014\u2014\u6B63\u5728\u6253\u5F00\u7F51\u76D8\u9875 " + targetHost + " \u81EA\u52A8\u5B8C\u6210\u767B\u5F55\uFF0C\u4E0D\u65B0\u589E\u8BBE\u5907\u3002");
+          location.href = plan.target;
+          return;
+        }
         alert("\u767B\u5F55\u4F1A\u8BDD\u5DF2\u5199\u5165\uFF0C\u9875\u9762\u5373\u5C06\u5237\u65B0\u3002");
         location.reload();
-      } catch (error) {
+      }).catch((error) => {
         alert(error?.message || String(error));
-      }
+      });
     });
-    return [exportMenu, importMenu];
+    return [pushMenu, pullMenu];
   }
   function registerSettingsMenu(ui) {
     if (typeof GM_registerMenuCommand !== "function" || !ui?.openSettings) return null;
@@ -15555,7 +15639,12 @@ ${end.comment}` : end.comment;
     const mapped = (field2) => findFixedMapping(text2, field2, configuredMappings)?.output || "";
     const videoFormat = mapped("videoFormat");
     const mediaSource = mapped("mediaSource");
-    const resourceType = mapped("resourceType");
+    let resourceType = mapped("resourceType");
+    // UHD.BluRay.2160p.REMUX 这类名字里 Remux 别名跨不过中间的分辨率段，会先被
+    // UHD BluRay/BluRay 条目命中；名字带 REMUX 记号时补升为对应 Remux 资源类型。
+    if (/\bREMUX\b/i.test(text2) && /^(?:UHD BluRay|BluRay)$/.test(resourceType)) {
+      resourceType = resourceType === "UHD BluRay" ? "UHD BluRay Remux" : "BluRay Remux";
+    }
     const dolbyVision = mapped("dolbyVision");
     const dynamicRange = mapped("dynamicRange");
     const videoCodec = mapped("videoCodec");
@@ -15583,7 +15672,14 @@ ${end.comment}` : end.comment;
     const effectRange = dynamicRange === "HDR10+" ? "HDR10" : dynamicRange;
     const effect = [dolbyVision, effectRange, highQuality, /\b3D\b/i.test(text2) ? "3D" : ""].filter((token, index, items) => token && items.indexOf(token) === index).join(" ");
     const frameRateMatch = text2.match(/\b(\d{2,3}(?:\.\d{1,3})?)[ ._-]?(?:fps|帧)\b/i);
-    const frameRate = frameRateMatch ? `${frameRateMatch[1]}fps` : "";
+    let frameRate = "";
+    if (frameRateMatch) {
+      let rate = frameRateMatch[1];
+      // H.265.25fps 的点分字段会把编码版本号并进帧率（265.25fps）；真实小数帧率
+      // 不超过 119.88，超过 120 的带小数取值只保留 fps 紧前一段。
+      if (rate.includes(".") && Number(rate) > 120) rate = rate.split(".").pop();
+      frameRate = `${rate}fps`;
+    }
     const colorDepth = String(text2.match(/\b(8|10|12)[ ._-]?bit\b/i)?.[1] ? `${text2.match(/\b(8|10|12)[ ._-]?bit\b/i)[1]}bit` : "");
     const originalEdition = mapped("originalEdition");
     return { videoFormat, mediaSource, resourceType, effect, highQuality, dolbyVision, dynamicRange, frameRate, colorDepth, originalEdition, videoCodec, audioCodec };
@@ -18912,6 +19008,9 @@ ${end.comment}` : end.comment;
   }
   function libraryRequestJson(url, options = {}) {
     const timeoutMs = Math.max(1000, Number(options.timeoutMs || 20000));
+    const method = String(options.method || "GET").toUpperCase();
+    const bodyPayload = options.body ? JSON.stringify(options.body) : void 0;
+    const requestHeaders = bodyPayload ? { accept: "application/json", "content-type": "application/json" } : { accept: "application/json" };
     if (typeof GM_xmlhttpRequest === "function") {
       return new Promise((resolve, reject) => {
         let settled = false;
@@ -18921,9 +19020,10 @@ ${end.comment}` : end.comment;
           callback(value);
         };
         GM_xmlhttpRequest({
-          method: "GET",
+          method,
           url,
-          headers: { accept: "application/json" },
+          headers: requestHeaders,
+          data: bodyPayload,
           timeout: timeoutMs,
           anonymous: true,
           onload: (response) => {
@@ -18945,7 +19045,7 @@ ${end.comment}` : end.comment;
         });
       });
     }
-    return fetch(url, { headers: { accept: "application/json" }, cache: "no-store" }).then(async (response) => {
+    return fetch(url, { method, headers: requestHeaders, body: bodyPayload, cache: "no-store" }).then(async (response) => {
       const text2 = await response.text();
       let payload;
       try {
@@ -18959,6 +19059,25 @@ ${end.comment}` : end.comment;
       if (error instanceof Error) throw error;
       throw new Error("\u65E0\u6CD5\u8FDE\u63A5\u5F71\u5E93\u63A5\u53E3");
     });
+  }
+  // ===== 登录会话中转（123Cloud 客户端 /api/pan/session）=====
+  // 已登录浏览器把网页会话推给客户端存档；其他浏览器从客户端拉取后走 completeSessionImport
+  // 的域名逻辑登录。客户端地址与令牌复用「影库接口地址 / 影库访问令牌」配置。
+  async function pushClientSession(config) {
+    const parsed = JSON.parse(buildSessionExportPayload());
+    const result = await libraryRequestJson(libraryRequestUrl(config, "/api/pan/session"), {
+      method: "POST",
+      body: { authorToken: parsed.authorToken, loginUuid: parsed.LoginUuid, origin: location.origin }
+    });
+    if (!result?.ok) throw new Error("\u5BA2\u6237\u7AEF\u672A\u786E\u8BA4\u4F1A\u8BDD\u5B58\u6863");
+    return result;
+  }
+  async function pullClientSession(config) {
+    const result = await libraryRequestJson(libraryRequestUrl(config, "/api/pan/session"));
+    if (!result?.ok) throw new Error("\u5BA2\u6237\u7AEF\u63A5\u53E3\u8FD4\u56DE\u5F02\u5E38");
+    const session = result.session || {};
+    if (!session.authorToken || !session.loginUuid) return null;
+    return { authorToken: String(session.authorToken), loginUuid: String(session.loginUuid), account: String(session.account || ""), origin: String(session.origin || ""), updatedAt: String(session.updatedAt || "") };
   }
   function readLibraryPosterCache() {
     try {
@@ -19842,8 +19961,7 @@ ${end.comment}` : end.comment;
   function renderPane(ui) {
     const draft = ui.settings.draft;
     if (ui.settings.picker) return renderFolderPicker(ui);
-    const sessionSection = `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("link", 17)}</span><div><h3>\u767B\u5F55\u4F1A\u8BDD\u590D\u7528</h3><p>\u5BFC\u51FA\u5F53\u524D\u6D4F\u89C8\u5668\u7684\u767B\u5F55\u4F1A\u8BDD\uFF0C\u5728\u5176\u4ED6\u6D4F\u89C8\u5668\u5BFC\u5165\u540E\u5171\u7528\u540C\u4E00\u4F1A\u8BDD\uFF0C\u4E0D\u518D\u6BCF\u4E2A\u6D4F\u89C8\u5668\u767B\u5F55\u90FD\u65B0\u589E\u4E00\u53F0\u8BBE\u5907\u3002</p></div></div><div class="form-card"><div class="button-row"><button class="button" data-action="session-export">${icon("download", 15)}\u5BFC\u51FA\u5F53\u524D\u4F1A\u8BDD\u5230\u526A\u8D34\u677F</button><button class="button" data-action="session-import">${icon("import", 15)}\u5BFC\u5165\u4F1A\u8BDD\uFF08\u7C98\u8D34\uFF09</button></div><small>\u5176\u4ED6\u6D4F\u89C8\u5668\u4E5F\u53EF\u7528\u6CB9\u7334\u83DC\u5355\u300C\u5BFC\u5165\u767B\u5F55\u4F1A\u8BDD\u300D\uFF08\u672A\u767B\u5F55\u9875\u9762\u4E5F\u80FD\u7528\uFF09\u3002\u4F1A\u8BDD\u8FC7\u671F\u540E\u9700\u91CD\u65B0\u5BFC\u51FA\u5BFC\u5165\uFF1B\u5BFC\u5165\u4F1A\u7ACB\u5373\u8986\u76D6\u672C\u6D4F\u89C8\u5668\u767B\u5F55\u5E76\u5237\u65B0\u9875\u9762\u3002</small></div></div>`;
-    if (ui.settings.tab === "general") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("settings", 17)}</span><div><h3>\u5916\u89C2\u4E0E\u4EFB\u52A1</h3><p>\u4E3B\u9898\u4F1A\u5E94\u7528\u5230\u6240\u6709\u52A9\u624B\u5F39\u7A97\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u4E3B\u9898</span><select data-config="appearance.theme"><option value="system" ${draft.appearance.theme === "system" ? "selected" : ""}>\u8DDF\u968F\u7CFB\u7EDF</option><option value="light" ${draft.appearance.theme === "light" ? "selected" : ""}>\u6D45\u8272</option><option value="dark" ${draft.appearance.theme === "dark" ? "selected" : ""}>\u6DF1\u8272</option></select></label><label class="check-line"><input type="checkbox" data-config="appearance.compactRows" ${draft.appearance.compactRows ? "checked" : ""}>\u4F7F\u7528\u7D27\u51D1\u8868\u683C\u884C</label></div></div></div>${sessionSection}<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("waveform", 17)}</span><div><h3>\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B</h3><p>\u4EC5\u5728\u6D4F\u89C8\u5668\u672C\u5730\u901A\u8FC7 123 \u76F4\u94FE\u3001Range \u5206\u6BB5\u548C MediaInfo WASM \u89E3\u6790\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u5A92\u4F53\u5185\u5BB9\u3002</p></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("share", 17)}</span><div><h3>\u5206\u4EAB\u4E0E\u79D2\u4F20</h3><p>\u53EF\u5728\u5206\u4EAB\u521B\u5EFA\u6210\u529F\u540E\u76F4\u63A5\u53D1\u9001\u5230\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\uFF0C\u7531\u670D\u52A1\u751F\u6210\u5E76\u63A8\u9001\u6295\u7A3F\u8349\u7A3F\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u5206\u4EAB\u5230\u671F\u65F6\u95F4</span><input data-config="share.expiration" value="${escapeHtml(draft.share.expiration)}"></label><label class="field"><span>\u968F\u673A\u53E3\u4EE4\u957F\u5EA6</span><input type="number" min="1" max="8" data-config="share.passwordLength" value="${draft.share.passwordLength}"></label><label class="check-line full"><input type="checkbox" data-config="share.autoSubmitEnabled" ${draft.share.autoSubmitEnabled ? "checked" : ""}>\u5206\u4EAB\u540E\u81EA\u52A8\u63A8\u9001\u5230\u6295\u7A3F\u673A\u5668\u4EBA</label><label class="field full"><span>\u6295\u7A3F\u5730\u5740</span><input data-config="share.submissionUrl" value="${escapeHtml(draft.share.submissionUrl || "")}" placeholder="\u8BF7\u8F93\u5165\u5B8C\u6574\u6295\u7A3F\u63A5\u53E3\u5730\u5740"><small>\u811A\u672C\u4F1A\u5411\u6B64\u5730\u5740\u53D1\u9001 POST \u8BF7\u6C42\uFF1B\u53EF\u586B\u5199 123Cloud \u6216\u5176\u4ED6\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\u7684\u5B8C\u6574\u63A5\u53E3\u5730\u5740\u3002</small></label><label class="field full"><span>\u5F71\u5E93\u63A5\u53E3\u5730\u5740\uFF08123Cloud \u5BA2\u6237\u7AEF\uFF09</span><input data-config="share.libraryUrl" value="${escapeHtml(draft.share.libraryUrl || "")}" placeholder="\u4F8B\u5982 http://127.0.0.1:62156\uFF0C\u53EF\u5E26 ?token="><small>\u586B\u5BA2\u6237\u7AEF\u5730\u5740\u5373\u53EF\uFF0C\u7AEF\u53E3\u770B\u5BA2\u6237\u7AEF\u300C\u8BBE\u7F6E \u2192 \u670D\u52A1\u7AEF\u53E3\u300D\uFF08\u540C\u6295\u7A3F\u7AEF\u53E3\uFF09\uFF1B\u54EA\u91CC\u80FD\u8FDE\u4E0A\u5C31\u586B\u54EA\u91CC\uFF0C\u7528\u4E8E\u79D2\u4F20\u5DE5\u5177\u7BB1\u7684\u300C\u5F71\u5E93\u641C\u7D22\u300D\u3002</small></label><label class="field"><span>\u5F71\u5E93\u8BBF\u95EE\u4EE4\u724C</span><input data-config="share.libraryToken" value="${escapeHtml(draft.share.libraryToken || "")}" placeholder="\u5BA2\u6237\u7AEF\u300C\u5F71\u5E93\uFF0D\u5F71\u5E93\u8BBE\u7F6E\u300D\u91CC\u751F\u6210\uFF0C\u672A\u8BBE\u7F6E\u53EF\u7559\u7A7A"></label></div></div></div>`;
+      if (ui.settings.tab === "general") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("settings", 17)}</span><div><h3>\u5916\u89C2\u4E0E\u4EFB\u52A1</h3><p>\u4E3B\u9898\u4F1A\u5E94\u7528\u5230\u6240\u6709\u52A9\u624B\u5F39\u7A97\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u4E3B\u9898</span><select data-config="appearance.theme"><option value="system" ${draft.appearance.theme === "system" ? "selected" : ""}>\u8DDF\u968F\u7CFB\u7EDF</option><option value="light" ${draft.appearance.theme === "light" ? "selected" : ""}>\u6D45\u8272</option><option value="dark" ${draft.appearance.theme === "dark" ? "selected" : ""}>\u6DF1\u8272</option></select></label><label class="check-line"><input type="checkbox" data-config="appearance.compactRows" ${draft.appearance.compactRows ? "checked" : ""}>\u4F7F\u7528\u7D27\u51D1\u8868\u683C\u884C</label></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("waveform", 17)}</span><div><h3>\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B</h3><p>\u4EC5\u5728\u6D4F\u89C8\u5668\u672C\u5730\u901A\u8FC7 123 \u76F4\u94FE\u3001Range \u5206\u6BB5\u548C MediaInfo WASM \u89E3\u6790\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u5A92\u4F53\u5185\u5BB9\u3002</p></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("share", 17)}</span><div><h3>\u5206\u4EAB\u4E0E\u79D2\u4F20</h3><p>\u53EF\u5728\u5206\u4EAB\u521B\u5EFA\u6210\u529F\u540E\u76F4\u63A5\u53D1\u9001\u5230\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\uFF0C\u7531\u670D\u52A1\u751F\u6210\u5E76\u63A8\u9001\u6295\u7A3F\u8349\u7A3F\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u5206\u4EAB\u5230\u671F\u65F6\u95F4</span><input data-config="share.expiration" value="${escapeHtml(draft.share.expiration)}"></label><label class="field"><span>\u968F\u673A\u53E3\u4EE4\u957F\u5EA6</span><input type="number" min="1" max="8" data-config="share.passwordLength" value="${draft.share.passwordLength}"></label><label class="check-line full"><input type="checkbox" data-config="share.autoSubmitEnabled" ${draft.share.autoSubmitEnabled ? "checked" : ""}>\u5206\u4EAB\u540E\u81EA\u52A8\u63A8\u9001\u5230\u6295\u7A3F\u673A\u5668\u4EBA</label><label class="field full"><span>\u6295\u7A3F\u5730\u5740</span><input data-config="share.submissionUrl" value="${escapeHtml(draft.share.submissionUrl || "")}" placeholder="\u8BF7\u8F93\u5165\u5B8C\u6574\u6295\u7A3F\u63A5\u53E3\u5730\u5740"><small>\u811A\u672C\u4F1A\u5411\u6B64\u5730\u5740\u53D1\u9001 POST \u8BF7\u6C42\uFF1B\u53EF\u586B\u5199 123Cloud \u6216\u5176\u4ED6\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\u7684\u5B8C\u6574\u63A5\u53E3\u5730\u5740\u3002</small></label><label class="field full"><span>\u5F71\u5E93\u63A5\u53E3\u5730\u5740\uFF08123Cloud \u5BA2\u6237\u7AEF\uFF09</span><input data-config="share.libraryUrl" value="${escapeHtml(draft.share.libraryUrl || "")}" placeholder="\u4F8B\u5982 http://127.0.0.1:62156\uFF0C\u53EF\u5E26 ?token="><small>\u586B\u5BA2\u6237\u7AEF\u5730\u5740\u5373\u53EF\uFF0C\u7AEF\u53E3\u770B\u5BA2\u6237\u7AEF\u300C\u8BBE\u7F6E \u2192 \u670D\u52A1\u7AEF\u53E3\u300D\uFF08\u540C\u6295\u7A3F\u7AEF\u53E3\uFF09\uFF1B\u54EA\u91CC\u80FD\u8FDE\u4E0A\u5C31\u586B\u54EA\u91CC\uFF0C\u7528\u4E8E\u79D2\u4F20\u5DE5\u5177\u7BB1\u7684\u300C\u5F71\u5E93\u641C\u7D22\u300D\u3002</small></label><label class="field"><span>\u5F71\u5E93\u8BBF\u95EE\u4EE4\u724C</span><input data-config="share.libraryToken" value="${escapeHtml(draft.share.libraryToken || "")}" placeholder="\u5BA2\u6237\u7AEF\u300C\u5F71\u5E93\uFF0D\u5F71\u5E93\u8BBE\u7F6E\u300D\u91CC\u751F\u6210\uFF0C\u672A\u8BBE\u7F6E\u53EF\u7559\u7A7A"></label></div></div></div>`;
     if (ui.settings.tab === "tmdb") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("cloud", 17)}</span><div><h3>TMDB \u8FDE\u63A5</h3><p>\u7528\u4E8E\u5A92\u4F53\u6D77\u62A5\u3001\u6807\u9898\u3001\u5E74\u4EFD\u548C\u5267\u96C6\u4FE1\u606F\u3002</p></div></div>${notice("\u4EE5 ey \u5F00\u5934\u7684\u503C\u6309 Read Access Token \u4F7F\u7528\uFF0C\u5176\u4ED6\u503C\u6309 v3 API Key \u4F7F\u7528\u3002\u65E0\u6CD5\u76F4\u8FDE TMDB \u65F6\u53EF\u586B\u5199\u4E0B\u65B9\u7684\u7B2C\u4E09\u65B9\u66FF\u4EE3\u6E90\uFF08\u81EA\u5EFA\u53CD\u4EE3/\u955C\u50CF\u5730\u5740\uFF0C\u586B\u5230\u542B /3 \u4E3A\u6B62\uFF1B\u53EA\u586B\u57DF\u540D\u4F1A\u81EA\u52A8\u8865 /3\uFF0Chttps:// \u524D\u7F00\u53EF\u7701\u7565\uFF09\uFF0C\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9\u6E90\u3002", "", "cloud")}<div class="form-card"><div class="form-grid"><label class="field full"><span>API Key / Read Access Token</span><input type="password" autocomplete="off" data-config="tmdb.credential" value="${escapeHtml(draft.tmdb.credential)}"></label><label class="field full"><span>TMDB \u66FF\u4EE3\u6E90\uFF08\u65E0\u6CD5\u76F4\u8FDE\u65F6\u4F7F\u7528\uFF09</span><input data-config="tmdb.apiBase" value="${escapeHtml(draft.tmdb.apiBase || "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9 api.themoviedb.org" spellcheck="false" autocomplete="off"></label><label class="field"><span>\u8BED\u8A00</span><input data-config="tmdb.language" value="${escapeHtml(draft.tmdb.language)}"></label><label class="field"><span>\u5730\u533A</span><input data-config="tmdb.region" value="${escapeHtml(draft.tmdb.region)}"></label></div></div><button class="button" data-action="tmdb-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>`;
     if (ui.settings.tab === "library") return renderLibrary(ui);
     if (ui.settings.tab === "naming") return renderNaming(ui);
@@ -23804,8 +23922,6 @@ ${end.comment}` : end.comment;
         },
         "config-export": () => this.exportConfig(),
         "config-import": () => this.importConfig(),
-        "session-export": () => this.exportLoginSession(),
-        "session-import": () => this.importLoginSessionDialog(),
         "config-reset": () => {
           this.settings.draft = structuredClone(DEFAULT_CONFIG);
           this.settings.categoryType = "movie";
@@ -23886,23 +24002,6 @@ ${end.comment}` : end.comment;
       const text2 = this.configStore.export({ includeSecrets });
       this.configStore.set(previous);
       downloadText("123-helper-config.json", text2);
-    }
-    exportLoginSession() {
-      try {
-        const payload = buildSessionExportPayload();
-        if (typeof GM_setClipboard === "function") GM_setClipboard(payload, "text");
-        else this.toast("\u526A\u8D34\u677F\u4E0D\u53EF\u7528\uFF0C\u8BF7\u7528\u6CB9\u7334\u83DC\u5355\u91CD\u8BD5", "error");
-        this.toast("\u767B\u5F55\u4F1A\u8BDD\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F\uFF0C\u5230\u5176\u4ED6\u6D4F\u89C8\u5668\u300C\u5BFC\u5165\u4F1A\u8BDD\u300D\u7C98\u8D34\u5373\u53EF\u590D\u7528", "success");
-      } catch (error) {
-        this.toast(error.message, "error");
-      }
-    }
-    importLoginSessionDialog() {
-      this.openInputDialog("\u5BFC\u5165\u767B\u5F55\u4F1A\u8BDD", [{ key: "session", label: "\u7C98\u8D34\u5BFC\u51FA\u7684\u4F1A\u8BDD\u5185\u5BB9\uFF08JSON \u6216 token|uuid\uFF09" }], ({ session }) => {
-        applySessionImportPayload(session);
-        this.toast("\u4F1A\u8BDD\u5DF2\u5199\u5165\uFF0C\u9875\u9762\u5373\u5C06\u5237\u65B0", "success");
-        setTimeout(() => location.reload(), 800);
-      }, "\u5BFC\u5165\u5E76\u5237\u65B0");
     }
     importConfig() {
       const input = this.root.querySelector("#config-file");
@@ -24461,9 +24560,18 @@ ${end.comment}` : end.comment;
     const start = () => {
       try {
         if (!isOfficialPanPortalHost()) return;
+        // 会话跨域接力：导入若发生在登录页/分享页等其他域名，会话已暂存进油猴存储——
+        // 首次进网盘页时写回 localStorage 并刷新，完成跨域导入
+        if (consumePendingSessionHandoff()) {
+          location.reload();
+          return;
+        }
         installShareMessageInterceptor(pageWindow);
         installOfficialShareTokenCleaner(document);
         const configStore = new ConfigStore();
+        // 会话复用菜单不依赖设置面板：登录页 user.123pan.cn 没有面板，菜单是唯一入口，
+        // 提前注册，避免后续初始化在登录页失败时把入口一起带走
+        registerSessionMenu(() => configStore.get());
         const config = configStore.get();
         installPageStyles();
         // user. 登录域名不服务 /b/api 接口：脚本 API 一律回落 www.123pan.cn
@@ -24479,7 +24587,6 @@ ${end.comment}` : end.comment;
         const ui = new AssistantUi({ api, bridge, configStore, tmdb, metadata });
         ui.init();
         registerSettingsMenu(ui);
-        registerSessionMenu();
         bridge.init();
       } catch (error) {
         console.error("[123 \u52A9\u624B] \u542F\u52A8\u5931\u8D25", error);

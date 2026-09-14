@@ -60,4 +60,22 @@ assert.equal(fields.audioCodec, "XXEA");
 assert.equal(inferTitle("Movie.XXEA.2.0.H.265-GROUP", customCodecMappings), "Movie");
 console.log("ok 全新编码无声道写法识别 + 标题截断生效");
 
+// 5. 帧率：H.265.25fps 不能把编码版本号并进帧率（此前识别成 265.25fps）；真实小数帧率保留
+fields = inferTechnicalFields("火烧红莲寺.Burning.Paradise.1994.2160p.WEB-DL.H.265.25fps.10bit.AAC.CHS.Mandarin-CSWEB");
+assert.equal(fields.frameRate, "25fps");
+assert.equal(fields.videoCodec, "H265");
+assert.equal(fields.colorDepth, "10bit");
+assert.equal(inferTechnicalFields("Movie.2020.1080p.BluRay.23.976fps.x264-GROUP").frameRate, "23.976fps");
+assert.equal(inferTechnicalFields("Movie.2020.1080p.BluRay.60FPS.x264-GROUP").frameRate, "60fps");
+console.log("ok H.265.25fps 帧率识别为 25fps，真实小数帧率不受影响");
+
+// 6. REMUX：UHD.BluRay.2160p.REMUX 中间隔着分辨率段，也要识别为 UHD BluRay Remux（此前落成 UHD BluRay）
+fields = inferTechnicalFields("Flight.of.the.Butterflies.2012.UHD.BluRay.2160p.REMUX.HDR.HEVC.Atmos.TrueHD.7.1-UBits");
+assert.equal(fields.resourceType, "UHD BluRay Remux");
+assert.equal(fields.videoFormat, "2160p");
+assert.equal(fields.videoCodec, "HEVC");
+assert.equal(fields.audioCodec, "TrueHD.7.1");
+assert.equal(inferTechnicalFields("Movie.2018.1080p.UHD.BluRay.REMUX.HEVC-GROUP").resourceType, "UHD BluRay Remux");
+console.log("ok REMUX 与 UHD BluRay 隔段出现时识别为 UHD BluRay Remux");
+
 console.log("technical-fields.test.mjs 全部通过");
