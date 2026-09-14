@@ -603,3 +603,212 @@ class LibraryRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MovieLibraryStreamImportTests(unittest.TestCase):
+    """巨型秒传 JSON 流式导入：分块解析与整读结果严格一致、跨批次作品聚合、去重跳过、错误回退。"""
+
+    def _make_json_file(self, path: Path, common_path: str = "电影", count: int = 300) -> Path:
+        """构造标准 123FastLink JSON：多作品、含 tmdb 标记/Season/海报，乱序穿插保证跨批次。"""
+        files = []
+        for i in range(count):
+            work = f"作品{i % 7} (2018) {{tmdb-{1000 + i % 7}}}"
+            files.append({"path": f"{work}/Season 1/E{i:03d}.mkv", "etag": hex_to_base62(_etag(i)), "size": 100 + i})
+            if i % 3 == 0:
+                files.append({"path": f"{work}/海报{i}.jpg", "etag": hex_to_base62(_etag(5000 + i)), "size": 9})
+        payload = _fastlink_payload(common_path, files)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_stream_matches_full_parse(self):
+        """分块极小（强制部分读取路径）时，流式条目与整读解析严格一致。"""
+        with tempfile.TemporaryDirectory() as d:
+            f = self._make_json_file(Path(d) / "库.json", common_path="电影")
+            meta, entries = movie_library.open_library_stream(f, chunk_size=97)
+            streamed = list(entries)
+            self.assertEqual(meta["commonPath"], "电影")
+            self.assertTrue(meta["usesBase62"])
+            full = parse_library_content(f.read_text(encoding="utf-8"))
+            self.assertEqual(meta["commonPath"], full["commonPath"])
+            self.assertEqual(len(streamed), len(full["files"]))
+            self.assertEqual(streamed, full["files"])
+
+    def test_stream_array_root_and_commonpath_prefix(self):
+        """[etag,size,path] 数组形态与相对路径拼回 commonPath。"""
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "arr.json"
+            f.write_text(json.dumps([[_etag(1), "100", "a.mkv"], [_etag(2), "200", "sub/b.mkv"]]), encoding="utf-8")
+            meta, entries = movie_library.open_library_stream(f, chunk_size=11)
+            files = list(entries)
+            self.assertEqual(meta, {"commonPath": "", "usesBase62": False})
+            self.assertEqual(files[0]["path"], "a.mkv")
+            self.assertEqual(files[1]["path"], "sub/b.mkv")
+
+    def test_stream_db_import_matches_payload_import(self):
+        """流式入库与整读入库的库内容/统计完全一致（含跨批次、跨分块的作品聚合）。"""
+        from app.movie_library_db import LibraryDb
+
+        def rows_of(db_path: Path):
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            try:
+                works = conn.execute(
+                    "SELECT dir, title, file_count, video_count, total_size, source FROM library_works ORDER BY dir"
+                ).fetchall()
+                files = conn.execute(
+                    "SELECT dir, path, file_name, etag, size, is_video FROM library_work_files ORDER BY dir, path"
+                ).fetchall()
+                sources = conn.execute(
+                    "SELECT name, common_path, work_count, file_count, total_size FROM library_sources"
+                ).fetchall()
+                return works, files, sources
+            finally:
+                conn.close()
+
+        with tempfile.TemporaryDirectory() as d:
+            f = self._make_json_file(Path(d) / "库.json", common_path="电影", count=120)
+            db_a = LibraryDb(Path(d) / "a.db")
+            payload = movie_library.parse_library_content(f.read_text(encoding="utf-8"))
+            r_payload = db_a.import_payload("库.json", payload)
+            db_b = LibraryDb(Path(d) / "b.db")
+            meta, entries = movie_library.open_library_stream(f, chunk_size=211)
+            r_stream = db_b.import_stream("库.json", meta["commonPath"], entries, batch_size=13)
+            self.assertEqual(r_payload["added"], r_stream["added"])
+            self.assertEqual(r_payload["fileCount"], r_stream["fileCount"])
+            self.assertEqual(r_payload["totalSize"], r_stream["totalSize"])
+            self.assertEqual(rows_of(Path(d) / "a.db"), rows_of(Path(d) / "b.db"))
+
+    def test_stream_db_skip_existing_and_reimport_updates(self):
+        """dir 已存在跳过（保留先入库的）；同名来源重导先清后插（可更新）。"""
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as d:
+            db = LibraryDb(Path(d) / "cloud123.db")
+            payload = _fastlink_payload("电影", [
+                {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 100},
+            ])
+            db.import_payload("旧来源.json", payload)
+
+            f = Path(d) / "库.json"
+            f.write_text(json.dumps(_fastlink_payload("电影", [
+                {"path": f"{WORK_A}/new.mkv", "fileName": "new.mkv", "etag": _etag(9), "size": 5},
+                {"path": f"{WORK_B}/b.mkv", "fileName": "b.mkv", "etag": _etag(2), "size": 200},
+            ]), ensure_ascii=False), encoding="utf-8")
+            meta, entries = movie_library.open_library_stream(f)
+            r = db.import_stream("库.json", meta["commonPath"], entries)
+            self.assertEqual(r["added"], 1)
+            self.assertEqual(r["skipped"], 1)
+            listing = db.list_files(WORK_A)
+            self.assertEqual(listing["files"][0]["fileName"], "a.mkv", "已存在作品应保留先入库的文件")
+
+            # 同名来源重导 → 先清后插（可更新）
+            work_c = "剧集/美剧/Show (2020) {tmdb-3}"
+            f2 = Path(d) / "库2.json"
+            f2.write_text(json.dumps(_fastlink_payload("电影", [
+                {"path": f"{work_c}/b2.mkv", "fileName": "b2.mkv", "etag": _etag(3), "size": 1},
+            ]), ensure_ascii=False), encoding="utf-8")
+            meta2, entries2 = movie_library.open_library_stream(f2)
+            r2 = db.import_stream("库2.json", meta2["commonPath"], entries2)
+            self.assertEqual(r2["added"], 1)
+            total, _ = db.search("", 1, 20, libs=["库2.json"])
+            self.assertEqual(total, 1)
+
+            f3 = Path(d) / "库2.json"
+            f3.write_text(json.dumps(_fastlink_payload("电影", [
+                {"path": f"{work_c}/b2.mkv", "fileName": "b2.mkv", "etag": _etag(4), "size": 2},
+            ]), ensure_ascii=False), encoding="utf-8")
+            meta3, entries3 = movie_library.open_library_stream(f3)
+            r3 = db.import_stream("库2.json", meta3["commonPath"], entries3)
+            self.assertEqual(r3["added"], 1, "同名来源重导应先清后插、再次新增")
+            listing = db.list_files(f"电影/{work_c}")
+            self.assertEqual(listing["files"][0]["etag"], _etag(4), "重导后文件应为新版本")
+
+    def test_stream_errors(self):
+        """空 files / 缺 files / 截断 JSON / libraries 嵌套 → 各自明确报错或触发整读回退。"""
+        with tempfile.TemporaryDirectory() as d:
+            empty = Path(d) / "empty.json"
+            empty.write_text(json.dumps({"commonPath": "x", "files": []}), encoding="utf-8")
+            meta, entries = movie_library.open_library_stream(empty)
+            with self.assertRaises(ValueError):
+                list(entries)
+
+            no_files = Path(d) / "nofiles.json"
+            no_files.write_text(json.dumps({"hello": "world"}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                movie_library.open_library_stream(no_files)
+
+            truncated = Path(d) / "trunc.json"
+            truncated.write_text('{"commonPath":"x","files":[{"path":"a.mkv"', encoding="utf-8")
+            meta, entries = movie_library.open_library_stream(truncated)
+            with self.assertRaises(ValueError):
+                list(entries)
+
+            libs = Path(d) / "libs.json"
+            libs.write_text(json.dumps({"libraries": [{"commonPath": "x", "files": []}]}), encoding="utf-8")
+            with self.assertRaises(movie_library.LibraryFullParseFallback):
+                movie_library.open_library_stream(libs)
+
+    def test_video_extensions_config_and_import(self):
+        """视频扩展名：默认放宽、自定义合并、导入 is_video/聚合计数生效、非影库文件跳过。"""
+        from app.movie_library import normalize_video_extensions, video_ext_set
+        from app.movie_library_db import LibraryDb
+
+        # 清洗：逗号/分号/空格/中文顿号，带点不带点均可，去重去杂
+        self.assertEqual(normalize_video_extensions("tp, MXF; m4v、 .dv  bad!"), (".tp", ".mxf", ".m4v", ".dv"))
+        merged = video_ext_set("td5")
+        self.assertIn(".mkv", merged)
+        self.assertIn(".td5", merged)
+        self.assertIn(".m4v", merged, "m4v 应已进默认集合")
+
+        # 导入：默认不算视频的扩展名，配置自定义后计入 video_count / is_video
+        with tempfile.TemporaryDirectory() as d:
+            db = LibraryDb(Path(d) / "cloud123.db")
+            payload = _fastlink_payload("电影", [
+                {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 100},
+                {"path": f"{WORK_A}/b.td5", "fileName": "b.td5", "etag": _etag(2), "size": 50},
+            ])
+            r_default = db.import_payload("默认.json", payload)
+            self.assertEqual(r_default["added"], 1)
+            listing_default = db.list_files(WORK_A)
+            by_name = {row["fileName"]: row for row in listing_default["files"]}
+            self.assertEqual(by_name["a.mkv"]["isVideo"], True)
+            self.assertEqual(by_name["b.td5"]["isVideo"], False)
+
+            ext = video_ext_set("td5")
+            def entries():
+                for f in payload["files"]:
+                    yield f
+            db2 = LibraryDb(Path(d) / "cloud123-2.db")
+            r_custom = db2.import_stream("自定义.json", "电影", entries(), video_ext=ext)
+            self.assertEqual(r_custom["added"], 1)
+            listing_custom = db2.list_files(WORK_A)
+            by_name2 = {row["fileName"]: row for row in listing_custom["files"]}
+            self.assertEqual(by_name2["b.td5"]["isVideo"], True)
+            total_rows, work_rows = db2.search("", 1, 20)
+            self.assertEqual(len(work_rows), 1)
+            self.assertEqual(work_rows[0]["count"], 2)
+            self.assertEqual(work_rows[0]["videoCount"], 2, "自定义扩展名应计入视频数")
+
+    def test_import_from_path_helper(self):
+        """路由层 _import_library_from_path：JSON 流式、libraries 回退整读、V2 文本整读。"""
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as d:
+            db = LibraryDb(Path(d) / "cloud123.db")
+            with unittest.mock.patch.object(movie_library_db, "_default_db", db):
+                big = self._make_json_file(Path(d) / "big.json", common_path="电影", count=90)
+                r = main._import_library_from_path(str(big), "big.json")
+                self.assertEqual(r["added"], 7)
+                self.assertEqual(r["fileCount"], 120)
+
+                libs = Path(d) / "libs.json"
+                libs.write_text(json.dumps({"libraries": [
+                    {"commonPath": "电影", "files": [
+                        {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 100},
+                    ]},
+                ]}, ensure_ascii=False), encoding="utf-8")
+                r2 = main._import_library_from_path(str(libs), "libs.json")
+                self.assertEqual(r2["added"], 1)
+
+                text = Path(d) / "links.txt"
+                text.write_text("123FSLinkV1$0123456789abcdef0123456789abcdef#7#dir/a.mkv", encoding="utf-8")
+                r3 = main._import_library_from_path(str(text), "links.txt")
+                self.assertEqual(r3["added"], 1)

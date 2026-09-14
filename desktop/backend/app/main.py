@@ -1990,6 +1990,7 @@ class LibraryConfigRequest(BaseModel):
     transferIntervalMs: int = 200
     transferConcurrency: int = 5
     exportDir: str = ""
+    videoExtensions: str = ""
     token: str = ""
     clearToken: bool = False
 
@@ -2009,6 +2010,8 @@ def normalize_movie_library_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         "transferIntervalMs": clamp_int(cfg.get("transferIntervalMs"), 0, 10000, 200),
         "transferConcurrency": clamp_int(cfg.get("transferConcurrency"), 1, 10, 5),
         "exportDir": str(cfg.get("exportDir") or "").strip(),
+        # 视频扩展名白名单补遗：逗号/空格分隔，导入时与内置默认合并
+        "videoExtensions": str(cfg.get("videoExtensions") or "").strip(),
     }
 
 
@@ -2052,6 +2055,7 @@ async def read_library_config(request: Request) -> Dict[str, Any]:
             "transferIntervalMs": cfg["transferIntervalMs"],
             "transferConcurrency": cfg.get("transferConcurrency", 5),
             "exportDir": cfg.get("exportDir", ""),
+            "videoExtensions": cfg.get("videoExtensions", ""),
             "tokenSet": bool(token),
             # 令牌明文只回给本机管理页；远程浏览器/脚本只能拿到打码预览
             "token": token if loopback else "",
@@ -2075,6 +2079,7 @@ async def write_library_config(request: LibraryConfigRequest, request_obj: Reque
             "transferIntervalMs": request.transferIntervalMs,
             "transferConcurrency": request.transferConcurrency,
             "exportDir": str(request.exportDir or "").strip() or current.get("exportDir", ""),
+            "videoExtensions": str(request.videoExtensions or "").strip() or current.get("videoExtensions", ""),
             "token": new_token,
         }
     })
@@ -2089,6 +2094,7 @@ async def write_library_config(request: LibraryConfigRequest, request_obj: Reque
         "transferIntervalMs": saved_cfg["transferIntervalMs"],
         "transferConcurrency": saved_cfg.get("transferConcurrency", 5),
         "exportDir": saved_cfg.get("exportDir", ""),
+        "videoExtensions": saved_cfg.get("videoExtensions", ""),
         "tokenSet": bool(saved_cfg["token"]),
         "token": saved_cfg["token"] if loopback else "",
         "tokenPreview": None if loopback else _mask_token(saved_cfg["token"]),
@@ -2131,7 +2137,7 @@ async def import_library_file(request: Request, name: str = Query(""), token: st
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
     safe_name = os.path.basename(str(name or "").strip()) or "导入"
-    return movie_library_db.import_payload(safe_name, payload)
+    return await asyncio.to_thread(movie_library_db.import_payload, safe_name, payload, _library_video_ext())
 
 
 class LibraryImportPathsRequest(BaseModel):
@@ -2139,26 +2145,52 @@ class LibraryImportPathsRequest(BaseModel):
     token: str = ""
 
 
+def _library_video_ext() -> Any:
+    """影库设置「自定义视频扩展名」与内置默认合并成判定集合（随配置实时生效）。"""
+    return movie_library.video_ext_set(_library_config().get("videoExtensions") or None)
+
+
+def _import_library_from_path(path: str, name: str, video_ext: Any = None) -> Dict[str, Any]:
+    """按路径导入单个影库文件（同步、阻塞，调用方须放线程池）。
+    JSON（含 GB 级巨型秒传文件）走流式解析 + 流式入库，不再整读进内存；
+    秒传文本 / .123share 沿用整读解析。非影库文件抛 ValueError，由路由记为跳过。"""
+    with open(path, "rb") as f:
+        head = f.read(64).lstrip(b"\xef\xbb\xbf \t\r\n")
+    if head[:1] in (b"[", b"{"):
+        try:
+            meta, files_iter = movie_library.open_library_stream(path)
+        except movie_library.LibraryFullParseFallback:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                payload = movie_library.parse_library_content(f.read())
+            return movie_library_db.import_payload(name, payload, video_ext)
+        return movie_library_db.import_stream(name, meta["commonPath"], files_iter, video_ext=video_ext)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        payload = movie_library.parse_library_content(f.read())
+    return movie_library_db.import_payload(name, payload, video_ext)
+
+
 @app.post("/api/library/import/paths")
 async def import_library_paths(request: LibraryImportPathsRequest, request_obj: Request) -> Dict[str, Any]:
-    """按本地路径批量导入影库文件（桌面端文件选择器）。"""
+    """按本地路径批量导入影库文件（桌面端文件选择器）。大文件流式导入，不阻塞事件循环。"""
     _guard_library_token(request_obj, request.token)
     if not request.paths:
         raise HTTPException(status_code=400, detail="请选择要导入的文件")
+    video_ext = _library_video_ext()
     results = []
     for raw_path in request.paths[:50]:
         path = os.path.abspath(os.path.expanduser(str(raw_path or "").strip()))
         base = os.path.basename(path)
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                payload = movie_library.parse_library_content(f.read())
+            result = await asyncio.to_thread(_import_library_from_path, path, base, video_ext)
+            results.append({"file": base, **result})
         except OSError as error:
             results.append({"file": base, "ok": False, "error": f"读取失败：{error}"})
             continue
         except ValueError as error:
-            results.append({"file": base, "ok": False, "error": str(error)})
+            # 非影库文件/内容无法解析：默认跳过，不算失败
+            results.append({"file": base, "ok": True, "added": 0, "skipped": 0, "fileCount": 0,
+                            "skippedFile": True, "error": f"非影库文件，已跳过（{error}）"})
             continue
-        results.append({"file": base, **movie_library_db.import_payload(base, payload)})
     added = sum(r.get("added", 0) for r in results)
     skipped = sum(r.get("skipped", 0) for r in results)
     failed = sum(1 for r in results if not r.get("ok"))
@@ -2192,16 +2224,19 @@ async def import_library_dir(request: LibraryImportDirRequest, request_obj: Requ
         raise HTTPException(status_code=404, detail="目录里没有找到影库文件（支持 json/txt/123share）")
     results = []
     added = skipped = failed = 0
+    video_ext = _library_video_ext()
     for path in sorted(walked):
         base = os.path.basename(path)
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                payload = movie_library.parse_library_content(f.read())
-        except Exception as error:
+            r = await asyncio.to_thread(_import_library_from_path, path, base, video_ext)
+        except OSError as error:
             failed += 1
-            results.append({"file": base, "status": "失败", "info": str(error)})
+            results.append({"file": base, "status": "失败", "info": f"读取失败：{error}"})
             continue
-        r = movie_library_db.import_payload(base, payload)
+        except ValueError as error:
+            # 非影库文件/内容无法解析：默认跳过，不算失败
+            results.append({"file": base, "status": "跳过", "info": f"非影库文件，已跳过（{error}）"})
+            continue
         added += r["added"]
         skipped += r["skipped"]
         results.append({"file": base, "status": "完成", "info": f"新增 {r['added']} · 重复 {r['skipped']} · {r['fileCount']} 个文件"})

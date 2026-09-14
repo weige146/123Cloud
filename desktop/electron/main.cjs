@@ -255,6 +255,16 @@ function createWindow() {
   const target = isDev ? DEV_URL : `${backend.baseUrl}/admin`;
   if (isDev) {
     mainWindow.loadURL(target);
+  } else if (backend.port) {
+    // 关窗保活后由 activate 重建窗口：后端早已就绪，启动时的健康加载只跑一次不会再来。
+    // 必须在这里主动加载 /admin，否则新窗口停留在 about:blank 只剩深色底（用户看到的黑屏）。
+    const loadAdmin = () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.loadURL(target).catch((error) => {
+        console.error("[123cloud] reload admin after recreate failed:", error);
+      });
+    };
+    backend.waitForHealth(30_000).then(loadAdmin).catch(loadAdmin);
   } else {
     // The real /admin URL is loaded once the sidecar reports healthy.
     mainWindow.loadURL("about:blank");

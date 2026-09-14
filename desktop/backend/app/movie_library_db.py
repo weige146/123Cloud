@@ -16,7 +16,7 @@ import re
 import sqlite3
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .movie_library import fmt_size, norm, parse_dir_name, pinyin_keys, split_category
+from .movie_library import VIDEO_EXT, fmt_size, norm, parse_dir_name, pinyin_keys, split_category, split_work, video_ext_set
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +78,11 @@ class LibraryDb:
         return connection
 
     # ---------- 导入 ----------
-    def import_payload(self, name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def import_payload(self, name: str, payload: Dict[str, Any], video_ext: Any = None) -> Dict[str, Any]:
         """把解析后的影库 payload 入库。dir 已存在 → 跳过（保留先入库的）；
-        同名来源重新导入 → 先清该来源旧数据再插（可更新）。"""
+        同名来源重新导入 → 先清该来源旧数据再插（可更新）。
+        video_ext：视频扩展名集合（None=默认 VIDEO_EXT，可传 video_ext_set(用户自定义)）。"""
+        ext_set = video_ext_set(video_ext) if video_ext else VIDEO_EXT
         common_path = str(payload.get("commonPath") or "").strip("/")
         files: List[Dict[str, Any]] = payload.get("files") or []
         # path 拼回 commonPath 再聚合，避免相对路径被拆散成多个作品
@@ -92,7 +94,7 @@ class LibraryDb:
 
         from .movie_library import aggregate_works
 
-        works = aggregate_works(common_path, files)
+        works = aggregate_works(common_path, files, ext_set)
         imported_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
 
         added = skipped = 0
@@ -121,7 +123,7 @@ class LibraryDb:
                             "INSERT OR REPLACE INTO library_work_files (dir, path, file_name, etag, size, s3_key_flag, is_video)"
                             " VALUES (?,?,?,?,?,?,?)",
                             (work_dir, fpath or fname, fname, str(f.get("etag") or ""), int(f.get("size") or 0),
-                             str(f.get("s3KeyFlag") or ""), 1 if fpath.lower().endswith((".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m2ts", ".mpg", ".mpeg", ".rm", ".rmvb", ".iso", ".vob", ".3gp", ".asf", ".divx", ".f4v")) else 0),
+                             str(f.get("s3KeyFlag") or ""), 1 if fpath.lower().endswith(tuple(ext_set)) else 0),
                         )
                     added += 1
                     added_files += info["count"]
@@ -162,12 +164,97 @@ class LibraryDb:
         finally:
             connection.close()
 
+    # ---------- 流式导入（巨型秒传 JSON） ----------
+    def import_stream(self, name: str, common_path: str, files_iter: Iterable[Dict[str, Any]], batch_size: int = 20000, video_ext: Any = None) -> Dict[str, Any]:
+        """流式导入：条目迭代器逐批 executemany 写 library_work_files，作品行按累计统计最后统一写。
+        语义与 import_payload 一致：dir 已存在 → 跳过（保留先入库的）；同名来源先清旧数据再插（可更新）。
+        千万级条目内存占用只与批次大小和作品数相关，不随文件条数线性增长。
+        video_ext：视频扩展名集合（None=默认 VIDEO_EXT，可传 video_ext_set(用户自定义)）。"""
+        ext_set = video_ext_set(video_ext) if video_ext else VIDEO_EXT
+        imported_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+        fallback_root = common_path.rsplit("/", 1)[-1] if common_path else ""
+        stats: Dict[str, List[int]] = {}
+        verdicts: Dict[str, bool] = {}
+        added_files = added_size = 0
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    "DELETE FROM library_work_files WHERE dir IN (SELECT dir FROM library_works WHERE source = ?)", (name,))
+                connection.execute("DELETE FROM library_works WHERE source = ?", (name,))
+                batch: List[Tuple] = []
+                for entry in files_iter:
+                    path = str(entry.get("path") or "")
+                    # 相对路径拼回 commonPath（与 import_payload 一致），避免被拆散成多个作品
+                    if common_path and path and not path.startswith(common_path + "/"):
+                        path = common_path + "/" + path.lstrip("/")
+                    fname = str(entry.get("fileName") or "") or path.rsplit("/", 1)[-1]
+                    split = split_work(path, fallback_root)
+                    if split is None:
+                        continue
+                    root = split[0]
+                    verdict = verdicts.get(root)
+                    if verdict is None:
+                        verdict = connection.execute("SELECT 1 FROM library_works WHERE dir = ?", (root,)).fetchone() is not None
+                        verdicts[root] = verdict
+                    if verdict:
+                        continue
+                    size = int(entry.get("size") or 0)
+                    is_video = 1 if fname.lower().endswith(tuple(ext_set)) else 0
+                    batch.append((root, path or fname, fname,
+                                  str(entry.get("etag") or ""), size, str(entry.get("s3KeyFlag") or ""), is_video))
+                    g = stats.get(root)
+                    if g is None:
+                        g = stats[root] = [0, 0, 0]
+                    g[0] += 1
+                    g[1] += is_video
+                    g[2] += size
+                    if len(batch) >= batch_size:
+                        connection.executemany(
+                            "INSERT OR REPLACE INTO library_work_files (dir, path, file_name, etag, size, s3_key_flag, is_video)"
+                            " VALUES (?,?,?,?,?,?,?)", batch)
+                        added_files += len(batch)
+                        added_size += sum(row[4] for row in batch)
+                        batch.clear()
+                if batch:
+                    connection.executemany(
+                        "INSERT OR REPLACE INTO library_work_files (dir, path, file_name, etag, size, s3_key_flag, is_video)"
+                        " VALUES (?,?,?,?,?,?,?)", batch)
+                    added_files += len(batch)
+                    added_size += sum(row[4] for row in batch)
+                    batch.clear()
+                work_rows = []
+                for root, (count, video_count, total_size) in stats.items():
+                    cat, sub = split_category(root)
+                    title, year, tmdb_id = parse_dir_name(root)
+                    pinyin_full, pinyin_first = pinyin_keys(title)
+                    work_rows.append((root, title, norm(title), year, tmdb_id, cat, sub,
+                                      pinyin_full, pinyin_first, count, video_count, total_size, name))
+                if work_rows:
+                    connection.executemany(
+                        "INSERT INTO library_works (dir, title, norm_title, year, tmdb_id, cat, sub, pinyin, pinyin_first,"
+                        " file_count, video_count, total_size, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", work_rows)
+                added = len(work_rows)
+                skipped = sum(1 for v in verdicts.values() if v)
+                connection.execute(
+                    "INSERT OR REPLACE INTO library_sources (name, imported_at, common_path, work_count, file_count, total_size)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (name, imported_at, common_path, added, added_files, added_size))
+        finally:
+            connection.close()
+        logger.info(
+            "影库流式导入：%s — 新增 %d 个作品、重复跳过 %d 个、%d 个文件",
+            name, added, skipped, added_files,
+        )
+        return {"ok": True, "name": name, "added": added, "skipped": skipped,
+                "fileCount": added_files, "totalSize": added_size}
+
     # ---------- 查询 ----------
     def list_sources(self) -> List[Dict[str, Any]]:
         connection = self._connect()
         try:
             rows = connection.execute(
-                "SELECT name, imported_at, work_count, file_count, total_size FROM library_sources ORDER BY imported_at DESC"
+                "SELECT name, imported_at, common_path, work_count, file_count, total_size FROM library_sources ORDER BY imported_at DESC"
             ).fetchall()
             return [{
                 "name": r["name"], "loadDate": r["imported_at"][:10],
@@ -483,8 +570,12 @@ def _db() -> LibraryDb:
     return _default_db
 
 
-def import_payload(name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _db().import_payload(name, payload)
+def import_payload(name: str, payload: Dict[str, Any], video_ext: Any = None) -> Dict[str, Any]:
+    return _db().import_payload(name, payload, video_ext)
+
+
+def import_stream(name: str, common_path: str, files_iter: Iterable[Dict[str, Any]], batch_size: int = 20000, video_ext: Any = None) -> Dict[str, Any]:
+    return _db().import_stream(name, common_path, files_iter, batch_size, video_ext)
 
 
 def delete_source(name: str) -> bool:

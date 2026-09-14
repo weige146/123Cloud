@@ -12,23 +12,51 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import os
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 VIDEO_EXT = {
-    ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts",
-    ".m2ts", ".m2t", ".mts", ".mpg", ".mpeg", ".rm", ".rmvb", ".iso",
-    ".vob", ".3gp", ".asf", ".divx", ".f4v",
+    # PT/BT 站主流影视格式（含 ISO 原盘），用于判定导入 JSON 里的文件条目是否为视频；
+    # 不够的可在影库设置「自定义视频扩展名」里补
+    ".mkv", ".mp4", ".ts", ".iso", ".m2ts", ".mts", ".m2t",
+    ".avi", ".rmvb", ".rm", ".wmv", ".mpg", ".mpeg", ".m4v",
+    ".mov", ".flv", ".webm", ".vob", ".f4v", ".divx",
 }
+
+
+def normalize_video_extensions(raw: Any) -> Tuple[str, ...]:
+    """把用户输入（逗号/分号/空格分隔或列表/集合）清洗成小写扩展名元组（带点），如 ".mp4" / "mp4" 均可。"""
+    if isinstance(raw, str):
+        parts = re.split(r"[,;、\s]+", raw)
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        parts = [str(item) for item in raw]
+    else:
+        parts = []
+    out: List[str] = []
+    seen = set()
+    for part in parts:
+        ext = part.strip().lower()
+        if ext and not ext.startswith("."):
+            ext = "." + ext
+        if len(ext) >= 2 and re.match(r"^\.[a-z0-9]{1,8}$", ext) and ext not in seen:
+            seen.add(ext)
+            out.append(ext)
+    return tuple(out)
+
+
+def video_ext_set(extra: Any = None) -> frozenset:
+    """默认视频扩展名 + 用户自定义扩展名（影库设置 videoExtensions）合并成判定集合。"""
+    return frozenset(VIDEO_EXT) | frozenset(normalize_video_extensions(extra))
 
 RE_YEAR = re.compile(r"\((\d{4})\)")
 # {tmdb-123} 与 [tmdb-123] 两种标记都认（后者是 MegaShare_Search 等第三方导出格式）
@@ -146,19 +174,25 @@ def parse_fastlink_entries(common_path: str, entries: List[Dict[str, Any]], uses
     """把 files 数组归一化成影库内部结构（对齐油猴脚本 normalizeImportedFiles）。"""
     files: List[Dict[str, Any]] = []
     for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        path = str(entry.get("path") or entry.get("fileName") or "").replace("\\", "/").strip().strip("/")
-        if not path or set(path.split("/")) & {".", ".."}:
-            continue
-        files.append({
-            "path": path,
-            "fileName": path.rsplit("/", 1)[-1],
-            "etag": _normalize_etag(entry.get("etag"), uses_base62),
-            "size": int(entry.get("size") or 0),
-            "s3KeyFlag": str(entry.get("s3KeyFlag") or ""),
-        })
+        normalized = _normalize_entry(entry, uses_base62)
+        if normalized is not None:
+            files.append(normalized)
     return {"commonPath": str(common_path or "").strip().strip("/"), "files": files}
+
+
+def _normalize_entry(entry: Any, uses_base62: bool) -> Optional[Dict[str, Any]]:
+    if not isinstance(entry, dict):
+        return None
+    path = str(entry.get("path") or entry.get("fileName") or "").replace("\\", "/").strip().strip("/")
+    if not path or set(path.split("/")) & {".", ".."}:
+        return None
+    return {
+        "path": path,
+        "fileName": path.rsplit("/", 1)[-1],
+        "etag": _normalize_etag(entry.get("etag"), uses_base62),
+        "size": int(entry.get("size") or 0),
+        "s3KeyFlag": str(entry.get("s3KeyFlag") or ""),
+    }
 
 
 def parse_fastlink_json_data(data: Any) -> Dict[str, Any]:
@@ -283,6 +317,178 @@ def parse_library_content(text: str) -> Dict[str, Any]:
     raise ValueError("不是影库文件（无法按 123 助手任何格式解析）")
 
 
+class LibraryFullParseFallback(Exception):
+    """流式解析不支持的嵌套结构（如 123pan-strm-docker 的 libraries[]），
+    提示调用方回退到整读解析。"""
+
+
+class _StreamJsonArrayReader:
+    """按块读取 UTF-8 文本，用 json.JSONDecoder.raw_decode 逐个解出数组元素。
+    巨型秒传 JSON（GB 级、千万条目）不再整读进内存，内存占用只与单个元素相关。"""
+
+    def __init__(self, fileobj, chunk_size: int = 1 << 20):
+        self._file = fileobj
+        self._chunk_size = chunk_size
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._json = json.JSONDecoder()
+        self._buf = ""
+        self._pos = 0
+        self._eof = False
+
+    def _read_more(self) -> bool:
+        """再读一块；EOF 时冲掉增量解码器尾字节。返回是否新增了文本。"""
+        if self._eof:
+            return False
+        data = self._file.read(self._chunk_size)
+        if not data:
+            self._buf += self._decoder.decode(b"", final=True)
+            self._eof = True
+            return False
+        self._buf += self._decoder.decode(data)
+        return True
+
+    def _trim(self) -> None:
+        if self._pos >= (1 << 20):
+            self._buf = self._buf[self._pos:]
+            self._pos = 0
+
+    def peek(self) -> str:
+        """跳过空白后返回当前字符；EOF 返回空串。"""
+        while True:
+            n = len(self._buf)
+            while self._pos < n and self._buf[self._pos] in " \t\r\n":
+                self._pos += 1
+            if self._pos < n:
+                return self._buf[self._pos]
+            if not self._read_more():
+                return ""
+
+    def read_value(self):
+        """从当前位置解出下一个完整 JSON 值。文件被截断/损坏时抛 ValueError。"""
+        self.peek()
+        while True:
+            try:
+                value, end = self._json.raw_decode(self._buf, self._pos)
+                self._pos = end
+                self._trim()
+                return value
+            except json.JSONDecodeError:
+                if not self._read_more():
+                    raise ValueError("JSON 不完整或已损坏（文件被截断？）")
+
+    def expect(self, char: str) -> str:
+        got = self.peek()
+        if got != char:
+            raise ValueError(f"JSON 结构不符合预期（期望 {char}，实际 {got or 'EOF'}）")
+        self._pos += 1
+        return got
+
+
+def open_library_stream(path: str, chunk_size: int = 1 << 20) -> Tuple[Dict[str, Any], Iterator[Dict[str, Any]]]:
+    """流式打开本地秒传 JSON：先解析出元信息（commonPath/usesBase62），
+    返回 (meta, 文件条目迭代器)——条目已归一化并拼回 commonPath，逐条产出、不全量驻留内存。
+    支持 ① {commonPath, usesBase62EtagsInExport, files:[{path,etag,size},...]} ② [[etag,size,path],...]；
+    strm-docker 的 libraries[] 嵌套结构抛 LibraryFullParseFallback，由调用方回退整读。"""
+    fileobj = open(path, "rb")
+    try:
+        reader = _StreamJsonArrayReader(fileobj, chunk_size)
+        first = reader.peek()
+        if first not in "[{":
+            raise ValueError("不是 JSON 影库文件")
+        uses_base62 = False
+        common_path = ""
+        entry_state: Dict[str, Any] = {"started": False}
+
+        def stream_entries() -> Iterator[Dict[str, Any]]:
+            count = 0
+            try:
+                while True:
+                    ch = reader.peek()
+                    if ch == "]":
+                        reader._pos += 1
+                        break
+                    if ch == ",":
+                        reader._pos += 1
+                        continue
+                    if not ch:
+                        raise ValueError("JSON 不完整或已损坏（files 数组未闭合）")
+                    raw_entry = reader.read_value()
+                    if root_first == "[" and isinstance(raw_entry, list) and len(raw_entry) >= 3:
+                        raw_entry = {"etag": raw_entry[0], "size": raw_entry[1], "path": raw_entry[2]}
+                    normalized = _normalize_entry(raw_entry, uses_base62)
+                    if normalized is None:
+                        continue
+                    count += 1
+                    yield normalized
+                if count == 0:
+                    raise ValueError("不是影库索引文件（files 数组为空）")
+                # files 之后的其余键（若有）快速跳过，保证整个 JSON 合法性检查走完
+                _skip_trailing(reader, root_first)
+            finally:
+                fileobj.close()
+
+        root_first = first
+        if first == "[":
+            reader._pos += 1
+            meta = {"commonPath": "", "usesBase62": False}
+            entry_state["started"] = True
+        else:
+            reader._pos += 1
+            while True:
+                ch = reader.peek()
+                if ch == "}":
+                    reader._pos += 1
+                    break
+                if ch == ",":
+                    reader._pos += 1
+                    continue
+                if not ch:
+                    raise ValueError("JSON 不完整或已损坏（根对象未闭合）")
+                key = reader.read_value()
+                if not isinstance(key, str):
+                    raise ValueError("不是影库索引文件（键名不是字符串）")
+                reader.expect(":")
+                if key == "commonPath":
+                    common_path = str(reader.read_value() or "").strip().strip("/")
+                elif key == "usesBase62EtagsInExport":
+                    uses_base62 = reader.read_value() is True
+                elif key == "files":
+                    reader.expect("[")
+                    meta = {"commonPath": common_path, "usesBase62": uses_base62}
+                    entry_state["started"] = True
+                    break
+                elif key == "libraries":
+                    raise LibraryFullParseFallback("strm-docker libraries[] 嵌套格式")
+                else:
+                    reader.read_value()
+        if not entry_state["started"]:
+            raise ValueError("不是影库索引文件（缺少 files 字段）")
+        return meta, stream_entries()
+    except LibraryFullParseFallback:
+        fileobj.close()
+        raise
+    except Exception:
+        fileobj.close()
+        raise
+
+
+def _skip_trailing(reader: _StreamJsonArrayReader, root_first: str) -> None:
+    """files 数组闭合后消费根值剩余部分（对象键值对或数组尾部），确保 JSON 完整合法。"""
+    if root_first == "[":
+        reader.peek()
+        return
+    while True:
+        ch = reader.peek()
+        if ch in ("}", ""):
+            return
+        if ch == ",":
+            reader._pos += 1
+            continue
+        key = reader.read_value()
+        reader.expect(":")
+        reader.read_value()
+
+
 def split_category(dir_path: str) -> Tuple[str, str]:
     """取作品目录的一级/二级分类（二级只在作品之上有更深层级时才有意义）。"""
     segs = [s for s in str(dir_path or "").split("/") if s]
@@ -291,36 +497,47 @@ def split_category(dir_path: str) -> Tuple[str, str]:
     return cat, sub
 
 
-def aggregate_works(common_path: str, files: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def split_work(path: str, fallback_root: str = "") -> Optional[Tuple[str, str]]:
+    """path → (作品聚合根, 文件名)；无斜杠时用 fallback_root 兜底，两级都没有返回 None。
+    聚合根：路径中带 {tmdb-N} / [tmdb-N] 标记的那一级（Season 子目录并入），否则整个父目录。"""
+    if "/" in str(path):
+        d, name = str(path).rsplit("/", 1)
+    else:
+        if not fallback_root:
+            return None
+        d, name = fallback_root, str(path)
+    segs = d.split("/")
+    root = None
+    for i in range(len(segs) - 1, -1, -1):
+        if "{tmdb-" in segs[i] or "[tmdb-" in segs[i]:
+            root = "/".join(segs[: i + 1])
+            break
+    if root is None:
+        root = d
+    return root, name
+
+
+def aggregate_works(common_path: str, files: List[Dict[str, Any]], video_ext: Any = None) -> Dict[str, Dict[str, Any]]:
     """把归一化的文件列表按作品聚合（对齐参考项目）：
-    带 {tmdb-N}/[tmdb-N] 的那一级为聚合根，Season 子目录并入；返回 dir -> 作品信息。"""
+    带 {tmdb-N}/[tmdb-N] 的那一级为聚合根，Season 子目录并入；返回 dir -> 作品信息。
+    video_ext：视频扩展名判定集合（默认 VIDEO_EXT，可传 video_ext_set(用户自定义) 的合并结果）。"""
+    ext_set = frozenset(video_ext) if video_ext else VIDEO_EXT
     groups: Dict[str, Dict[str, Any]] = {}
     fallback_root = common_path.rsplit("/", 1)[-1] if common_path else ""
     for fi in files:
         if not isinstance(fi, dict):
             continue
-        path = str(fi.get("path") or "")
-        if "/" not in path:
-            if not fallback_root:
-                continue
-            d, name = fallback_root, path
-        else:
-            d, name = path.rsplit("/", 1)
-        segs = d.split("/")
-        root = None
-        for i in range(len(segs) - 1, -1, -1):
-            if "{tmdb-" in segs[i] or "[tmdb-" in segs[i]:
-                root = "/".join(segs[: i + 1])
-                break
-        if root is None:
-            root = d
+        split = split_work(str(fi.get("path") or ""), fallback_root)
+        if split is None:
+            continue
+        root, name = split
         g = groups.get(root)
         if g is None:
             g = groups[root] = {"files": [], "count": 0, "video_count": 0, "total_size": 0}
         g["files"].append(fi)
         g["count"] += 1
         g["total_size"] += int(fi.get("size") or 0)
-        if os.path.splitext(name)[1].lower() in VIDEO_EXT:
+        if os.path.splitext(name)[1].lower() in ext_set:
             g["video_count"] += 1
 
     works: Dict[str, Dict[str, Any]] = {}

@@ -53,6 +53,7 @@ const pickingFolder = ref(false);
 const uploading = ref(false);
 const libraryFileInput = ref<HTMLInputElement | null>(null);
 const exportDirInput = ref("");
+const videoExtensionsInput = ref("");
 const openingExportDir = ref(false);
 
 interface DesktopBridge {
@@ -83,6 +84,7 @@ async function loadConfig() {
   config.value = data.config;
   configTransferConcurrency.value = data.config.transferConcurrency || 5;
   exportDirInput.value = data.config.exportDir || "";
+  videoExtensionsInput.value = data.config.videoExtensions || "";
   // 本机直接回填明文令牌，重启后一眼可见它还在；留空保存=保留现有令牌
   if (data.config.token) {
     configTokenInput.value = data.config.token;
@@ -96,6 +98,7 @@ async function saveConfig() {
     const data = await libraryApi.putConfig({
       transferConcurrency: Number(configTransferConcurrency.value) || 5,
       exportDir: exportDirInput.value.trim(),
+      videoExtensions: videoExtensionsInput.value.trim(),
       token: configTokenInput.value.trim(),
       clearToken: configClearToken.value,
     });
@@ -1165,6 +1168,19 @@ onUnmounted(() => {
               class="small-input"
             />
             <v-btn color="primary" prepend-icon="mdi-content-save" :loading="configSaving" @click="saveConfig">保存</v-btn>
+          </div>
+        </FormField>
+        <FormField hint="用于判定导入 JSON 里的文件条目是否为视频（计入作品视频数）。逗号或空格分隔，如「tp mxf m4v」；与内置默认（mkv/mp4/ts/iso/rmvb 等）合并，修改后重新导入才生效。">
+          <div class="port-row">
+            <v-text-field
+              v-model="videoExtensionsInput"
+              label="自定义视频扩展名（可选）"
+              placeholder="例：tp, mxf, m4v"
+              variant="outlined"
+              density="compact"
+              hide-details
+              class="grow"
+            />
           </div>
         </FormField>
         <FormField label="导出目录（导出的秒传 JSON 落在这里；留空=数据目录下的「秒传文件导出」）">

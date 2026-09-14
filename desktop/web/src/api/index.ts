@@ -245,6 +245,7 @@ export interface LibraryConfig {
   transferIntervalMs: number;
   transferConcurrency: number;
   exportDir: string;
+  videoExtensions: string;
   tokenSet: boolean;
   token: string;
   tokenPreview: string | null;
