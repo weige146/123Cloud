@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.8
-// @description  增强 123 云盘网页端的文件、分享与秒传管理。文件页：全盘搜索、批量重命名（正则替换、模板编号、大小写与全角半角转换等规则链）、TMDB 媒体整理（中文标题命名，季集校准支持季重映射与会员版/加更/先导片等特别篇按期数精确匹配，识别词与发布组映射，兼容 MoviePilot 二级分类的媒体库自动归类，整理与重命名操作记录按文件夹归档、错整一键还原）、按扩展名/关键词/大小清理文件并统计容量、递归清理空目录。秒传工具箱：导出与转存 123FLCPV2 链接及标准 JSON，支持 V1/V2/.123share 转存、二级秒传短链接（云盘种子文件）、从云盘秒传文件直接转存、分享链接免转存生成 JSON、批量解析、拆分与互转、扩展名过滤、分享口令规范化。批量分享一键复制与 CSV 导出，可推送为 123Cloud 客户端投稿草稿；公开分享页屏蔽广告并支持免登录生成秒传 JSON。液态玻璃主题与文件页纯净模式。
+// @version      1.3.9
+// @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
 // @match        *://*.123pan.com/*
@@ -827,6 +827,44 @@
       return "";
     }
   }
+  // —— 登录会话导出/导入：跨浏览器复用同一会话，不再每个浏览器登录都新增一台设备 ——
+  // 导出的是 localStorage 里的原始值（LoginUuid 可能是站点加密形态），导入原样写回，
+  // 保证与官方 SPA 完全兼容；token 过期后需在任一已登录浏览器重新导出导入。
+  function buildSessionExportPayload() {
+    const authorToken = readCredentialStorage("authorToken");
+    const loginUuid = readCredentialStorage("LoginUuid");
+    if (!authorToken || !loginUuid) throw new Error("\u5F53\u524D\u9875\u9762\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u767B\u5F55\u4F1A\u8BDD\uFF08\u8BF7\u5148\u767B\u5F55 123 \u4E91\u76D8\uFF09");
+    return JSON.stringify({ c123Session: 1, authorToken, LoginUuid: loginUuid });
+  }
+  function parseSessionImportPayload(text2) {
+    const raw = String(text2 || "").trim();
+    if (!raw) throw new Error("\u8BF7\u7C98\u8D34\u5BFC\u51FA\u7684\u4F1A\u8BDD\u5185\u5BB9");
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed?.c123Session === 1 && parsed.authorToken && parsed.LoginUuid) {
+        return { authorToken: String(parsed.authorToken), loginUuid: String(parsed.LoginUuid) };
+      }
+    } catch {
+    }
+    const parts = raw.split(/[|\n\r]+/).map((part) => part.trim()).filter(Boolean);
+    if (parts.length >= 2) return { authorToken: parts[0], loginUuid: parts[1] };
+    throw new Error("\u4F1A\u8BDD\u5185\u5BB9\u4E0D\u5B8C\u6574\uFF1A\u9700\u8981\u540C\u65F6\u5305\u542B authorToken \u4E0E LoginUuid");
+  }
+  function applySessionImportPayload(text2) {
+    const parsed = parseSessionImportPayload(text2);
+    try {
+      globalThis.localStorage.setItem("authorToken", parsed.authorToken);
+      globalThis.localStorage.setItem("LoginUuid", parsed.loginUuid);
+    } catch (error) {
+      throw new Error(`\u5199\u5165\u767B\u5F55\u4F1A\u8BDD\u5931\u8D25\uFF1A${error?.message || error}`);
+    }
+    return parsed;
+  }
+  // 秒传线路镜像域名：与 www.123865.com 同一套官方网盘接口（/b/api/*），维护者 2026-09-14
+  // 实测 upload_request 16~24 线程可达 ~150 次/秒（123865 为 32 并发 85 次/秒）。
+  // 会话级健康位：一旦网络层失败（连不通/CORS 拦截）就摘除线路，回退页面域名，不再反复撞墙。
+  var FASTLANE_HOST = "https://api.123278.com";
+  var fastlaneState = { dead: false };
   var Pan123Api = class {
     constructor(options = {}) {
       this.host = options.host || location.origin;
@@ -834,6 +872,10 @@
       this.retryAttempts = options.retryAttempts || 6;
       this.writeConcurrency = options.writeConcurrency || 3;
       this.requestTimeout = Math.max(1e3, Number(options.requestTimeout || 3e4));
+      // 秒传接口线路：默认空 = 页面域名。秒传设置开启 fastLane 后，导入/导出任务窗口内
+      // 置为 FASTLANE_HOST 直连 api.123278.com（维护者 2026-09-14 实测 16~24 线程 ≈150 次/秒，
+      // 高于 123865 的 32 并发 85 次/秒）；request() 内置网络级故障回退，撞坏自动切回默认域名。
+      this.laneHost = "";
     }
     credentials() {
       return {
@@ -844,6 +886,11 @@
     isReady() {
       const { token, loginUuid } = this.credentials();
       return Boolean(this.host && token && loginUuid);
+    }
+    // 线路健康：镜像域名网络层失败（连不通/CORS 拦截）后本会话内摘除，避免每个请求都白等一次超时
+    markLaneDead() {
+      fastlaneState.dead = true;
+      this.laneHost = "";
     }
     buildUrl(path, query = {}, hostOverride = "") {
       const url = new URL(path, hostOverride || this.host);
@@ -870,20 +917,41 @@
           requestController.abort();
         }, Math.max(1e3, Number(timeoutMs || this.requestTimeout)));
         try {
-          const response = await fetch(this.buildUrl(path, finalQuery, host), {
-            method,
-            credentials: credentialsMode,
-            signal: requestController.signal,
-            headers: {
-              accept: "*/*",
-              "accept-language": "zh-CN",
-              "app-version": appVersion,
-              platform: "web",
-              ...auth ? { authorization: `Bearer ${token}`, loginuuid: loginUuid } : {},
-              ...body === void 0 ? {} : { "content-type": "application/json;charset=UTF-8" }
-            },
-            body: body === void 0 ? void 0 : JSON.stringify(body)
-          });
+          // 线路请求两段式：先打镜像域名，网络层失败（TypeError/CORS）或镜像明确不服务该路径
+          //（403/404/501）时立刻摘除线路，同一轮直接改打默认域名，不烧重试次数也不多等一个超时
+          let response = null;
+          for (let laneTry = 0; laneTry < 2; laneTry += 1) {
+            const requestHost = laneTry === 0 ? host : "";
+            try {
+              response = await fetch(this.buildUrl(path, finalQuery, requestHost), {
+                method,
+                // 仅镜像域名强制 omit（鉴权走 Bearer 头，跨域带 cookie 会触发 CORS 凭据校验拒收）；
+                // 分享线路等其他 host 覆盖沿用调用方给定的 credentialsMode
+                credentials: requestHost === FASTLANE_HOST ? "omit" : credentialsMode,
+                signal: requestController.signal,
+                headers: {
+                  accept: "*/*",
+                  "accept-language": "zh-CN",
+                  "app-version": appVersion,
+                  platform: "web",
+                  ...auth ? { authorization: `Bearer ${token}`, loginuuid: loginUuid } : {},
+                  ...body === void 0 ? {} : { "content-type": "application/json;charset=UTF-8" }
+                },
+                body: body === void 0 ? void 0 : JSON.stringify(body)
+              });
+              if (requestHost && [403, 404, 501].includes(response.status)) {
+                this.markLaneDead();
+                continue;
+              }
+              } catch (fetchError) {
+                // 默认域名一轮直接上抛；镜像域名上网络错误或超时（挂起）都摘除线路，
+                // 只有用户主动取消（signal 已中止）才原样上抛、不回退
+                if (!requestHost || (fetchError?.name === "AbortError" && signal?.aborted)) throw fetchError;
+                this.markLaneDead();
+                continue;
+              }
+              break;
+          }
           const data = await response.json().catch(() => ({}));
           const code = data?.code ?? data?.Code;
           const ok = response.ok && (code === void 0 || code === null || [0, 200, "0"].includes(code));
@@ -921,6 +989,7 @@
     async listPage(parentFileId = "0", page = 1, options = {}) {
       const data = await this.request("GET", "/b/api/file/list/new", {
         signal: options.signal,
+        host: this.laneHost,
         query: {
           driveId: "0",
           limit: String(options.limit || 100),
@@ -1163,6 +1232,7 @@
     async createFolder(parentFileId, name, signal) {
       const data = await this.request("POST", "/b/api/file/upload_request", {
         signal,
+        host: this.laneHost,
         body: {
           driveId: 0,
           duplicate: 1,
@@ -1188,6 +1258,7 @@
     async reuseFile(file, parentFileId, signal) {
       const data = await this.request("POST", "/b/api/file/upload_request", {
         signal,
+        host: this.laneHost,
         body: {
           driveId: 0,
           etag: String(file?.etag || ""),
@@ -2089,6 +2160,7 @@
       debugMode: false,
       useFolderNameForJson: true,
       appendDateToJson: false,
+      fastLane: false,
       seedFolderId: "",
       seedFolderName: "",
       secondaryUseJson: true,
@@ -2205,7 +2277,7 @@
     delete stored.library.fallbackTvCategory;
     delete stored.library.categoryRules;
     if (stored.fastlink && typeof stored.fastlink === "object") {
-      stored.fastlinkTools = { ...stored.fastlinkTools || {}, ...Object.fromEntries(["debugMode", "useFolderNameForJson", "appendDateToJson", "filterOnShareEnabled", "filterOnTransferEnabled", "filters"].filter((key) => stored.fastlink[key] !== void 0).map((key) => [key, stored.fastlink[key]])) };
+      stored.fastlinkTools = { ...stored.fastlinkTools || {}, ...Object.fromEntries(["debugMode", "useFolderNameForJson", "appendDateToJson", "fastLane", "filterOnShareEnabled", "filterOnTransferEnabled", "filters"].filter((key) => stored.fastlink[key] !== void 0).map((key) => [key, stored.fastlink[key]])) };
     }
     delete stored.fastlink;
     const config = mergeKnown(DEFAULT_CONFIG, stored);
@@ -5332,6 +5404,33 @@
   var SETTINGS_MENU_LABEL = "\u6253\u5F00 123 \u52A9\u624B\u8BBE\u7F6E";
   var PURE_PAGE_MENU_LABEL = "\u5207\u6362\u9875\u9762\u7EAF\u51C0\u7248";
   var RECORDS_MENU_LABEL = "\u6253\u5F00 123 \u52A9\u624B\u64CD\u4F5C\u8BB0\u5F55";
+  var SESSION_EXPORT_MENU_LABEL = "\u5BFC\u51FA\u767B\u5F55\u4F1A\u8BDD\uFF08\u8DE8\u6D4F\u89C8\u5668\u590D\u7528\uFF09";
+  var SESSION_IMPORT_MENU_LABEL = "\u5BFC\u5165\u767B\u5F55\u4F1A\u8BDD\uFF08\u8DE8\u6D4F\u89C8\u5668\u590D\u7528\uFF09";
+  function registerSessionMenu() {
+    // 会话复用菜单不依赖面板：登录页/未登录状态也能用（其他浏览器导入会话免登录、不新增设备）
+    if (typeof GM_registerMenuCommand !== "function") return [];
+    const exportMenu = GM_registerMenuCommand(SESSION_EXPORT_MENU_LABEL, () => {
+      try {
+        const payload = buildSessionExportPayload();
+        if (typeof GM_setClipboard === "function") GM_setClipboard(payload, "text");
+        alert("\u767B\u5F55\u4F1A\u8BDD\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F\u3002\n\u5728\u5176\u4ED6\u6D4F\u89C8\u5668\u7684\u6CB9\u7334\u83DC\u5355\u91CC\u9009\u300C\u5BFC\u5165\u767B\u5F55\u4F1A\u8BDD\u300D\u7C98\u8D34\u5373\u53EF\u590D\u7528\uFF0C\u4E0D\u4F1A\u65B0\u589E\u8BBE\u5907\u3002");
+      } catch (error) {
+        alert(error?.message || String(error));
+      }
+    });
+    const importMenu = GM_registerMenuCommand(SESSION_IMPORT_MENU_LABEL, () => {
+      const text2 = prompt("\u7C98\u8D34\u5BFC\u51FA\u7684\u767B\u5F55\u4F1A\u8BDD\u5185\u5BB9\uFF08JSON \u6216 token|uuid\uFF09\uFF1A");
+      if (text2 === null) return;
+      try {
+        applySessionImportPayload(text2);
+        alert("\u767B\u5F55\u4F1A\u8BDD\u5DF2\u5199\u5165\uFF0C\u9875\u9762\u5373\u5C06\u5237\u65B0\u3002");
+        location.reload();
+      } catch (error) {
+        alert(error?.message || String(error));
+      }
+    });
+    return [exportMenu, importMenu];
+  }
   function registerSettingsMenu(ui) {
     if (typeof GM_registerMenuCommand !== "function" || !ui?.openSettings) return null;
     const settingsMenu = GM_registerMenuCommand(SETTINGS_MENU_LABEL, () => {
@@ -6076,28 +6175,98 @@
     return /^[0-9a-f]{32}$/i.test(String(value || ""));
   }
   function importedPathParts(value, label = "\u6587\u4EF6\u8DEF\u5F84") {
-    const raw = String(value || "").replace(/\\/g, "/").trim();
-    if (!raw || raw.startsWith("/")) throw new Error(`${label}\u65E0\u6548`);
-    const parts = raw.split("/").filter(Boolean);
-    if (!parts.length || parts.some((part) => part === "." || part === ".." || cleanPathPart(part) !== part)) {
-      throw new Error(`${label}\u5305\u542B\u4E0D\u652F\u6301\u7684\u76EE\u5F55\u6216\u5B57\u7B26\uFF1A${raw}`);
-    }
-    return parts;
+    const resolved = resolveImportedPathParts(value, label, false);
+    return resolved.parts;
   }
-  function normalizeImportedFiles(files, usesBase62EtagsInExport, startIndex = 0) {
+  // 路径段校验/清理。sanitize=false（拆分、转换、导出等路径）保持既有严格抛错语义；
+  // sanitize=true（秒传导入专用）：路径段先按 cleanPathPart 清理（连续空格折叠成单空格、
+  // \/:*?"<>| 替换成空格、#$% 删除、去首尾点/空格），115 等导出的「双空格文件名」清理后照常导入；
+  // 点开头段（.stfolder/.aria2 等隐藏目录或隐藏文件）整条跳过，不清理不导入；
+  // 清理后仍为空或 ./.. 的条目也按无效返回，由调用方跳过计数，不再整包中止。
+  function resolveImportedPathParts(value, label = "\u6587\u4EF6\u8DEF\u5F84", sanitize = false) {
+    const raw = String(value || "").replace(/\\/g, "/").trim();
+    if (!raw || raw.startsWith("/")) {
+      if (sanitize) return { invalid: `${label}\u65E0\u6548`, reason: "path" };
+      throw new Error(`${label}\u65E0\u6548`);
+    }
+    const rawParts = raw.split("/").filter(Boolean);
+    if (!sanitize) {
+      if (!rawParts.length || rawParts.some((part) => part === "." || part === ".." || cleanPathPart(part) !== part)) {
+        throw new Error(`${label}\u5305\u542B\u4E0D\u652F\u6301\u7684\u76EE\u5F55\u6216\u5B57\u7B26\uFF1A${raw}`);
+      }
+      return { parts: rawParts };
+    }
+    if (rawParts.some((part) => part.startsWith("."))) {
+      return { invalid: `${label}\u542B\u9690\u85CF\u76EE\u5F55\u6216\u9690\u85CF\u6587\u4EF6\uFF08\u70B9\u5F00\u5934\uFF09\uFF1A${raw}`, reason: "hidden" };
+    }
+    const parts = rawParts.map((part) => cleanPathPart(part)).filter(Boolean);
+    if (!parts.length || parts.some((part) => part === "." || part === "..")) {
+      return { invalid: `${label}\u5305\u542B\u4E0D\u652F\u6301\u7684\u76EE\u5F55\u6216\u5B57\u7B26\uFF1A${raw}`, reason: "path" };
+    }
+    return { parts, sanitized: parts.length !== rawParts.length || parts.some((part, index) => part !== rawParts[index]) };
+  }
+  // 公共路径：与 parseFastlinkJson/扫描器共用；sanitize 时无效公共路径按丢一条无效计数、退回无公共路径。
+  function resolveImportedCommonPath(value, onInvalid) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    const resolved = resolveImportedPathParts(raw.replace(/\/+$/, ""), "\u516C\u5171\u8DEF\u5F84", Boolean(onInvalid));
+    if (resolved.invalid) {
+      onInvalid?.({ reason: resolved.reason || "path", index: 0, name: raw.slice(0, 160), message: resolved.invalid });
+      return "";
+    }
+    return resolved.parts.length ? `${resolved.parts.join("/")}/` : "";
+  }
+  function normalizeImportedFiles(files, usesBase62EtagsInExport, startIndex = 0, options = {}) {
     if (!Array.isArray(files) || !files.length) throw new Error("\u79D2\u4F20\u5185\u5BB9\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55");
-    return files.map((file, index) => {
+    const sanitize = options.sanitize === true;
+    const onInvalid = sanitize ? options.onInvalid : null;
+    const output = [];
+    files.forEach((file, index) => {
+      const number = startIndex + index + 1;
+      const fail = (reason, message) => {
+        if (!onInvalid) throw new Error(message);
+        onInvalid({ reason, index: number, name: String(file?.path || file?.fileName || "").slice(0, 160), message });
+      };
       const path = String(file?.path || file?.fileName || "").trim();
-      const parts = importedPathParts(path, `\u7B2C ${startIndex + index + 1} \u4E2A\u6587\u4EF6\u8DEF\u5F84`);
+      const resolved = resolveImportedPathParts(path, `\u7B2C ${number} \u4E2A\u6587\u4EF6\u8DEF\u5F84`, sanitize);
+      if (resolved.invalid) { fail(resolved.reason || "path", resolved.invalid); return; }
       const sourceEtag = String(file?.etag || "").trim();
       const etag = usesBase62EtagsInExport && !validEtag(sourceEtag) ? base62ToHex(sourceEtag) : sourceEtag.toLocaleLowerCase();
       const size = Number(file?.size);
-      if (!validEtag(etag)) throw new Error(`\u7B2C ${startIndex + index + 1} \u4E2A\u6587\u4EF6 Etag \u65E0\u6548`);
-      if (!Number.isSafeInteger(size) || size < 0) throw new Error(`\u7B2C ${startIndex + index + 1} \u4E2A\u6587\u4EF6 \u5927\u5C0F\u65E0\u6548`);
-      return { path: parts.join("/"), fileName: parts.at(-1), etag, size };
+      if (!validEtag(etag)) { fail("etag", `\u7B2C ${number} \u4E2A\u6587\u4EF6 Etag \u65E0\u6548`); return; }
+      if (!Number.isSafeInteger(size) || size < 0) { fail("size", `\u7B2C ${number} \u4E2A\u6587\u4EF6 \u5927\u5C0F\u65E0\u6548`); return; }
+      const entry = { path: resolved.parts.join("/"), fileName: resolved.parts.at(-1), etag, size };
+      if (resolved.sanitized === true) {
+        entry.sanitized = true;
+        options.onSanitized?.(1);
+      }
+      output.push(entry);
     });
+    return output;
   }
-  function parseFastlinkJson(value) {
+  // 无效条目汇总器：分类计数 + 样本封顶（千万级文件里坏条目可能几十万条，样本只留前几条用于展示）。
+  function createFastlinkInvalidCollector(sampleCap = 50) {
+    const summary = { total: 0, sanitized: 0, reasons: { path: 0, etag: 0, size: 0, hidden: 0 }, samples: [] };
+    return {
+      summary,
+      collect(info) {
+        summary.total += 1;
+        if (info?.reason && summary.reasons[info.reason] !== void 0) summary.reasons[info.reason] += 1;
+        if (summary.samples.length < sampleCap) summary.samples.push({ index: info.index, name: info.name, message: info.message });
+      },
+      noteSanitized(count = 1) { summary.sanitized += count; }
+    };
+  }
+  function withFastlinkInvalidSummary(result, invalidSummary) {
+    return {
+      ...result,
+      invalid: invalidSummary?.total || 0,
+      sanitized: invalidSummary?.sanitized || 0,
+      invalidReasons: invalidSummary?.reasons || { ...EMPTY_FASTLINK_INVALID_REASONS },
+      invalidSamples: invalidSummary?.samples || []
+    };
+  }
+  function parseFastlinkJson(value, options = {}) {
     if (Array.isArray(value)) {
       if (!value.every((item) => Array.isArray(item) && item.length >= 3)) throw new Error("\u65E0\u6548\u7684\u79D2\u4F20 JSON \u6570\u7EC4");
       value = {
@@ -6106,10 +6275,12 @@
       };
     }
     if (!value || typeof value !== "object") throw new Error("\u65E0\u6548\u7684\u79D2\u4F20 JSON");
-    const commonParts = String(value.commonPath || "").trim() ? importedPathParts(String(value.commonPath).replace(/\/+$/, ""), "\u516C\u5171\u8DEF\u5F84") : [];
+    const sanitize = options.sanitize === true;
+    const collector = options.invalidCollector || null;
+    const commonPath = resolveImportedCommonPath(value.commonPath, sanitize ? collector?.collect : null);
     return {
-      commonPath: commonParts.length ? `${commonParts.join("/")}/` : "",
-      files: normalizeImportedFiles(value.files, Boolean(value.usesBase62EtagsInExport))
+      commonPath,
+      files: normalizeImportedFiles(value.files, Boolean(value.usesBase62EtagsInExport), 0, sanitize ? { sanitize: true, onInvalid: collector?.collect, onSanitized: collector?.noteSanitized } : {})
     };
   }
   // —— 秒传 JSON 流式解析：几百 MB / 几 GB 的本地秒传文件不再整读进内存（会卡死页面）——
@@ -6118,8 +6289,18 @@
   // ② [[etag, size, path],...]
   // 调用方分块喂文本（push），结束后 finish() 返回与 parseFastlinkJson 完全一致的结果；
   // 条目级 JSON.parse、commonPath/usesBase62 的键序无关处理都在这里完成，校验统一交给 finish 里的 parseFastlinkJson。
+  // 导入模式（options.sanitize）：路径自动清理、无效条目跳过并计数（不再整包中止）；
+  // 批次模式（options.batchSize + takeBatch）：条目攒满一批交给导入方消费，千万级文件不再全量驻留内存。
   function createFastlinkJsonScanner(options = {}) {
     const fingerprint = options.fingerprint || null;
+    const sanitize = options.sanitize === true;
+    const batchSize = Math.max(0, Number(options.batchSize) || 0);
+    const invalidCollector = sanitize ? options.invalidCollector || createFastlinkInvalidCollector() : null;
+    const invalid = invalidCollector ? invalidCollector.summary : null;
+    const onInvalid = invalidCollector ? invalidCollector.collect : null;
+    let entryIndex = 0;
+    let batch = [];
+    let closedBatches = [];
     let started = false;
     let rootDone = false;
     let rootType = "";
@@ -6186,24 +6367,39 @@
       try {
         value = JSON.parse(raw);
       } catch (error) {
-        failStructure(`第 ${entries.length + 1} 个文件条目解析失败：${error.message}`);
+        failStructure(`第 ${entryIndex + 1} 个文件条目解析失败：${error.message}`);
       }
       // 逐条即时归一化：数百万条时若先攒原始条目、finish 再统一归一化，两份副本会同时驻留内存。
-      // 单条报错语义与 normalizeImportedFiles 全量处理一致（全局序号）。
+      // 单条报错语义与 normalizeImportedFiles 全量处理一致（全局序号）；
+      // 导入模式（sanitize）下单条无效只跳过计数，不再让整包解析中止。
+      const number = entryIndex;
+      entryIndex += 1;
+      const normalizeOptions = sanitize ? { sanitize: true, onInvalid, onSanitized: invalidCollector ? invalidCollector.noteSanitized : null } : {};
       if (rootType === "array") {
         if (!Array.isArray(value) || value.length < 3) failStructure("无效的秒传 JSON 数组");
-        value = normalizeImportedFiles([{ etag: value[0], size: value[1], path: value[2] }], usesBase62, entries.length)[0];
+        value = normalizeImportedFiles([{ etag: value[0], size: value[1], path: value[2] }], usesBase62, number, normalizeOptions)[0];
       } else {
-        value = normalizeImportedFiles([value], usesBase62, entries.length)[0];
+        value = normalizeImportedFiles([value], usesBase62, number, normalizeOptions)[0];
       }
+      if (!value) return;
       if (fingerprint) {
         // 字段与顺序和 fastlinkImportContentHash 完全一致，两条路径的摘要可互相比对；
-        // 条目已归一化：path/etag 必为小写字符串、size 必为安全整数，无需再转换
+        // 条目已归一化：path/etag 必为小写字符串、size 必为安全整数，无需再转换。
+        // 无效条目不喂指纹：同一文件重跑时跳过集合稳定一致，断点续传匹配不受坏条目影响。
         fingerprint.feed(value.path);
         fingerprint.feed(value.etag || "");
         fingerprint.feed(value.size);
       }
-      entries.push(value);
+      if (batchSize > 0) {
+        // 批次模式：攒满一批交给导入方（takeBatch），条目不全量驻留内存。
+        batch.push(value);
+        if (batch.length >= batchSize) {
+          closedBatches.push(batch);
+          batch = [];
+        }
+      } else {
+        entries.push(value);
+      }
     };
     const openContainer = (kind, ch) => {
       if (!started) {
@@ -6276,7 +6472,7 @@
           }
           if (ch === "\uFEFF" || /\s/.test(ch)) continue;
           if (atEntriesElementSlot() && !"{}[],:".includes(ch)) {
-            failStructure(`秒传 JSON 数组的第 ${entries.length + 1} 项不是${rootType === "array" ? "数组" : "对象"}`);
+            failStructure(`秒传 JSON 数组的第 ${entryIndex + 1} 项不是${rootType === "array" ? "数组" : "对象"}`);
           }
           if (ch === "\"") {
             inString = true;
@@ -6320,17 +6516,39 @@
           }
         }
       },
+      getCommonPath() {
+        // commonPath 在 JSON 头部（files 数组之前）就已解析完，批次消费方在第一批交付时即可读取。
+        return commonPath;
+      },
+      takeBatch() {
+        if (closedBatches.length) return closedBatches.shift();
+        if (batch.length) {
+          const pending = batch;
+          batch = [];
+          return pending;
+        }
+        return null;
+      },
+      invalidSummary() {
+        return invalid ? { total: invalid.total, sanitized: invalid.sanitized, reasons: { ...invalid.reasons }, samples: invalid.samples.slice() } : { total: 0, sanitized: 0, reasons: { path: 0, etag: 0, size: 0, hidden: 0 }, samples: [] };
+      },
       finish() {
         if (!started) return parseFastlinkJson({ commonPath: "", files: [] });
         if (!rootDone || inString) failStructure("\u79D2\u4F20 JSON \u4E0D\u5B8C\u6574\uFF08\u5185\u5BB9\u88AB\u622A\u65AD\uFF1F\uFF09");
-        const commonParts = String(commonPath || "").trim() ? importedPathParts(String(commonPath).replace(/\/+$/, ""), "\u516C\u5171\u8DEF\u5F84") : [];
+        const commonPath2 = resolveImportedCommonPath(commonPath, onInvalid);
         // 条目已在扫描时逐条归一化（finishEntry），这里只做汇总与空档校验
         const files = entries || [];
-        if (!files.length) throw new Error("\u79D2\u4F20\u5185\u5BB9\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55");
-        return {
-          commonPath: commonParts.length ? `${commonParts.join("/")}/` : "",
+        if (!files.length && batchSize <= 0) {
+          if (invalid && invalid.total) throw new Error(`\u79D2\u4F20\u5185\u5BB9\u6CA1\u6709\u53EF\u5BFC\u5165\u7684\u6587\u4EF6\uFF1A\u5168\u90E8 ${invalid.total} \u6761\u65E0\u6548\uFF08\u8DEF\u5F84 ${invalid.reasons.path}\u3001\u9690\u85CF\u6587\u4EF6 ${invalid.reasons.hidden}\u3001Etag ${invalid.reasons.etag}\u3001\u5927\u5C0F ${invalid.reasons.size}\uFF09`);
+          throw new Error("\u79D2\u4F20\u5185\u5BB9\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55");
+        }
+        const result = {
+          commonPath: commonPath2,
           files
         };
+        if (sanitize) result.invalid = this.invalidSummary();
+        if (batchSize > 0) result.totalEntries = entryIndex;
+        return result;
       }
     };
   }
@@ -6373,10 +6591,24 @@
   }
   // 本地秒传文件解析入口：秒传 JSON 走流式增量解析（按块读取、定期让出主线程，进度实时上报）；
   // V1/V2 秒传文本、.123share、二级短链接等小内容整读后复用 parseFastlink 旧解析。
+  // 导入模式（options.sanitize）：路径自动清理 + 无效条目跳过计数；
+  // 批次模式（options.batchSize + options.onBatch）：每攒满一批就交给 onBatch 消费（await 完成才继续读文件，
+  // 文件流天然背压），条目不再全量驻留内存，finish() 里 files 恒为空数组、只带汇总。
   async function parseFastlinkInputFile(file, options = {}) {
     const head = await readFastlinkFileHead(file);
-    if (!/^\uFEFF?\s*[\[{]/.test(head)) return parseFastlink(await file.text());
-    const scanner = createFastlinkJsonScanner(options.fingerprint ? { fingerprint: options.fingerprint } : {});
+    const sanitize = options.sanitize === true;
+    const invalidCollector = sanitize ? options.invalidCollector || createFastlinkInvalidCollector() : null;
+    if (!/^\uFEFF?\s*[\[{]/.test(head)) {
+      const parsedText = parseFastlink(await file.text(), sanitize ? { sanitize: true, invalidCollector } : {});
+      if (sanitize) parsedText.invalid = invalidCollector.summary;
+      return parsedText;
+    }
+    const scanner = createFastlinkJsonScanner({
+      fingerprint: options.fingerprint,
+      sanitize,
+      invalidCollector,
+      batchSize: Number(options.batchSize) || 0
+    });
     const decoder = new TextDecoder("utf-8");
     const total = Number(file.size) || 0;
     const reader = file.stream().getReader();
@@ -6385,6 +6617,14 @@
     const wrapStructureError = (error) => {
       if (error?.name === "FastlinkJsonStructureError") return new Error(`秒传 JSON 解析失败：${error.message}`);
       return error;
+    };
+    const drainBatches = async () => {
+      if (!options.onBatch) return;
+      for (;;) {
+        const pending = scanner.takeBatch();
+        if (!pending) break;
+        await options.onBatch(pending, scanner);
+      }
     };
     try {
       for (;;) {
@@ -6397,6 +6637,7 @@
         } catch (error) {
           throw wrapStructureError(error);
         }
+        await drainBatches();
         options.onProgress?.(bytesRead, total);
         if (Date.now() - lastYield >= 12) {
           await yieldToUiThread();
@@ -6404,6 +6645,7 @@
         }
       }
       scanner.push(decoder.decode());
+      await drainBatches();
       return scanner.finish();
     } catch (error) {
       throw wrapStructureError(error);
@@ -6411,7 +6653,7 @@
       reader.releaseLock?.();
     }
   }
-  function parseFastlinkText(value) {
+  function parseFastlinkText(value, options = {}) {
     let text2 = String(value || "").trim();
     let commonPath2 = "";
     let usesBase62 = false;
@@ -6432,28 +6674,28 @@
       const [etag, size, ...path] = entry2.split("#");
       return { etag, size: Number(size), path: path.join("#") };
     });
-    return parseFastlinkJson({ commonPath: commonPath2, files, usesBase62EtagsInExport: usesBase62 });
+    return parseFastlinkJson({ commonPath: commonPath2, files, usesBase62EtagsInExport: usesBase62 }, options);
   }
-  function decode123Share(value) {
+  function decode123Share(value, options = {}) {
     const text2 = String(value || "").trim();
     if (!text2 || !/^[0-9A-Za-z+/=\s]+$/.test(text2)) return null;
     try {
-      return parseFastlinkJson(convert123ShareToJson(text2, { raw: true }));
+      return parseFastlinkJson(convert123ShareToJson(text2, { raw: true }), options);
     } catch {
       return null;
     }
   }
-  function parseFastlink(value) {
+  function parseFastlink(value, options = {}) {
     const text2 = String(value || "").trim();
     if (!text2) throw new Error("\u8BF7\u7C98\u8D34\u79D2\u4F20\u5185\u5BB9\u6216\u9009\u62E9\u79D2\u4F20\u6587\u4EF6");
     try {
-      return parseFastlinkJson(JSON.parse(text2));
+      return parseFastlinkJson(JSON.parse(text2), options);
     } catch (error) {
       if (/^[\\[{]/.test(text2)) throw new Error(`\u79D2\u4F20 JSON \u89E3\u6790\u5931\u8D25\uFF1A${error.message}`);
     }
-    const converted123Share = decode123Share(text2);
+    const converted123Share = decode123Share(text2, options);
     if (converted123Share) return converted123Share;
-    return parseFastlinkText(text2);
+    return parseFastlinkText(text2, options);
   }
   function fastlinkImportFileKey(file) {
     return `${String(file.path || file.fileName || "")}|${String(file.etag || "").toLowerCase()}`;
@@ -6504,9 +6746,15 @@
   // 导入断点：按「目标目录 + 内容指纹」记录已成功秒传的文件；重跑同一内容时自动跳过，
   // 失败项不在 done 里，重跑只会重试失败的部分。全部成功后清除。
   async function importFastlink(api, value, rootId, options = {}) {
-    const parsed = typeof value === "string" ? parseFastlink(value) : value;
+    // 字符串输入（种子文件内容等）：导入语义解析（自动清理路径 + 无效条目跳过计数）
+    const parseCollector = typeof value === "string" ? createFastlinkInvalidCollector() : null;
+    const parsed = typeof value === "string" ? parseFastlink(value, { sanitize: true, invalidCollector: parseCollector }) : value;
+    const invalidSummary = parseCollector ? parseCollector.summary : parsed?.invalid || null;
     const filtered = filterFastlinkFiles(parsed.files, { filterEnabled: options.filterEnabled, filterExtensions: options.filterExtensions });
-    if (!filtered.length) throw new Error("\u8FC7\u6EE4\u540E\u6CA1\u6709\u53EF\u5BFC\u5165\u7684\u6587\u4EF6");
+    if (!filtered.length) {
+      if (invalidSummary?.total) throw new Error(`\u6CA1\u6709\u53EF\u5BFC\u5165\u7684\u6587\u4EF6\uFF1A\u5168\u90E8 ${invalidSummary.total} \u6761\u65E0\u6548\uFF08\u8DEF\u5F84 ${invalidSummary.reasons.path}\u3001\u9690\u85CF\u6587\u4EF6 ${invalidSummary.reasons.hidden}\u3001Etag ${invalidSummary.reasons.etag}\u3001\u5927\u5C0F ${invalidSummary.reasons.size}\uFF09`);
+      throw new Error("\u8FC7\u6EE4\u540E\u6CA1\u6709\u53EF\u5BFC\u5165\u7684\u6587\u4EF6");
+    }
     const commonParts = parsed.commonPath ? importedPathParts(parsed.commonPath.replace(/\/$/, ""), "\u516C\u5171\u8DEF\u5F84") : [];
     let progress = null;
     let progressShards = null;
@@ -6539,7 +6787,7 @@
     if (skipped) options.onProgress?.(0, Math.max(todo.length, 1), `\u8DF3\u8FC7\u4E0A\u6B21\u5DF2\u5BFC\u5165\u7684 ${skipped} \u9879\uFF0C\u7EE7\u7EED\u5BFC\u5165\u5269\u4F59 ${todo.length} \u9879`);
     if (!todo.length) {
       const details = filtered.map((file) => ({ ...file, name: [...commonParts, file.path].filter(Boolean).join("/"), status: "skipped", message: "\u4E0A\u6B21\u5DF2\u5BFC\u5165" }));
-      return { ...batchResult(details, [rootId]), skipped };
+      return withFastlinkInvalidSummary({ ...batchResult(details, [rootId]), skipped }, invalidSummary);
     }
     let progressSavedAt = 0;
     let progressDoneCount = progress ? Number(progress.doneCount) || Object.keys(progress.done || {}).length : 0;
@@ -6576,13 +6824,17 @@
       const saveInterval = Math.min(30000, Math.max(1500, progressDoneCount * 2));
       if (now - progressSavedAt >= saveInterval) saveProgressNow();
     };
-    const cache = /* @__PURE__ */ new Map();
-    const listingCache = /* @__PURE__ */ new Map();
-    // 秒传导入并发：下限 32、上限 64（2026-09-08 实测 upload_request 复用接口 32 并发
+    // 秒传导入并发：默认线路下限 32、上限 64（2026-09-08 实测 upload_request 复用接口 32 并发
     // 85 req/s 全部成功、零频控）。此前跟随通用 writeConcurrency（默认 10），实际只有
     // 10 并发白白浪费约 3 倍吞吐；现在导入固定不低于 32，显式配置更高时最高可到 64。
     // 目录预建并发仍与 list 接口的 ~15 QPS 频控对齐（上限 12）。
-    const concurrency = Math.min(64, Math.max(32, Number(options.concurrency) || 32));
+    // 镜像线路（api.laneHost）实测 16~24 线程 ≈150 req/s：并发按配置值生效、未配置默认 24（下限 8）。
+    const lane = Boolean(api.laneHost);
+    const concurrency = lane
+      ? Math.min(64, Math.max(8, Number(options.concurrency) >= 16 ? Number(options.concurrency) : 24))
+      : Math.min(64, Math.max(32, Number(options.concurrency) || 32));
+    const cache = /* @__PURE__ */ new Map();
+    const listingCache = /* @__PURE__ */ new Map();
     // 目录按层并发预建：先把本次导入涉及的全部父目录按深度逐层并发建立/复用，
     // 避免文件阶段逐个 ensurePath 串行逐级查目录拖慢导入。
     {
@@ -6677,7 +6929,7 @@
         }
       }
     }
-    return { ...batchResult(details, [rootId]), skipped };
+    return withFastlinkInvalidSummary({ ...batchResult(details, [rootId]), skipped }, invalidSummary);
   }
   var FASTLINK_SCAN_CHECKPOINT_KEY = "Cloud123.Helper.FastlinkScanProgress";
   var FASTLINK_IMPORT_CHECKPOINT_KEY = "Cloud123.Helper.FastlinkImportProgress";
@@ -6706,6 +6958,288 @@
       else localStorage.removeItem(key);
     } catch {
     }
+  }
+  // —— 千万级流式导入（本地大 JSON 专用）：批次消费 + 64 位指纹 done 集 + 断点 v3 ——
+  // 数组路径 importFastlink（粘贴文本 / 云盘种子 / 小文件）保持原逻辑与 v2 断点不动。
+  var FASTLINK_IMPORT_STREAM_BATCH = 8192;
+  var FASTLINK_STREAM_FULL_PARSE_MAX = 8 * 1024 * 1024;
+  var FASTLINK_IMPORT_STREAM_CHECKPOINT_KEY = "Cloud123.Helper.FastlinkImportStreamProgress";
+  var FASTLINK_IMPORT_STREAM_SHARD_SUFFIX = "#stream-shard";
+  var FASTLINK_IMPORT_RESULT_DETAILS_CAP = 200;
+  var EMPTY_FASTLINK_INVALID_REASONS = { path: 0, etag: 0, size: 0, hidden: 0 };
+  // 单条 importKey 的 64 位指纹（与内容指纹同一套滚动哈希，种子不同）：done 集合只存指纹，
+  // 1400 万条从全量 key 字符串的 2-3GB 压到 112MB；16 位 hex 便于分片落盘。
+  function fastlinkKeyFingerprint(text) {
+    const value = String(text ?? "");
+    let rollA = 0x811c9dc5;
+    let rollB = 0x01935c11;
+    for (let index = 0; index < value.length; index += 1) {
+      rollA = Math.imul(rollA ^ value.charCodeAt(index), 16777619) >>> 0;
+      rollB = Math.imul(rollB + value.charCodeAt(index), 2654435761) >>> 0;
+    }
+    rollA = (rollA ^ 0x9e3779b9) >>> 0;
+    rollB = (rollB ^ 0x85ebca6b) >>> 0;
+    return rollB.toString(16).padStart(8, "0") + rollA.toString(16).padStart(8, "0");
+  }
+  // done 集：BigInt64Array 有序主段 + 小段有序尾巴（都有序，二分查找）。
+  // 添加先进尾巴（插入位置二分 + splice），尾巴到上限归并进主段；1400 万条全程内存 ~112MB。
+  function createFastlinkDoneSet() {
+    const TAIL_LIMIT = 4096;
+    let main = new BigInt64Array(1 << 16);
+    let mainCount = 0;
+    let tail = [];
+    const compare = (left, right) => left < right ? -1 : left > right ? 1 : 0;
+    const toKey = (hex) => BigInt.asIntN(64, BigInt(`0x${hex}`));
+    const ensureCapacity = (needed) => {
+      if (needed <= main.length) return;
+      let capacity = main.length;
+      while (capacity < needed) capacity *= 2;
+      const next = new BigInt64Array(capacity);
+      next.set(main.subarray(0, mainCount));
+      main = next;
+    };
+    const bsearchArray = (value) => {
+      let low = 0;
+      let high = mainCount;
+      while (low < high) {
+        const mid = (low + high) >> 1;
+        if (main[mid] < value) low = mid + 1;
+        else high = mid;
+      }
+      return low;
+    };
+    const bsearchTail = (value) => {
+      let low = 0;
+      let high = tail.length;
+      while (low < high) {
+        const mid = (low + high) >> 1;
+        if (tail[mid] < value) low = mid + 1;
+        else high = mid;
+      }
+      return low;
+    };
+    const mergeTail = () => {
+      if (!tail.length) return;
+      tail.sort(compare);
+      ensureCapacity(mainCount + tail.length);
+      let readMain = mainCount;
+      let readTail = tail.length;
+      let write = mainCount + readTail;
+      while (readTail > 0) {
+        write -= 1;
+        if (readMain > 0 && main[readMain - 1] > tail[readTail - 1]) main[write] = main[--readMain];
+        else main[write] = tail[--readTail];
+      }
+      mainCount += tail.length;
+      tail = [];
+    };
+    return {
+      get size() {
+        return mainCount + tail.length;
+      },
+      has(hex) {
+        const key = toKey(hex);
+        let at = bsearchArray(key);
+        if (at < mainCount && main[at] === key) return true;
+        at = bsearchTail(key);
+        return at < tail.length && tail[at] === key;
+      },
+      add(hex) {
+        const key = toKey(hex);
+        let at = bsearchArray(key);
+        if (at < mainCount && main[at] === key) return false;
+        at = bsearchTail(key);
+        if (at < tail.length && tail[at] === key) return false;
+        tail.splice(at, 0, key);
+        if (tail.length >= TAIL_LIMIT) mergeTail();
+        return true;
+      },
+      load(hexList) {
+        const list = [];
+        for (const hex of hexList) {
+          try {
+            list.push(toKey(hex));
+          } catch {
+          }
+        }
+        if (!list.length) return;
+        if (!mainCount && !tail.length) {
+          list.sort(compare);
+          ensureCapacity(list.length);
+          main.set(list);
+          mainCount = list.length;
+          return;
+        }
+        tail = list;
+        mergeTail();
+      }
+    };
+  }
+  function readFastlinkStreamCheckpoint() {
+    try {
+      return checkpointStorageGet(FASTLINK_IMPORT_STREAM_CHECKPOINT_KEY);
+    } catch {
+      return null;
+    }
+  }
+  function clearFastlinkStreamCheckpoint(record = null) {
+    const shardCount = Math.max(0, Number(record?.shardCount) || 0);
+    for (let index = 0; index < shardCount; index += 1) {
+      checkpointStorageRemove(FASTLINK_IMPORT_STREAM_CHECKPOINT_KEY + FASTLINK_IMPORT_STREAM_SHARD_SUFFIX + index);
+    }
+    checkpointStorageRemove(FASTLINK_IMPORT_STREAM_CHECKPOINT_KEY);
+  }
+  // 流式导入器：解析器每攒满一批（FASTLINK_IMPORT_STREAM_BATCH）就交给 consume()，
+  // 消费完成前文件流暂停（天然背压）。目录不再全量预建，逐条 ensurePath（promise 缓存去重并发）。
+  function createFastlinkStreamImporter(api, rootId, options = {}) {
+    const signal = options.signal;
+    // 并发：镜像线路实测 16~24 线程 ≈150 req/s，按配置生效、未配置默认 24；默认线路保持 32 底
+    const lane = Boolean(api.laneHost);
+    const concurrency = lane
+      ? Math.min(64, Math.max(8, Number(options.concurrency) >= 16 ? Number(options.concurrency) : 24))
+      : Math.min(64, Math.max(32, Number(options.concurrency) || 32));
+    const filters = { filterEnabled: options.filterEnabled, filterExtensions: options.filterExtensions };
+    const cache = /* @__PURE__ */ new Map();
+    const listingCache = /* @__PURE__ */ new Map();
+    const commonResolved = String(options.commonPath || "").trim() ? resolveImportedPathParts(String(options.commonPath).replace(/\/+$/, ""), "\u516C\u5171\u8DEF\u5F84", true) : { parts: [] };
+    const commonParts = commonResolved.parts || [];
+    // 断点 v3：主记录只存计数（doneCount/shardCount），指纹分片另存；按根目录匹配续传，
+    // 不再依赖内容指纹（流式场景批次边扫边导，指纹要到扫描结束才完整）。旧版本/异根目录直接清档。
+    let record = readFastlinkStreamCheckpoint();
+    let resumable = !!record && Number(record.version) === 3 && String(record.rootId || "0") === String(rootId || "0") && Date.now() - Number(record.savedAt || 0) <= FASTLINK_CHECKPOINT_TTL;
+    if (record && !resumable) {
+      clearFastlinkStreamCheckpoint(record);
+      record = null;
+    }
+    const doneSet = createFastlinkDoneSet();
+    if (resumable) {
+      const shardCount = Math.max(0, Number(record.shardCount) || 0);
+      const hexes = [];
+      for (let index = 0; index < shardCount; index += 1) {
+        const shard = checkpointStorageGet(FASTLINK_IMPORT_STREAM_CHECKPOINT_KEY + FASTLINK_IMPORT_STREAM_SHARD_SUFFIX + index);
+        if (shard && Array.isArray(shard.keys)) for (const hex of shard.keys) hexes.push(hex);
+      }
+      doneSet.load(hexes);
+    }
+    let nextShardIndex = resumable ? Math.max(0, Number(record.shardCount) || 0) : 0;
+    const shardBuffers = /* @__PURE__ */ new Map();
+    const dirtyShards = /* @__PURE__ */ new Set();
+    let ok = 0;
+    let fail = 0;
+    let doneSkip = 0;
+    let filteredOut = 0;
+    let processed = 0;
+    let lastUi = 0;
+    let lastSave = Date.now();
+    let finished = false;
+    const failDetails = [];
+    const reportProgress = (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastUi < 300) return;
+      lastUi = now;
+      options.onProgress?.(0, 1, `\u6210\u529F ${ok} \u00B7 \u5931\u8D25 ${fail}${doneSkip ? ` \u00B7 \u5DF2\u5BFC\u5165\u8DF3\u8FC7 ${doneSkip}` : ""}`);
+    };
+    const markDone = (file) => {
+      const hex = fastlinkKeyFingerprint(fastlinkImportFileKey(file));
+      if (!doneSet.add(hex)) return;
+      let buffer = shardBuffers.get(nextShardIndex);
+      if (!buffer) {
+        buffer = [];
+        shardBuffers.set(nextShardIndex, buffer);
+      }
+      buffer.push(hex);
+      dirtyShards.add(nextShardIndex);
+      if (buffer.length >= FASTLINK_IMPORT_SHARD_SIZE) nextShardIndex += 1;
+    };
+    const save = () => {
+      if (finished) return;
+      try {
+        for (const index of dirtyShards) {
+          checkpointStorageSet(FASTLINK_IMPORT_STREAM_CHECKPOINT_KEY + FASTLINK_IMPORT_STREAM_SHARD_SUFFIX + index, { kind: "import-stream-shard", version: 3, shard: index, keys: shardBuffers.get(index) });
+        }
+        dirtyShards.clear();
+        const liveShards = nextShardIndex + (shardBuffers.get(nextShardIndex)?.length ? 1 : 0);
+        checkpointStorageSet(FASTLINK_IMPORT_STREAM_CHECKPOINT_KEY, { kind: "import-stream", version: 3, savedAt: Date.now(), rootId: String(rootId || "0"), doneCount: doneSet.size, shardCount: Math.max(liveShards, nextShardIndex) });
+        lastSave = Date.now();
+      } catch {
+      }
+    };
+    const maybeSave = () => {
+      if (Date.now() - lastSave >= 2000) save();
+    };
+    async function consume(batch2) {
+      if (signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
+      const todo = [];
+      for (const file of batch2) {
+        processed += 1;
+        if (!filterFastlinkFiles([file], filters).length) {
+          filteredOut += 1;
+          continue;
+        }
+        if (doneSet.size && doneSet.has(fastlinkKeyFingerprint(fastlinkImportFileKey(file)))) {
+          doneSkip += 1;
+          continue;
+        }
+        todo.push(file);
+      }
+      await mapLimit(todo, concurrency, async (file) => {
+        const parts = file.path.split("/");
+        const name = [...commonParts, file.path].filter(Boolean).join("/");
+        try {
+          const parentId = await api.ensurePath(rootId, [...commonParts, ...parts.slice(0, -1)], cache, signal, listingCache);
+          await api.reuseFile(file, parentId, signal);
+          ok += 1;
+          markDone(file);
+        } catch (error) {
+          if (error?.name === "AbortError") throw error;
+          fail += 1;
+          if (failDetails.length < FASTLINK_IMPORT_RESULT_DETAILS_CAP) failDetails.push({ ...file, name, status: "failed", message: error.message });
+        } finally {
+          reportProgress();
+        }
+      }, { signal });
+      reportProgress(true);
+      maybeSave();
+    }
+    return {
+      get processed() {
+        return processed;
+      },
+      consume,
+      flush: () => {
+        if (!finished) save();
+      },
+      async finish(meta = {}) {
+        const invalid = meta.invalid || null;
+        // 先落盘/清档、再置 finished（save 有 finished 守卫，顺序反了会让失败收尾永远不落盘）
+        if (fail === 0 && ok + doneSkip + filteredOut > 0) {
+          // 全部成功：清档，重跑幂等（范围放宽，确保尾巴分片一并清掉）
+          clearFastlinkStreamCheckpoint({ shardCount: nextShardIndex + shardBuffers.size + 1 });
+          finished = true;
+        } else if (ok + fail + doneSkip > 0) {
+          save();
+          finished = true;
+        } else {
+          finished = true;
+        }
+        return {
+          status: fail === 0 ? "success" : ok > 0 ? "partial" : "failed",
+          ok,
+          fail,
+          total: ok + fail,
+          done: ok + fail,
+          details: failDetails,
+          detailsTruncated: fail > failDetails.length,
+          skipped: doneSkip,
+          filteredOut,
+          processed,
+          invalid: invalid?.total || 0,
+          sanitized: invalid?.sanitized || 0,
+          invalidReasons: invalid?.reasons || { ...EMPTY_FASTLINK_INVALID_REASONS },
+          invalidSamples: invalid?.samples || []
+        };
+      }
+    };
   }
   function freshFastlinkFileEntry(item, fileName, path, root = 0) {
     return { id: String(item?.id ?? ""), name: String(item?.name ?? fileName), fileName, path, etag: String(item?.etag ?? ""), size: Number(item?.size) || 0, s3KeyFlag: String(item?.s3KeyFlag ?? ""), root: Number(root) || 0 };
@@ -7183,21 +7717,63 @@
     return importFastlink(api, parsed, rootId, options);
   }
   async function resolveAndImportFastlink(api, content, rootId, options = {}) {
-    return importResolvedFastlink(api, parseFastlink(content), rootId, options);
+    const collector = createFastlinkInvalidCollector();
+    const parsed = parseFastlink(content, { sanitize: true, invalidCollector: collector });
+    parsed.invalid = collector.summary;
+    return importResolvedFastlink(api, parsed, rootId, options);
   }
   // 面板转存入口：本地文件（秒传 JSON 流式解析）或粘贴文本二选一。
+  // 本地 JSON：小文件（≤8MB）沿用整读路径（保留二级种子单文件转存语义）；
+  // 大文件走流式批次导入——解析器每攒满一批交给导入器消费完再继续读（文件流天然背压），
+  // 路径自动清理、无效条目（含点开头隐藏文件）跳过计数，千万级条目不全量驻留内存。
   async function resolveAndImportFastlinkInput(api, input, rootId, options = {}) {
     if (input?.file) {
       const file = input.file;
-      // 指纹在扫描时逐条顺带计算（零额外遍历），供断点续传匹配
+      // 指纹在扫描时逐条顺带计算（零额外遍历）；无效条目不喂入，同一文件重跑指纹稳定一致。
       const fingerprint = createFastlinkImportFingerprint(rootId);
-      const parsed = await parseFastlinkInputFile(file, {
-        ...options,
-        fingerprint,
-        onProgress: (bytes, total) => options.onProgress?.(0, 1, `流式读取 ${file.name}：${formatFastlinkReadProgress(bytes)}${total ? ` / ${formatFastlinkReadProgress(total)}` : ""}`)
-      });
-      parsed.contentFingerprint = fingerprint.digest();
-      return importResolvedFastlink(api, parsed, rootId, options);
+      const readProgress = (bytes, total) => options.onProgress?.(0, 1, `流式读取 ${file.name}：${formatFastlinkReadProgress(bytes)}${total ? ` / ${formatFastlinkReadProgress(total)}` : ""}`);
+      if (Number(file.size) <= FASTLINK_STREAM_FULL_PARSE_MAX) {
+        const collector = createFastlinkInvalidCollector();
+        const parsed = await parseFastlinkInputFile(file, {
+          ...options,
+          fingerprint,
+          sanitize: true,
+          invalidCollector: collector,
+          onProgress: readProgress
+        });
+        parsed.contentFingerprint = fingerprint.digest();
+        parsed.invalid = collector.summary;
+        return importResolvedFastlink(api, parsed, rootId, options);
+      }
+      let importer = null;
+      let summary = null;
+      try {
+        summary = await parseFastlinkInputFile(file, {
+          ...options,
+          fingerprint,
+          sanitize: true,
+          batchSize: FASTLINK_IMPORT_STREAM_BATCH,
+          onBatch: async (batch2, scanner) => {
+            if (!importer) {
+              importer = createFastlinkStreamImporter(api, rootId, { ...options, commonPath: scanner.getCommonPath() });
+            }
+            await importer.consume(batch2);
+          },
+          onProgress: readProgress
+        });
+      } finally {
+        // 中途报错/取消也把已完成的指纹落盘，断点续传少重导
+        try {
+          importer?.flush();
+        } catch {
+        }
+      }
+      if (!importer) {
+        const invalid = summary?.invalid || { total: 0, reasons: { ...EMPTY_FASTLINK_INVALID_REASONS } };
+        if (invalid.total) throw new Error(`\u6CA1\u6709\u53EF\u5BFC\u5165\u7684\u6587\u4EF6\uFF1A\u5168\u90E8 ${invalid.total} \u6761\u65E0\u6548\uFF08\u8DEF\u5F84 ${invalid.reasons.path}\u3001\u9690\u85CF\u6587\u4EF6 ${invalid.reasons.hidden}\u3001Etag ${invalid.reasons.etag}\u3001\u5927\u5C0F ${invalid.reasons.size}\uFF09`);
+        throw new Error("\u79D2\u4F20\u5185\u5BB9\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55");
+      }
+      return importer.finish({ invalid: summary?.invalid || null });
     }
     return resolveAndImportFastlink(api, input?.text, rootId, options);
   }
@@ -18613,14 +19189,30 @@ ${end.comment}` : end.comment;
     return `<img src="${escapeHtml(poster)}" alt="${escapeHtml(alt || media?.title || "\u5A92\u4F53\u6D77\u62A5")}" loading="lazy" data-poster-fallback>`;
   }
   var RESULT_PAGE_SIZE = 200;
+  function fastlinkInvalidNote(result2) {
+    const invalid = Number(result2?.invalid) || 0;
+    const sanitized = Number(result2?.sanitized) || 0;
+    if (!invalid && !sanitized) return "";
+    const reasons = result2?.invalidReasons || {};
+    const parts = [];
+    if (Number(reasons.path) > 0) parts.push(`\u8DEF\u5F84 ${reasons.path}`);
+    if (Number(reasons.hidden) > 0) parts.push(`\u9690\u85CF\u6587\u4EF6 ${reasons.hidden}`);
+    if (Number(reasons.etag) > 0) parts.push(`Etag ${reasons.etag}`);
+    if (Number(reasons.size) > 0) parts.push(`\u5927\u5C0F ${reasons.size}`);
+    const detail = [];
+    if (sanitized) detail.push(`\u5DF2\u81EA\u52A8\u6E05\u7406 ${sanitized} \u6761\u8DEF\u5F84\uFF08\u8FDE\u7EED\u7A7A\u683C\u6298\u53E0\u3001\u975E\u6CD5\u5B57\u7B26\u5220\u9664\uFF09`);
+    if (invalid) detail.push(`\u8DF3\u8FC7 ${invalid} \u6761\u65E0\u6548\u6761\u76EE\uFF08${parts.join("\u3001") || "\u683C\u5F0F\u4E0D\u5408\u6CD5"}\uFF09`);
+    return `<div class="notice warning">${icon("alert", 17)}<div>${escapeHtml(detail.join("\uFF1B"))}\u3002\u79D2\u4F20\u53EA\u5BFC\u5165\u6709\u6548\u6761\u76EE\uFF0C\u4E0D\u5F71\u54CD\u5176\u4F59\u6587\u4EF6\u3002</div></div>`;
+  }
   function resultTable(result2, page = 1) {
-    const details = Array.isArray(result2.details) ? result2.details : [];
+    const details = Array.isArray(result2?.details) ? result2.details : [];
     const pages = Math.max(1, Math.ceil(details.length / RESULT_PAGE_SIZE));
     const current = Math.min(Math.max(1, Number(page) || 1), pages);
     const visible = details.slice((current - 1) * RESULT_PAGE_SIZE, current * RESULT_PAGE_SIZE);
     const rows = visible.map((item) => `<tr><td>${escapeHtml(item.path || item.targetPath || item.name || item.fileName || "")}</td><td class="${item.status === "failed" ? "danger" : item.status === "skipped" ? "warning" : "success"}">${item.status === "failed" ? "\u5931\u8D25" : item.status === "skipped" ? "\u5DF2\u8DF3\u8FC7" : "\u6210\u529F"}</td><td>${escapeHtml(item.message || "")}</td></tr>`).join("");
     const pager = pages > 1 ? `<div class="organize-pager result-pager"><button class="button compact" data-action="result-page" data-page="${current - 1}" ${current <= 1 ? "disabled" : ""}>上一页</button><span>第 ${current} / ${pages} 页 · 共 ${details.length} 项</span><button class="button compact" data-action="result-page" data-page="${current + 1}" ${current >= pages ? "disabled" : ""}>下一页</button></div>` : "";
-    return `<div class="result-summary"><div><span class="stat-icon success">${icon("check", 16)}</span><span>\u6210\u529F</span><strong>${Number(result2.ok || 0)}</strong></div><div><span class="stat-icon danger">${icon("alert", 16)}</span><span>\u5931\u8D25</span><strong>${Number(result2.fail || 0)}</strong></div></div><div class="table-wrap result-table"><table><thead><tr><th>\u9879\u76EE</th><th>\u72B6\u6001</th><th>\u8BF4\u660E</th></tr></thead><tbody>${rows}</tbody></table></div>${pager}`;
+    const skippedCount = Number(result2?.skipped) || 0;
+    return `${result2?.invalid || result2?.sanitized ? fastlinkInvalidNote(result2) : ""}<div class="result-summary"><div><span class="stat-icon success">${icon("check", 16)}</span><span>\u6210\u529F</span><strong>${Number(result2?.ok || 0)}</strong></div><div><span class="stat-icon danger">${icon("alert", 16)}</span><span>\u5931\u8D25</span><strong>${Number(result2?.fail || 0)}</strong></div>${skippedCount ? `<div><span class="stat-icon" style="color:var(--c123-muted)">${icon("restart", 16)}</span><span>\u5DF2\u5BFC\u5165\u8DF3\u8FC7</span><strong>${skippedCount}</strong></div>` : ""}</div><div class="table-wrap result-table"><table><thead><tr><th>\u9879\u76EE</th><th>\u72B6\u6001</th><th>\u8BF4\u660E</th></tr></thead><tbody>${rows}</tbody></table></div>${result2?.detailsTruncated && details.length ? `<span class="footer-note">\u5931\u8D25\u9879\u4EC5\u5C55\u793A\u524D ${details.length} \u6761\u6837\u672C\uFF0C\u5176\u4F59\u5931\u8D25\u539F\u56E0\u540C\u7C7B\u3002</span>` : ""}${pager}`;
   }
   // src/ui/views/actions.js
   function statusLabel(status) {
@@ -18670,7 +19262,7 @@ ${end.comment}` : end.comment;
     const splitPane = `${notice("\u652F\u6301\u9879\u76EE JSON\u3001123FLCPV2 \u94FE\u63A5\u548C\u65E7\u7248 V1/V2 \u6587\u672C\u3002\u6309\u76EE\u5F55\u5C42\u7EA7\u4F1A\u4E3A\u6BCF\u4E2A\u76EE\u5F55\u7EC4\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\uFF0C\u6309\u6570\u91CF\u4F1A\u6309\u6761\u76EE\u5207\u5206\uFF0C\u6309\u5B63\u96C6/\u5267\u540D\u4F1A\u4E3A\u6BCF\u90E8\u4F5C\u54C1\uFF08\u5267\u540D+\u5B63\uFF09\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\u3002", "", "download")}<div class="button-row"><button class="button" data-action="fastlink-split-file-open">${icon("folderOpen", 15)}\u9009\u62E9 JSON</button><span>${escapeHtml(state.splitFileName || "\u4E5F\u53EF\u4EE5\u76F4\u63A5\u7C98\u8D34")}</span><input id="fastlink-split-file" type="file" accept=".json,.txt,.123fastlink" hidden></div><div class="editor-surface"><textarea id="fastlink-split-input" placeholder="\u7C98\u8D34 JSON \u6216\u79D2\u4F20\u94FE\u63A5">${state.splitInput && state.splitInput.length > 2000000 ? "" : escapeHtml(state.splitInput || "")}</textarea></div>${state.splitInput && state.splitInput.length > 2000000 ? `<span class="footer-note">\u7C98\u8D34\u5185\u5BB9\u8F83\u5927\uFF08${formatBytes(stringByteSize(state.splitInput))}\uFF09\uFF0C\u5DF2\u4FDD\u7559\u4F46\u4E0D\u56DE\u663E\uFF0C\u53EF\u76F4\u63A5\u5F00\u59CB\u62C6\u5206</span>` : ""}<div class="inline-fields"><label class="field"><span>\u62C6\u5206\u65B9\u5F0F</span><select id="fastlink-split-method"><option value="folder" ${state.splitMethod === "folder" ? "selected" : ""}>\u6309\u76EE\u5F55\u5C42\u7EA7</option><option value="count" ${state.splitMethod === "count" ? "selected" : ""}>\u6309\u6587\u4EF6\u6570\u91CF</option><option value="work" ${state.splitMethod === "work" ? "selected" : ""}>\u6309\u5B63\u96C6/\u5267\u540D</option></select></label>${state.splitMethod === "work" ? "" : `<label class="field"><span>${state.splitMethod === "count" ? "\u6BCF\u4EFD\u6587\u4EF6\u6570" : "\u76EE\u5F55\u5C42\u6570"}</span><input id="fastlink-split-amount" type="number" min="1" value="${Math.max(1, Number(state.splitAmount) || 1)}"></label>`}</div>`;
     const convertPane = `${notice("\u5728 .123share \u4E0E\u9879\u76EE\u6807\u51C6 JSON \u4E4B\u95F4\u4E92\u8F6C\u3002\u8F6C\u6362\u53EA\u5728\u672C\u5730\u5B8C\u6210\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u6587\u4EF6\u3002", "", "settings")}<div class="button-row"><button class="button" data-action="fastlink-convert-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u6587\u4EF6</button><span>${escapeHtml(state.convertFileName || "\u652F\u6301 .123share / .json")}</span><input id="fastlink-convert-file" type="file" accept=".123share,.json" hidden></div><div class="editor-surface"><textarea id="fastlink-convert-input" placeholder="\u4E5F\u53EF\u4EE5\u7C98\u8D34\u6587\u4EF6\u5185\u5BB9">${escapeHtml(state.convertInput || "")}</textarea></div>${state.converted ? notice(`\u5DF2\u8F6C\u6362\u4E3A ${state.converted === "json" ? "JSON" : ".123share"} \u5E76\u5F00\u59CB\u4E0B\u8F7D\u3002`, "success", "check") : ""}`;
     const filterPane =`${notice("\u542F\u7528\u540E\uFF0C\u751F\u6210\u6216\u8F6C\u5B58\u65F6\u4F1A\u8DF3\u8FC7\u5BF9\u5E94\u6269\u5C55\u540D\u3002\u8BBE\u7F6E\u4FDD\u5B58\u5728\u9879\u76EE\u914D\u7F6E\u4E2D\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-filter="share" ${settings.filterOnShareEnabled ? "checked" : ""}>\u751F\u6210\u65F6\u542F\u7528\u8FC7\u6EE4</label><label class="check-line"><input type="checkbox" data-fastlink-filter="transfer" ${settings.filterOnTransferEnabled ? "checked" : ""}>\u8F6C\u5B58\u65F6\u542F\u7528\u8FC7\u6EE4</label></div><div class="filter-actions"><button class="button compact" data-action="fastlink-filter-all">\u5168\u9009</button><button class="button compact" data-action="fastlink-filter-none">\u5168\u4E0D\u9009</button><button class="button compact" data-action="fastlink-filter-reset">\u6062\u590D\u9ED8\u8BA4</button></div><div class="fastlink-filter-list">${filters.map((item, index) => `<label class="check-line"><input type="checkbox" data-fastlink-filter="extension" data-index="${index}" ${item.enabled ? "checked" : ""}><span>.${escapeHtml(item.ext)}</span><small>${escapeHtml(item.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B")}</small></label>`).join("")}</div>`;
-    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? settings.seedFolderName ? `${settings.seedFolderName}\uFF08${settings.seedFolderId}\uFF09` : `ID ${settings.seedFolderId}` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
+    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="check-line"><input type="checkbox" data-fastlink-setting="fastLane" ${settings.fastLane ? "checked" : ""}>\u5BFC\u5165/\u5BFC\u51FA\u76F4\u8FDE api.123278.com \u7EBF\u8DEF\uFF08\u5B9E\u6D4B 16~24 \u7EBF\u7A0B\u7EA6 150 \u6B21/\u79D2\uFF0C\u9AD8\u4E8E\u9ED8\u8BA4\u57DF\u540D\u7684 32 \u5E76\u53D1 85 \u6B21/\u79D2\uFF1B\u8BF7\u6C42\u5931\u8D25\u81EA\u52A8\u56DE\u9000\u9ED8\u8BA4\u57DF\u540D\uFF09</label><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? settings.seedFolderName ? `${settings.seedFolderName}\uFF08${settings.seedFolderId}\uFF09` : `ID ${settings.seedFolderId}` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002\u7EBF\u8DEF\u5E76\u53D1\uFF1A\u9ED8\u8BA4\u57DF\u540D\u56FA\u5B9A 32\uFF1B\u76F4\u8FDE\u7EBF\u8DEF\u4E0B\u300C\u5199\u5165\u5E76\u53D1\u300D\u8BBE\u7F6E \u226516 \u65F6\u751F\u6548\uFF0C\u5426\u5219\u7528 24\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
     const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"], ["library", "\u5F71\u5E93\u641C\u7D22", "film"]];
     const libraryPane = (() => {
       const lib = state.library ||= librarySearchState();
@@ -19250,7 +19842,8 @@ ${end.comment}` : end.comment;
   function renderPane(ui) {
     const draft = ui.settings.draft;
     if (ui.settings.picker) return renderFolderPicker(ui);
-    if (ui.settings.tab === "general") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("settings", 17)}</span><div><h3>\u5916\u89C2\u4E0E\u4EFB\u52A1</h3><p>\u4E3B\u9898\u4F1A\u5E94\u7528\u5230\u6240\u6709\u52A9\u624B\u5F39\u7A97\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u4E3B\u9898</span><select data-config="appearance.theme"><option value="system" ${draft.appearance.theme === "system" ? "selected" : ""}>\u8DDF\u968F\u7CFB\u7EDF</option><option value="light" ${draft.appearance.theme === "light" ? "selected" : ""}>\u6D45\u8272</option><option value="dark" ${draft.appearance.theme === "dark" ? "selected" : ""}>\u6DF1\u8272</option></select></label><label class="check-line"><input type="checkbox" data-config="appearance.compactRows" ${draft.appearance.compactRows ? "checked" : ""}>\u4F7F\u7528\u7D27\u51D1\u8868\u683C\u884C</label></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("waveform", 17)}</span><div><h3>\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B</h3><p>\u4EC5\u5728\u6D4F\u89C8\u5668\u672C\u5730\u901A\u8FC7 123 \u76F4\u94FE\u3001Range \u5206\u6BB5\u548C MediaInfo WASM \u89E3\u6790\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u5A92\u4F53\u5185\u5BB9\u3002</p></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("share", 17)}</span><div><h3>\u5206\u4EAB\u4E0E\u79D2\u4F20</h3><p>\u53EF\u5728\u5206\u4EAB\u521B\u5EFA\u6210\u529F\u540E\u76F4\u63A5\u53D1\u9001\u5230\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\uFF0C\u7531\u670D\u52A1\u751F\u6210\u5E76\u63A8\u9001\u6295\u7A3F\u8349\u7A3F\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u5206\u4EAB\u5230\u671F\u65F6\u95F4</span><input data-config="share.expiration" value="${escapeHtml(draft.share.expiration)}"></label><label class="field"><span>\u968F\u673A\u53E3\u4EE4\u957F\u5EA6</span><input type="number" min="1" max="8" data-config="share.passwordLength" value="${draft.share.passwordLength}"></label><label class="check-line full"><input type="checkbox" data-config="share.autoSubmitEnabled" ${draft.share.autoSubmitEnabled ? "checked" : ""}>\u5206\u4EAB\u540E\u81EA\u52A8\u63A8\u9001\u5230\u6295\u7A3F\u673A\u5668\u4EBA</label><label class="field full"><span>\u6295\u7A3F\u5730\u5740</span><input data-config="share.submissionUrl" value="${escapeHtml(draft.share.submissionUrl || "")}" placeholder="\u8BF7\u8F93\u5165\u5B8C\u6574\u6295\u7A3F\u63A5\u53E3\u5730\u5740"><small>\u811A\u672C\u4F1A\u5411\u6B64\u5730\u5740\u53D1\u9001 POST \u8BF7\u6C42\uFF1B\u53EF\u586B\u5199 123Cloud \u6216\u5176\u4ED6\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\u7684\u5B8C\u6574\u63A5\u53E3\u5730\u5740\u3002</small></label><label class="field full"><span>\u5F71\u5E93\u63A5\u53E3\u5730\u5740\uFF08123Cloud \u5BA2\u6237\u7AEF\uFF09</span><input data-config="share.libraryUrl" value="${escapeHtml(draft.share.libraryUrl || "")}" placeholder="\u4F8B\u5982 http://127.0.0.1:62156\uFF0C\u53EF\u5E26 ?token="><small>\u586B\u5BA2\u6237\u7AEF\u5730\u5740\u5373\u53EF\uFF0C\u7AEF\u53E3\u770B\u5BA2\u6237\u7AEF\u300C\u8BBE\u7F6E \u2192 \u670D\u52A1\u7AEF\u53E3\u300D\uFF08\u540C\u6295\u7A3F\u7AEF\u53E3\uFF09\uFF1B\u54EA\u91CC\u80FD\u8FDE\u4E0A\u5C31\u586B\u54EA\u91CC\uFF0C\u7528\u4E8E\u79D2\u4F20\u5DE5\u5177\u7BB1\u7684\u300C\u5F71\u5E93\u641C\u7D22\u300D\u3002</small></label><label class="field"><span>\u5F71\u5E93\u8BBF\u95EE\u4EE4\u724C</span><input data-config="share.libraryToken" value="${escapeHtml(draft.share.libraryToken || "")}" placeholder="\u5BA2\u6237\u7AEF\u300C\u5F71\u5E93\uFF0D\u5F71\u5E93\u8BBE\u7F6E\u300D\u91CC\u751F\u6210\uFF0C\u672A\u8BBE\u7F6E\u53EF\u7559\u7A7A"></label></div></div></div>`;
+    const sessionSection = `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("link", 17)}</span><div><h3>\u767B\u5F55\u4F1A\u8BDD\u590D\u7528</h3><p>\u5BFC\u51FA\u5F53\u524D\u6D4F\u89C8\u5668\u7684\u767B\u5F55\u4F1A\u8BDD\uFF0C\u5728\u5176\u4ED6\u6D4F\u89C8\u5668\u5BFC\u5165\u540E\u5171\u7528\u540C\u4E00\u4F1A\u8BDD\uFF0C\u4E0D\u518D\u6BCF\u4E2A\u6D4F\u89C8\u5668\u767B\u5F55\u90FD\u65B0\u589E\u4E00\u53F0\u8BBE\u5907\u3002</p></div></div><div class="form-card"><div class="button-row"><button class="button" data-action="session-export">${icon("download", 15)}\u5BFC\u51FA\u5F53\u524D\u4F1A\u8BDD\u5230\u526A\u8D34\u677F</button><button class="button" data-action="session-import">${icon("import", 15)}\u5BFC\u5165\u4F1A\u8BDD\uFF08\u7C98\u8D34\uFF09</button></div><small>\u5176\u4ED6\u6D4F\u89C8\u5668\u4E5F\u53EF\u7528\u6CB9\u7334\u83DC\u5355\u300C\u5BFC\u5165\u767B\u5F55\u4F1A\u8BDD\u300D\uFF08\u672A\u767B\u5F55\u9875\u9762\u4E5F\u80FD\u7528\uFF09\u3002\u4F1A\u8BDD\u8FC7\u671F\u540E\u9700\u91CD\u65B0\u5BFC\u51FA\u5BFC\u5165\uFF1B\u5BFC\u5165\u4F1A\u7ACB\u5373\u8986\u76D6\u672C\u6D4F\u89C8\u5668\u767B\u5F55\u5E76\u5237\u65B0\u9875\u9762\u3002</small></div></div>`;
+    if (ui.settings.tab === "general") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("settings", 17)}</span><div><h3>\u5916\u89C2\u4E0E\u4EFB\u52A1</h3><p>\u4E3B\u9898\u4F1A\u5E94\u7528\u5230\u6240\u6709\u52A9\u624B\u5F39\u7A97\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u4E3B\u9898</span><select data-config="appearance.theme"><option value="system" ${draft.appearance.theme === "system" ? "selected" : ""}>\u8DDF\u968F\u7CFB\u7EDF</option><option value="light" ${draft.appearance.theme === "light" ? "selected" : ""}>\u6D45\u8272</option><option value="dark" ${draft.appearance.theme === "dark" ? "selected" : ""}>\u6DF1\u8272</option></select></label><label class="check-line"><input type="checkbox" data-config="appearance.compactRows" ${draft.appearance.compactRows ? "checked" : ""}>\u4F7F\u7528\u7D27\u51D1\u8868\u683C\u884C</label></div></div></div>${sessionSection}<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("waveform", 17)}</span><div><h3>\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B</h3><p>\u4EC5\u5728\u6D4F\u89C8\u5668\u672C\u5730\u901A\u8FC7 123 \u76F4\u94FE\u3001Range \u5206\u6BB5\u548C MediaInfo WASM \u89E3\u6790\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u5A92\u4F53\u5185\u5BB9\u3002</p></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("share", 17)}</span><div><h3>\u5206\u4EAB\u4E0E\u79D2\u4F20</h3><p>\u53EF\u5728\u5206\u4EAB\u521B\u5EFA\u6210\u529F\u540E\u76F4\u63A5\u53D1\u9001\u5230\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\uFF0C\u7531\u670D\u52A1\u751F\u6210\u5E76\u63A8\u9001\u6295\u7A3F\u8349\u7A3F\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u5206\u4EAB\u5230\u671F\u65F6\u95F4</span><input data-config="share.expiration" value="${escapeHtml(draft.share.expiration)}"></label><label class="field"><span>\u968F\u673A\u53E3\u4EE4\u957F\u5EA6</span><input type="number" min="1" max="8" data-config="share.passwordLength" value="${draft.share.passwordLength}"></label><label class="check-line full"><input type="checkbox" data-config="share.autoSubmitEnabled" ${draft.share.autoSubmitEnabled ? "checked" : ""}>\u5206\u4EAB\u540E\u81EA\u52A8\u63A8\u9001\u5230\u6295\u7A3F\u673A\u5668\u4EBA</label><label class="field full"><span>\u6295\u7A3F\u5730\u5740</span><input data-config="share.submissionUrl" value="${escapeHtml(draft.share.submissionUrl || "")}" placeholder="\u8BF7\u8F93\u5165\u5B8C\u6574\u6295\u7A3F\u63A5\u53E3\u5730\u5740"><small>\u811A\u672C\u4F1A\u5411\u6B64\u5730\u5740\u53D1\u9001 POST \u8BF7\u6C42\uFF1B\u53EF\u586B\u5199 123Cloud \u6216\u5176\u4ED6\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\u7684\u5B8C\u6574\u63A5\u53E3\u5730\u5740\u3002</small></label><label class="field full"><span>\u5F71\u5E93\u63A5\u53E3\u5730\u5740\uFF08123Cloud \u5BA2\u6237\u7AEF\uFF09</span><input data-config="share.libraryUrl" value="${escapeHtml(draft.share.libraryUrl || "")}" placeholder="\u4F8B\u5982 http://127.0.0.1:62156\uFF0C\u53EF\u5E26 ?token="><small>\u586B\u5BA2\u6237\u7AEF\u5730\u5740\u5373\u53EF\uFF0C\u7AEF\u53E3\u770B\u5BA2\u6237\u7AEF\u300C\u8BBE\u7F6E \u2192 \u670D\u52A1\u7AEF\u53E3\u300D\uFF08\u540C\u6295\u7A3F\u7AEF\u53E3\uFF09\uFF1B\u54EA\u91CC\u80FD\u8FDE\u4E0A\u5C31\u586B\u54EA\u91CC\uFF0C\u7528\u4E8E\u79D2\u4F20\u5DE5\u5177\u7BB1\u7684\u300C\u5F71\u5E93\u641C\u7D22\u300D\u3002</small></label><label class="field"><span>\u5F71\u5E93\u8BBF\u95EE\u4EE4\u724C</span><input data-config="share.libraryToken" value="${escapeHtml(draft.share.libraryToken || "")}" placeholder="\u5BA2\u6237\u7AEF\u300C\u5F71\u5E93\uFF0D\u5F71\u5E93\u8BBE\u7F6E\u300D\u91CC\u751F\u6210\uFF0C\u672A\u8BBE\u7F6E\u53EF\u7559\u7A7A"></label></div></div></div>`;
     if (ui.settings.tab === "tmdb") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("cloud", 17)}</span><div><h3>TMDB \u8FDE\u63A5</h3><p>\u7528\u4E8E\u5A92\u4F53\u6D77\u62A5\u3001\u6807\u9898\u3001\u5E74\u4EFD\u548C\u5267\u96C6\u4FE1\u606F\u3002</p></div></div>${notice("\u4EE5 ey \u5F00\u5934\u7684\u503C\u6309 Read Access Token \u4F7F\u7528\uFF0C\u5176\u4ED6\u503C\u6309 v3 API Key \u4F7F\u7528\u3002\u65E0\u6CD5\u76F4\u8FDE TMDB \u65F6\u53EF\u586B\u5199\u4E0B\u65B9\u7684\u7B2C\u4E09\u65B9\u66FF\u4EE3\u6E90\uFF08\u81EA\u5EFA\u53CD\u4EE3/\u955C\u50CF\u5730\u5740\uFF0C\u586B\u5230\u542B /3 \u4E3A\u6B62\uFF1B\u53EA\u586B\u57DF\u540D\u4F1A\u81EA\u52A8\u8865 /3\uFF0Chttps:// \u524D\u7F00\u53EF\u7701\u7565\uFF09\uFF0C\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9\u6E90\u3002", "", "cloud")}<div class="form-card"><div class="form-grid"><label class="field full"><span>API Key / Read Access Token</span><input type="password" autocomplete="off" data-config="tmdb.credential" value="${escapeHtml(draft.tmdb.credential)}"></label><label class="field full"><span>TMDB \u66FF\u4EE3\u6E90\uFF08\u65E0\u6CD5\u76F4\u8FDE\u65F6\u4F7F\u7528\uFF09</span><input data-config="tmdb.apiBase" value="${escapeHtml(draft.tmdb.apiBase || "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9 api.themoviedb.org" spellcheck="false" autocomplete="off"></label><label class="field"><span>\u8BED\u8A00</span><input data-config="tmdb.language" value="${escapeHtml(draft.tmdb.language)}"></label><label class="field"><span>\u5730\u533A</span><input data-config="tmdb.region" value="${escapeHtml(draft.tmdb.region)}"></label></div></div><button class="button" data-action="tmdb-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>`;
     if (ui.settings.tab === "library") return renderLibrary(ui);
     if (ui.settings.tab === "naming") return renderNaming(ui);
@@ -20845,6 +21438,10 @@ ${end.comment}` : end.comment;
     }
     async runFastlinkTask(kind, worker) {
       const task = this.startFastlinkTask(kind);
+      // 秒传线路窗口：导入/导出任务期间把网盘请求切到镜像域名（api.123278.com），
+      // 任务结束（含失败/取消）恢复；request() 内置故障回退，撞坏自动摘除
+      const laneWanted = ["import", "cloudImport", "export"].includes(kind) && (this.config.fastlinkTools || {}).fastLane === true && !fastlaneState.dead;
+      if (laneWanted) this.api.laneHost = FASTLANE_HOST;
       try {
         return { task, result: await this.runTask(worker, { backgroundTask: task }) };
       } catch (error) {
@@ -20857,6 +21454,8 @@ ${end.comment}` : end.comment;
         }
         if (backgrounded) return { task, error };
         throw error;
+      } finally {
+        if (laneWanted) this.api.laneHost = "";
       }
     }
     minimizeBackgroundTask() {
@@ -21454,6 +22053,11 @@ ${end.comment}` : end.comment;
       if (outcome.error) return;
       const result2 = outcome.result;
       if (Number(result2?.skipped) > 0) this.toast(`\u5DF2\u8DF3\u8FC7\u4E0A\u6B21\u6210\u529F\u5BFC\u5165\u7684 ${result2.skipped} \u9879`, "info");
+      if (Number(result2?.invalid) > 0 || Number(result2?.sanitized) > 0) {
+        const parts = [`${result2.invalid} \u6761\u65E0\u6548\u6761\u76EE\u5DF2\u8DF3\u8FC7`];
+        if (Number(result2?.sanitized) > 0) parts.push(`${result2.sanitized} \u6761\u8DEF\u5F84\u5DF2\u81EA\u52A8\u6E05\u7406\u540E\u5BFC\u5165`);
+        this.toast(`\u5171 ${parts.join("\uFF0C")}\uFF0C\u8BE6\u89C1\u5BFC\u5165\u7ED3\u679C`, "info");
+      }
       this.bridge.refresh();
       if (this.completeFastlinkTask(outcome.task, result2)) return;
       this.setResult("\u79D2\u4F20\u5BFC\u5165\u7ED3\u679C", result2);
@@ -21646,6 +22250,11 @@ ${end.comment}` : end.comment;
       if (outcome.error) return;
       const result2 = outcome.result;
       if (Number(result2?.skipped) > 0) this.toast(`\u5DF2\u8DF3\u8FC7\u4E0A\u6B21\u6210\u529F\u5BFC\u5165\u7684 ${result2.skipped} \u9879`, "info");
+      if (Number(result2?.invalid) > 0 || Number(result2?.sanitized) > 0) {
+        const parts = [`${result2.invalid} \u6761\u65E0\u6548\u6761\u76EE\u5DF2\u8DF3\u8FC7`];
+        if (Number(result2?.sanitized) > 0) parts.push(`${result2.sanitized} \u6761\u8DEF\u5F84\u5DF2\u81EA\u52A8\u6E05\u7406\u540E\u5BFC\u5165`);
+        this.toast(`\u5171 ${parts.join("\uFF0C")}\uFF0C\u8BE6\u89C1\u5BFC\u5165\u7ED3\u679C`, "info");
+      }
       this.bridge.refresh();
       if (this.completeFastlinkTask(outcome.task, result2)) return;
       this.setResult("\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58\u7ED3\u679C", result2);
@@ -23195,6 +23804,8 @@ ${end.comment}` : end.comment;
         },
         "config-export": () => this.exportConfig(),
         "config-import": () => this.importConfig(),
+        "session-export": () => this.exportLoginSession(),
+        "session-import": () => this.importLoginSessionDialog(),
         "config-reset": () => {
           this.settings.draft = structuredClone(DEFAULT_CONFIG);
           this.settings.categoryType = "movie";
@@ -23275,6 +23886,23 @@ ${end.comment}` : end.comment;
       const text2 = this.configStore.export({ includeSecrets });
       this.configStore.set(previous);
       downloadText("123-helper-config.json", text2);
+    }
+    exportLoginSession() {
+      try {
+        const payload = buildSessionExportPayload();
+        if (typeof GM_setClipboard === "function") GM_setClipboard(payload, "text");
+        else this.toast("\u526A\u8D34\u677F\u4E0D\u53EF\u7528\uFF0C\u8BF7\u7528\u6CB9\u7334\u83DC\u5355\u91CD\u8BD5", "error");
+        this.toast("\u767B\u5F55\u4F1A\u8BDD\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F\uFF0C\u5230\u5176\u4ED6\u6D4F\u89C8\u5668\u300C\u5BFC\u5165\u4F1A\u8BDD\u300D\u7C98\u8D34\u5373\u53EF\u590D\u7528", "success");
+      } catch (error) {
+        this.toast(error.message, "error");
+      }
+    }
+    importLoginSessionDialog() {
+      this.openInputDialog("\u5BFC\u5165\u767B\u5F55\u4F1A\u8BDD", [{ key: "session", label: "\u7C98\u8D34\u5BFC\u51FA\u7684\u4F1A\u8BDD\u5185\u5BB9\uFF08JSON \u6216 token|uuid\uFF09" }], ({ session }) => {
+        applySessionImportPayload(session);
+        this.toast("\u4F1A\u8BDD\u5DF2\u5199\u5165\uFF0C\u9875\u9762\u5373\u5C06\u5237\u65B0", "success");
+        setTimeout(() => location.reload(), 800);
+      }, "\u5BFC\u5165\u5E76\u5237\u65B0");
     }
     importConfig() {
       const input = this.root.querySelector("#config-file");
@@ -23817,7 +24445,9 @@ ${end.comment}` : end.comment;
   // src/main.js
   function isOfficialPanPortalHost(hostname = location.hostname) {
     const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
-    return /^(?:(?:www|yun)\.)?(?:123pan\.(?:com|cn)|123912\.com|123635\.com|123865\.com|123684\.com)$/.test(host);
+    // user. 是登录/账号域名：脚本要在未登录状态也能在这里跑起来（会话导入入口），
+    // 否则「导入登录会话」必须先登录才能用，登录本身又新增设备，复用就失去意义
+    return /^(?:(?:www|yun|user)\.)?(?:123pan\.(?:com|cn)|123912\.com|123635\.com|123865\.com|123684\.com)$/.test(host);
   }
   (() => {
     "use strict";
@@ -23836,7 +24466,10 @@ ${end.comment}` : end.comment;
         const configStore = new ConfigStore();
         const config = configStore.get();
         installPageStyles();
+        // user. 登录域名不服务 /b/api 接口：脚本 API 一律回落 www.123pan.cn
+        const apiHost = String(location.hostname || "").toLowerCase().startsWith("user.") ? "https://www.123pan.cn" : void 0;
         const api = new Pan123Api({
+          host: apiHost,
           retryAttempts: config.requests.retryAttempts,
           writeConcurrency: config.requests.writeConcurrency
         });
@@ -23846,6 +24479,7 @@ ${end.comment}` : end.comment;
         const ui = new AssistantUi({ api, bridge, configStore, tmdb, metadata });
         ui.init();
         registerSettingsMenu(ui);
+        registerSessionMenu();
         bridge.init();
       } catch (error) {
         console.error("[123 \u52A9\u624B] \u542F\u52A8\u5931\u8D25", error);
