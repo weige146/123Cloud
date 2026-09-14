@@ -2,6 +2,8 @@ const { app, BrowserWindow, Menu, ipcMain, shell, dialog, nativeTheme } = requir
 const fs = require("fs");
 const path = require("path");
 const net = require("net");
+const os = require("os");
+const { spawn } = require("child_process");
 const { BackendManager } = require("./backend.cjs");
 
 const DEV_URL = process.env.CLOUD123_DEV_URL || "";
@@ -69,13 +71,17 @@ let dataDir = "";
 let fixedPort = null;
 
 // ===== 自动更新 =====
-// GitHub 有新 Release 时自动检测并后台下载；macOS 无正式签名（ad-hoc），
-// Squirrel 静默换包不可用，quitAndInstall 会退化为打开已下载的 DMG 引导拖装；
-// Windows NSIS 为静默安装。所有事件同步给渲染层，由设置页展示状态。
+// GitHub 有新 Release 时自动检测并后台下载（electron-updater + GitHub provider，
+// 依赖 Release 里的 latest*.yml 与安装包；mac 产物必须是 dmg+zip 双 target，缺 zip
+// 时 MacUpdater 直接抛 ERR_UPDATER_ZIP_FILE_NOT_FOUND）。本应用只有 ad-hoc 签名，
+// Squirrel.Mac 换包会校验签名、过不了，因此 macOS 只用 electron-updater 下载与
+// sha512 校验，安装走自定义脚本（installMacUpdateBySwap）：退出应用 → 解压换包 →
+// 重新拉起；Windows 由 NsisUpdater 静默安装。所有事件同步给渲染层，由设置页展示状态。
 let updateState = { status: "idle", info: null, error: "" };
 let updateTimer = null;
 let updateCheckRunner = null;
 let lastSeenLatest = "";
+let downloadedUpdateFile = "";
 
 const RELEASES_LATEST_API = "https://api.github.com/repos/weige146/123Cloud/releases/latest";
 
@@ -125,7 +131,10 @@ function setupAutoUpdater() {
     return;
   }
   autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
+  // macOS 的安装由自定义换包脚本接管（见 app:installUpdate），不能让 MacUpdater
+  // 把更新递给 Squirrel（下载完成时它就会开始签名校验然后报错）；Windows 保持
+  // 退出时自动静默安装
+  autoUpdater.autoInstallOnAppQuit = process.platform !== "darwin";
   autoUpdater.on("checking-for-update", () => setUpdateStatus("checking"));
   autoUpdater.on("update-available", (info) => setUpdateStatus("downloading", { info: { version: info.version } }));
   autoUpdater.on("update-not-available", (info) => setUpdateStatus("none", { info: { version: info && info.version } }));
@@ -133,7 +142,11 @@ function setupAutoUpdater() {
     updateState = { ...updateState, status: "downloading", percent: Math.round(progress.percent || 0) };
     sendUpdateStatus();
   });
-  autoUpdater.on("update-downloaded", (info) => setUpdateStatus("downloaded", { info: { version: info && info.version } }));
+  autoUpdater.on("update-downloaded", (info) => {
+    // macOS 自定义换包要用下载产物路径；zip 已由 electron-updater 完成 sha512 校验
+    downloadedUpdateFile = (info && info.downloadedFile) || "";
+    setUpdateStatus("downloaded", { info: { version: info && info.version } });
+  });
   autoUpdater.on("error", (error) => {
     // 错误可能只通过事件报告（promise 不 reject），也可能两条路径都触发；
     // 已处于更明确的状态时不覆盖
@@ -172,6 +185,61 @@ function setupAutoUpdater() {
   setTimeout(() => { runUpdateCheck().catch(() => {}); }, 10_000);
   updateTimer = setInterval(() => { runUpdateCheck().catch(() => {}); }, 6 * 60 * 60 * 1000);
   updateCheckRunner = runUpdateCheck;
+}
+
+// macOS 换包安装：electron-updater 已下载并校验过的 zip 交给独立脚本，等本进程
+// 完全退出（含后端 sidecar）后解压、原地换掉 .app、重新 open。独立进程是为了
+// 在应用退出后还能继续收尾；日志落 dataDir/update-install.log 便于排查。
+function installMacUpdateBySwap() {
+  if (!downloadedUpdateFile || !fs.existsSync(downloadedUpdateFile)) {
+    setUpdateStatus("error", { error: "更新包缓存已失效，请重新检查更新" });
+    return false;
+  }
+  const bundlePath = path.dirname(path.dirname(path.dirname(process.execPath)));
+  const installDir = path.dirname(bundlePath);
+  try {
+    fs.accessSync(installDir, fs.constants.W_OK);
+  } catch {
+    setUpdateStatus("error", { error: "安装目录不可写，请把应用移回「应用程序」文件夹后重试，或到发布页手动下载安装" });
+    return false;
+  }
+  const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+  const logPath = path.join(dataDir, "update-install.log");
+  const script = [
+    "#!/bin/bash",
+    `exec >> ${shellQuote(logPath)} 2>&1`,
+    `echo "[123cloud] $(date '+%F %T') install update from ${downloadedUpdateFile}"`,
+    `ZIP=${shellQuote(downloadedUpdateFile)}`,
+    `DEST=${shellQuote(installDir)}`,
+    `BUNDLE=${shellQuote(path.basename(bundlePath))}`,
+    `APP_PID=${shellQuote(String(process.pid))}`,
+    `APP_PATH="$DEST/$BUNDLE"`,
+    `BACKUP="$DEST/.123Cloud-update-backup"`,
+    `STAGE=$(mktemp -d "$DEST/.123Cloud-stage.XXXXXX") || exit 1`,
+    `while kill -0 "$APP_PID" 2>/dev/null; do sleep 0.5; done`,
+    `sleep 1`,
+    `ditto -x -k "$ZIP" "$STAGE" || { rm -rf "$STAGE"; exit 1; }`,
+    `STAGED_APP=$(find "$STAGE" -maxdepth 1 -name '*.app' -print -quit)`,
+    `[ -n "$STAGED_APP" ] || { rm -rf "$STAGE"; exit 1; }`,
+    `rm -rf "$BACKUP"`,
+    `mv "$APP_PATH" "$BACKUP"`,
+    `if mv "$STAGED_APP" "$APP_PATH"; then`,
+    `  rm -rf "$BACKUP" "$STAGE"`,
+    `else`,
+    `  mv "$BACKUP" "$APP_PATH"`,
+    `  rm -rf "$STAGE"`,
+    `  exit 1`,
+    `fi`,
+    `sleep 1`,
+    `open "$APP_PATH"`,
+    `echo "[123cloud] $(date '+%F %T') update installed"`,
+    "",
+  ].join("\n");
+  const scriptPath = path.join(os.tmpdir(), `123cloud-update-${Date.now()}.sh`);
+  fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+  const child = spawn("/bin/bash", [scriptPath], { detached: true, stdio: "ignore" });
+  child.unref();
+  return true;
 }
 
 function configPath() {
@@ -486,12 +554,32 @@ function registerIpc() {
     if (updateCheckRunner) await updateCheckRunner().catch(() => {});
     return updateState;
   });
-  ipcMain.handle("app:installUpdate", () => {
+  ipcMain.handle("app:installUpdate", async () => {
     if (updateState.status !== "downloaded") return false;
+    if (process.platform === "darwin") {
+      // ad-hoc 签名过不了 Squirrel.Mac 校验：退出前由独立脚本换包并重新拉起。
+      // app.exit() 不触发 before-quit，须先像 app:relaunchApp 一样手动停后端
+      if (!installMacUpdateBySwap()) return false;
+      try {
+        await backend.stop();
+      } catch (error) {
+        console.error("[123cloud] backend stop before update install failed:", error);
+      }
+      setUpdateStatus("installing");
+      app.exit(0);
+      return true;
+    }
+    try {
+      // Windows：quitAndInstall 会先拉起 NSIS 静默安装器、之后才退出应用，sidecar
+      // （cloudgateway.exe）不先停干净会锁住安装目录里的文件，导致静默安装失败
+      await backend.stop();
+    } catch (error) {
+      console.error("[123cloud] backend stop before update install failed:", error);
+    }
     try {
       const { autoUpdater } = require("electron-updater");
       setUpdateStatus("installing");
-      // Windows：静默安装并在完成后自动启动新版本；macOS：退出后打开已下载的 DMG
+      // 静默安装并在完成后自动启动新版本
       autoUpdater.quitAndInstall(true, true);
     } catch (error) {
       setUpdateStatus("error", { error: String((error && error.message) || error) });

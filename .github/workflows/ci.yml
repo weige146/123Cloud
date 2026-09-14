@@ -119,6 +119,7 @@ jobs:
           name: 123Cloud-macOS-${{ github.ref_name }}
           path: |
             desktop/release/*.dmg
+            desktop/release/*.zip
             desktop/release/*.blockmap
             desktop/release/latest-mac.yml
           if-no-files-found: error
@@ -152,4 +153,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "123Cloud ${{ github.ref_name }}" \
             --generate-notes \
-            $(find artifacts -type f \( -name "*.dmg" -o -name "*.exe" -o -name "*.blockmap" -o -name "latest*.yml" \))
+            $(find artifacts -type f \( -name "*.dmg" -o -name "*.zip" -o -name "*.exe" -o -name "*.blockmap" -o -name "latest*.yml" \))

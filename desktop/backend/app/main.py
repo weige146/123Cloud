@@ -53,7 +53,7 @@ from .pan123 import (
 )
 from .pan115_transfer import extract_115_links
 from .panlink import browse_pan123_dir, list_pan123_links, proxy_pan123_download, submit_pan123_offline
-from .session_store import SessionStore, positive_user_ids
+from .session_store import SessionStore, positive_user_ids, utc_now_iso
 from . import sha1_cloud, sha1_pool
 from .submission import (
     build_submission_display_preview,
@@ -2037,6 +2037,79 @@ def _guard_library_token(request: Request, provided: str = "") -> None:
     if supplied and hmac.compare_digest(supplied, expected):
         return
     raise HTTPException(status_code=401, detail="影库访问令牌不正确：请在客户端设置里核对令牌")
+
+
+# ===== 网页端登录会话中转（123 助手「会话复用」）=====
+# 已登录浏览器把网页会话（authorToken + LoginUuid）推给客户端存档，同机/局域网内
+# 其他浏览器从客户端拉取登录，免去剪贴板来回倒。凭据敏感：鉴权与影库接口同门
+# （配置了影库访问令牌就必须携带），后端默认只监听 127.0.0.1。
+PAN_WEB_SESSION_KEY = "pan_web_session"
+
+
+class PanWebSessionRequest(BaseModel):
+    authorToken: str = ""
+    loginUuid: str = ""
+    account: str = ""
+    origin: str = ""
+    token: str = ""
+
+
+def _normalize_pan_session_origin(origin: str) -> str:
+    """记录推送来源的网盘页 origin（如 https://yun.123pan.cn），拉取端据此跳转。"""
+    raw = str(origin or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _pan_web_session_payload() -> Dict[str, Any]:
+    raw = store.read_value(PAN_WEB_SESSION_KEY)
+    data = raw if isinstance(raw, dict) else {}
+    return {
+        "authorToken": str(data.get("authorToken") or ""),
+        "loginUuid": str(data.get("loginUuid") or ""),
+        "account": str(data.get("account") or ""),
+        "origin": str(data.get("origin") or ""),
+        "updatedAt": str(data.get("updatedAt") or ""),
+    }
+
+
+@app.get("/api/pan/session")
+async def read_pan_web_session(request: Request, token: str = "") -> Dict[str, Any]:
+    _guard_library_token(request, token)
+    payload = _pan_web_session_payload()
+    return {"ok": True, "empty": not payload["authorToken"], "session": payload}
+
+
+@app.post("/api/pan/session")
+async def write_pan_web_session(request: Request, body: PanWebSessionRequest, token: str = "") -> Dict[str, Any]:
+    # 令牌可走 query（脚本统一把 token 拼在 URL 上）或 body.token，其一即可
+    _guard_library_token(request, token or body.token)
+    author_token = str(body.authorToken or "").strip()
+    login_uuid = str(body.loginUuid or "").strip()
+    if not author_token or not login_uuid:
+        raise HTTPException(status_code=400, detail="会话不完整：需要同时携带 authorToken 与 LoginUuid")
+    payload = {
+        "authorToken": author_token,
+        "loginUuid": login_uuid,
+        "account": str(body.account or "").strip(),
+        "origin": _normalize_pan_session_origin(body.origin),
+        "updatedAt": utc_now_iso(),
+    }
+    store.write_value(PAN_WEB_SESSION_KEY, payload)
+    safe = dict(payload)
+    safe["authorToken"] = f"{author_token[:8]}…({len(author_token)} chars)"
+    return {"ok": True, "session": safe}
+
+
+@app.delete("/api/pan/session")
+async def clear_pan_web_session(request: Request, token: str = "") -> Dict[str, Any]:
+    _guard_library_token(request, token)
+    store.delete_value(PAN_WEB_SESSION_KEY)
+    return {"ok": True}
 
 
 def _split_lib_filter(lib: str) -> Optional[List[str]]:

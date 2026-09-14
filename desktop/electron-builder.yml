@@ -33,8 +33,11 @@ mac:
   category: public.app-category.utilities
   identity: null
   artifactName: ${productName}-${version}-macOS-arm64.${ext}
+  # dmg 供首次/手动安装；zip 是 electron-updater 唯一认的 mac 自动更新产物
+  # （缺 zip 时 MacUpdater 抛 ERR_UPDATER_ZIP_FILE_NOT_FOUND，latest-mac.yml 也会列出）
   target:
     - target: dmg
+    - target: zip
   darkModeSupport: true
 
 dmg:
