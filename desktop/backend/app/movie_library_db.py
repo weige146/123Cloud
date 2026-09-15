@@ -16,7 +16,10 @@ import re
 import sqlite3
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .movie_library import VIDEO_EXT, fmt_size, norm, parse_dir_name, pinyin_keys, split_category, split_work, video_ext_set
+from .movie_library import (
+    VIDEO_EXT, fmt_size, new_tech_state, norm, parse_dir_name, pinyin_keys,
+    split_category, split_work, tech_result, update_tech_state, video_ext_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,19 @@ CREATE TABLE IF NOT EXISTS library_works (
     file_count INTEGER NOT NULL DEFAULT 0,
     video_count INTEGER NOT NULL DEFAULT 0,
     total_size INTEGER NOT NULL DEFAULT 0,
+    resolution TEXT NOT NULL DEFAULT '',
+    edition TEXT NOT NULL DEFAULT '',
+    media_type TEXT NOT NULL DEFAULT '',
+    genres TEXT NOT NULL DEFAULT '[]',
+    region TEXT NOT NULL DEFAULT '',
+    poster_path TEXT NOT NULL DEFAULT '',
+    vote_average REAL NOT NULL DEFAULT 0,
+    overview TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '',
+    air_status TEXT NOT NULL DEFAULT '',
+    popularity REAL NOT NULL DEFAULT 0,
+    tmdb_status TEXT NOT NULL DEFAULT 'none',
+    enrich_attempts INTEGER NOT NULL DEFAULT 0,
     source TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS library_work_files (
@@ -70,6 +86,49 @@ class LibraryDb:
         self.db_path = str(db_path)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """幂等迁移：给旧库 library_works 补分类/充实列、建新列索引、回填 tmdb_status。
+
+        新库 _SCHEMA 已含全部列与旧索引；旧库 CREATE IF NOT EXISTS 不生效，
+        新列在此 ALTER 补齐后，再安全创建依赖新列的索引。"""
+        new_columns = {
+            "media_type": "TEXT NOT NULL DEFAULT ''",
+            "genres": "TEXT NOT NULL DEFAULT '[]'",
+            "region": "TEXT NOT NULL DEFAULT ''",
+            "poster_path": "TEXT NOT NULL DEFAULT ''",
+            "vote_average": "REAL NOT NULL DEFAULT 0",
+            "overview": "TEXT NOT NULL DEFAULT ''",
+            "resolution": "TEXT NOT NULL DEFAULT ''",
+            "edition": "TEXT NOT NULL DEFAULT ''",
+            "language": "TEXT NOT NULL DEFAULT ''",
+            "air_status": "TEXT NOT NULL DEFAULT ''",
+            "popularity": "REAL NOT NULL DEFAULT 0",
+            "tmdb_status": "TEXT NOT NULL DEFAULT 'none'",
+            "enrich_attempts": "INTEGER NOT NULL DEFAULT 0",
+        }
+        with self._connect() as conn:
+            existing = {str(r[1]) for r in conn.execute("PRAGMA table_info(library_works)").fetchall()}
+            for name, decl in new_columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE library_works ADD COLUMN {name} {decl}")
+            for stmt in (
+                "CREATE INDEX IF NOT EXISTS idx_library_works_tmdb_status ON library_works(tmdb_status)",
+                "CREATE INDEX IF NOT EXISTS idx_library_works_media_type ON library_works(media_type)",
+                "CREATE INDEX IF NOT EXISTS idx_library_works_region ON library_works(region)",
+                "CREATE INDEX IF NOT EXISTS idx_library_works_year ON library_works(year)",
+                "CREATE INDEX IF NOT EXISTS idx_library_works_language ON library_works(language)",
+                "CREATE INDEX IF NOT EXISTS idx_library_works_air_status ON library_works(air_status)",
+                "CREATE INDEX IF NOT EXISTS idx_library_works_resolution ON library_works(resolution)",
+                "CREATE INDEX IF NOT EXISTS idx_library_works_edition ON library_works(edition)",
+            ):
+                conn.execute(stmt)
+            # 有 tmdb_id 却仍是默认状态的行（旧数据）排进回填队列；无 id 的落 none
+            conn.execute(
+                "UPDATE library_works SET tmdb_status = 'pending'"
+                " WHERE tmdb_id IS NOT NULL AND (tmdb_status IS NULL OR tmdb_status = 'none')"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30)
@@ -112,9 +171,12 @@ class LibraryDb:
                     cat, sub = split_category(work_dir)
                     connection.execute(
                         "INSERT INTO library_works (dir, title, norm_title, year, tmdb_id, cat, sub, pinyin, pinyin_first,"
-                        " file_count, video_count, total_size, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        " file_count, video_count, total_size, resolution, edition, tmdb_status, source)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (work_dir, info["title"], norm(info["title"]), info["year"], info["tmdb_id"], cat, sub,
-                         info["pinyin"], info["pinyin_first"], info["count"], info["video_count"], info["total_size"], name),
+                         info["pinyin"], info["pinyin_first"], info["count"], info["video_count"], info["total_size"],
+                         info.get("resolution") or "", info.get("edition") or "",
+                         "pending" if info["tmdb_id"] else "none", name),
                     )
                     for f in info["files"]:
                         fpath = str(f.get("path") or "")
@@ -174,6 +236,7 @@ class LibraryDb:
         imported_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
         fallback_root = common_path.rsplit("/", 1)[-1] if common_path else ""
         stats: Dict[str, List[int]] = {}
+        tech: Dict[str, Dict[str, Any]] = {}
         verdicts: Dict[str, bool] = {}
         added_files = added_size = 0
         connection = self._connect()
@@ -209,6 +272,8 @@ class LibraryDb:
                     g[0] += 1
                     g[1] += is_video
                     g[2] += size
+                    if is_video:
+                        update_tech_state(tech.setdefault(root, new_tech_state()), fname)
                     if len(batch) >= batch_size:
                         connection.executemany(
                             "INSERT OR REPLACE INTO library_work_files (dir, path, file_name, etag, size, s3_key_flag, is_video)"
@@ -228,12 +293,15 @@ class LibraryDb:
                     cat, sub = split_category(root)
                     title, year, tmdb_id = parse_dir_name(root)
                     pinyin_full, pinyin_first = pinyin_keys(title)
+                    resolution, edition = tech_result(tech.get(root) or new_tech_state())
                     work_rows.append((root, title, norm(title), year, tmdb_id, cat, sub,
-                                      pinyin_full, pinyin_first, count, video_count, total_size, name))
+                                      pinyin_full, pinyin_first, count, video_count, total_size,
+                                      resolution, edition, "pending" if tmdb_id else "none", name))
                 if work_rows:
                     connection.executemany(
                         "INSERT INTO library_works (dir, title, norm_title, year, tmdb_id, cat, sub, pinyin, pinyin_first,"
-                        " file_count, video_count, total_size, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", work_rows)
+                        " file_count, video_count, total_size, resolution, edition, tmdb_status, source)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", work_rows)
                 added = len(work_rows)
                 skipped = sum(1 for v in verdicts.values() if v)
                 connection.execute(
@@ -282,10 +350,59 @@ class LibraryDb:
         finally:
             connection.close()
 
-    def search(self, q: str, page: int, size: int, cat: str = "", sub: str = "", libs: Optional[List[str]] = None):
-        """q 非空：片名/拼音模糊搜索（归一化标题、目录、全拼、首字母）；q 为空：浏览模式年份降序。"""
+    def _match_clause(self, q: str) -> Tuple[str, List[Any]]:
+        """q 归一化后的匹配 SQL 片段（标题/目录/全拼/首字母）；空 q 返回 ("", [])。"""
         nq = norm(q) if q else ""
-        where = []
+        if not nq:
+            return "", []
+        like = f"%{nq}%"
+        match = ("(norm_title LIKE ? OR dir LIKE ? OR (pinyin != '' AND pinyin LIKE ?)"
+                 " OR (pinyin_first != '' AND length(?) >= 2 AND pinyin_first LIKE ?))")
+        return match, [like, like, like, nq, like]
+
+    def _classification_clauses(self, media_type: str, genre: str, region: str, decade: int,
+                                language: str = "", air_status: str = "", resolution: str = "",
+                                edition: str = "", rating: float = 0) -> Tuple[List[str], List[Any]]:
+        where: List[str] = []
+        params: List[Any] = []
+        if media_type:
+            where.append("media_type = ?")
+            params.append(media_type)
+        if region:
+            where.append("region = ?")
+            params.append(region)
+        if genre:
+            where.append("genres LIKE ?")
+            params.append(f'%"{genre}"%')
+        if decade:
+            where.append("year >= ? AND year <= ?")
+            params.extend([decade, decade + 9])
+        if language:
+            where.append("language = ?")
+            params.append(language)
+        if air_status:
+            where.append("air_status = ?")
+            params.append(air_status)
+        if resolution:
+            where.append("resolution = ?")
+            params.append(resolution)
+        if edition:
+            where.append("edition = ?")
+            params.append(edition)
+        if rating and rating > 0:
+            where.append("vote_average >= ?")
+            params.append(float(rating))
+        return where, params
+
+    def search(self, q: str, page: int, size: int, cat: str = "", sub: str = "",
+               libs: Optional[List[str]] = None, media_type: str = "", genre: str = "",
+               region: str = "", decade: int = 0, sort: str = "", language: str = "",
+               air_status: str = "", resolution: str = "", edition: str = "",
+               rating: float = 0):
+        """片名/拼音模糊搜索 + 分类维度筛选 + 分页。q 为空且无筛选=浏览。
+        sort：popularity(热度)/rating(评分)/recent(入库顺序)/title(拼音)/year，空=默认。"""
+        nq = norm(q) if q else ""
+        where: List[str] = []
         params: List[Any] = []
         if cat and cat != "全部文件":
             where.append("cat = ?")
@@ -293,47 +410,159 @@ class LibraryDb:
             if sub:
                 where.append("sub = ?")
                 params.append(sub)
+        cls_where, cls_params = self._classification_clauses(
+            media_type, genre, region, decade, language, air_status, resolution, edition, rating)
+        where += cls_where
+        params += cls_params
         if libs:
             where.append(f"source IN ({','.join('?' for _ in libs)})")
             params.extend(libs)
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-        order = ("ORDER BY CASE WHEN year IS NULL THEN 1 ELSE 0 END, year DESC, video_count DESC, dir"
-                 if not nq else
-                 "ORDER BY video_count DESC, dir")
+        if sort == "popularity":
+            order = "ORDER BY popularity DESC, vote_average DESC, year DESC, dir"
+        elif sort == "recent":
+            order = "ORDER BY rowid DESC"
+        elif sort == "rating":
+            order = "ORDER BY vote_average DESC, year DESC, video_count DESC, dir"
+        elif sort == "title":
+            order = "ORDER BY CASE WHEN pinyin != '' THEN pinyin ELSE title END, dir"
+        elif nq:
+            order = "ORDER BY video_count DESC, dir"
+        else:
+            order = ("ORDER BY CASE WHEN year IS NULL THEN 1 ELSE 0 END, year DESC, video_count DESC, dir")
+        match_sql, match_params = self._match_clause(q)
         connection = self._connect()
         try:
-            if nq:
-                like = f"%{nq}%"
-                match = ("(norm_title LIKE ? OR dir LIKE ? OR (pinyin != '' AND pinyin LIKE ?)"
-                         " OR (pinyin_first != '' AND length(?) >= 2 AND pinyin_first LIKE ?))")
-                match_params = [like, like, like, nq, like]
-                if where:
-                    total = connection.execute(
-                        f"SELECT COUNT(*) AS c FROM library_works WHERE {where_sql} AND {match}",
-                        [*params, *match_params]).fetchone()["c"]
-                    rows = connection.execute(
-                        f"SELECT * FROM library_works WHERE {where_sql} AND {match} {order} LIMIT ? OFFSET ?",
-                        [*params, *match_params, size, (page - 1) * size]).fetchall()
+            base_params = list(params)
+            base_where = where_sql
+            if match_sql:
+                if where_sql:
+                    base_where = f"{where_sql} AND {match_sql}"
+                    base_params = base_params + match_params
                 else:
-                    total = connection.execute(
-                        f"SELECT COUNT(*) AS c FROM library_works WHERE {match}", match_params).fetchone()["c"]
-                    rows = connection.execute(
-                        f"SELECT * FROM library_works WHERE {match} {order} LIMIT ? OFFSET ?",
-                        [*match_params, size, (page - 1) * size]).fetchall()
-            else:
-                total = connection.execute(
-                    f"SELECT COUNT(*) AS c FROM library_works {where_sql}", params).fetchone()["c"]
-                rows = connection.execute(
-                    f"SELECT * FROM library_works {where_sql} {order} LIMIT ? OFFSET ?",
-                    [*params, size, (page - 1) * size]).fetchall()
-            results = [{
-                "dir": r["dir"], "title": r["title"], "year": r["year"], "tmdbId": r["tmdb_id"],
-                "count": r["file_count"], "videoCount": r["video_count"], "totalSize": r["total_size"],
-                "cat": r["cat"], "sub": r["sub"],
-            } for r in rows]
+                    base_where = f"WHERE {match_sql}"
+                    base_params = match_params
+            total = connection.execute(
+                f"SELECT COUNT(*) AS c FROM library_works {base_where}", base_params).fetchone()["c"]
+            rows = connection.execute(
+                f"SELECT * FROM library_works {base_where} {order} LIMIT ? OFFSET ?",
+                [*base_params, size, (page - 1) * size]).fetchall()
+            results = [self._row_to_work(r) for r in rows]
             return total, results
         finally:
             connection.close()
+
+    @staticmethod
+    def _row_to_work(r: sqlite3.Row) -> Dict[str, Any]:
+        import json as _json
+        try:
+            genres = [str(g) for g in _json.loads(r["genres"] or "[]")]
+        except Exception:
+            genres = []
+        return {
+            "dir": r["dir"], "title": r["title"], "year": r["year"], "tmdbId": r["tmdb_id"],
+            "count": r["file_count"], "videoCount": r["video_count"], "totalSize": r["total_size"],
+            "cat": r["cat"], "sub": r["sub"],
+            "mediaType": r["media_type"] or "", "genres": genres, "region": r["region"] or "",
+            "voteAverage": r["vote_average"] or 0, "posterPath": r["poster_path"] or "",
+            "overview": r["overview"] or "", "tmdbStatus": r["tmdb_status"] or "none",
+            "language": r["language"] or "", "airStatus": r["air_status"] or "",
+            "resolution": r["resolution"] or "", "edition": r["edition"] or "",
+            "popularity": r["popularity"] or 0,
+        }
+
+    def facets(self, media_type: str = "", genre: str = "", region: str = "",
+               decade: int = 0, libs: Optional[List[str]] = None, q: str = "",
+               language: str = "", air_status: str = "", resolution: str = "",
+               edition: str = "", rating: float = 0) -> Dict[str, Any]:
+        """各分类维度的候选计数，用于前端动态筛选条。某维度的选项反映其它维度的当前选择
+        （交叉筛选），但不含该维度自身选择——像优爱腾点了某频道后其它筛选项随之收窄。"""
+        import json as _json
+
+        state = {
+            "media_type": media_type, "genre": genre, "region": region, "decade": decade,
+            "language": language, "air_status": air_status, "resolution": resolution,
+            "edition": edition, "rating": rating,
+        }
+
+        def fetch(exclude: str) -> List[sqlite3.Row]:
+            vals = {k: (type(state[k])() if k == exclude else state[k]) for k in state}
+            where, params = self._classification_clauses(
+                vals["media_type"], vals["genre"], vals["region"], vals["decade"],
+                vals["language"], vals["air_status"], vals["resolution"], vals["edition"], vals["rating"],
+            )
+            if libs:
+                where.append(f"source IN ({','.join('?' for _ in libs)})")
+                params.extend(libs)
+            match_sql, match_params = self._match_clause(q)
+            if match_sql:
+                where.append(match_sql)
+                params += match_params
+            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+            connection = self._connect()
+            try:
+                return connection.execute(
+                    "SELECT media_type, genres, region, year, language, air_status, resolution,"
+                    f" edition, vote_average FROM library_works {where_sql}", params).fetchall()
+            finally:
+                connection.close()
+
+        def count_by(exclude: str, getter) -> Dict[Any, int]:
+            out: Dict[Any, int] = {}
+            for r in fetch(exclude):
+                k = getter(r)
+                if k:
+                    out[k] = out.get(k, 0) + 1
+            return out
+
+        channels = count_by("media_type", lambda r: r["media_type"])
+        regions = count_by("region", lambda r: r["region"])
+        languages = count_by("language", lambda r: r["language"])
+        statuses = count_by("air_status", lambda r: r["air_status"])
+        resolutions = count_by("resolution", lambda r: r["resolution"])
+        editions = count_by("edition", lambda r: r["edition"])
+
+        genres: Dict[str, int] = {}
+        for r in fetch("genre"):
+            try:
+                for g in _json.loads(r["genres"] or "[]"):
+                    g = str(g)
+                    if g:
+                        genres[g] = genres.get(g, 0) + 1
+            except Exception:
+                continue
+
+        decades: Dict[int, int] = {}
+        for r in fetch("decade"):
+            if r["year"]:
+                d = (int(r["year"]) // 10) * 10
+                decades[d] = decades.get(d, 0) + 1
+
+        # 评分区间桶（阈值式：与 search 的 rating>=阈值 对齐，9 表示 9+，0 表示全部）
+        ratings: Dict[int, int] = {}
+        for r in fetch("rating"):
+            v = float(r["vote_average"] or 0)
+            if v >= 9:
+                ratings[9] = ratings.get(9, 0) + 1
+            if v >= 8:
+                ratings[8] = ratings.get(8, 0) + 1
+            if v >= 7:
+                ratings[7] = ratings.get(7, 0) + 1
+
+        def top(d: Dict[Any, int]) -> List[Dict[str, Any]]:
+            return [{"name": k, "count": v} for k, v in sorted(d.items(), key=lambda kv: -kv[1])]
+
+        return {
+            "channels": top(channels),
+            "genres": top(genres),
+            "regions": top(regions),
+            "languages": top(languages),
+            "statuses": top(statuses),
+            "resolutions": top(resolutions),
+            "editions": top(editions),
+            "decades": [{"name": d, "count": c} for d, c in sorted(decades.items(), reverse=True)],
+            "ratings": [{"name": b, "count": ratings[b]} for b in (9, 8, 7) if b in ratings],
+        }
 
     def categories(self, libs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         where = ""
@@ -396,6 +625,94 @@ class LibraryDb:
                 "dir": dirname, "title": work["title"], "year": work["year"],
                 "tmdbId": work["tmdb_id"], "files": files,
             }
+        finally:
+            connection.close()
+
+    # ---------- 分类充实（后台懒回填队列） ----------
+    def enrich_stats(self) -> Dict[str, int]:
+        """按充实状态统计作品数：{total, pending, ok, failed, none}。"""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT tmdb_status AS s, COUNT(*) AS c FROM library_works GROUP BY tmdb_status").fetchall()
+        finally:
+            connection.close()
+        stats = {"total": 0, "pending": 0, "ok": 0, "failed": 0, "none": 0}
+        for r in rows:
+            key = str(r["s"] or "none")
+            stats[key] = stats.get(key, 0) + r["c"]
+            stats["total"] += r["c"]
+        return stats
+
+    def pending_works(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """取一批待回填作品（有 tmdb_id、状态 pending），重试次数少的优先。"""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT dir, tmdb_id, title, year FROM library_works"
+                " WHERE tmdb_status = 'pending' AND tmdb_id IS NOT NULL"
+                " ORDER BY enrich_attempts, year DESC, dir LIMIT ?",
+                (max(1, int(limit)),)).fetchall()
+            return [{"dir": r["dir"], "tmdb_id": r["tmdb_id"], "title": r["title"], "year": r["year"]} for r in rows]
+        finally:
+            connection.close()
+
+    def apply_enrichment(self, dirname: str, fields: Dict[str, Any]) -> None:
+        """写回 TMDB 分类字段并置 tmdb_status='ok'。fields 可含 media_type/genres/region/poster_path/vote_average/overview/year。"""
+        import json as _json
+        genres = fields.get("genres")
+        if not isinstance(genres, str):
+            genres = _json.dumps(list(genres or []), ensure_ascii=False)
+        year = fields.get("year")
+        connection = self._connect()
+        try:
+            with connection:
+                # year 为空（TMDB 未给）时保留原解析年份
+                year_sql = "year = COALESCE(?, year)," if year else ""
+                params = [
+                    str(fields.get("media_type") or ""), genres,
+                    str(fields.get("region") or ""), str(fields.get("poster_path") or ""),
+                    float(fields.get("vote_average") or 0), str(fields.get("overview") or ""),
+                    str(fields.get("language") or ""), str(fields.get("air_status") or ""),
+                    float(fields.get("popularity") or 0),
+                ]
+                if year:
+                    params.append(int(year))
+                params.append(dirname)
+                connection.execute(
+                    "UPDATE library_works SET media_type = ?, genres = ?, region = ?, poster_path = ?,"
+                    " vote_average = ?, overview = ?, language = ?, air_status = ?, popularity = ?,"
+                    f" {year_sql} tmdb_status = 'ok', enrich_attempts = 0 WHERE dir = ?",
+                    params,
+                )
+        finally:
+            connection.close()
+
+    def mark_enrich_failure(self, dirname: str, max_attempts: int = 3) -> None:
+        """回填失败：重试计数 +1，达阈值转 failed（交手动/下次重置），否则保持 pending 继续排。"""
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE library_works SET enrich_attempts = enrich_attempts + 1,"
+                    " tmdb_status = CASE WHEN enrich_attempts + 1 >= ? THEN 'failed' ELSE 'pending' END"
+                    " WHERE dir = ?",
+                    (max(1, int(max_attempts)), dirname),
+                )
+        finally:
+            connection.close()
+
+    def reset_enrichment(self, only_failed: bool = True) -> int:
+        """重新入队：默认把 failed 打回 pending；only_failed=False 则全部有 tmdb_id 的重排（含 ok，用于刷新分类）。"""
+        connection = self._connect()
+        try:
+            with connection:
+                sql = ("UPDATE library_works SET tmdb_status = 'pending', enrich_attempts = 0"
+                       " WHERE tmdb_id IS NOT NULL")
+                if only_failed:
+                    sql += " AND tmdb_status = 'failed'"
+                cur = connection.execute(sql)
+                return cur.rowcount
         finally:
             connection.close()
 
@@ -590,8 +907,19 @@ def totals() -> Dict[str, Any]:
     return _db().totals()
 
 
-def search(q: str, page: int, size: int, cat: str = "", sub: str = "", libs: Optional[List[str]] = None):
-    return _db().search(q, page, size, cat, sub, libs)
+def search(q: str, page: int, size: int, cat: str = "", sub: str = "", libs: Optional[List[str]] = None,
+           media_type: str = "", genre: str = "", region: str = "", decade: int = 0, sort: str = "",
+           language: str = "", air_status: str = "", resolution: str = "", edition: str = "",
+           rating: float = 0):
+    return _db().search(q, page, size, cat, sub, libs, media_type, genre, region, decade, sort,
+                        language, air_status, resolution, edition, rating)
+
+
+def facets(media_type: str = "", genre: str = "", region: str = "", decade: int = 0,
+           libs: Optional[List[str]] = None, q: str = "", language: str = "", air_status: str = "",
+           resolution: str = "", edition: str = "", rating: float = 0) -> Dict[str, Any]:
+    return _db().facets(media_type, genre, region, decade, libs, q, language, air_status,
+                        resolution, edition, rating)
 
 
 def categories(libs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -600,6 +928,26 @@ def categories(libs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
 
 def list_files(dirname: str) -> Optional[Dict[str, Any]]:
     return _db().list_files(dirname)
+
+
+def enrich_stats() -> Dict[str, int]:
+    return _db().enrich_stats()
+
+
+def pending_works(limit: int = 20) -> List[Dict[str, Any]]:
+    return _db().pending_works(limit)
+
+
+def apply_enrichment(dirname: str, fields: Dict[str, Any]) -> None:
+    return _db().apply_enrichment(dirname, fields)
+
+
+def mark_enrich_failure(dirname: str, max_attempts: int = 3) -> None:
+    return _db().mark_enrich_failure(dirname, max_attempts)
+
+
+def reset_enrichment(only_failed: bool = True) -> int:
+    return _db().reset_enrichment(only_failed)
 
 
 def export_work(dirname: str) -> Optional[Dict[str, Any]]:

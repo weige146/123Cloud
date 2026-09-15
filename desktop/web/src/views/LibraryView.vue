@@ -11,6 +11,8 @@ import {
   pan115HelperApi,
   type LibraryCategory,
   type LibraryConfig,
+  type LibraryEnrichStats,
+  type LibraryFacets,
   type LibraryFile,
   type LibraryLibInfo,
   type LibraryStatus,
@@ -147,7 +149,7 @@ async function importFiles(items: Array<{ name: string; text: string }>) {
         notifyError(`${item.name} 入库失败：${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    await Promise.all([loadStatus(), loadCategories(), loadSources()]);
+    await Promise.all([loadStatus(), loadCategories(), loadSources(), loadFacets(), loadEnrich()]);
   } finally {
     uploading.value = false;
   }
@@ -162,7 +164,7 @@ async function pickAndImportFiles() {
     try {
       const data = await libraryApi.importPaths(result.paths, apiToken.value);
       notifySuccess(`已导入 ${data.results.length} 个文件：新增 ${data.added} 个作品 · 重复跳过 ${data.skipped} 个${data.failed ? ` · 失败 ${data.failed}` : ""}`);
-      await Promise.all([loadStatus(), loadCategories(), loadSources()]);
+      await Promise.all([loadStatus(), loadCategories(), loadSources(), loadFacets(), loadEnrich()]);
     } catch (error) {
       notifyError(`导入失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -180,7 +182,7 @@ async function importFromFolder() {
   try {
     const data = await libraryApi.importDir(path, apiToken.value);
     notifySuccess(`已从文件夹导入 ${data.total} 个文件：新增 ${data.added} 个作品 · 重复跳过 ${data.skipped} 个${data.failed ? ` · 失败 ${data.failed}` : ""}`);
-    await Promise.all([loadStatus(), loadCategories(), loadSources()]);
+    await Promise.all([loadStatus(), loadCategories(), loadSources(), loadFacets(), loadEnrich()]);
   } catch (error) {
     notifyError(`批量导入失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
@@ -194,7 +196,7 @@ async function deleteSource(name: string) {
   try {
     await libraryApi.deleteSource(name, apiToken.value);
     notifySuccess(`已删除 ${name}`);
-    await Promise.all([loadStatus(), loadCategories(), loadSources()]);
+    await Promise.all([loadStatus(), loadCategories(), loadSources(), loadFacets(), loadEnrich()]);
   } catch (error) {
     notifyError(`删除失败：${error instanceof Error ? error.message : String(error)}`);
   }
@@ -260,7 +262,7 @@ async function loadSources() {
 async function refreshLibrary() {
   scanning.value = true;
   try {
-    await Promise.all([loadStatus(), loadCategories(), loadSources(), searchWorks()]);
+    await Promise.all([loadStatus(), loadCategories(), loadSources(), loadFacets(), loadEnrich(), searchWorks()]);
   } finally {
     scanning.value = false;
   }
@@ -271,13 +273,13 @@ const libFilter = ref<string[]>([]);
 watch(libFilter, () => {
   page.value = 1;
   void loadCategories();
+  void loadFacets();
+  void loadEnrich();
   void searchWorks();
 });
 
 // ===== 分类与搜索 =====
 const categories = ref<LibraryCategory[]>([]);
-const activeCat = ref("");
-const activeSub = ref("");
 const keyword = ref("");
 const searching = ref(false);
 const works = ref<LibraryWork[]>([]);
@@ -285,6 +287,51 @@ const totalWorks = ref(0);
 const page = ref(1);
 const pageSize = ref(20);
 const searchNotice = ref("");
+
+// ===== 分类维度筛选（对标优爱腾：频道/类型/地区/年代） =====
+const facets = ref<LibraryFacets>({
+  channels: [], genres: [], regions: [], languages: [], statuses: [],
+  resolutions: [], editions: [], decades: [], ratings: [],
+});
+const activeMedia = ref("");       // "" | movie | tv
+const activeGenre = ref("");       // 类型/题材中文名（单选）
+const activeRegion = ref("");      // 地区中文桶
+const activeDecade = ref<number | "">(""); // 起始年（如 2020 表示 2020s）
+const activeLanguage = ref("");    // 语言中文桶
+const activeStatus = ref("");      // 剧集更新状态
+const activeResolution = ref("");  // 分辨率 4K/1080p/720p/SD
+const activeEdition = ref("");     // 片源版本 REMUX/BluRay/WEB-DL/...
+const activeRating = ref(0);       // 评分下限 9/8/7，0=不限
+const sortMode = ref("");          // "" 默认 / popularity 热度 / rating 评分 / title 片名 / recent 最新入库
+
+// ===== TMDB 分类信息充实进度 =====
+const enrich = ref<LibraryEnrichStats | null>(null);
+const enriching = ref(false);
+let enrichTimer: number | undefined;
+
+// ===== 详情弹层 =====
+const detailOpen = ref(false);
+const detailWork = ref<LibraryWork | null>(null);
+
+const activeFilterCount = computed(
+  () => [activeMedia.value, activeGenre.value, activeRegion.value, activeLanguage.value,
+    activeStatus.value, activeResolution.value, activeEdition.value].filter(Boolean).length
+    + (activeDecade.value === "" ? 0 : 1)
+    + (activeRating.value > 0 ? 1 : 0),
+);
+const hasBrowseFilters = computed(() => activeFilterCount.value > 0);
+
+const CHANNEL_LABEL: Record<string, string> = { movie: "电影", tv: "剧集" };
+function channelLabel(k: string | number): string {
+  return CHANNEL_LABEL[String(k)] || String(k);
+}
+function decadeLabel(k: string | number): string {
+  return `${k}年代`;
+}
+const RATING_LABEL: Record<string, string> = { "9": "9分以上", "8": "8分以上", "7": "7分以上" };
+function ratingLabel(k: string | number): string {
+  return RATING_LABEL[String(k)] || `${k}分以上`;
+}
 
 // 搜索历史
 const HISTORY_KEY = "librarySearchHistory";
@@ -312,76 +359,11 @@ function clearHistory() {
   localStorage.removeItem(HISTORY_KEY);
 }
 
-// 合并导出分类
-const mergeMode = ref(false);
-const mergeSelected = ref<Set<string>>(new Set());
-const mergeExporting = ref(false);
-
-function toggleMergeMode() {
-  mergeMode.value = !mergeMode.value;
-  if (!mergeMode.value) mergeSelected.value = new Set();
-}
-
-function toggleMergeCat(name: string) {
-  const next = new Set(mergeSelected.value);
-  if (next.has(name)) next.delete(name);
-  else next.add(name);
-  mergeSelected.value = next;
-}
-
-async function exportMergedCategories() {
-  const cats = Array.from(mergeSelected.value);
-  if (!cats.length) {
-    notifyError("请先勾选要合并导出的分类");
-    return;
-  }
-  mergeExporting.value = true;
-  try {
-    const data = await libraryApi.exportSave({ cats: cats.join("|"), token: apiToken.value });
-    notifySuccess(`已导出：${data.file} · ${data.totalFilesCount.toLocaleString()} 个文件 · ${data.formattedTotalSize}`);
-  } catch (error) {
-    notifyError(`合并导出失败：${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    mergeExporting.value = false;
-  }
-}
-
-// 分类折叠
-const showAllCats = ref(false);
-const showAllSubs = ref(false);
-const CAT_LIMIT = 12;
-const visibleCats = computed(() => (showAllCats.value ? categories.value : categories.value.slice(0, CAT_LIMIT)));
-const activeCatNode = computed(() => categories.value.find((c) => c.name === activeCat.value) || null);
-const visibleSubs = computed(() => {
-  const subs = activeCatNode.value?.subs || [];
-  return showAllSubs.value ? subs : subs.slice(0, CAT_LIMIT);
-});
-
-const CAT_ICON: Record<string, string> = {
-  电影: "🎬", 电视剧: "📺", 剧集: "📺", 动漫: "🎨", 综艺: "🎤", 纪录片: "🌍",
-  演唱会: "🎵", 儿童节目: "🧒", 短剧: "📱", 原盘ISO: "💿", 有声书: "🎧", 广播剧: "📻",
-};
-
-function catIcon(name: string): string {
-  return CAT_ICON[name] || "📂";
-}
-
-function selectCat(name: string) {
-  if (mergeMode.value) {
-    toggleMergeCat(name);
-    return;
-  }
-  activeCat.value = activeCat.value === name ? "" : name;
-  activeSub.value = "";
-  showAllSubs.value = false;
-  page.value = 1;
-  void searchWorks();
-}
-
-function selectSub(name: string) {
-  activeSub.value = activeSub.value === name ? "" : name;
-  page.value = 1;
-  void searchWorks();
+// 分类维度折叠（每个维度超过一行时收起）
+const showAll = ref<Record<string, boolean>>({});
+const FACET_LIMIT = 14;
+function facetVisible(key: string, len: number) {
+  return showAll.value[key] ? len : Math.min(len, FACET_LIMIT);
 }
 
 async function loadCategories() {
@@ -393,14 +375,106 @@ async function loadCategories() {
   }
 }
 
+async function loadFacets() {
+  try {
+    const data = await libraryApi.facets({
+      mediaType: activeMedia.value,
+      genre: activeGenre.value,
+      region: activeRegion.value,
+      decade: activeDecade.value === "" ? 0 : Number(activeDecade.value),
+      language: activeLanguage.value,
+      status: activeStatus.value,
+      resolution: activeResolution.value,
+      edition: activeEdition.value,
+      rating: activeRating.value,
+      lib: libFilter.value.join(","),
+      q: keyword.value.trim(),
+      token: apiToken.value,
+    });
+    facets.value = data.facets;
+  } catch {
+    /* facets 失败不打断浏览 */
+  }
+}
+
+async function loadEnrich() {
+  try {
+    enrich.value = (await libraryApi.enrichStatus(apiToken.value)).stats;
+  } catch {
+    /* 静默 */
+  }
+}
+
+async function runEnrich() {
+  if (enriching.value) return;
+  enriching.value = true;
+  try {
+    const data = await libraryApi.enrichStart(apiToken.value);
+    enrich.value = data.stats;
+    notifySuccess(`已整理 ${data.processed} 条分类信息`);
+    await Promise.all([loadFacets(), searchWorks()]);
+  } catch (error) {
+    notifyError(`整理失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    enriching.value = false;
+  }
+}
+
+async function resetEnrich() {
+  const ok = await confirm("重新整理全部作品的分类信息？会重新拉取 TMDB 覆盖现有分类。", "刷新影库分类");
+  if (!ok) return;
+  try {
+    const data = await libraryApi.enrichReset(apiToken.value, true);
+    enrich.value = data.stats;
+    notifySuccess(`已重排 ${data.requeued} 条，正在后台整理…`);
+  } catch (error) {
+    notifyError(`重置失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// 维度选择（单选切换；选中即刷新列表与其它维度候选）
+function toggleMedia(v: string) { activeMedia.value = activeMedia.value === v ? "" : v; onFilterChange(); }
+function toggleGenre(v: string) { activeGenre.value = activeGenre.value === v ? "" : v; onFilterChange(); }
+function toggleRegion(v: string) { activeRegion.value = activeRegion.value === v ? "" : v; onFilterChange(); }
+function toggleDecade(v: number) { activeDecade.value = activeDecade.value === v ? "" : v; onFilterChange(); }
+function toggleLanguage(v: string) { activeLanguage.value = activeLanguage.value === v ? "" : v; onFilterChange(); }
+function toggleStatus(v: string) { activeStatus.value = activeStatus.value === v ? "" : v; onFilterChange(); }
+function toggleResolution(v: string) { activeResolution.value = activeResolution.value === v ? "" : v; onFilterChange(); }
+function toggleEdition(v: string) { activeEdition.value = activeEdition.value === v ? "" : v; onFilterChange(); }
+function toggleRating(v: number) { activeRating.value = activeRating.value === v ? 0 : v; onFilterChange(); }
+function clearFilters() {
+  activeMedia.value = "";
+  activeGenre.value = "";
+  activeRegion.value = "";
+  activeDecade.value = "";
+  activeLanguage.value = "";
+  activeStatus.value = "";
+  activeResolution.value = "";
+  activeEdition.value = "";
+  activeRating.value = 0;
+  onFilterChange();
+}
+function onFilterChange() {
+  page.value = 1;
+  void searchWorks();
+  void loadFacets();
+}
+
 async function searchWorks(record = false) {
   searching.value = true;
   searchNotice.value = "";
   try {
     const data = await libraryApi.search({
       q: keyword.value.trim(),
-      cat: activeCat.value,
-      sub: activeSub.value,
+      mediaType: activeMedia.value,
+      genre: activeGenre.value,
+      region: activeRegion.value,
+      decade: activeDecade.value === "" ? 0 : Number(activeDecade.value),
+      language: activeLanguage.value,
+      status: activeStatus.value,
+      edition: activeEdition.value,
+      rating: activeRating.value,
+      sort: sortMode.value,
       page: page.value,
       size: pageSize.value,
       lib: libFilter.value.join(","),
@@ -411,8 +485,8 @@ async function searchWorks(record = false) {
     if (data.total === 0) {
       searchNotice.value = keyword.value.trim()
         ? "没有找到匹配的片名"
-        : activeCat.value
-          ? "该分类下没有作品"
+        : hasBrowseFilters.value
+          ? "当前分类组合下没有作品"
           : "影库还是空的，先去「导入影库」导入影库文件。";
     }
     if (record && keyword.value.trim()) recordHistory(keyword.value);
@@ -428,26 +502,36 @@ async function searchWorks(record = false) {
 const totalPages = computed(() => Math.max(1, Math.ceil(totalWorks.value / pageSize.value)));
 const browseMode = computed(() => !keyword.value.trim());
 
+const SORT_LABEL: Record<string, string> = { "": "默认（年份↓）", popularity: "热度↓", rating: "评分↓", title: "片名 A→Z", recent: "最新入库" };
+const sortOptions = ["", "popularity", "rating", "title", "recent"].map((v) => ({ title: SORT_LABEL[v], value: v }));
+
 const resultInfo = computed(() => {
   if (!totalWorks.value) return "";
-  const where = activeCat.value + (activeSub.value ? ` / ${activeSub.value}` : "");
-  if (browseMode.value) {
-    return `分类 “${where || "全部"}” 共 ${totalWorks.value.toLocaleString()} 个作品 · 按年份降序`;
-  }
-  const head = activeCat.value ? `片名 “${keyword.value.trim()}”（分类：${where}）` : `片名 “${keyword.value.trim()}”`;
-  return `${head} 共找到 ${totalWorks.value.toLocaleString()} 个作品`;
+  if (!browseMode.value) return `片名 “${keyword.value.trim()}” 共找到 ${totalWorks.value.toLocaleString()} 个作品`;
+  const parts = [
+    activeMedia.value ? channelLabel(activeMedia.value) : "",
+    activeGenre.value,
+    activeRegion.value,
+    activeLanguage.value,
+    activeStatus.value,
+    activeResolution.value,
+    activeEdition.value,
+    activeDecade.value === "" ? "" : decadeLabel(activeDecade.value),
+    activeRating.value > 0 ? ratingLabel(activeRating.value) : "",
+  ].filter(Boolean);
+  return `${parts.length ? parts.join(" · ") : "全部"} 共 ${totalWorks.value.toLocaleString()} 个作品 · ${SORT_LABEL[sortMode.value]}`;
 });
 
-const yearGroups = computed(() => {
-  if (!browseMode.value) return [{ year: null as number | null, label: "", items: works.value }];
-  const groups: Array<{ year: number | null; label: string; items: LibraryWork[] }> = [];
-  for (const work of works.value) {
-    const last = groups[groups.length - 1];
-    if (last && last.year === work.year) last.items.push(work);
-    else groups.push({ year: work.year, label: work.year ? String(work.year) : "未知年份", items: [work] });
-  }
-  return groups;
-});
+// 详情弹层：点击海报打开，展开文件列表 + TMDB 详情（评分/类型/简介）
+function openDetail(work: LibraryWork) {
+  detailWork.value = work;
+  detailOpen.value = true;
+  void toggleWorkFiles(work);
+}
+function closeDetail() {
+  detailOpen.value = false;
+  detailWork.value = null;
+}
 
 function goToPage(next: number) {
   if (next < 1 || next > totalPages.value) return;
@@ -458,6 +542,7 @@ function goToPage(next: number) {
 function runSearch() {
   page.value = 1;
   void searchWorks(true);
+  void loadFacets();
 }
 
 let searchDebounce: number | undefined;
@@ -466,7 +551,12 @@ watch(keyword, () => {
   searchDebounce = window.setTimeout(() => {
     page.value = 1;
     void searchWorks(true);
+    void loadFacets();
   }, 300);
+});
+watch(sortMode, () => {
+  page.value = 1;
+  void searchWorks();
 });
 
 // ===== TMDB 海报/详情：后端代理（客户端投稿配置的 TMDB TOKEN），带 sqlite 缓存 =====
@@ -624,20 +714,16 @@ function toggleDetailAll() {
 }
 
 async function toggleWorkFiles(work: LibraryWork) {
-  if (expandedDir.value === work.dir) {
-    expandedDir.value = null;
-    dirFiles.value = [];
-    detailSelected.value = new Set();
-    return;
-  }
   expandedDir.value = work.dir;
   dirFiles.value = [];
   detailSelected.value = new Set();
   detailVersion.value = "__all__";
-  detailInfo.value = null;
+  detailInfo.value = work.tmdbStatus === "ok" && work.overview
+    ? { title: work.title, year: work.year || 0, overview: work.overview, voteAverage: work.voteAverage, genres: work.genres, posterUrl: work.posterPath }
+    : null;
   dirFilesLoading.value = true;
   void fetchTmdbDetail(work).then((detail) => {
-    if (expandedDir.value === work.dir) detailInfo.value = detail;
+    if (detail && expandedDir.value === work.dir) detailInfo.value = detail;
   });
   try {
     const data = await libraryApi.files(work.dir, apiToken.value);
@@ -863,8 +949,16 @@ function saveUiState() {
   try {
     localStorage.setItem(UI_STATE_KEY, JSON.stringify({
       tab: tab.value,
-      activeCat: activeCat.value,
-      activeSub: activeSub.value,
+      activeMedia: activeMedia.value,
+      activeGenre: activeGenre.value,
+      activeRegion: activeRegion.value,
+      activeDecade: activeDecade.value,
+      activeLanguage: activeLanguage.value,
+      activeStatus: activeStatus.value,
+      activeResolution: activeResolution.value,
+      activeEdition: activeEdition.value,
+      activeRating: activeRating.value,
+      sortMode: sortMode.value,
       page: page.value,
       keyword: keyword.value,
     }));
@@ -877,8 +971,16 @@ function restoreUiState() {
   try {
     const state = JSON.parse(localStorage.getItem(UI_STATE_KEY) || "{}") || {};
     if (["browse", "config"].includes(state.tab)) tab.value = state.tab;
-    activeCat.value = String(state.activeCat || "");
-    activeSub.value = String(state.activeSub || "");
+    activeMedia.value = String(state.activeMedia || "");
+    activeGenre.value = String(state.activeGenre || "");
+    activeRegion.value = String(state.activeRegion || "");
+    activeDecade.value = state.activeDecade === "" || state.activeDecade == null ? "" : Number(state.activeDecade);
+    activeLanguage.value = String(state.activeLanguage || "");
+    activeStatus.value = String(state.activeStatus || "");
+    activeResolution.value = String(state.activeResolution || "");
+    activeEdition.value = String(state.activeEdition || "");
+    activeRating.value = Number(state.activeRating || 0);
+    sortMode.value = String(state.sortMode || "");
     page.value = Math.max(1, Number(state.page) || 1);
     keyword.value = String(state.keyword || "");
   } catch {
@@ -886,16 +988,25 @@ function restoreUiState() {
   }
 }
 
-watch([tab, activeCat, activeSub, page, keyword], saveUiState);
+watch(
+  [tab, activeMedia, activeGenre, activeRegion, activeDecade, activeLanguage, activeStatus,
+    activeResolution, activeEdition, activeRating, sortMode, page, keyword],
+  saveUiState,
+);
 
 onMounted(async () => {
   restoreUiState();
-  await Promise.all([loadConfig(), loadStatus(), loadCategories(), loadSources(), searchWorks()]);
+  await Promise.all([
+    loadConfig(), loadStatus(), loadCategories(), loadSources(),
+    loadFacets(), loadEnrich(), searchWorks(),
+  ]);
   statusTimer = window.setInterval(loadStatus, 30000);
+  enrichTimer = window.setInterval(loadEnrich, 8000);
 });
 
 onUnmounted(() => {
   window.clearInterval(statusTimer);
+  window.clearInterval(enrichTimer);
   window.clearInterval(transferTimer);
   window.clearTimeout(searchDebounce);
 });
@@ -921,7 +1032,7 @@ onUnmounted(() => {
         <StatTile label="总大小" :value="status?.totalSizeLabel || '0 B'" icon="mdi-harddisk" tone="success" />
       </div>
 
-      <GlassCard accent="group" icon="mdi-magnify" title="搜索影库" desc="片名模糊搜索；点分类按年份降序浏览；行内「展开文件」可勾选导出或转存。">
+      <GlassCard accent="group" icon="mdi-magnify" title="海报墙" desc="按 TMDB 分类（频道 / 类型 / 地区 / 年代）筛选浏览；点击海报查看详情、导出或转存。片名搜索仍可用。">
         <div class="search-row">
           <v-select
             v-model="libFilter"
@@ -966,62 +1077,166 @@ onUnmounted(() => {
           <v-btn variant="outlined" prepend-icon="mdi-folder-open-outline" @click="openTransferPicker">浏览 123 目录…</v-btn>
         </div>
 
-        <div class="cat-panel">
-          <div class="cat-panel-head">
-            <span class="cat-panel-title">📂 分类</span>
-            <span class="muted-hint">点击分类按年份降序浏览 · 不输入片名也能用</span>
+        <div class="filter-panel">
+          <div class="filter-head">
+            <span class="filter-title">分类筛选</span>
+            <v-select
+              v-model="sortMode"
+              :items="sortOptions"
+              item-title="title"
+              item-value="value"
+              label="排序"
+              variant="outlined"
+              density="compact"
+              hide-details
+              class="sort-select"
+            />
             <v-spacer />
-            <v-btn
-              size="small"
-              :variant="mergeMode ? 'tonal' : 'text'"
-              :color="mergeMode ? 'primary' : 'default'"
-              prepend-icon="mdi-check"
-              @click="toggleMergeMode"
-            >合并导出</v-btn>
+            <span v-if="enrich" class="enrich-hint">
+              分类信息：已整理 {{ enrich.ok }} · 待整理 {{ enrich.pending + enrich.failed }}<template v-if="enrich.failed">（失败 {{ enrich.failed }}）</template>
+            </span>
+            <v-btn size="small" variant="text" :loading="enriching" @click="runEnrich">立即整理</v-btn>
+            <v-btn size="small" variant="text" @click="resetEnrich">刷新全部</v-btn>
+            <v-btn v-if="hasBrowseFilters" size="small" color="primary" variant="text" prepend-icon="mdi-close" @click="clearFilters">清除筛选</v-btn>
           </div>
-          <div v-if="mergeMode" class="merge-toolbar">
-            <span class="muted-hint">已选 {{ mergeSelected.size }} 个分类</span>
-            <v-btn size="small" color="primary" prepend-icon="mdi-download" :loading="mergeExporting" :disabled="!mergeSelected.size" @click="exportMergedCategories">合并导出选中分类</v-btn>
-            <v-btn size="small" variant="text" @click="mergeSelected = new Set()">清空选择</v-btn>
-          </div>
-          <div class="cat-bar">
-            <template v-if="!mergeMode">
-              <button type="button" class="cat-chip" :class="{ active: !activeCat }" @click="selectCat('')">全部</button>
+
+          <div v-if="facets.channels.length" class="facet-row">
+            <span class="facet-label">频道</span>
+            <div class="facet-chips">
               <button
-                v-for="cat in visibleCats"
-                :key="cat.name"
+                v-for="c in facets.channels"
+                :key="c.name"
                 type="button"
                 class="cat-chip"
-                :class="{ active: activeCat === cat.name }"
-                @click="selectCat(cat.name)"
-              >{{ catIcon(cat.name) }} {{ cat.name }}<small>{{ cat.count }}</small></button>
-            </template>
-            <template v-else>
+                :class="{ active: activeMedia === String(c.name) }"
+                @click="toggleMedia(String(c.name))"
+              >{{ channelLabel(c.name) }}<small>{{ c.count }}</small></button>
+            </div>
+          </div>
+
+          <div v-if="facets.genres.length" class="facet-row">
+            <span class="facet-label">类型</span>
+            <div class="facet-chips">
               <button
-                v-for="cat in visibleCats"
-                :key="cat.name"
+                v-for="g in facets.genres.slice(0, facetVisible('genres', facets.genres.length))"
+                :key="g.name"
                 type="button"
                 class="cat-chip"
-                :class="{ active: mergeSelected.has(cat.name) }"
-                @click="toggleMergeCat(cat.name)"
-              >{{ mergeSelected.has(cat.name) ? "☑" : "☐" }} {{ catIcon(cat.name) }} {{ cat.name }}<small>{{ cat.count }}</small></button>
-            </template>
-            <v-btn v-if="categories.length > CAT_LIMIT" size="x-small" variant="text" @click="showAllCats = !showAllCats">
-              {{ showAllCats ? "收起" : `展开更多（${categories.length - CAT_LIMIT}）` }}
-            </v-btn>
+                :class="{ active: activeGenre === String(g.name) }"
+                @click="toggleGenre(String(g.name))"
+              >{{ g.name }}<small>{{ g.count }}</small></button>
+              <v-btn v-if="facets.genres.length > FACET_LIMIT" size="x-small" variant="text" @click="showAll.genres = !showAll.genres">
+                {{ showAll.genres ? "收起" : "展开更多" }}
+              </v-btn>
+            </div>
           </div>
-          <div v-if="activeCat && !mergeMode" class="cat-bar sub-bar">
-            <button
-              v-for="sub in visibleSubs"
-              :key="sub.name"
-              type="button"
-              class="cat-chip sub"
-              :class="{ active: activeSub === sub.name }"
-              @click="selectSub(sub.name)"
-            >{{ sub.name }}<small>{{ sub.count }}</small></button>
-            <v-btn v-if="(activeCatNode?.subs.length || 0) > CAT_LIMIT" size="x-small" variant="text" @click="showAllSubs = !showAllSubs">
-              {{ showAllSubs ? "收起" : "展开更多" }}
-            </v-btn>
+
+          <div v-if="facets.regions.length" class="facet-row">
+            <span class="facet-label">地区</span>
+            <div class="facet-chips">
+              <button
+                v-for="r in facets.regions"
+                :key="r.name"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeRegion === String(r.name) }"
+                @click="toggleRegion(String(r.name))"
+              >{{ r.name }}<small>{{ r.count }}</small></button>
+            </div>
+          </div>
+
+          <div v-if="facets.decades.length" class="facet-row">
+            <span class="facet-label">年代</span>
+            <div class="facet-chips">
+              <button
+                v-for="d in facets.decades.slice(0, facetVisible('decades', facets.decades.length))"
+                :key="d.name"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeDecade === Number(d.name) }"
+                @click="toggleDecade(Number(d.name))"
+              >{{ decadeLabel(d.name) }}<small>{{ d.count }}</small></button>
+              <v-btn v-if="facets.decades.length > FACET_LIMIT" size="x-small" variant="text" @click="showAll.decades = !showAll.decades">
+                {{ showAll.decades ? "收起" : "展开更多" }}
+              </v-btn>
+            </div>
+          </div>
+
+          <div v-if="facets.languages.length" class="facet-row">
+            <span class="facet-label">语言</span>
+            <div class="facet-chips">
+              <button
+                v-for="l in facets.languages"
+                :key="l.name"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeLanguage === String(l.name) }"
+                @click="toggleLanguage(String(l.name))"
+              >{{ l.name }}<small>{{ l.count }}</small></button>
+            </div>
+          </div>
+
+          <div v-if="facets.statuses.length" class="facet-row">
+            <span class="facet-label">状态</span>
+            <div class="facet-chips">
+              <button
+                v-for="s in facets.statuses"
+                :key="s.name"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeStatus === String(s.name) }"
+                @click="toggleStatus(String(s.name))"
+              >{{ s.name }}<small>{{ s.count }}</small></button>
+            </div>
+          </div>
+
+          <div v-if="facets.resolutions.length" class="facet-row">
+            <span class="facet-label">画质</span>
+            <div class="facet-chips">
+              <button
+                v-for="r in facets.resolutions"
+                :key="r.name"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeResolution === String(r.name) }"
+                @click="toggleResolution(String(r.name))"
+              >{{ r.name }}<small>{{ r.count }}</small></button>
+            </div>
+          </div>
+
+          <div v-if="facets.editions.length" class="facet-row">
+            <span class="facet-label">版本</span>
+            <div class="facet-chips">
+              <button
+                v-for="e in facets.editions.slice(0, facetVisible('editions', facets.editions.length))"
+                :key="e.name"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeEdition === String(e.name) }"
+                @click="toggleEdition(String(e.name))"
+              >{{ e.name }}<small>{{ e.count }}</small></button>
+              <v-btn v-if="facets.editions.length > FACET_LIMIT" size="x-small" variant="text" @click="showAll.editions = !showAll.editions">
+                {{ showAll.editions ? "收起" : "展开更多" }}
+              </v-btn>
+            </div>
+          </div>
+
+          <div v-if="facets.ratings.length" class="facet-row">
+            <span class="facet-label">评分</span>
+            <div class="facet-chips">
+              <button
+                v-for="rt in facets.ratings"
+                :key="rt.name"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeRating === Number(rt.name) }"
+                @click="toggleRating(Number(rt.name))"
+              >{{ ratingLabel(rt.name) }}<small>{{ rt.count }}</small></button>
+            </div>
+          </div>
+
+          <div v-if="!facets.channels.length && !facets.genres.length && !facets.regions.length && !facets.decades.length && !facets.languages.length && !facets.statuses.length && !facets.resolutions.length && !facets.editions.length && !facets.ratings.length" class="muted-hint">
+            还没有可用的分类维度——导入带 {tmdb-N} / [tmdb-N] 标记的影库文件后，点「立即整理」拉取 TMDB 分类即可出现。
           </div>
         </div>
 
@@ -1029,81 +1244,19 @@ onUnmounted(() => {
         <div v-if="searchNotice" class="hub-status-line">{{ searchNotice }}</div>
 
         <div v-if="searching" class="empty-state"><p>加载中…</p></div>
-        <template v-else-if="works.length">
-          <template v-for="group in yearGroups" :key="group.label + group.items.length">
-            <div v-if="browseMode && yearGroups.length > 1" class="year-sep">
-              <b>{{ group.label }}</b>
-              <span class="line" />
+        <div v-else-if="works.length" class="poster-grid">
+          <div v-for="work in works" :key="work.dir" class="poster-card" @click="openDetail(work)">
+            <div class="poster-box">
+              <WorkPoster :work="work" :fetch-poster="fetchPoster" />
+              <span v-if="work.mediaType" class="poster-badge">{{ channelLabel(work.mediaType) }}</span>
+              <span v-else-if="work.tmdbStatus === 'pending'" class="poster-badge pending">整理中…</span>
+              <span v-else-if="!work.tmdbId" class="poster-badge uncategorized">未分类</span>
             </div>
-            <div v-for="work in group.items" :key="work.dir" class="work-row">
-              <div class="work-row-head">
-                <WorkPoster :work="work" :fetch-poster="fetchPoster" />
-                <div class="work-main">
-                  <div class="work-title-line">
-                    <strong class="work-title" :title="work.dir">{{ work.title }}</strong>
-                    <span v-if="work.year" class="work-year">({{ work.year }})</span>
-                    <v-chip v-if="work.tmdbId" size="x-small" variant="tonal" class="tmdb-chip">TMDB:{{ work.tmdbId }}</v-chip>
-                  </div>
-                  <div class="work-meta">{{ work.videoCount }} 个视频 · {{ work.count }} 个文件 · {{ formatBytes(work.totalSize) }}</div>
-                  <div class="work-path" :title="work.dir">{{ work.dir }}</div>
-                </div>
-                <div class="work-actions">
-                  <v-btn size="small" variant="outlined" :color="expandedDir === work.dir ? 'primary' : 'default'" @click="toggleWorkFiles(work)">
-                    {{ expandedDir === work.dir ? "收起文件" : "展开文件" }}
-                  </v-btn>
-                  <v-btn size="small" variant="outlined" prepend-icon="mdi-download" :loading="exporting === work.dir" @click="exportWork(work)">导出</v-btn>
-                  <v-btn size="small" color="success" variant="tonal" prepend-icon="mdi-fast-forward" :loading="transferBusy === work.dir" :disabled="Boolean(transferBusy)" @click="submitTransferWork(work)">转存</v-btn>
-                </div>
-              </div>
-              <div v-if="expandedDir === work.dir" class="work-files">
-                <div v-if="detailInfo" class="work-tmdb-line">
-                  <v-chip size="x-small" color="warning" variant="tonal">⭐ {{ detailInfo.voteAverage ? detailInfo.voteAverage.toFixed(1) : "—" }}</v-chip>
-                  <span v-if="detailInfo.genres.length" class="muted-hint">{{ detailInfo.genres.join(" / ") }}</span>
-                  <span class="work-overview" :title="detailInfo.overview">{{ detailInfo.overview || "暂无简介" }}</span>
-                </div>
-                <div v-if="dirFilesLoading" class="empty-state"><p>文件加载中…</p></div>
-                <template v-else>
-                  <div v-if="detailVersions.length" class="cat-bar">
-                    <button type="button" class="cat-chip" :class="{ active: detailVersion === '__all__' }" @click="detailVersion = '__all__'">全部 <small>{{ dirFiles.length }}</small></button>
-                    <button
-                      v-for="v in detailVersions"
-                      :key="v"
-                      type="button"
-                      class="cat-chip"
-                      :class="{ active: detailVersion === v }"
-                      @click="detailVersion = v"
-                    >{{ v }} <small>{{ dirFiles.filter((f) => versionLabel(f.fileName) === v).length }}</small></button>
-                  </div>
-                  <div class="dir-picker-list">
-                    <label v-for="file in detailVisibleFiles" :key="file.path || file.fileName" class="share-item-row">
-                      <v-checkbox
-                        :model-value="detailSelected.has(file.path || file.fileName)"
-                        density="compact"
-                        hide-details
-                        :label="file.fileName + (episodeNum(file.fileName) != null ? `（第${episodeNum(file.fileName)}集）` : '')"
-                        @update:model-value="toggleDetailFile(file)"
-                      />
-                      <span class="share-item-meta">
-                        <v-chip v-if="detailVersions.length" size="x-small" variant="tonal" class="mr-2">{{ versionLabel(file.fileName) }}</v-chip>
-                        {{ formatBytes(file.size) }}{{ file.isVideo ? " · 视频" : "" }}
-                      </span>
-                    </label>
-                  </div>
-                  <div class="button-row">
-                    <v-btn size="small" variant="text" @click="toggleDetailAll">
-                      {{ detailVisibleFiles.length && detailVisibleFiles.every((f) => detailSelected.has(f.path || f.fileName)) ? "全不选" : "全选" }}
-                    </v-btn>
-                    <span class="muted-hint">已选 {{ detailSelected.size }} / {{ dirFiles.length }}</span>
-                    <v-spacer />
-                    <v-btn size="small" variant="outlined" prepend-icon="mdi-download" :disabled="!detailSelected.size" @click="exportSelectedFiles(work)">导出选中</v-btn>
-                    <v-btn size="small" color="success" variant="tonal" prepend-icon="mdi-fast-forward" :disabled="!detailSelected.size || Boolean(transferBusy)" @click="submitTransferSelectedFiles(work)">转存选中</v-btn>
-                  </div>
-                </template>
-              </div>
-            </div>
-          </template>
-        </template>
-        <div v-else-if="!searchNotice" class="empty-state"><p>输入片名，或点击上方分类浏览。</p></div>
+            <div class="poster-title" :title="work.dir">{{ work.title }}</div>
+            <div class="poster-sub">{{ work.year || "—" }}</div>
+          </div>
+        </div>
+        <div v-else-if="!searchNotice" class="empty-state"><p>输入片名，或用上方分类维度筛选浏览。</p></div>
 
         <div v-if="totalPages > 1" class="pager">
           <v-btn size="small" variant="outlined" :disabled="page <= 1" @click="goToPage(page - 1)">上一页</v-btn>
@@ -1235,6 +1388,90 @@ onUnmounted(() => {
         </div>
       </GlassCard>
     </div>
+
+    <!-- ====================== 作品详情弹层 ====================== -->
+    <v-dialog v-model="detailOpen" max-width="820" scrollable @update:model-value="(v: boolean) => { if (!v) closeDetail(); }">
+      <v-card v-if="detailWork" class="dir-picker-card detail-card">
+        <div class="detail-head">
+          <div class="detail-poster">
+            <WorkPoster :work="detailWork" :fetch-poster="fetchPoster" />
+          </div>
+          <div class="detail-info">
+            <div class="detail-title-line">
+              <strong class="detail-title">{{ detailWork.title }}</strong>
+              <span v-if="detailWork.year" class="work-year">({{ detailWork.year }})</span>
+            </div>
+            <div class="detail-chips">
+              <v-chip v-if="detailWork.mediaType" size="small" color="primary" variant="tonal">{{ channelLabel(detailWork.mediaType) }}</v-chip>
+              <v-chip v-if="detailWork.region" size="small" variant="tonal">{{ detailWork.region }}</v-chip>
+              <v-chip v-if="detailWork.language" size="small" variant="outlined">{{ detailWork.language }}</v-chip>
+              <v-chip v-if="detailWork.airStatus" size="small" variant="outlined">{{ detailWork.airStatus }}</v-chip>
+              <v-chip v-if="detailWork.resolution" size="small" variant="outlined">{{ detailWork.resolution }}</v-chip>
+              <v-chip v-if="detailWork.edition" size="small" variant="outlined">{{ detailWork.edition }}</v-chip>
+              <v-chip v-if="detailInfo && detailInfo.voteAverage" size="small" color="warning" variant="tonal">⭐ {{ detailInfo.voteAverage.toFixed(1) }}</v-chip>
+              <v-chip v-if="detailWork.tmdbId" size="small" variant="text" class="tmdb-chip">TMDB:{{ detailWork.tmdbId }}</v-chip>
+              <v-chip v-if="!detailWork.tmdbId" size="small" color="grey" variant="tonal">未分类</v-chip>
+              <v-chip v-else-if="detailWork.tmdbStatus === 'pending'" size="small" color="grey" variant="tonal">分类整理中…</v-chip>
+            </div>
+            <div v-if="detailInfo && detailInfo.genres.length" class="detail-genres">
+              <v-chip v-for="g in detailInfo.genres" :key="g" size="x-small" variant="outlined">{{ g }}</v-chip>
+            </div>
+            <div v-if="detailInfo && detailInfo.overview" class="detail-overview">{{ detailInfo.overview }}</div>
+            <div class="detail-meta muted-hint">{{ detailWork.videoCount }} 个视频 · {{ detailWork.count }} 个文件 · {{ formatBytes(detailWork.totalSize) }}</div>
+            <div class="work-path" :title="detailWork.dir">{{ detailWork.dir }}</div>
+            <div class="detail-actions">
+              <v-btn size="small" variant="outlined" prepend-icon="mdi-download" :loading="exporting === detailWork.dir" @click="exportWork(detailWork)">导出全部</v-btn>
+              <v-btn size="small" color="success" variant="tonal" prepend-icon="mdi-fast-forward" :loading="transferBusy === detailWork.dir" :disabled="Boolean(transferBusy)" @click="submitTransferWork(detailWork)">转存全部</v-btn>
+              <v-spacer />
+              <v-btn size="small" variant="text" @click="closeDetail">关闭</v-btn>
+            </div>
+          </div>
+        </div>
+
+        <v-divider />
+
+        <v-card-text class="detail-files">
+          <div v-if="dirFilesLoading" class="empty-state"><p>文件加载中…</p></div>
+          <template v-else>
+            <div v-if="detailVersions.length" class="cat-bar">
+              <button type="button" class="cat-chip" :class="{ active: detailVersion === '__all__' }" @click="detailVersion = '__all__'">全部 <small>{{ dirFiles.length }}</small></button>
+              <button
+                v-for="v in detailVersions"
+                :key="v"
+                type="button"
+                class="cat-chip"
+                :class="{ active: detailVersion === v }"
+                @click="detailVersion = v"
+              >{{ v }} <small>{{ dirFiles.filter((f) => versionLabel(f.fileName) === v).length }}</small></button>
+            </div>
+            <div class="dir-picker-list">
+              <label v-for="file in detailVisibleFiles" :key="file.path || file.fileName" class="share-item-row">
+                <v-checkbox
+                  :model-value="detailSelected.has(file.path || file.fileName)"
+                  density="compact"
+                  hide-details
+                  :label="file.fileName + (episodeNum(file.fileName) != null ? `（第${episodeNum(file.fileName)}集）` : '')"
+                  @update:model-value="toggleDetailFile(file)"
+                />
+                <span class="share-item-meta">
+                  <v-chip v-if="detailVersions.length" size="x-small" variant="tonal" class="mr-2">{{ versionLabel(file.fileName) }}</v-chip>
+                  {{ formatBytes(file.size) }}{{ file.isVideo ? " · 视频" : "" }}
+                </span>
+              </label>
+            </div>
+            <div class="button-row">
+              <v-btn size="small" variant="text" @click="toggleDetailAll">
+                {{ detailVisibleFiles.length && detailVisibleFiles.every((f) => detailSelected.has(f.path || f.fileName)) ? "全不选" : "全选" }}
+              </v-btn>
+              <span class="muted-hint">已选 {{ detailSelected.size }} / {{ dirFiles.length }}</span>
+              <v-spacer />
+              <v-btn size="small" variant="outlined" prepend-icon="mdi-download" :disabled="!detailSelected.size" @click="exportSelectedFiles(detailWork)">导出选中</v-btn>
+              <v-btn size="small" color="success" variant="tonal" prepend-icon="mdi-fast-forward" :disabled="!detailSelected.size || Boolean(transferBusy)" @click="submitTransferSelectedFiles(detailWork)">转存选中</v-btn>
+            </div>
+          </template>
+        </v-card-text>
+      </v-card>
+    </v-dialog>
 
     <!-- ====================== 123 目录选择弹窗 ====================== -->
     <v-dialog v-model="transferPickerOpen" max-width="620">
@@ -1369,30 +1606,209 @@ onUnmounted(() => {
   color: rgb(var(--v-theme-error));
 }
 
-.cat-panel {
+.filter-panel {
   margin-top: 12px;
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.cat-panel-head {
+.filter-head {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
 }
 
-.cat-panel-title {
+.filter-title {
   font-size: 14px;
   font-weight: 700;
 }
 
-.merge-toolbar {
+.sort-select {
+  max-width: 170px;
+}
+
+.enrich-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.facet-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.facet-label {
+  flex-shrink: 0;
+  width: 44px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  padding-top: 5px;
+}
+
+.facet-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.poster-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+  gap: 16px;
+  margin-top: 14px;
+}
+
+.poster-card {
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.poster-box {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.25);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.poster-card:hover .poster-box {
+  transform: translateY(-3px);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
+}
+
+.poster-box :deep(.work-poster) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 0;
+}
+
+.poster-box :deep(.work-poster-fallback) {
+  width: 100%;
+  height: 100%;
+  font-size: 40px;
+}
+
+.poster-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  backdrop-filter: blur(2px);
+}
+
+.poster-badge.pending {
+  background: rgba(91, 141, 239, 0.85);
+}
+
+.poster-badge.uncategorized {
+  background: rgba(120, 120, 120, 0.7);
+}
+
+.poster-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.poster-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.detail-card {
+  overflow: hidden;
+}
+
+.detail-head {
+  display: flex;
+  gap: 18px;
+  padding: 18px;
+}
+
+.detail-poster {
+  width: 160px;
+  flex-shrink: 0;
+}
+
+.detail-poster :deep(.work-poster) {
+  width: 160px;
+  height: 240px;
+  object-fit: cover;
+  border-radius: 10px;
+}
+
+.detail-poster :deep(.work-poster-fallback) {
+  width: 160px;
+  height: 240px;
+  font-size: 48px;
+}
+
+.detail-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.detail-title-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.detail-title {
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.detail-chips,
+.detail-genres {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.detail-overview {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.detail-actions {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 6px;
+  margin-top: 4px;
+}
+
+.detail-files {
+  max-height: 46vh;
 }
 
 .cat-bar {

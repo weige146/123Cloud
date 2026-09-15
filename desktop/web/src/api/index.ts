@@ -197,6 +197,43 @@ export interface LibraryWork {
   totalSize: number;
   cat: string;
   sub: string;
+  mediaType: string;
+  genres: string[];
+  region: string;
+  voteAverage: number;
+  posterPath: string;
+  overview: string;
+  tmdbStatus: string;
+  language: string;
+  airStatus: string;
+  resolution: string;
+  edition: string;
+  popularity: number;
+}
+
+export interface LibraryFacetItem {
+  name: string | number;
+  count: number;
+}
+
+export interface LibraryFacets {
+  channels: LibraryFacetItem[];
+  genres: LibraryFacetItem[];
+  regions: LibraryFacetItem[];
+  languages: LibraryFacetItem[];
+  statuses: LibraryFacetItem[];
+  resolutions: LibraryFacetItem[];
+  editions: LibraryFacetItem[];
+  decades: LibraryFacetItem[];
+  ratings: LibraryFacetItem[];
+}
+
+export interface LibraryEnrichStats {
+  total: number;
+  pending: number;
+  ok: number;
+  failed: number;
+  none: number;
 }
 
 export interface LibraryCategory {
@@ -321,11 +358,43 @@ export const libraryApi = {
     api.post<{ ok: boolean }>("/api/library/sources/delete", { name, token }),
   categories: (token: string) =>
     api.get<{ ok: boolean; categories: LibraryCategory[] }>(`/api/library/categories${libraryTokenQuery(token)}`),
-  search: (params: { q?: string; cat?: string; sub?: string; page?: number; size?: number; lib?: string; token?: string }) => {
+  facets: (params: { mediaType?: string; genre?: string; region?: string; decade?: number; lib?: string; q?: string; language?: string; status?: string; resolution?: string; edition?: string; rating?: number; token?: string }) => {
+    const query = new URLSearchParams();
+    if (params.mediaType) query.set("mediaType", params.mediaType);
+    if (params.genre) query.set("genre", params.genre);
+    if (params.region) query.set("region", params.region);
+    if (params.decade) query.set("decade", String(params.decade));
+    if (params.language) query.set("language", params.language);
+    if (params.status) query.set("status", params.status);
+    if (params.resolution) query.set("resolution", params.resolution);
+    if (params.edition) query.set("edition", params.edition);
+    if (params.rating) query.set("rating", String(params.rating));
+    if (params.lib) query.set("lib", params.lib);
+    if (params.q) query.set("q", params.q);
+    if (params.token) query.set("token", params.token);
+    const qs = query.toString();
+    return api.get<{ ok: boolean; facets: LibraryFacets }>(`/api/library/facets${qs ? `?${qs}` : ""}`);
+  },
+  enrichStatus: (token: string) =>
+    api.get<{ ok: boolean; stats: LibraryEnrichStats }>(`/api/library/enrich/status${libraryTokenQuery(token)}`),
+  enrichStart: (token: string) =>
+    api.post<{ ok: boolean; processed: number; stats: LibraryEnrichStats }>("/api/library/enrich/start", { token }),
+  enrichReset: (token: string, refreshAll = false) =>
+    api.post<{ ok: boolean; requeued: number; stats: LibraryEnrichStats }>("/api/library/enrich/reset", { token, refreshAll }),
+  search: (params: { q?: string; cat?: string; sub?: string; page?: number; size?: number; lib?: string; mediaType?: string; genre?: string; region?: string; decade?: number; sort?: string; language?: string; status?: string; edition?: string; rating?: number; token?: string }) => {
     const query = new URLSearchParams();
     if (params.q) query.set("q", params.q);
     if (params.cat) query.set("cat", params.cat);
     if (params.sub) query.set("sub", params.sub);
+    if (params.mediaType) query.set("mediaType", params.mediaType);
+    if (params.genre) query.set("genre", params.genre);
+    if (params.region) query.set("region", params.region);
+    if (params.decade) query.set("decade", String(params.decade));
+    if (params.sort) query.set("sort", params.sort);
+    if (params.language) query.set("language", params.language);
+    if (params.status) query.set("status", params.status);
+    if (params.edition) query.set("edition", params.edition);
+    if (params.rating) query.set("rating", String(params.rating));
     query.set("page", String(params.page ?? 1));
     query.set("size", String(params.size ?? 20));
     if (params.lib) query.set("lib", params.lib);

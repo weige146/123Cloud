@@ -173,6 +173,13 @@ logger = logging.getLogger(__name__)
 sha1_cloud.set_pool_token_override(str(store.read_value("sha1PoolTokenOverride") or "") or None)
 pan115_recycle_cleanup_task: Optional[asyncio.Task[None]] = None
 telegram_callback_polling_task: Optional[asyncio.Task[None]] = None
+library_enrich_task: Optional[asyncio.Task[None]] = None
+# 影库分类充实（后台懒回填）：每批条数 / 相邻请求间隔 / 无活时空闲 / 单作品失败重试阈值
+LIBRARY_ENRICH_BATCH = 20
+LIBRARY_ENRICH_REQ_GAP = 0.25
+LIBRARY_ENRICH_IDLE_SEC = 30
+LIBRARY_ENRICH_ACTIVE_SEC = 2
+LIBRARY_ENRICH_MAX_ATTEMPTS = 3
 PAN123_COPY_PASSWORD_PENDING_PREFIX = "telegram_pan123_copy_password:"
 PAN123_COPY_PASSWORD_TTL_SECONDS = 600
 TELEGRAM_BOT_COMMANDS = [
@@ -203,7 +210,7 @@ app.add_middleware(
 
 
 async def start_background_tasks() -> None:
-    global pan115_recycle_cleanup_task, telegram_callback_polling_task
+    global pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task
     await start_telegram_client()
     transfer_service.set_queued_notifier(send_telegram_transfer_queued_messages)
     transfer_service.set_notifier(send_telegram_transfer_status_message)
@@ -217,12 +224,16 @@ async def start_background_tasks() -> None:
         pass
     else:
         telegram_callback_polling_task = asyncio.create_task(telegram_callback_polling_loop())
+    if library_enrich_task and not library_enrich_task.done():
+        pass
+    else:
+        library_enrich_task = asyncio.create_task(library_enrich_loop())
     await transfer_service.init()
-    # 影库：数据库优先，无后台扫描线程
+    # 影库：数据库优先，无后台扫描线程；分类信息靠 library_enrich_loop 懒回填
 
 
 async def stop_background_tasks() -> None:
-    for task in (pan115_recycle_cleanup_task, telegram_callback_polling_task):
+    for task in (pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task):
         if not task or task.done():
             continue
         task.cancel()
@@ -2435,6 +2446,113 @@ async def library_tmdb_detail(
     return {"ok": True, "detail": best}
 
 
+# ===== 影库分类充实（后台懒回填队列）=====
+
+def _tmdb_enrich_fields(info: Dict[str, Any], matched_type: str) -> Dict[str, Any]:
+    """把 TMDB info 归一成入库分类字段（genres 中文名列表、region 中文桶、海报 URL、评分、简介、年份）。"""
+    genres = [str(g.get("name") or "") for g in (info.get("genres") or []) if isinstance(g, dict) and g.get("name")]
+    date = str(info.get("release_date") or info.get("first_air_date") or "")
+    poster = f"https://image.tmdb.org/t/p/w185{info['poster_path']}" if info.get("poster_path") else ""
+    return {
+        "media_type": matched_type,
+        "genres": genres,
+        "region": movie_library.normalize_region(info.get("origin_country")),
+        "poster_path": poster,
+        "vote_average": float(info.get("vote_average") or 0),
+        "overview": str(info.get("overview") or ""),
+        "year": int(date[:4]) if date[:4].isdigit() else None,
+        "language": movie_library.normalize_language(info.get("original_language")),
+        "air_status": movie_library.normalize_air_status(matched_type, info),
+        "popularity": float(info.get("popularity") or 0),
+    }
+
+
+async def _tmdb_enrich_lookup(tmdb_id: int, title: str, year: int) -> Optional[Dict[str, Any]]:
+    """movie/tv 双查择优，返回可直接入库的分类字段；查不到返回 None。"""
+    best: Optional[Dict[str, Any]] = None
+    best_type = ""
+    best_score = -1
+    for type_ in ("movie", "tv"):
+        info = await _tmdb_fetch_info(type_, tmdb_id)
+        if not info:
+            continue
+        score = _tmdb_match_score(info, title, year)
+        if score <= best_score:
+            continue
+        best, best_type, best_score = info, type_, score
+    if best is None:
+        return None
+    return _tmdb_enrich_fields(best, best_type)
+
+
+async def _library_enrich_pass(limit: int = LIBRARY_ENRICH_BATCH) -> int:
+    """处理一批 pending：逐条查 TMDB 写回成功或计失败重试。返回本批处理条数。"""
+    rows = await asyncio.to_thread(movie_library_db.pending_works, limit)
+    processed = 0
+    for row in rows:
+        dirname = row["dir"]
+        tmdb_id = row.get("tmdb_id")
+        fields = None
+        if tmdb_id:
+            try:
+                fields = await _tmdb_enrich_lookup(tmdb_id, str(row.get("title") or ""), int(row.get("year") or 0))
+            except Exception:
+                fields = None
+        if fields:
+            await asyncio.to_thread(movie_library_db.apply_enrichment, dirname, fields)
+        else:
+            await asyncio.to_thread(movie_library_db.mark_enrich_failure, dirname, LIBRARY_ENRICH_MAX_ATTEMPTS)
+        processed += 1
+        await asyncio.sleep(LIBRARY_ENRICH_REQ_GAP)
+    return processed
+
+
+async def library_enrich_loop() -> None:
+    """常驻后台：有 pending 就分批回填，队列空时长时间空闲等待新导入。"""
+    while True:
+        try:
+            n = await _library_enrich_pass()
+            await asyncio.sleep(LIBRARY_ENRICH_ACTIVE_SEC if n else LIBRARY_ENRICH_IDLE_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.debug(f"影库分类充实轮询异常：{error}")
+            await asyncio.sleep(LIBRARY_ENRICH_IDLE_SEC)
+
+
+class LibraryTokenRequest(BaseModel):
+    token: str = ""
+
+
+class LibraryEnrichResetRequest(BaseModel):
+    token: str = ""
+    refreshAll: bool = False
+
+
+@app.get("/api/library/enrich/status")
+async def read_library_enrich_status(request: Request, token: str = "") -> Dict[str, Any]:
+    """充实进度统计：{total, pending, ok, failed, none}。"""
+    _guard_library_token(request, token)
+    stats = await asyncio.to_thread(movie_library_db.enrich_stats)
+    return {"ok": True, "stats": stats}
+
+
+@app.post("/api/library/enrich/start")
+async def start_library_enrich(request: LibraryTokenRequest, request_obj: Request) -> Dict[str, Any]:
+    """手动触发：立即处理一批 pending（后台循环照常另跑）。"""
+    _guard_library_token(request_obj, request.token)
+    processed = await _library_enrich_pass()
+    return {"ok": True, "processed": processed, "stats": await asyncio.to_thread(movie_library_db.enrich_stats)}
+
+
+@app.post("/api/library/enrich/reset")
+async def reset_library_enrich(request: LibraryEnrichResetRequest, request_obj: Request) -> Dict[str, Any]:
+    """重新入队回填：默认只把 failed 打回 pending；refreshAll=true 连 ok 一起重排刷新分类。"""
+    _guard_library_token(request_obj, request.token)
+    requeued = await asyncio.to_thread(movie_library_db.reset_enrichment, not request.refreshAll)
+    return {"ok": True, "requeued": requeued, "stats": await asyncio.to_thread(movie_library_db.enrich_stats)}
+
+
 @app.post("/api/library/export/save")
 async def save_library_export(request: LibraryExportSaveRequest, request_obj: Request) -> Dict[str, Any]:
     """服务端直接把秒传 JSON 写进导出目录（不走浏览器下载，大分类也快）。"""
@@ -2573,8 +2691,34 @@ async def search_library(
     _guard_library_token(request, token)
     total, results = await asyncio.to_thread(
         movie_library_db.search, q, page, size, cat, sub, _split_lib_filter(lib),
+        mediaType, genre, region, decade, sort, language, status, "", edition, rating,
     )
     return {"ok": True, "total": total, "page": page, "size": size, "dirs": results}
+
+
+@app.get("/api/library/facets")
+async def read_library_facets(
+    request: Request,
+    lib: str = "",
+    mediaType: str = "",
+    genre: str = "",
+    region: str = "",
+    decade: int = 0,
+    q: str = "",
+    language: str = "",
+    status: str = "",
+    resolution: str = "",
+    edition: str = "",
+    rating: float = 0,
+    token: str = "",
+) -> Dict[str, Any]:
+    """分类维度候选计数（优爱腾式交叉筛选），供前端动态渲染筛选条。"""
+    _guard_library_token(request, token)
+    facets = await asyncio.to_thread(
+        movie_library_db.facets, mediaType, genre, region, decade, _split_lib_filter(lib), q,
+        language, status, resolution, edition, rating,
+    )
+    return {"ok": True, "facets": facets}
 
 
 @app.get("/api/library/files")
@@ -2594,6 +2738,15 @@ async def export_library_json(
     sub: str = "",
     cats: str = "",
     lib: str = "",
+    mediaType: str = "",
+    genre: str = "",
+    region: str = "",
+    decade: int = 0,
+    sort: str = "",
+    language: str = "",
+    status: str = "",
+    edition: str = "",
+    rating: float = 0,
     token: str = "",
 ) -> Dict[str, Any]:
     _guard_library_token(request, token)

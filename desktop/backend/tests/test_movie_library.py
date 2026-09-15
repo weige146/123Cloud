@@ -242,6 +242,87 @@ class MovieLibraryEngineTests(unittest.TestCase):
             self.assertEqual(db.transfer_files(["不存在目录"]), [])
 
 
+class MovieLibraryClassificationTests(unittest.TestCase):
+    """影库分类重写步骤1：地区归一、tmdb_status 入库、旧库迁移补列。"""
+
+    def test_normalize_region(self):
+        self.assertEqual(movie_library.normalize_region(["CN"]), "华语")
+        self.assertEqual(movie_library.normalize_region(["HK"]), "港台")
+        self.assertEqual(movie_library.normalize_region(["TW", "CN"]), "港台")  # 首个命中
+        self.assertEqual(movie_library.normalize_region(["JP"]), "日韩")
+        self.assertEqual(movie_library.normalize_region(["US", "GB"]), "欧美")
+        self.assertEqual(movie_library.normalize_region("cn"), "华语")  # 字符串、大小写不敏感
+        self.assertEqual(movie_library.normalize_region(["NG"]), "其他")  # 有值未映射
+        self.assertEqual(movie_library.normalize_region([]), "")
+        self.assertEqual(movie_library.normalize_region(None), "")
+
+    def test_import_sets_tmdb_status(self):
+        """有 tmdb_id → pending（交后台回填），无 tmdb 标记 → none。"""
+        from app.movie_library_db import LibraryDb
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            db = LibraryDb(Path(d) / "cloud123.db")
+            db.import_payload("库.json", _fastlink_payload("", [
+                {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 100},
+                {"path": "电影/无名作品 2020/b.mkv", "fileName": "b.mkv", "etag": _etag(2), "size": 200},
+            ]))
+            conn = sqlite3.connect(Path(d) / "cloud123.db")
+            try:
+                status = {r[0]: r[1] for r in conn.execute(
+                    "SELECT dir, tmdb_status FROM library_works").fetchall()}
+            finally:
+                conn.close()
+            self.assertEqual(status[WORK_A], "pending")
+            self.assertEqual(status["电影/无名作品 2020"], "none")
+
+    def test_migration_adds_columns_backfills_and_is_idempotent(self):
+        """旧库缺新列：LibraryDb 初始化补列、把有 tmdb_id 的旧行排进 pending、可重复迁移。"""
+        import sqlite3
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as d:
+            db_file = Path(d) / "cloud123.db"
+            old_schema = (
+                "CREATE TABLE library_works (dir TEXT PRIMARY KEY, title TEXT NOT NULL,"
+                " norm_title TEXT NOT NULL, year INTEGER, tmdb_id INTEGER,"
+                " cat TEXT NOT NULL DEFAULT '', sub TEXT NOT NULL DEFAULT '',"
+                " pinyin TEXT NOT NULL DEFAULT '', pinyin_first TEXT NOT NULL DEFAULT '',"
+                " file_count INTEGER NOT NULL DEFAULT 0, video_count INTEGER NOT NULL DEFAULT 0,"
+                " total_size INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL);"
+            )
+            conn = sqlite3.connect(db_file)
+            try:
+                conn.execute(old_schema)
+                conn.execute(
+                    "INSERT INTO library_works (dir, title, norm_title, tmdb_id, source)"
+                    " VALUES (?,?,?,?,?)",
+                    (WORK_A, "海王", "海王", 297802, "旧库.json"))
+                conn.execute(
+                    "INSERT INTO library_works (dir, title, norm_title, tmdb_id, source)"
+                    " VALUES (?,?,?,?,?)",
+                    ("电影/无名 2020", "无名", "无名", None, "旧库.json"))
+                conn.commit()
+            finally:
+                conn.close()
+
+            LibraryDb(db_file)  # 触发迁移
+            LibraryDb(db_file)  # 再迁移一次，验证幂等（不报错、不重复补列）
+
+            conn = sqlite3.connect(db_file)
+            conn.row_factory = sqlite3.Row
+            try:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(library_works)").fetchall()}
+                self.assertTrue({
+                    "media_type", "genres", "region", "poster_path",
+                    "vote_average", "overview", "tmdb_status", "enrich_attempts",
+                } <= cols)
+                rows = {r["dir"]: dict(r) for r in conn.execute("SELECT * FROM library_works").fetchall()}
+            finally:
+                conn.close()
+            self.assertEqual(rows[WORK_A]["tmdb_status"], "pending")
+            self.assertEqual(rows["电影/无名 2020"]["tmdb_status"], "none")
+            self.assertEqual(rows[WORK_A]["genres"], "[]")  # 新列默认值
+
+
 class _FakePan123:
     """记录 ensure_path/md5_reuse 调用的假 OpenAPI 客户端。"""
 
@@ -812,3 +893,323 @@ class MovieLibraryStreamImportTests(unittest.TestCase):
                 text.write_text("123FSLinkV1$0123456789abcdef0123456789abcdef#7#dir/a.mkv", encoding="utf-8")
                 r3 = main._import_library_from_path(str(text), "links.txt")
                 self.assertEqual(r3["added"], 1)
+
+
+class LibraryEnrichTests(unittest.TestCase):
+    """影库分类充实（步骤2）：DB 队列方法 + 字段归一 + 路由（打桩免联网）。"""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self._original_db = movie_library_db._default_db
+        self.addCleanup(setattr, movie_library_db, "_default_db", self._original_db)
+        self.db = movie_library_db.LibraryDb(Path(self._directory.name) / "cloud123.db")
+        movie_library_db._default_db = self.db
+
+    def _seed(self):
+        self.db.import_payload("库.json", _fastlink_payload("", [
+            {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 100},
+        ]))
+
+    def test_pending_works_only_pending_with_id(self):
+        self.db.import_payload("库.json", _fastlink_payload("", [
+            {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 100},
+            {"path": "电影/无名 2020/b.mkv", "fileName": "b.mkv", "etag": _etag(2), "size": 10},
+        ]))
+        rows = self.db.pending_works(50)
+        self.assertEqual([r["dir"] for r in rows], [WORK_A])  # 无 tmdb 的不进队列
+        self.assertEqual(rows[0]["tmdb_id"], 297802)
+        stats = self.db.enrich_stats()
+        self.assertEqual((stats["pending"], stats["none"]), (1, 1))
+        self.assertEqual(stats["total"], 2)
+
+    def test_apply_enrichment_writes_and_sets_ok(self):
+        self._seed()
+        self.db.apply_enrichment(WORK_A, {
+            "media_type": "movie", "genres": ["动作", "科幻"], "region": "欧美",
+            "poster_path": "https://image.tmdb.org/x.jpg", "vote_average": 7.5,
+            "overview": "海底王国", "year": 2018,
+        })
+        import sqlite3
+        conn = sqlite3.connect(Path(self._directory.name) / "cloud123.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            r = dict(conn.execute("SELECT * FROM library_works WHERE dir = ?", (WORK_A,)).fetchone())
+        finally:
+            conn.close()
+        self.assertEqual(r["tmdb_status"], "ok")
+        self.assertEqual(r["media_type"], "movie")
+        self.assertEqual(json.loads(r["genres"]), ["动作", "科幻"])
+        self.assertEqual(r["region"], "欧美")
+        self.assertAlmostEqual(r["vote_average"], 7.5)
+        self.assertEqual(self.db.enrich_stats()["ok"], 1)
+        # 已 ok 不再进 pending
+        self.assertEqual(self.db.pending_works(50), [])
+
+    def test_mark_failure_threshold_then_reset(self):
+        self._seed()
+        self.db.mark_enrich_failure(WORK_A, max_attempts=3)
+        self.assertEqual(self.db.enrich_stats()["pending"], 1)  # 第 1 次仍 pending
+        self.db.mark_enrich_failure(WORK_A, max_attempts=3)
+        self.db.mark_enrich_failure(WORK_A, max_attempts=3)   # 第 3 次 → failed
+        stats = self.db.enrich_stats()
+        self.assertEqual((stats["failed"], stats["pending"]), (1, 0))
+        # 只重排 failed → 回到 pending，attempts 归零
+        self.assertEqual(self.db.reset_enrichment(only_failed=True), 1)
+        self.assertEqual(self.db.enrich_stats()["pending"], 1)
+        self.assertEqual(self.db.pending_works(50)[0]["tmdb_id"], 297802)
+
+    def test_reset_refresh_all_requeues_ok(self):
+        self._seed()
+        self.db.apply_enrichment(WORK_A, {"media_type": "movie", "genres": [], "region": "欧美",
+                                          "poster_path": "", "vote_average": 0, "overview": "", "year": 2018})
+        self.assertEqual(self.db.reset_enrichment(only_failed=True), 0)  # 只重排 failed，ok 不动
+        self.assertEqual(self.db.reset_enrichment(only_failed=False), 1)  # 全量重排
+        self.assertEqual(self.db.enrich_stats()["pending"], 1)
+
+    def test_tmdb_enrich_fields_normalize(self):
+        info = {
+            "title": "Aquaman", "release_date": "2018-12-07", "overview": "o",
+            "vote_average": 6.8, "poster_path": "/abc.jpg", "origin_country": ["US", "CN"],
+            "genres": [{"id": 1, "name": "动作"}, {"id": 2, "name": "科幻"}, {"id": 3}],
+        }
+        fields = main._tmdb_enrich_fields(info, "movie")
+        self.assertEqual(fields["media_type"], "movie")
+        self.assertEqual(fields["genres"], ["动作", "科幻"])
+        self.assertEqual(fields["region"], "欧美")  # 首个命中 US
+        self.assertEqual(fields["year"], 2018)
+        self.assertEqual(fields["poster_path"], "https://image.tmdb.org/t/p/w185/abc.jpg")
+        self.assertAlmostEqual(fields["vote_average"], 6.8)
+
+    def test_enrich_status_route(self):
+        original_store = main.store
+        self.addCleanup(setattr, main, "store", original_store)
+        from app.session_store import SessionStore
+        main.store = SessionStore(Path(self._directory.name))
+        self._seed()
+        result = asyncio.run(main.read_library_enrich_status(_StubRequest(), token=""))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stats"]["pending"], 1)
+
+    def test_enrich_start_route_applies_stubbed_lookup(self):
+        original_store = main.store
+        self.addCleanup(setattr, main, "store", original_store)
+        from app.session_store import SessionStore
+        main.store = SessionStore(Path(self._directory.name))
+        self._seed()
+        fields = {"media_type": "movie", "genres": ["动作"], "region": "欧美",
+                  "poster_path": "", "vote_average": 7.0, "overview": "", "year": 2018}
+        with unittest.mock.patch.object(main, "_tmdb_enrich_lookup", AsyncMock(return_value=fields)):
+            result = asyncio.run(main.start_library_enrich(main.LibraryTokenRequest(), _StubRequest()))
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["stats"]["ok"], 1)
+
+
+W_MOVIE_1 = "合集/甲 (2018) {tmdb-11}"
+W_MOVIE_2 = "合集/乙 (2019) {tmdb-12}"
+W_TV_1 = "合集/丙 (2021) {tmdb-13}"
+W_NOID = "合集/丁 2020"
+
+
+class LibraryFacetsTests(unittest.TestCase):
+    """影库分类维度筛选与交叉计数（步骤3）。"""
+
+    def setUp(self):
+        from app.movie_library_db import LibraryDb
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.db = LibraryDb(Path(self._directory.name) / "cloud123.db")
+        self.db.import_payload("库.json", _fastlink_payload("", [
+            {"path": f"{W_MOVIE_1}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 10},
+            {"path": f"{W_MOVIE_2}/b.mkv", "fileName": "b.mkv", "etag": _etag(2), "size": 10},
+            {"path": f"{W_TV_1}/c.mkv", "fileName": "c.mkv", "etag": _etag(3), "size": 10},
+            {"path": f"{W_NOID}/d.mkv", "fileName": "d.mkv", "etag": _etag(4), "size": 10},
+        ]))
+        self.db.apply_enrichment(W_MOVIE_1, {"media_type": "movie", "genres": ["动作", "科幻"],
+                                             "region": "欧美", "vote_average": 7.0, "year": 2018})
+        self.db.apply_enrichment(W_MOVIE_2, {"media_type": "movie", "genres": ["科幻"],
+                                             "region": "华语", "vote_average": 9.0, "year": 2019})
+        self.db.apply_enrichment(W_TV_1, {"media_type": "tv", "genres": ["动作"],
+                                          "region": "日韩", "vote_average": 5.0, "year": 2021})
+
+    def _names(self, items):
+        return {i["name"]: i["count"] for i in items}
+
+    def test_facets_counts(self):
+        f = self.db.facets()
+        self.assertEqual(self._names(f["channels"]), {"movie": 2, "tv": 1})
+        self.assertEqual(self._names(f["genres"]), {"动作": 2, "科幻": 2})
+        self.assertEqual(self._names(f["regions"]), {"欧美": 1, "华语": 1, "日韩": 1})
+        self.assertEqual(self._names(f["decades"]), {2010: 2, 2020: 1})
+
+    def test_facets_cross_filter_narrows_others(self):
+        # 选电影频道：类型/地区/年代按电影作品收窄，频道自身不变
+        f = self.db.facets(media_type="movie")
+        self.assertEqual(self._names(f["channels"]), {"movie": 2, "tv": 1})  # 自身不收窄
+        self.assertEqual(self._names(f["genres"]), {"动作": 1, "科幻": 2})   # 丙(tv 的动作)被排除
+        self.assertEqual(self._names(f["regions"]), {"欧美": 1, "华语": 1})
+        self.assertEqual(self._names(f["decades"]), {2010: 2})
+
+    def test_search_by_dimension(self):
+        total, rows = self.db.search("", 1, 20, media_type="movie")
+        self.assertEqual(total, 2)
+        total, rows = self.db.search("", 1, 20, genre="动作")
+        self.assertEqual({r["dir"] for r in rows}, {W_MOVIE_1, W_TV_1})
+        total, _ = self.db.search("", 1, 20, region="日韩")
+        self.assertEqual(total, 1)
+        total, _ = self.db.search("", 1, 20, decade=2020)  # 2020-2029
+        self.assertEqual(total, 1)
+
+    def test_search_sort_and_enriched_fields(self):
+        total, rows = self.db.search("", 1, 20, sort="rating")
+        self.assertEqual([r["dir"] for r in rows][:2], [W_MOVIE_2, W_MOVIE_1])  # 9.0 → 7.0
+        movie = {r["dir"]: r for r in rows}
+        self.assertEqual(movie[W_MOVIE_1]["mediaType"], "movie")
+        self.assertEqual(movie[W_MOVIE_1]["genres"], ["动作", "科幻"])
+        self.assertEqual(movie[W_MOVIE_1]["region"], "欧美")
+        self.assertAlmostEqual(movie[W_MOVIE_2]["voteAverage"], 9.0)
+        # 无 tmdb 的作品分类字段留空、状态 none
+        _, norows = self.db.search("丁", 1, 20)
+        self.assertEqual(norows[0]["tmdbStatus"], "none")
+        self.assertEqual(norows[0]["genres"], [])
+
+    def test_facets_and_search_routes(self):
+        original_store = main.store
+        self.addCleanup(setattr, main, "store", original_store)
+        from app.session_store import SessionStore
+        self._original_db = movie_library_db._default_db
+        self.addCleanup(setattr, movie_library_db, "_default_db", self._original_db)
+        movie_library_db.init(Path(self._directory.name) / "cloud123.db")
+        main.store = SessionStore(Path(self._directory.name))
+        facets = asyncio.run(main.read_library_facets(_StubRequest()))
+        self.assertEqual(self._names(facets["facets"]["channels"]), {"movie": 2, "tv": 1})
+        result = asyncio.run(main.search_library(_StubRequest(), mediaType="tv", page=1, size=20))
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["dirs"][0]["dir"], W_TV_1)
+
+
+class LibraryDimTests(unittest.TestCase):
+    """分类维度增量：语言/完结/画质版本/评分区间/热度。"""
+
+    def test_normalize_language(self):
+        self.assertEqual(movie_library.normalize_language("zh"), "中文")
+        self.assertEqual(movie_library.normalize_language("en"), "英语")
+        self.assertEqual(movie_library.normalize_language("JA"), "日语")
+        self.assertEqual(movie_library.normalize_language("xx"), "其他")
+        self.assertEqual(movie_library.normalize_language(""), "")
+        self.assertEqual(movie_library.normalize_language(None), "")
+
+    def test_normalize_air_status(self):
+        self.assertEqual(movie_library.normalize_air_status("movie", {"status": "Released"}), "")
+        self.assertEqual(movie_library.normalize_air_status("tv", {"in_production": True}), "更新中")
+        self.assertEqual(movie_library.normalize_air_status("tv", {"status": "Ended"}), "已完结")
+        self.assertEqual(movie_library.normalize_air_status("tv", {"status": "Returning Series"}), "更新中")
+        self.assertEqual(movie_library.normalize_air_status("tv", {"status": "Canceled"}), "已停更")
+        self.assertEqual(movie_library.normalize_air_status("tv", {"status": "Planned"}), "未开播")
+        self.assertEqual(movie_library.normalize_air_status("tv", {}), "")
+
+    def test_infer_technical(self):
+        self.assertEqual(movie_library.infer_technical(["Movie.2160p.x265.mkv", "Movie.1080p.mkv"]), ("4K", ""))
+        self.assertEqual(movie_library.infer_technical(["S01E01.1080p.WEB-DL.mkv", "x.720p.HDTV.mkv"]), ("1080p", "WEB-DL"))
+        self.assertEqual(movie_library.infer_technical(["a.2160p.REMUX.mkv", "b.1080p.BluRay.mkv"]), ("4K", "REMUX"))
+        self.assertEqual(movie_library.infer_technical(["纯中文无标记.mkv"]), ("", ""))
+        self.assertEqual(movie_library.infer_technical([]), ("", ""))
+
+    def test_import_writes_resolution_edition(self):
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as d:
+            db = LibraryDb(Path(d) / "cloud123.db")
+            db.import_payload("库.json", _fastlink_payload("", [
+                {"path": f"{WORK_A}/Movie.2160p.x265.mkv", "fileName": "Movie.2160p.x265.mkv", "etag": _etag(1), "size": 100},
+                {"path": f"{WORK_A}/nfo.txt", "fileName": "nfo.txt", "etag": _etag(2), "size": 5},
+            ]))
+            _, rows = db.search("", 1, 20)
+            self.assertEqual(rows[0]["resolution"], "4K")
+            self.assertEqual(rows[0]["edition"], "")
+
+    def test_import_stream_writes_tech(self):
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as d:
+            db = LibraryDb(Path(d) / "cloud123.db")
+            entries = [
+                {"path": f"{WORK_A}/Ep01.1080p.WEB-DL.mkv", "fileName": "Ep01.1080p.WEB-DL.mkv", "etag": _etag(1), "size": 100},
+                {"path": f"{WORK_A}/Ep02.720p.HDTV.mkv", "fileName": "Ep02.720p.HDTV.mkv", "etag": _etag(2), "size": 50},
+            ]
+            r = db.import_stream("库.json", "", entries)
+            self.assertEqual(r["added"], 1)
+            _, rows = db.search("", 1, 20)
+            self.assertEqual(rows[0]["resolution"], "1080p")  # 取最高
+            self.assertEqual(rows[0]["edition"], "WEB-DL")    # 最高优先级
+
+    def test_apply_enrichment_persists_new_fields(self):
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as d:
+            db = LibraryDb(Path(d) / "cloud123.db")
+            db.import_payload("库.json", _fastlink_payload("", [
+                {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 100},
+            ]))
+            db.apply_enrichment(WORK_A, {
+                "media_type": "tv", "genres": ["科幻"], "region": "日韩", "poster_path": "",
+                "vote_average": 8.5, "overview": "", "year": 2021,
+                "language": "日语", "air_status": "已完结", "popularity": 123.4,
+            })
+            _, rows = db.search("", 1, 20)
+            w = rows[0]
+            self.assertEqual(w["language"], "日语")
+            self.assertEqual(w["airStatus"], "已完结")
+            self.assertAlmostEqual(w["popularity"], 123.4)
+
+    def test_search_rating_and_popularity(self):
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as d:
+            db = LibraryDb(Path(d) / "cloud123.db")
+            dirs = ["合集/高 (2020) {tmdb-201}", "合集/中 (2020) {tmdb-202}", "合集/低 (2020) {tmdb-203}"]
+            db.import_payload("库.json", _fastlink_payload("", [
+                {"path": f"{dirs[0]}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 1},
+                {"path": f"{dirs[1]}/b.mkv", "fileName": "b.mkv", "etag": _etag(2), "size": 1},
+                {"path": f"{dirs[2]}/c.mkv", "fileName": "c.mkv", "etag": _etag(3), "size": 1},
+            ]))
+            db.apply_enrichment(dirs[0], {"media_type": "movie", "genres": [], "region": "欧美",
+                                          "poster_path": "", "vote_average": 9.2, "overview": "", "popularity": 5})
+            db.apply_enrichment(dirs[1], {"media_type": "movie", "genres": [], "region": "欧美",
+                                          "poster_path": "", "vote_average": 7.5, "overview": "", "popularity": 99})
+            db.apply_enrichment(dirs[2], {"media_type": "movie", "genres": [], "region": "欧美",
+                                          "poster_path": "", "vote_average": 6.0, "overview": "", "popularity": 50})
+            total, _ = db.search("", 1, 20, rating=8)  # vote_average >= 8
+            self.assertEqual(total, 1)
+            total, rows = db.search("", 1, 20, rating=7)
+            self.assertEqual(total, 2)
+            _, rows = db.search("", 1, 20, sort="popularity")
+            self.assertEqual(rows[0]["dir"], dirs[1])  # popularity 99 最高
+            f = db.facets()
+            self.assertEqual({i["name"]: i["count"] for i in f["ratings"]}, {9: 1, 8: 1, 7: 2})
+
+    def test_facets_new_dimensions(self):
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as d:
+            db = LibraryDb(Path(d) / "cloud123.db")
+            w1 = "合集/甲 (2018) {tmdb-11}"
+            w2 = "合集/乙 (2019) {tmdb-12}"
+            db.import_payload("库.json", _fastlink_payload("", [
+                {"path": f"{w1}/Movie.2160p.BluRay.mkv", "fileName": "Movie.2160p.BluRay.mkv", "etag": _etag(1), "size": 1},
+                {"path": f"{w2}/Show.1080p.WEB-DL.mkv", "fileName": "Show.1080p.WEB-DL.mkv", "etag": _etag(2), "size": 1},
+            ]))
+            db.apply_enrichment(w1, {"media_type": "movie", "genres": ["动作"], "region": "欧美",
+                                     "poster_path": "", "vote_average": 8.2, "overview": "", "year": 2018,
+                                     "language": "英语", "air_status": "", "popularity": 10})
+            db.apply_enrichment(w2, {"media_type": "tv", "genres": ["剧情"], "region": "华语",
+                                     "poster_path": "", "vote_average": 9.0, "overview": "", "year": 2019,
+                                     "language": "中文", "air_status": "已完结", "popularity": 20})
+            f = db.facets()
+            self.assertEqual({i["name"]: i["count"] for i in f["languages"]}, {"英语": 1, "中文": 1})
+            self.assertEqual({i["name"]: i["count"] for i in f["statuses"]}, {"已完结": 1})
+            self.assertEqual({i["name"]: i["count"] for i in f["resolutions"]}, {"4K": 1, "1080p": 1})
+            self.assertEqual({i["name"]: i["count"] for i in f["editions"]}, {"BluRay": 1, "WEB-DL": 1})
+            # 选电影频道：语言收窄到英语、地区欧美；状态（仅 tv）变空
+            f2 = db.facets(media_type="movie")
+            self.assertEqual({i["name"]: i["count"] for i in f2["languages"]}, {"英语": 1})
+            self.assertEqual(f2["statuses"], [])
+            # 选分辨率 4K：只有甲，其它维度随之收窄，分辨率自身仍是全集
+            f3 = db.facets(resolution="4K")
+            self.assertEqual({i["name"]: i["count"] for i in f3["resolutions"]}, {"4K": 1, "1080p": 1})
+            self.assertEqual({i["name"]: i["count"] for i in f3["editions"]}, {"BluRay": 1})

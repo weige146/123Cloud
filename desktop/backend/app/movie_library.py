@@ -544,6 +544,8 @@ def aggregate_works(common_path: str, files: List[Dict[str, Any]], video_ext: An
     for d, g in groups.items():
         title, year, tmdb_id = parse_dir_name(d)
         pinyin_full, pinyin_first = pinyin_keys(title)
+        resolution, edition = infer_technical(
+            str(fi.get("path") or "").rsplit("/", 1)[-1] for fi in g["files"])
         works[d] = {
             "dir": d,
             "title": title,
@@ -554,8 +556,146 @@ def aggregate_works(common_path: str, files: List[Dict[str, Any]], video_ext: An
             "total_size": g["total_size"],
             "pinyin": pinyin_full,
             "pinyin_first": pinyin_first,
+            "resolution": resolution,
+            "edition": edition,
             "files": g["files"],
         }
     return works
+
+
+# TMDB origin_country（ISO-3166 代码）→ 优爱腾式中文地区桶。取首个命中，未匹配归「其他」。
+_REGION_MAP = {
+    "CN": "华语",
+    "HK": "港台", "MO": "港台", "TW": "港台",
+    "JP": "日韩", "KR": "日韩",
+    "US": "欧美", "GB": "欧美", "FR": "欧美", "DE": "欧美", "IT": "欧美", "ES": "欧美",
+    "CA": "欧美", "RU": "欧美", "AU": "欧美", "IN": "欧美", "BR": "欧美", "SE": "欧美",
+    "DK": "欧美", "NL": "欧美", "BE": "欧美", "PL": "欧美", "IE": "欧美", "NZ": "欧美",
+    "MX": "欧美", "AR": "欧美", "NO": "欧美", "PT": "欧美", "AT": "欧美", "CH": "欧美",
+    "CZ": "欧美", "HU": "欧美", "UA": "欧美", "TR": "欧美", "ZA": "欧美", "EG": "欧美",
+}
+
+
+def normalize_region(codes: Any) -> str:
+    """把 TMDB origin_country 代码列表归一成中文地区桶（华语/港台/日韩/欧美/其他）。
+
+    接受字符串或列表（如 'CN' / ['US','GB']），大小写不敏感，取首个命中；
+    空或全未匹配返回「其他」。"""
+    if isinstance(codes, str):
+        items = [codes]
+    elif isinstance(codes, (list, tuple, set)):
+        items = [str(c) for c in codes]
+    else:
+        items = []
+    region = ""
+    for code in items:
+        c = str(code or "").strip().upper()
+        if not c:
+            continue
+        hit = _REGION_MAP.get(c)
+        if hit:
+            return hit
+        if not region:  # 记住「有值但未映射」→ 其他
+            region = "其他"
+    return region or ""
+
+
+# TMDB original_language（ISO-639-1）→ 中文语言桶；未映射但有值 → 其他；空 → 空串。
+_LANG_MAP = {
+    "zh": "中文", "yue": "粤语", "en": "英语", "ja": "日语", "ko": "韩语",
+    "fr": "法语", "de": "德语", "es": "西班牙语", "it": "意大利语", "ru": "俄语",
+    "hi": "印地语", "th": "泰语", "pt": "葡萄牙语", "sv": "瑞典语", "da": "丹麦语",
+    "nl": "荷兰语", "pl": "波兰语", "tr": "土耳其语", "ar": "阿拉伯语", "id": "印尼语",
+    "vi": "越南语", "ta": "泰米尔语", "te": "泰卢固语", "hu": "匈牙利语", "cs": "捷克语",
+    "no": "挪威语", "el": "希腊语", "he": "希伯来语", "ro": "罗马尼亚语", "uk": "乌克兰语",
+    "fa": "波斯语", "fi": "芬兰语", "bn": "孟加拉语", "ms": "马来语", "zh-cn": "中文",
+}
+
+
+def normalize_language(code: Any) -> str:
+    c = str(code or "").strip().lower()
+    if not c:
+        return ""
+    return _LANG_MAP.get(c, "其他")
+
+
+def normalize_air_status(matched_type: str, info: Dict[str, Any]) -> str:
+    """剧集更新状态（中文桶）；电影返回空串。取 TMDB in_production / status。"""
+    if matched_type != "tv":
+        return ""
+    if info.get("in_production"):
+        return "更新中"
+    status = str(info.get("status") or "")
+    if status == "Ended":
+        return "已完结"
+    if status == "Returning Series":
+        return "更新中"
+    if status == "Canceled":
+        return "已停更"
+    if status in ("Planned", "In Production"):
+        return "未开播"
+    return ""
+
+
+# 文件名 → 分辨率（取命中的最高档）
+_RESOLUTIONS = (
+    (4, "4K", ("2160P", "4K", "UHD")),
+    (3, "1080p", ("1080P", "1080I", "FHD")),
+    (2, "720p", ("720P", "HD")),
+    (1, "SD", ("480P", "576P", "SDTV")),
+)
+# 文件名 → 片源版本（取命中的最高优先级）
+_EDITIONS = (
+    (6, "REMUX", ("REMUX",)),
+    (5, "BluRay", ("BLURAY", "BLUE-RAY", "蓝光", "BDMV", "BDRIP")),
+    (4, "WEB-DL", ("WEB-DL", "WEBDL", "WEBRIP", "WEB RIP")),
+    (3, "HDTV", ("HDTV",)),
+    (2, "HDrip", ("HDRIP", "BRRIP", "DVDRIP", "DVDSCR", "PDTV")),
+    (1, "其他", ("CAM", "TS", "SCREENER", "SCRE")),
+)
+
+
+def _scan_resolution(upper_name: str) -> Tuple[int, str]:
+    for rank, label, marks in _RESOLUTIONS:
+        if any(m in upper_name for m in marks):
+            return rank, label
+    return 0, ""
+
+
+def _scan_edition(upper_name: str) -> Tuple[int, str]:
+    for rank, label, marks in _EDITIONS:
+        if any(m in upper_name for m in marks):
+            return rank, label
+    return 0, ""
+
+
+def new_tech_state() -> Dict[str, Any]:
+    """流式导入按作品增量累积分辨率/版本的状态袋。"""
+    return {"res_rank": 0, "resolution": "", "ed_rank": 0, "edition": ""}
+
+
+def update_tech_state(state: Dict[str, Any], name: str) -> Dict[str, Any]:
+    upper = str(name or "").upper()
+    if not upper:
+        return state
+    rank, label = _scan_resolution(upper)
+    if rank > state["res_rank"]:
+        state["res_rank"], state["resolution"] = rank, label
+    erank, elabel = _scan_edition(upper)
+    if erank > state["ed_rank"]:
+        state["ed_rank"], state["edition"] = erank, elabel
+    return state
+
+
+def tech_result(state: Dict[str, Any]) -> Tuple[str, str]:
+    return str(state.get("resolution") or ""), str(state.get("edition") or "")
+
+
+def infer_technical(names: Iterable[str]) -> Tuple[str, str]:
+    """扫描一个作品的全部文件名，返回（最高分辨率, 最高优先级片源版本）。"""
+    state = new_tech_state()
+    for name in names:
+        update_tech_state(state, name)
+    return tech_result(state)
 
 
