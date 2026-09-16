@@ -18,6 +18,7 @@ const slice = (fromMarker, toMarker) => {
 };
 const code = [
   slice("// src/core/utils.js", "// src/api.js"),
+  slice("// src/api.js", "// src/core/categories.js"),
   slice("// src/core/table-selection.js", "// src/public-share-cleanup.js")
 ].join("\n");
 const driver = `;

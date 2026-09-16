@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.11
+// @version      1.3.12
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -117,14 +117,18 @@
   function batchResult(details, affectedDirIds = []) {
     let ok = 0;
     let fail = 0;
+    let miss = 0;
     for (const item of details) {
       if (item.status === "success" || item.status === "skipped") ok += 1;
       else if (item.status === "failed") fail += 1;
+      // 秒传未命中（云端无同哈希文件）单列一桶：既不是成功转存也不算失败，避免结果页被刷屏
+      else if (item.status === "miss") miss += 1;
     }
     return {
       status: fail === 0 ? "success" : ok > 0 ? "partial" : "failed",
       ok,
       fail,
+      miss,
       total: details.length,
       done: details.length,
       details,
@@ -134,6 +138,139 @@
 
   // src/api.js
   var RETRY_PATTERN = /正在|移动|处理中|操作中|稍后|稍候|繁忙|频繁|busy|try\s*again|retry|429|too\s*many|rate\s*limit|throttl|请求过快|访问过于频繁|限流/i;
+  // —— 自适应限速门（AIMD）工厂 ——
+  // 服务端按「请求速率 + 时间窗口」计数限流，跟客户端并发数无关，所以并发只当流水深度用，
+  // 真正的速率由门统一保证：任意两个请求之间至少留 interval 间距（全局共享 lastStart），
+  // 撞限流后 hit() 进入冷却并把间距放大（乘性减），连续成功足够多次后 ok() 再逐步提速（加性增）。
+  // 冷却期内所有 worker 的 waitTurn 一起等 = 全局熔断，避免「每个 worker 各自退避重试」
+  // 把同一个风控窗口继续灌满（那正是导入/导出报"请求过于频繁"后整轮失败的根因）。
+  // 车道（lane）按实际请求的 host 切换：不同域名的配额口径差别很大。
+  function createApiGate(profile = {}) {
+    const clampInterval = (value, lane) => Math.min(Math.max(Number(value) || 0, lane.baseInterval), lane.maxInterval);
+    // 初始档位取快车道（分享门的历史默认值），没有快车道就取默认车道
+    const initialLane = (profile.lanes && (profile.lanes.fast || profile.lanes.default)) || { baseInterval: 0, maxInterval: 1200, jitterMs: 2 };
+    return {
+      name: profile.name || "api",
+      lanes: profile.lanes || { default: { baseInterval: 0, maxInterval: 1200, jitterMs: 2 } },
+      laneFor: profile.laneFor || null,
+      lane: "default",
+      baseInterval: initialLane.baseInterval,
+      interval: initialLane.baseInterval,
+      maxInterval: initialLane.maxInterval,
+      jitterMs: initialLane.jitterMs,
+      cooldownBaseMs: profile.cooldownBaseMs ?? 60e3,
+      cooldownMaxMs: profile.cooldownMaxMs ?? 300e3,
+      recoverAfterMs: profile.recoverAfterMs ?? 90e3,
+      okStreakTarget: profile.okStreakTarget ?? 12,
+      // decreaseFactor > 0：撞限先按倍数放大间距（够不到 maxInterval 时不一步踩死）；
+      // 0（分享接口旧行为）：直接跳到该车道最大间距——那边窗口回补极慢，慢不透就反复撞。
+      decreaseFactor: profile.decreaseFactor ?? 0,
+      cooldownUntil: 0,
+      strikes: 0,
+      okStreak: 0,
+      lastStart: 0,
+      nextFree: 0,
+      lastHitAt: 0,
+      currentLane() {
+        return this.lanes[this.lane] || this.lanes.default;
+      },
+      // 兼容既有写法：直接整体替换快/慢车道对象（回归测试与调参用），映射到 lanes.fast / lanes.slow
+      get fastLane() {
+        return this.lanes.fast;
+      },
+      set fastLane(value) {
+        this.lanes.fast = value;
+      },
+      get slowLane() {
+        return this.lanes.slow;
+      },
+      set slowLane(value) {
+        this.lanes.slow = value;
+      },
+      configureFor(host) {
+        const nextLane = this.laneFor ? this.laneFor(host) || "default" : "default";
+        const lane = this.lanes[nextLane] || this.lanes.default;
+        const cruising = this.interval <= this.baseInterval;
+        const cooling = Date.now() < this.cooldownUntil;
+        this.lane = nextLane;
+        this.baseInterval = lane.baseInterval;
+        this.maxInterval = lane.maxInterval;
+        this.jitterMs = lane.jitterMs;
+        if (cooling) return; // 冷却中的惩罚间距保持不动，冷却结束按新车道档位靠 ok() 降回来
+        this.interval = cruising ? lane.baseInterval : clampInterval(Math.max(this.interval, lane.baseInterval), lane);
+      },
+      reset() {
+        const lane = this.currentLane();
+        this.interval = lane.baseInterval;
+        this.baseInterval = lane.baseInterval;
+        this.maxInterval = lane.maxInterval;
+        this.jitterMs = lane.jitterMs;
+        this.cooldownUntil = 0;
+        this.nextFree = 0;
+        this.strikes = 0;
+        this.okStreak = 0;
+        this.lastHitAt = 0;
+      },
+      snapshot() {
+        return { interval: this.interval, maxInterval: this.maxInterval, cooldownUntil: this.cooldownUntil, strikes: this.strikes, lastHitAt: this.lastHitAt };
+      },
+      restore(saved) {
+        if (!saved || typeof saved !== "object") return;
+        this.maxInterval = Math.max(this.baseInterval, Number(saved.maxInterval) || this.maxInterval);
+        this.interval = Math.min(Math.max(1, Number(saved.interval) || this.baseInterval), this.maxInterval);
+        this.strikes = Math.max(0, Number(saved.strikes) || 0);
+        this.lastHitAt = Math.max(0, Number(saved.lastHitAt) || 0);
+        const until = Number(saved.cooldownUntil) || 0;
+        if (until > Date.now()) {
+          this.cooldownUntil = until;
+          this.nextFree = Math.max(this.nextFree || 0, until);
+        }
+      },
+      async waitTurn(signal, onWait) {
+        for (;;) {
+          if (signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
+          const now = Date.now();
+          const cooldownLeft = this.cooldownUntil - now;
+          if (cooldownLeft > 0) {
+            onWait?.(Math.ceil(cooldownLeft / 1e3), this.strikes);
+            await sleep(Math.min(cooldownLeft, 1e3));
+            continue;
+          }
+          // 预约时隙：并发请求各自排队（原来只比较 lastStart，同一瞬间进来的 N 个请求会算出
+          // gap<0 一起放行，等于只约束了「波与波」之间、没约束同波内的并发）。
+          // nextFree 管同波内的排队，lastStart + interval 管顺序请求的最小间距。
+          const jitter = Math.floor(Math.random() * Math.max(1, this.jitterMs));
+          const earliest = Math.max(this.nextFree || 0, (this.lastStart || 0) + this.interval + jitter);
+          const slot = Math.max(now, earliest);
+          this.nextFree = slot + this.interval + jitter;
+          const wait = slot - now;
+          if (wait > 0) await sleep(wait);
+          this.lastStart = Date.now();
+          return;
+        }
+      },
+      hit() {
+        const now = Date.now();
+        if (now >= this.cooldownUntil) this.strikes += 1;
+        this.okStreak = 0;
+        this.lastHitAt = now;
+        this.cooldownUntil = now + Math.min(this.cooldownBaseMs * 2 ** (this.strikes - 1), this.cooldownMaxMs);
+        // 冷却期内不放行任何请求：把排队时隙一并推到冷却结束
+        this.nextFree = Math.max(this.nextFree || 0, this.cooldownUntil);
+        const slowed = this.decreaseFactor > 0 ? this.interval * this.decreaseFactor : this.maxInterval;
+        this.interval = Math.min(Math.max(slowed, this.decreaseFactor > 0 ? 0 : this.maxInterval, this.baseInterval), this.maxInterval);
+        return this.cooldownUntil - now;
+      },
+      ok() {
+        this.okStreak += 1;
+        // 提速要谨慎：距上次撞限不足恢复窗口时配额可能还没回满，提前降档会马上再撞
+        if (this.okStreak < this.okStreakTarget || Date.now() - this.lastHitAt < this.recoverAfterMs) return;
+        this.okStreak = 0;
+        this.interval = Math.max(this.baseInterval, Math.floor(this.interval / 2));
+        if (this.strikes > 0) this.strikes -= 1;
+      }
+    };
+  }
   // 分享接口限速门（2026-09 对真实分享实测）：分享页域名（*.mshare.123pan.cn 等）按窗口计数配额，
   // 约 60 个请求/分钟、窗口回补仅约 33 个/分钟，超了返回 HTTP 200 +
   // {"code":"429","message":"分享接口请求过于频繁"}，约 60 秒自动解封，不带 Retry-After 头；
@@ -144,92 +281,331 @@
   // 无论哪条车道，收到 429 都全门一起长冷却（60s 起步翻倍封顶 5 分钟），冷却后直接放慢到
   // 该车道最大间距（慢车道实测 1.2s 仍会反复撞），再按大步长（400ms 或对半）逐级提速。
   // 断点里存 snapshot()，续扫 restore()，不会带着刚触发的风控状态立刻再撞。
-  var shareApiGate = {
-    fastLane: { baseInterval: 0, maxInterval: 1200, jitterMs: 2 },
-    slowLane: { baseInterval: 1000, maxInterval: 2000, jitterMs: 120 },
-    baseInterval: 0,
-    interval: 0,
-    maxInterval: 1200,
-    jitterMs: 2,
+  var shareApiGate = createApiGate({
+    name: "share",
     cooldownBaseMs: 60e3,
     cooldownMaxMs: 300e3,
     recoverAfterMs: 90e3,
-    cooldownUntil: 0,
-    strikes: 0,
-    okStreak: 0,
-    lastStart: 0,
-    lastHitAt: 0,
-    configureFor(host) {
-      const lane = host === CANONICAL_SHARE_ORIGIN ? this.fastLane : this.slowLane;
-      const cruising = this.interval <= this.baseInterval;
-      const cooling = Date.now() < this.cooldownUntil;
-      this.baseInterval = lane.baseInterval;
-      this.maxInterval = lane.maxInterval;
-      this.jitterMs = lane.jitterMs;
-      if (cooling) return; // 冷却中的惩罚间距保持不动，冷却结束按新车道档位靠 ok() 降回来
-      this.interval = cruising ? lane.baseInterval : Math.min(Math.max(this.interval, lane.baseInterval), lane.maxInterval);
+    lanes: {
+      default: { baseInterval: 1000, maxInterval: 2000, jitterMs: 120 },
+      fast: { baseInterval: 0, maxInterval: 1200, jitterMs: 2 },
+      slow: { baseInterval: 1000, maxInterval: 2000, jitterMs: 120 }
     },
-    reset() {
-      this.interval = this.baseInterval;
-      this.cooldownUntil = 0;
-      this.strikes = 0;
-      this.okStreak = 0;
-      this.lastHitAt = 0;
+    laneFor: (host) => host === CANONICAL_SHARE_ORIGIN ? "fast" : "slow"
+  });
+  // 网盘自身接口限速门（2026-09-15 新增）：此前 list/new 与 upload_request 完全没有门控，
+  // 靠 worker 数硬顶，实测 file/list/new 约 15 QPS/用户（超了返回 code 100011、文案为空）。
+  // 页面域名（*.123pan.cn 等）前面是 CDN/WAF、按 IP+窗口计数，起步保守；123865 与
+  // api.123278 两条实测宽松的线路给更高的起步速率，撞限后照样由 hit() 自动降下来。
+  var driveLaneFor = (host) => {
+    const value = String(host || "");
+    if (value === CANONICAL_SHARE_ORIGIN) return "canonical";
+    if (value === FASTLANE_HOST || value === "https://api.123278.com") return "mirror";
+    return "page";
+  };
+  var panApiGates = {
+    list: createApiGate({
+      name: "list",
+      cooldownBaseMs: 1500,
+      cooldownMaxMs: 20e3,
+      recoverAfterMs: 12e3,
+      okStreakTarget: 24,
+      decreaseFactor: 3,
+      lanes: {
+        default: { baseInterval: 80, maxInterval: 1500, jitterMs: 25 },
+        page: { baseInterval: 80, maxInterval: 1500, jitterMs: 25 },
+        canonical: { baseInterval: 55, maxInterval: 1200, jitterMs: 15 },
+        mirror: { baseInterval: 55, maxInterval: 1200, jitterMs: 15 }
+      },
+      laneFor: driveLaneFor
+    }),
+    write: createApiGate({
+      name: "write",
+      cooldownBaseMs: 2e3,
+      cooldownMaxMs: 30e3,
+      recoverAfterMs: 15e3,
+      okStreakTarget: 40,
+      decreaseFactor: 3,
+      lanes: {
+        default: { baseInterval: 0, maxInterval: 800, jitterMs: 2 },
+        page: { baseInterval: 30, maxInterval: 800, jitterMs: 10 },
+        canonical: { baseInterval: 0, maxInterval: 600, jitterMs: 2 },
+        mirror: { baseInterval: 0, maxInterval: 600, jitterMs: 2 }
+      },
+      laneFor: driveLaneFor
+    })
+  };
+  // 按接口路径自动挑门：网盘目录列举/详情走 list 门，秒传写入（upload_request）走 write 门；
+  // 分享接口沿用调用方显式传入的 shareApiGate（它有自己的 host 候选与冷却重试），这里不重复挂。
+  var PACING_BY_PATH = {
+    "/b/api/file/list/new": "list",
+    "/b/api/file/info": "list",
+    "/b/api/file/detail": "list",
+    "/b/api/file/upload_request": "write"
+  };
+  function gateForPath(path) {
+    const kind = PACING_BY_PATH[String(path || "")];
+    return kind ? panApiGates[kind] || null : null;
+  }
+  // 父目录子项索引（目录名 → ID）挂在 listAll 结果 promise 上的键：随任务的 listingCache
+  // 一起回收，不需要额外的全局缓存与失效逻辑。（刻意用字符串键：回归测试的 vm 沙箱不一定有 Symbol）
+  var FASTLINK_CHILD_INDEX = "c123ChildFolderIndex";
+  // 秒传长任务的全局运行控制：暂停/继续。挂在 request() 取号之前，所以导出扫描、目录预建、
+  // 秒传写入三条链路不需要各自实现暂停——在途请求跑完，新请求停在门口（断点照常每 2 秒落盘）。
+  var panRunControl = {
+    paused: false,
+    pause() {
+      this.paused = true;
     },
-    snapshot() {
-      return { interval: this.interval, maxInterval: this.maxInterval, cooldownUntil: this.cooldownUntil, strikes: this.strikes, lastHitAt: this.lastHitAt };
+    resume() {
+      this.paused = false;
     },
-    restore(saved) {
-      if (!saved || typeof saved !== "object") return;
-      this.interval = Math.min(Math.max(1, Number(saved.interval) || this.baseInterval), this.maxInterval);
-      this.maxInterval = Math.max(this.baseInterval, Number(saved.maxInterval) || this.maxInterval);
-      this.strikes = Math.max(0, Number(saved.strikes) || 0);
-      this.lastHitAt = Math.max(0, Number(saved.lastHitAt) || 0);
-      const until = Number(saved.cooldownUntil) || 0;
-      if (until > Date.now()) this.cooldownUntil = until;
+    toggle() {
+      this.paused = !this.paused;
+      return this.paused;
     },
-    async waitTurn(signal, onWait) {
-      for (;;) {
+    async wait(signal, onWait) {
+      let reported = false;
+      while (this.paused) {
         if (signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
-        const now = Date.now();
-        const cooldownLeft = this.cooldownUntil - now;
-        if (cooldownLeft > 0) {
-          onWait?.(Math.ceil(cooldownLeft / 1e3), this.strikes);
-          await sleep(Math.min(cooldownLeft, 1e3));
-          continue;
+        if (!reported) {
+          reported = true;
+          onWait?.();
         }
-        const gap = this.lastStart + this.interval + Math.floor(Math.random() * Math.max(1, this.jitterMs)) - now;
-        if (gap > 0) {
-          await sleep(gap);
-          continue;
-        }
-        this.lastStart = Date.now();
-        return;
+        await sleep(200);
       }
-    },
-    hit() {
-      const now = Date.now();
-      if (now >= this.cooldownUntil) this.strikes += 1;
-      this.okStreak = 0;
-      this.lastHitAt = now;
-      this.cooldownUntil = now + Math.min(this.cooldownBaseMs * 2 ** (this.strikes - 1), this.cooldownMaxMs);
-      // 一次直接提到最大间距（约 28 个/分钟，实测 mshare 窗口回补仅约 33 个/分钟，
-      // 提到 1.2s 仍会反复撞限），之后靠 ok() 逐步降回来
-      this.interval = Math.min(Math.max(this.interval * 2, this.maxInterval), this.maxInterval);
-      return this.cooldownUntil - now;
-    },
-    ok() {
-      this.okStreak += 1;
-      // 提速要谨慎：距上次撞限不足 90s 时窗口配额可能还没回满，提前降档会马上再撞
-      if (this.okStreak < 12 || Date.now() - this.lastHitAt < this.recoverAfterMs) return;
-      this.okStreak = 0;
-      this.interval = Math.max(this.baseInterval, Math.floor(this.interval / 2));
-      if (this.strikes > 0) this.strikes -= 1;
+      return reported;
     }
   };
-  function isShareRateLimited(error) {
+  // 频控等待的全局观察者（面板进度条注册）：门在冷却/排队时把「X 秒后继续」透出去，
+  // 省得把 onPace 一路透传进 listAll / reuseFile / ensurePath 每个调用点。
+  var apiPaceListener = null;
+  function setApiPaceListener(listener) {
+    apiPaceListener = typeof listener === "function" ? listener : null;
+  }
+  // —— 秒传运行明细账本 ——
+  // 参考脚本（123FastLink）扫描/转存时能看见「正在扫哪个目录、哪个文件、多大」，我们此前只有一行
+  // 「已扫描 N 个文件」。这里补齐明细，但只保留内存环形缓冲（默认 200 行、展开 800 行）——
+  // 千万级任务把日志整表驻留或往 DOM 里灌，页面会直接卡死（2-3GB 内存的坑踩过一次）。
+  var LEDGER_SAMPLE_WINDOW_MS = 5000;
+  function createRunLedger(options = {}) {
+    const compactLimit = Math.max(20, Number(options.limit || 200));
+    const verboseLimit = Math.max(compactLimit, Number(options.verboseLimit || 800));
+    const startedAt = Date.now();
+    let lines = [];
+    let verbose = false;
+    let headline = "";
+    let done = 0;
+    let total = 0;
+    const counters = {
+      folders: 0,
+      files: 0,
+      bytes: 0,
+      ok: 0,
+      fail: 0,
+      miss: 0,
+      skipped: 0,
+      invalid: 0,
+      sanitized: 0
+    };
+    const samples = [];
+    let note = "";
+    const trim = () => {
+      const cap = verbose ? verboseLimit : compactLimit;
+      if (lines.length > cap) lines = lines.slice(lines.length - cap);
+    };
+    const push = (text, tone) => {
+      if (!text) return;
+      lines.push({ t: Date.now(), text: String(text), tone: tone || "" });
+      trim();
+    };
+    // 速率按「已处理条目」算：导出是文件 + 目录（媒体库这类深层级目录远多于文件，
+        // 只算文件会把速率显示成 1 项/秒这种荒谬值），导入是成功转存数
+    const nowCount = () => counters.files + counters.folders + counters.ok;
+    const pushSample = () => {
+      const t = Date.now();
+      samples.push({ t, n: nowCount() });
+      while (samples.length > 2 && t - samples[0].t > LEDGER_SAMPLE_WINDOW_MS * 2) samples.shift();
+    };
+    let currentFile = "";
+    return {
+      counters,
+      startedAt,
+      setVerbose(value) {
+        verbose = Boolean(value);
+        trim();
+      },
+      get verbose() {
+        return verbose;
+      },
+      get lines() {
+        return lines;
+      },
+      headline(text) {
+        headline = String(text || headline || "");
+      },
+      progress(doneValue, totalValue, message) {
+        done = Number(doneValue) || 0;
+        total = Math.max(1, Number(totalValue) || 1);
+        if (message) headline = String(message);
+      },
+      note(text, tone) {
+        note = String(text || "");
+        if (text) push(text, tone || "warning");
+      },
+      // collectFastlinkFiles / 导入器的 onDetail 事件
+      detail(event) {
+        if (!event || typeof event !== "object") return;
+        const size = Number(event.size) || 0;
+        if (event.kind === "folder") {
+          counters.folders = Math.max(counters.folders, Number(event.folders) || counters.folders + 1);
+          if (typeof event.files === "number") counters.files = Math.max(counters.files, event.files);
+          if (typeof event.bytes === "number") counters.bytes = Math.max(counters.bytes, event.bytes);
+          push(`扫描目录 ${event.path || event.name || ""}（本页 ${Number(event.entries) || 0} 项）`);
+          pushSample();
+          return;
+        }
+        if (event.kind === "file") {
+          counters.folders = Math.max(counters.folders, Number(event.folders) || 0);
+          counters.files = Math.max(counters.files, Number(event.files) || counters.files + 1);
+          counters.bytes = Math.max(counters.bytes, Number(event.bytes) || 0);
+          currentFile = String(event.path || event.name || "");
+          // 紧凑模式不逐条刷日志（十万级会把有用的目录/失败信息挤掉），当前文件显示在摘要里
+          if (verbose) push(`文件 ${currentFile}（${formatBytes(size)}）`, "success");
+          pushSample();
+          return;
+        }
+        if (event.kind === "folder-create" || event.kind === "folder-existing") {
+          if (verbose) push(`${event.kind === "folder-create" ? "新建目录" : "复用目录"} ${event.path || event.name || ""}`);
+          return;
+        }
+        if (event.kind === "import") {
+          if (typeof event.ok === "number") counters.ok = Math.max(counters.ok, event.ok);
+          else if (event.status === "success") counters.ok += 1;
+          if (typeof event.fail === "number") counters.fail = Math.max(counters.fail, event.fail);
+          else if (event.status === "failed") counters.fail += 1;
+          if (typeof event.miss === "number") counters.miss = Math.max(counters.miss, event.miss);
+          else if (event.status === "miss") counters.miss += 1;
+          if (typeof event.bytes === "number") counters.bytes = Math.max(counters.bytes, event.bytes);
+          else if (event.status === "success") counters.bytes += size;
+          if (typeof event.skipped === "number") counters.skipped = Math.max(counters.skipped, event.skipped);
+          const label = event.status === "success" ? "已转存" : event.status === "miss" ? "未命中" : "失败";
+          const detailText = `${label} ${event.path || event.name || ""}（${formatBytes(size)}${event.etag ? ` · ${event.etag}` : ""}${event.status === "failed" && event.message ? ` · ${event.message}` : ""}）`;
+          if (event.status !== "success" || verbose) push(detailText, event.status === "failed" ? "danger" : event.status === "miss" ? "warning" : "success");
+          else {
+            lines.push({ t: Date.now(), text: detailText, tone: "success" });
+            trim();
+          }
+          pushSample();
+          return;
+        }
+        if (event.kind === "skip" || event.kind === "invalid") {
+          counters.invalid += Number(event.count) || 1;
+          if (event.sanitized) counters.sanitized = Math.max(counters.sanitized, Number(event.sanitized) || 0);
+          if (verbose) push(`跳过 ${event.path || event.name || ""}${event.message ? ` · ${event.message}` : ""}`, "warning");
+        }
+      },
+      // request() 的频控/暂停/换道通知（apiPaceListener）
+      pace(info) {
+        if (!info || typeof info !== "object") return;
+        if (info.routeChanged) {
+          note = "";
+          push(`已切换接口线路到 ${driveRouteLabel(info.routeChanged)}（当前线路频控见底）`, "warning");
+          return;
+        }
+        if (info.paused) {
+          note = "已暂停，点击「继续」恢复";
+          return;
+        }
+        if (info.seconds) {
+          note = `频控冷却中，${info.seconds}s 后自动继续（第 ${info.strikes} 次）`;
+          if (!this.lastPaceLogged || Date.now() - this.lastPaceLogged > 4000) {
+            this.lastPaceLogged = Date.now();
+            push(note, "warning");
+          }
+          return;
+        }
+        note = "";
+      },
+      lastPaceLogged: 0,
+      stats() {
+        const t = Date.now();
+        // 滑动窗口平均速率：只看相邻两个采样点会被"同一毫秒内批量处理"骗到（实测媒体库
+        // 扫描一次翻页收几百条，相邻差值算出来只有 1 项/秒），改成按窗口首尾差值算
+        while (samples.length > 2 && t - samples[0].t > LEDGER_SAMPLE_WINDOW_MS) samples.shift();
+        let rate = 0;
+        if (samples.length >= 2) {
+          const first = samples[0];
+          const last = samples[samples.length - 1];
+          const span = (last.t - first.t) / 1000;
+          if (span > 0.4) rate = (last.n - first.n) / span;
+        }
+        // 总量未知（导出/流式导入的 total 只是顶层项目数或 1）时不猜剩余时间
+        const knownTotal = total > 1 && done <= total;
+        const remaining = knownTotal ? Math.max(0, total - done) : 0;
+        const etaSec = knownTotal && rate > 0.5 ? Math.round(remaining / rate) : 0;
+        return {
+          rate,
+          etaSec,
+          seconds: Math.max(1, Math.round((t - startedAt) / 1000)),
+          counters: { ...counters },
+          currentFile,
+          note
+        };
+      },
+      // 一行摘要：直接塞进进度条 message，不额外加 DOM 结构
+      summary(extra) {
+        const stats = this.stats();
+        const parts = [extra || headline].filter(Boolean);
+        if (stats.counters.folders) parts.push(`目录 ${stats.counters.folders}`);
+        if (stats.counters.files) parts.push(`文件 ${stats.counters.files}`);
+        if (stats.counters.ok) parts.push(`成功 ${stats.counters.ok}`);
+        if (stats.counters.miss) parts.push(`未命中 ${stats.counters.miss}`);
+        if (stats.counters.fail) parts.push(`失败 ${stats.counters.fail}`);
+        if (stats.counters.skipped) parts.push(`已导入跳过 ${stats.counters.skipped}`);
+        if (stats.counters.bytes) parts.push(formatBytes(stats.counters.bytes));
+        if (stats.rate > 0.5) parts.push(`${stats.rate.toFixed(1)} 项/秒`);
+        if (stats.etaSec > 5) parts.push(`剩余约 ${durationText(stats.etaSec)}`);
+        if (stats.note) parts.push(stats.note);
+        if (stats.currentFile && parts.length < 2) parts.push(`当前 ${truncateMiddle(stats.currentFile, 60)}`);
+        return parts.join(" · ");
+      },
+      render(limit = 40) {
+        const cap = Math.max(1, Number(limit) || 40);
+        const visible = lines.slice(-cap);
+        return visible.map((line) => `<div class="ledger-line ${escapeHtml(line.tone)}"><span class="ledger-time">${escapeHtml(formatClock(line.t))}</span>${escapeHtml(line.text)}</div>`).join("");
+      }
+    };
+  }
+  function formatClock(ms) {
+    const date = new Date(Number(ms) || Date.now());
+    const pad = (value) => String(value).padStart(2, "0");
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  }
+  function durationText(seconds) {
+    const value = Math.max(0, Math.round(Number(seconds) || 0));
+    if (value < 60) return `${value} 秒`;
+    if (value < 3600) return `${Math.round(value / 60)} 分钟`;
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.round((value % 3600) / 60);
+    return minutes ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
+  }
+  // 长路径中间省略、保留头尾（进度摘要里显示"当前文件"用，尾部文件名比开头更有辨识度）
+  function truncateMiddle(value, max = 60) {
+    const text2 = String(value || "");
+    const limit2 = Math.max(8, Number(max) || 60);
+    if (text2.length <= limit2) return text2;
+    const head = Math.ceil((limit2 - 1) / 2);
+    const tail = Math.floor((limit2 - 1) / 2);
+    return `${text2.slice(0, head)}\u2026${tail ? text2.slice(text2.length - tail) : ""}`;
+  }
+  function isRateLimitedError(error) {
     if (Number(error?.status) === 429 || String(error?.code) === "429") return true;
-    return /频繁|限流|请求过快|too\s*many|rate\s*limit|throttl/i.test(String(error?.message || ""));
+    if (String(error?.code) === "100011") return true;
+    return /频繁|限流|请求过快|操作过快|访问过快|too\s*many|rate\s*limit|throttl/i.test(String(error?.message || ""));
+  }
+  function isShareRateLimited(error) {
+    return isRateLimitedError(error);
   }
   // 分享目录接口的 host 选择：分享页自身域名（mshare 等）配额最小（约 60 个/分钟），
   // www.123865.com 独立额度大得多（实测 400+ 连发无风控），且 CORS 对任意来源放开、
@@ -939,6 +1315,205 @@
   // 会话级健康位：一旦网络层失败（连不通/CORS 拦截）就摘除线路，回退页面域名，不再反复撞墙。
   var FASTLANE_HOST = "https://api.123278.com";
   var fastlaneState = { dead: false };
+  // —— 秒传线路（接口域名）策略 ——
+  // 同一个 /b/api 后端挂在多个域名下，前面 CDN/WAF 的频控口径差别极大：页面域名
+  // （*.123pan.cn 等）最容易报"请求过于频繁"，www.123865.com 与 api.123278.com 实测宽松得多。
+  // 所以把「走哪条域名」当成一个可探测、可自动降级的策略，而不是一个手动开关。
+  var DRIVE_ROUTE_KINDS = {
+    page: "",
+    canonical: "https://www.123865.com",
+    mirror: "https://api.123278.com"
+  };
+  var DRIVE_ROUTE_LABELS = {
+    page: "\u9875\u9762\u57df\u540d",
+    canonical: "www.123865.com",
+    mirror: "api.123278.com"
+  };
+  var DRIVE_ROUTE_CACHE_KEY = "Cloud123.Helper.DriveRoute";
+  var DRIVE_ROUTE_CACHE_TTL = 30 * 60 * 1000;
+  var driveRouteState = {
+    order: ["mirror", "canonical", "page"],
+    cursor: 0,
+    listLimit: 0,
+    probedAt: 0,
+    origin: "",
+    detail: {},
+    applied: ""
+  };
+  function driveRouteKindForHost(host) {
+    const value = String(host || "");
+    if (!value) return "page";
+    if (value === FASTLANE_HOST || value === DRIVE_ROUTE_KINDS.mirror) return "mirror";
+    if (value === CANONICAL_SHARE_ORIGIN || value === DRIVE_ROUTE_KINDS.canonical) return "canonical";
+    return "page";
+  }
+  function driveRouteKindForKind(kind) {
+    const value = String(kind || "");
+    return Object.prototype.hasOwnProperty.call(DRIVE_ROUTE_KINDS, value) ? value : "page";
+  }
+  function driveRouteLabel(kind) {
+    return DRIVE_ROUTE_LABELS[driveRouteKindForKind(kind)] || String(kind || "");
+  }
+  function driveRouteCacheRead() {
+    try {
+      const raw = checkpointStorageGet(DRIVE_ROUTE_CACHE_KEY);
+      if (!raw || !Array.isArray(raw.order)) return null;
+      if (String(raw.origin || "") !== String(location.origin || "")) return null;
+      if (!Number(raw.probedAt) || Date.now() - Number(raw.probedAt) > DRIVE_ROUTE_CACHE_TTL) return null;
+      return raw;
+    } catch {
+      return null;
+    }
+  }
+  function driveRouteCacheWrite(state) {
+    try {
+      checkpointStorageSet(DRIVE_ROUTE_CACHE_KEY, {
+        order: [...state.order],
+        listLimit: Number(state.listLimit) || 0,
+        probedAt: Number(state.probedAt) || Date.now(),
+        origin: String(location.origin || ""),
+        detail: state.detail || {}
+      });
+    } catch {
+    }
+  }
+  // 探测：三条线路各拉一页目录（认证头一样、Bearer 走跨域不带 cookie），按
+  // 「可用 → 不撞频控 → 更快」排序；同时确认大分页是否被服务端吃下（吃不下就把每页条数降回 100）。
+  async function probeDriveRoute(api, options = {}) {
+    const signal = options.signal;
+    const parentFileId = String(options.parentFileId || "0");
+    const limit = Math.max(100, Number(options.limit || 500));
+    const kinds = ["mirror", "canonical", "page"];
+    const detail = {};
+    const scored = [];
+    for (const kind of kinds) {
+      const host = DRIVE_ROUTE_KINDS[kind];
+      const samples = [];
+      const record = { kind, host, ok: false, throttled: 0, failed: 0, limitOk: false, samples };
+      for (let round = 0; round < 2; round += 1) {
+        if (signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
+        const started = Date.now();
+        try {
+          // pacing: null = 探测要的是裸延迟与真实错误，不排队、也不让门把撞限"吃掉"
+          const page = await api.listPage(parentFileId, round + 1, {
+            limit,
+            host,
+            signal,
+            pacing: null,
+            attempts: 1,
+            credentialsMode: host && host !== String(api.host || location.origin) ? "omit" : "include"
+          });
+          record.samples.push(Date.now() - started);
+          record.ok = true;
+          record.limitOk = (page?.files?.length || 0) > 0 || String(page?.next) === "-1";
+        } catch (error) {
+          record.samples.push(Date.now() - started);
+          if (isRateLimitedError(error)) record.throttled += 1;
+          else if (error?.name !== "AbortError") record.failed += 1;
+        }
+      }
+      detail[kind] = record;
+      const median = medianValue(record.samples) || 0;
+      scored.push({
+        kind,
+        // 分数越小越好：不可用直接垫底，然后按撞限次数、失败次数、中位延迟排序；
+        // 再加一点按候选顺序的固定偏置（镜像 > 123865 > 页面域名），延迟差距在噪声内时
+        // 结果不该来回抖动
+        score: record.ok ? 0 : 1000,
+        penalty: record.throttled * 400 + record.failed * 200 + median + kinds.indexOf(kind) * 15
+      });
+    }
+    scored.sort((left, right) => left.score - right.score || left.penalty - right.penalty);
+    const usable = scored.filter((item) => detail[item.kind].ok).map((item) => item.kind);
+    const order = usable.length ? [...usable, ...kinds.filter((kind) => !usable.includes(kind))] : kinds;
+    const anyLimitOk = kinds.some((kind) => detail[kind].ok && detail[kind].limitOk);
+    driveRouteState.order = order;
+    driveRouteState.detail = detail;
+    driveRouteState.probedAt = Date.now();
+    driveRouteState.listLimit = anyLimitOk ? limit : 100;
+    driveRouteState.cursor = 0;
+    driveRouteCacheWrite(driveRouteState);
+    return { order, listLimit: driveRouteState.listLimit, detail };
+  }
+  // 中位延迟（探测样本只有两次，取较大值更能反映偶发抖动）
+  function medianValue(values) {
+    const samples = (values || []).map(Number).filter((value) => Number.isFinite(value));
+    if (!samples.length) return 0;
+    return Math.max(...samples);
+  }
+  // 应用秒传线路：任务开始前探测三条域名排序（结果新鲜就直接复用，不重复打），运行中撞限由
+  // noteRouteThrottle 自动换到下一候选。设置页不提供手动选路（也就没有测速入口）；线路偏好在
+  // 这里自动选中并缓存 30 分钟，「秒传设置 → 恢复默认」会清掉它与探测缓存，下一次任务重新探测。
+  // 旧 fastLane 开关仍兼容：开过它的用户继续只走镜像域名、不自动换道，行为不因改版漂移。
+  async function beginDriveRoute(api, options = {}) {
+    if (options.fastLane === true) {
+      driveRouteState.order = ["mirror", "page"];
+      driveRouteState.cursor = 0;
+      driveRouteState.applied = "mirror";
+      api.laneHost = DRIVE_ROUTE_KINDS.mirror;
+      api.routeAuto = false;
+      return { kind: "mirror", host: api.laneHost, auto: false, listLimit: api.listLimit };
+    }
+    const fresh = Date.now() - Number(driveRouteState.probedAt || 0) < DRIVE_ROUTE_CACHE_TTL && String(driveRouteState.origin || "") === String(location.origin || "") && driveRouteState.order?.length;
+    if (!fresh) {
+      const cached = driveRouteCacheRead();
+      if (cached) {
+        driveRouteState.order = cached.order.filter((item) => DRIVE_ROUTE_KINDS[item] !== void 0);
+        driveRouteState.listLimit = Number(cached.listLimit) || 0;
+        driveRouteState.probedAt = Number(cached.probedAt) || 0;
+        driveRouteState.detail = cached.detail || {};
+        driveRouteState.origin = String(cached.origin || "");
+      }
+    }
+    if (!driveRouteState.order.length || (Date.now() - Number(driveRouteState.probedAt || 0) >= DRIVE_ROUTE_CACHE_TTL)) {
+      try {
+        await probeDriveRoute(api, { signal: options.signal, parentFileId: options.parentFileId });
+      } catch {
+        // 探测本身失败（未登录/网络异常）不阻断任务：退回默认顺序
+        if (!driveRouteState.order.length) driveRouteState.order = ["mirror", "canonical", "page"];
+      }
+    }
+    driveRouteState.origin = String(location.origin || "");
+    driveRouteState.cursor = 0;
+    const chosen = driveRouteState.order[0] || "page";
+    driveRouteState.applied = chosen;
+    api.laneHost = DRIVE_ROUTE_KINDS[chosen] ?? "";
+    api.routeAuto = true;
+    if (driveRouteState.listLimit >= 100) api.listLimit = Math.min(1000, Math.max(100, driveRouteState.listLimit));
+    return { kind: chosen, host: api.laneHost, auto: true, listLimit: api.listLimit, probed: true };
+  }
+  // 运行中撞限自动换道：60 秒窗口内同一条线路连续撞 6 次，说明这条道的配额真的见底了，
+  // 换到下一候选并清零门冷却（换道后按新车道档位重新起步，不用带着旧惩罚空转）。
+  function noteRouteThrottle(api, host) {
+    if (!api?.routeAuto) return false;
+    const kind = driveRouteKindForHost(host || api.laneHost);
+    const now = Date.now();
+    if (!api.routeStrikes) api.routeStrikes = {};
+    const bucket = api.routeStrikes[kind] || { count: 0, since: now };
+    if (now - bucket.since > 60000) {
+      bucket.count = 0;
+      bucket.since = now;
+    }
+    bucket.count += 1;
+    api.routeStrikes[kind] = bucket;
+    if (bucket.count < 6) return false;
+    bucket.count = 0;
+    const order = (driveRouteState.order || []).length ? driveRouteState.order : ["mirror", "canonical", "page"];
+    const next = order.slice((driveRouteState.cursor || 0) + 1).find((item) => item !== kind) || order.find((item) => item !== kind);
+    if (!next || next === kind) return false;
+    driveRouteState.cursor = Math.max(0, order.indexOf(next));
+    driveRouteState.applied = next;
+    api.laneHost = DRIVE_ROUTE_KINDS[next] ?? "";
+    if (next === "mirror") fastlaneState.dead = false;
+    for (const gate of Object.values(panApiGates)) {
+      gate.strikes = 0;
+      gate.cooldownUntil = 0;
+      gate.configureFor?.(api.laneHost || api.host);
+      gate.reset?.();
+    }
+    if (apiPaceListener) apiPaceListener({ routeChanged: next, path: "", gate: "route" });
+    return true;
+  }
   var Pan123Api = class {
     constructor(options = {}) {
       this.host = options.host || location.origin;
@@ -946,6 +1521,15 @@
       this.retryAttempts = options.retryAttempts || 6;
       this.writeConcurrency = options.writeConcurrency || 3;
       this.requestTimeout = Math.max(1e3, Number(options.requestTimeout || 3e4));
+      // 撞频控后「等门开再试」的预算（次数 + 累计时长双闸）：门负责全局冷却，单个请求只给有限
+      // 耐心——超预算就把这一条按失败上抛，让千万级任务继续跑后面的条目（断点保证下次续传），
+      // 而不是被一个被硬封的账号冻在第一个文件上。
+      this.paceRetryCap = Math.max(1, Number(options.paceRetryCap ?? 3));
+      this.paceWaitBudgetMs = Math.max(1e3, Number(options.paceWaitBudgetMs ?? 20000));
+      // 目录列举每页条数：旧版写死 100，一个几千条目的目录要翻几十页——既是"请求过于频繁"
+      // 的主要放大器，也把 list 门的配额吃光。参考脚本用 500 且实测可用，这里默认提到 500，
+      // 并允许线路探测（probeDriveRoute）在遇到异常响应时下调；单次调用可用 options.limit 覆盖。
+      this.listLimit = Math.min(1000, Math.max(100, Number(options.listLimit || 500) || 500));
       // 秒传接口线路：默认空 = 页面域名。秒传设置开启 fastLane 后，导入/导出任务窗口内
       // 置为 FASTLANE_HOST 直连 api.123278.com（维护者 2026-09-14 实测 16~24 线程 ≈150 次/秒，
       // 高于 123865 的 32 并发 85 次/秒）；request() 内置网络级故障回退，撞坏自动切回默认域名。
@@ -971,38 +1555,87 @@
       for (const [key, value] of Object.entries(query)) if (value !== void 0 && value !== null) url.searchParams.set(key, String(value));
       return url.toString();
     }
-    async request(method, path, { query = {}, body, signal, attempts = this.retryAttempts, backoffCap = 6e3, signed = true, auth = true, appVersion = this.appVersion, timeoutMs = this.requestTimeout, credentialsMode = "include", host = "", isRetryable = null } = {}) {
+    async request(method, path, { query = {}, body, signal, attempts = this.retryAttempts, backoffCap = 6e3, signed = true, auth = true, appVersion = this.appVersion, timeoutMs = this.requestTimeout, credentialsMode = "include", host = "", isRetryable = null, pacing, onPace = null } = {}) {
+      // 限速门：调用方可显式指定（分享接口传自己的门）或传 null/false 关闭；
+      // 未指定时按接口路径自动挑（目录列举/详情 = list 门，秒传写入 = write 门）。
+      const gate = pacing === null || pacing === false ? null : pacing || gateForPath(path);
+      const notePace = (info) => {
+        onPace?.(info);
+        if (apiPaceListener) apiPaceListener(info);
+      };
       const { token, loginUuid } = auth ? this.credentials() : { token: "", loginUuid: "" };
       if (auth && (!token || !loginUuid)) throw new Error("\u8BF7\u5148\u767B\u5F55 123 \u4E91\u76D8\u5E76\u6253\u5F00\u6587\u4EF6\u5217\u8868\u9875");
       let lastError;
-      for (let attempt = 0; attempt < attempts; attempt += 1) {
+      let attempt = 0;
+      // 撞频控后的「等门开」次数：不烧常规重试预算（那 6 次是给网络/业务错误的），
+      // 但也封顶，避免账号被硬封时无限挂住任务。
+      let paceWaits = 0;
+      let paceStartedAt = 0;
+      const maxPaceWaits = Math.max(1, Number(this.paceRetryCap ?? 3));
+      const maxPaceWaitMs = Math.max(1e3, Number(this.paceWaitBudgetMs ?? 20000));
+      for (;;) {
         if (signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
-        if (attempt > 0) await sleep(Math.min(backoffCap, 800 * 1.7 ** (attempt - 1)));
-        // 签名含分钟级时间戳，必须每轮重试、且在退避 sleep 之后（紧贴 fetch）重新计算：
-        // 长退避链（如分享列表 8 次×12s 上限）跨分钟后旧签名会被服务端拒绝，
-        // 且签名类错误不在可重试文案里，会直接终局失败。
-        const finalQuery = signed ? { ...query, ...signedQuery(path, Date.now(), void 0, appVersion) } : query;
-        const requestController = new AbortController();
+        // 挂了门的路径由门负责等待（waitTurn 会睡过整个冷却窗口），不再叠加指数退避；
+        // 没挂门的路径保持旧的退避节奏不变。
+        if (attempt > 0 && !gate) await sleep(Math.min(backoffCap, 800 * 1.7 ** (attempt - 1)));
+        let response = null;
+        let usedHost = "";
+        let attemptController = null;
+        let abortAttempt = null;
         let timedOut = false;
-        const abortRequest = () => requestController.abort(signal?.reason);
-        if (signal) signal.addEventListener("abort", abortRequest, { once: true });
-        const timeout = setTimeout(() => {
-          timedOut = true;
-          requestController.abort();
-        }, Math.max(1e3, Number(timeoutMs || this.requestTimeout)));
+        let timeout = 0;
+        const startTimeout = () => {
+          // 超时计时紧贴 fetch：限速门的排队与冷却等待、暂停等待都不算进请求超时
+          // （否则一次 45s 冷却会被 30s 超时误判成网络故障，甚至把整轮任务打死）
+          timeout = setTimeout(() => {
+            timedOut = true;
+            attemptController?.abort();
+          }, Math.max(1e3, Number(timeoutMs || this.requestTimeout)));
+        };
+        const stopTimeout = () => {
+          if (timeout) clearTimeout(timeout);
+          timeout = 0;
+          if (signal && abortAttempt) signal.removeEventListener("abort", abortAttempt);
+        };
         try {
           // 线路请求两段式：先打镜像域名，网络层失败（TypeError/CORS）或镜像明确不服务该路径
           //（403/404/501）时立刻摘除线路，同一轮直接改打默认域名，不烧重试次数也不多等一个超时
-          let response = null;
           for (let laneTry = 0; laneTry < 2; laneTry += 1) {
             const requestHost = laneTry === 0 ? host : "";
+            if (gate) {
+              // 车道按实际要打到的 host 切换（页面域名 / 123865 / 镜像线路配额口径差别很大），
+              // 然后排队取号：全局最小间距 + 冷却期一起等，这就是「不报频繁」的关键
+              gate.configureFor?.(requestHost || this.host);
+              // 暂停：在途请求跑完，新请求停在门口（导出扫描与秒传导入共用这一个闸门，断点照常落盘）
+              await panRunControl.wait(signal, () => notePace({
+                paused: true,
+                path,
+                gate: gate.name
+              }));
+              await gate.waitTurn(signal, (seconds, strikes) => notePace({
+                seconds,
+                strikes,
+                path,
+                host: requestHost || this.host,
+                gate: gate.name
+              }));
+            }
+            // 签名含分钟级时间戳，必须每轮重试、且在所有等待之后（紧贴 fetch）重新计算：
+            // 长退避链（如分享列表 8 次×12s 上限）跨分钟后旧签名会被服务端拒绝，
+            // 且签名类错误不在可重试文案里，会直接终局失败。
+            const finalQuery = signed ? { ...query, ...signedQuery(path, Date.now(), void 0, appVersion) } : query;
+            attemptController = new AbortController();
+            abortAttempt = () => attemptController.abort(signal?.reason);
+            if (signal) signal.addEventListener("abort", abortAttempt, { once: true });
+            timedOut = false;
+            startTimeout();
             try {
               response = await fetch(this.buildUrl(path, finalQuery, requestHost), {
                 method,
                 // 仅镜像域名强制 omit（鉴权走 Bearer 头，跨域带 cookie 会触发 CORS 凭据校验拒收）；
                 // 分享线路等其他 host 覆盖沿用调用方给定的 credentialsMode
                 credentials: requestHost === FASTLANE_HOST ? "omit" : credentialsMode,
-                signal: requestController.signal,
+                signal: attemptController.signal,
                 headers: {
                   accept: "*/*",
                   "accept-language": "zh-CN",
@@ -1013,34 +1646,61 @@
                 },
                 body: body === void 0 ? void 0 : JSON.stringify(body)
               });
+              stopTimeout();
               if (requestHost && [403, 404, 501].includes(response.status)) {
                 this.markLaneDead();
                 continue;
               }
-              } catch (fetchError) {
-                // 默认域名一轮直接上抛；镜像域名上网络错误或超时（挂起）都摘除线路，
-                // 只有用户主动取消（signal 已中止）才原样上抛、不回退
-                if (!requestHost || (fetchError?.name === "AbortError" && signal?.aborted)) throw fetchError;
-                this.markLaneDead();
-                continue;
-              }
-              break;
+            } catch (fetchError) {
+              stopTimeout();
+              // 默认域名一轮直接上抛；镜像域名上网络错误或超时（挂起）都摘除线路，
+              // 只有用户主动取消（signal 已中止）才原样上抛、不回退
+              if (!requestHost || (fetchError?.name === "AbortError" && signal?.aborted)) throw fetchError;
+              this.markLaneDead();
+              continue;
+            }
+            usedHost = requestHost;
+            break;
           }
           const data = await response.json().catch(() => ({}));
           const code = data?.code ?? data?.Code;
           const ok = response.ok && (code === void 0 || code === null || [0, 200, "0"].includes(code));
-          if (ok) return data;
+          if (ok) {
+            if (gate) gate.ok();
+            return data;
+          }
           const message = String(data?.message || data?.Message || `\u8BF7\u6C42\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
           const error = new Error(isAuthFailure(response.status, code, message) ? "\u767B\u5F55\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55 123 \u4E91\u76D8" : message);
           error.status = response.status;
           error.code = code;
           error.auth = isAuthFailure(response.status, code, message);
           if (error.auth) throw error;
-          // 100011 = 网盘接口频控（实测 file/list/new 约 15 QPS/用户，报错文案为空，
-          // 不认它会直接把导出/导入中止），必须像 429 一样退避重试
+          // 100011 = 网盘接口频控（实测 file/list/new 约 15 QPS/用户，报错文案经常为空，
+          // 不认它会直接把导出/导入中止）。挂了门的路径走门：hit() 让所有在途请求一起冷却并放慢
+          // 间距，等门开再重试、不烧常规重试预算（旧逻辑每个 worker 各自退避完又同时打回
+          // 同一个风控窗口，越重试越撞，6 次烧完就把整轮任务判死）。
+          if (gate && !isRetryable && isRateLimitedError(error)) {
+            if (!paceStartedAt) paceStartedAt = Date.now();
+            gate.hit();
+            // 单条线路见底时自动换道（仅 auto 模式；换道会重置门的水位并按新车道档位起步）
+            noteRouteThrottle(this, usedHost || this.host);
+            paceWaits += 1;
+            // 门负责全局冷却，这里只给单个请求有限耐心：次数 + 累计等待时长双闸。
+            // 超预算就不再挂在这一条上（上层把该条目记成失败继续跑，断点保证下次续传），
+            // 否则一个被硬封的账号会把千万级任务冻在第一个文件上。
+            if (paceWaits <= maxPaceWaits && Date.now() - paceStartedAt <= maxPaceWaitMs) {
+              lastError = error;
+              continue;
+            }
+            // 预算耗尽：门已经记下这个窗口的惩罚（其他请求会排在门后面），这一条就不再
+            // 拿常规重试预算往同一个风控窗口里续命，直接终局上抛（上层记为失败、任务继续）。
+            error.paceExhausted = true;
+            throw error;
+          }
           const retryable = isRetryable ? isRetryable(error) : (String(code) === "100011" || RETRY_PATTERN.test(error.message) || [408, 425, 429, 500, 502, 503, 504].includes(response.status));
           if (attempt < attempts - 1 && retryable) {
             lastError = error;
+            attempt += 1;
             continue;
           }
           throw error;
@@ -1050,12 +1710,15 @@
             error.name = "TimeoutError";
           }
           lastError = error;
-          if (error?.auth) throw error;
+          if (error?.auth || error?.paceExhausted) throw error;
           const retryable = isRetryable ? isRetryable(error) : (String(error?.code) === "100011" || (!RETRY_PATTERN.test(String(error?.message)) && error?.status && ![408, 425, 429, 500, 502, 503, 504].includes(error.status) ? false : true));
-          if (["AbortError", "TimeoutError"].includes(error?.name) || attempt >= attempts - 1 || !retryable) throw error;
+          // 超时的处置：秒传这类长任务里一次网络抖动/挂起不该把整轮判死，挂了门时按重试预算重试；
+          // 用户主动取消（AbortError）永远原样上抛。调用方自带 isRetryable/attempts 的（分享接口）不改语义。
+          const timeoutRetryable = error?.name === "TimeoutError" && Boolean(gate) && !isRetryable && attempts > 1;
+          if (error?.name === "AbortError" || attempt >= attempts - 1 || (!retryable && !timeoutRetryable)) throw error;
+          attempt += 1;
         } finally {
-          clearTimeout(timeout);
-          if (signal) signal.removeEventListener("abort", abortRequest);
+          stopTimeout();
         }
       }
       throw lastError || new Error("123 \u8BF7\u6C42\u5931\u8D25");
@@ -1063,10 +1726,14 @@
     async listPage(parentFileId = "0", page = 1, options = {}) {
       const data = await this.request("GET", "/b/api/file/list/new", {
         signal: options.signal,
-        host: this.laneHost,
+        // 线路探测需要指定任意候选域名；日常调用不带 options.host = 沿用任务的 laneHost
+        host: options.host === void 0 ? this.laneHost : options.host,
+        credentialsMode: options.credentialsMode,
+        pacing: options.pacing,
+        attempts: options.attempts,
         query: {
           driveId: "0",
-          limit: String(options.limit || 100),
+          limit: String(options.limit || this.listLimit),
           next: "0",
           orderBy: options.orderBy || "update_time",
           orderDirection: options.orderDirection || "desc",
@@ -1090,10 +1757,19 @@
     }
     async listAll(parentFileId = "0", options = {}) {
       const output = [];
-      for (let page = 1; ; page += 1) {
+      // 翻页安全闸：每页 listLimit（默认 500）条，200 页 = 10 万条目，远超正常目录；
+      // 若某页与上一页的 FileID 集合完全相同（服务端分页语义异常时会出现），立即停止——
+      // 无限翻页会把限速门的配额占死，让整台机器上的秒传任务一起卡住。
+      const maxPages = Math.max(1, Number(options.maxPages || 200));
+      let previousIds = "";
+      for (let page = 1; page <= maxPages; page += 1) {
         const result2 = await this.listPage(parentFileId, page, options);
         output.push(...result2.files);
         if (result2.next === "-1" || result2.next === String(page)) break;
+        if (!result2.files.length) break;
+        const ids = result2.files.map((file) => file.id).join(",");
+        if (ids && ids === previousIds) break;
+        previousIds = ids;
       }
       return output;
     }
@@ -1303,7 +1979,7 @@
         });
       }
     }
-    async createFolder(parentFileId, name, signal) {
+    async createFolder(parentFileId, name, signal, listingCache = null) {
       const data = await this.request("POST", "/b/api/file/upload_request", {
         signal,
         host: this.laneHost,
@@ -1324,10 +2000,16 @@
       const body = data?.data || {};
       const info = body.Info || body.info || body;
       const id = body.dirID ?? body.dirId ?? info.FileId ?? info.fileId ?? info.fileID;
-      if (Number(id) > 0) return String(id);
-      const found = (await this.listAll(parentFileId, { signal })).find((file) => file.type === 1 && file.name === name);
+      if (Number(id) > 0) {
+        this.rememberCreatedFolder(parentFileId, name, String(id));
+        return String(id);
+      }
+      // 极少数情况下接口不返回新目录 ID：走带索引缓存的查找（旧版这里直接全量翻页列父目录）。
+      // 先剔除可能过期的父目录 listing——那条缓存抓建于本目录创建之前，不含它。
+      if (listingCache) listingCache.delete(String(parentFileId || "0"));
+      const found = await this.findChildFolder(parentFileId, name, listingCache, signal);
       if (!found) throw new Error(`\u521B\u5EFA\u76EE\u5F55\u540E\u672A\u627E\u5230\uFF1A${name}`);
-      return found.id;
+      return found;
     }
     async reuseFile(file, parentFileId, signal) {
       const data = await this.request("POST", "/b/api/file/upload_request", {
@@ -1347,7 +2029,13 @@
         }
       });
       const body = data?.data || {};
-      if (!body.Reuse && !body.reuse) throw new Error("\u4E91\u7AEF\u6CA1\u6709\u53EF\u590D\u7528\u7684\u540C\u54C8\u5E0C\u6587\u4EF6");
+      if (!body.Reuse && !body.reuse) {
+        // 秒传未命中（云端没有同哈希文件）不是失败：标记出来让导入侧单独分桶统计，
+        // 否则千万级导入的结果页会被"失败"刷屏、真实故障反而看不见。
+        const miss = new Error("\u4E91\u7AEF\u6CA1\u6709\u53EF\u590D\u7528\u7684\u540C\u54C8\u5E0C\u6587\u4EF6");
+        miss.fastlinkMiss = true;
+        throw miss;
+      }
       const info = body.Info || body.info || body;
       return String(info.FileId ?? info.fileId ?? body.FileId ?? body.fileId ?? "");
     }
@@ -1522,23 +2210,61 @@
         if (signal) signal.removeEventListener("abort", abortParent);
       }
     }
-    async findChildFolder(parentFileId, name, listingCache = null, signal) {
+    // 「本次任务刚建好的目录」覆盖表：新建成功的目录立刻记账，同一次导入里后续找兄弟/子目录
+    // 不再为它列一次父目录（旧版每个新目录都要重新全量列举父目录，是撞频控的主要放大器）。
+    lookupCreatedFolder(parentFileId, name) {
+      const bucket = this.createdFolderIndex?.get(String(parentFileId || "0"));
+      if (!bucket) return null;
+      return bucket.get(String(name || "").trim().toLocaleLowerCase()) || null;
+    }
+    rememberCreatedFolder(parentFileId, name, folderId) {
       const parentKey = String(parentFileId || "0");
       const target = String(name || "").trim().toLocaleLowerCase();
-      if (!target) return null;
-      let pending;
-      if (listingCache && listingCache.has(parentKey)) {
-        pending = listingCache.get(parentKey);
-      } else {
+      if (!parentKey || !target || !folderId) return;
+      if (!this.createdFolderIndex) this.createdFolderIndex = /* @__PURE__ */ new Map();
+      // api 实例是面板级长生命周期对象，百万级目录的任务会让这张表一直长大：
+      // 超过 4000 个父目录整表丢弃（只是少一次缓存命中，退回列举查询，不影响正确性）
+      if (this.createdFolderIndex.size > 4000) this.createdFolderIndex.clear();
+      let bucket = this.createdFolderIndex.get(parentKey);
+      if (!bucket) {
+        bucket = /* @__PURE__ */ new Map();
+        this.createdFolderIndex.set(parentKey, bucket);
+      }
+      bucket.set(target, String(folderId));
+    }
+    // 父目录子项索引（目录名 → ID）：一次 listAll 建好，挂在同一条 promise 上随任务级
+    // listingCache 一起回收；同父目录的后续查询 O(1) 命中，不再线性扫全表、也不再重新列举。
+    async childFolderIndex(parentFileId, listingCache = null, signal = null) {
+      const parentKey = String(parentFileId || "0");
+      let pending = listingCache?.get(parentKey) || null;
+      if (!pending) {
         pending = this.listAll(parentKey, { signal }).catch((error) => {
           if (listingCache) listingCache.delete(parentKey);
           throw error;
         });
         if (listingCache) listingCache.set(parentKey, pending);
       }
-      const children = await pending;
-      const found = (children || []).find((file) => Number(file.type) === 1 && String(file.name || "").trim().toLocaleLowerCase() === target);
-      return found ? String(found.id) : null;
+      if (!pending[FASTLINK_CHILD_INDEX]) {
+        const children = await pending;
+        const index = /* @__PURE__ */ new Map();
+        for (const file of children || []) {
+          if (Number(file.type) === 1) index.set(String(file.name || "").trim().toLocaleLowerCase(), String(file.id));
+        }
+        try {
+          pending[FASTLINK_CHILD_INDEX] = index;
+        } catch {
+          return index;
+        }
+      }
+      return pending[FASTLINK_CHILD_INDEX] || /* @__PURE__ */ new Map();
+    }
+    async findChildFolder(parentFileId, name, listingCache = null, signal) {
+      const target = String(name || "").trim().toLocaleLowerCase();
+      if (!target) return null;
+      const created = this.lookupCreatedFolder(parentFileId, target);
+      if (created) return created;
+      const index = await this.childFolderIndex(parentFileId, listingCache, signal);
+      return index.get(target) || null;
     }
     async ensurePath(rootId, parts, cache = /* @__PURE__ */ new Map(), signal, listingCache = null) {
       let current = String(rootId || "0");
@@ -1556,7 +2282,7 @@
             if (existing) return String(existing);
           } catch (_) {
           }
-          return String(await this.createFolder(parentId, part, signal));
+          return String(await this.createFolder(parentId, part, signal, listingCache));
         })();
         cache.set(path, pending);
         try {
@@ -2235,6 +2961,7 @@
       useFolderNameForJson: true,
       appendDateToJson: false,
       fastLane: false,
+      routePreference: "auto",
       seedFolderId: "",
       seedFolderName: "",
       secondaryUseJson: true,
@@ -2351,7 +3078,7 @@
     delete stored.library.fallbackTvCategory;
     delete stored.library.categoryRules;
     if (stored.fastlink && typeof stored.fastlink === "object") {
-      stored.fastlinkTools = { ...stored.fastlinkTools || {}, ...Object.fromEntries(["debugMode", "useFolderNameForJson", "appendDateToJson", "fastLane", "filterOnShareEnabled", "filterOnTransferEnabled", "filters"].filter((key) => stored.fastlink[key] !== void 0).map((key) => [key, stored.fastlink[key]])) };
+      stored.fastlinkTools = { ...stored.fastlinkTools || {}, ...Object.fromEntries(["debugMode", "useFolderNameForJson", "appendDateToJson", "fastLane", "routePreference", "filterOnShareEnabled", "filterOnTransferEnabled", "filters"].filter((key) => stored.fastlink[key] !== void 0).map((key) => [key, stored.fastlink[key]])) };
     }
     delete stored.fastlink;
     const config = mergeKnown(DEFAULT_CONFIG, stored);
@@ -2371,6 +3098,8 @@
     config.fastlinkTools.seedFolderId = /^\d+$/.test(seedFolderId) ? seedFolderId : "";
     if (!config.fastlinkTools.seedFolderId) config.fastlinkTools.seedFolderName = "";
     config.fastlinkTools.secondaryUseJson = config.fastlinkTools.secondaryUseJson !== false;
+    // 线路偏好是内部状态（设置页无 UI）：只认 auto/mirror，其余值（含旧版 apiRoute 四档）一律回落 auto
+    if (config.fastlinkTools.routePreference !== "mirror") config.fastlinkTools.routePreference = "auto";
     delete config.appearance.hideOfficialPromotions;
     // TMDB 替代源：非空即保存；没写协议头自动按 https 处理（如 api.tmdb.org），去尾部斜杠与内部空白
     const tmdbApiBaseRaw = String(config.tmdb?.apiBase ?? "").replace(/\s+/g, "");
@@ -2691,6 +3420,7 @@
 
   // node_modules/lucide/dist/esm/icons/play.js
   var Play = [["polygon", { points: "6 3 20 12 6 21 6 3" }]];
+  var Pause = [["rect", { x: "6", y: "4", width: "4", height: "16", rx: "1" }], ["rect", { x: "14", y: "4", width: "4", height: "16", rx: "1" }]];
 
   // node_modules/lucide/dist/esm/icons/plus.js
   var Plus = [
@@ -2896,6 +3626,7 @@
     list: List,
     grid: Grid2x2,
     brackets: Brackets,
+    pause: Pause,
     waveform: AudioWaveform
   };
   function icon(name, size = 17, className = "") {
@@ -5541,7 +6272,98 @@
       ui.bridge.updateConfig(next);
       ui.toast?.(`\u9875\u9762\u7EAF\u51C0\u7248\u5DF2${next.appearance.purePageMode ? "\u5F00\u542F" : "\u5173\u95ED"}`, "success");
     });
-    return [settingsMenu, recordsMenu, purePageMenu].filter(Boolean);
+    const changelogMenu = GM_registerMenuCommand(CHANGELOG_MENU_LABEL, () => showChangelogDialog());
+    return [settingsMenu, recordsMenu, purePageMenu, changelogMenu].filter(Boolean);
+  }
+
+  // —— 更新内容通知 ——
+  // 版本升级后首次加载弹一次「这次改了什么」，点「我已知晓」记下已读版本；菜单里可随时回看。
+  // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
+  var CHANGELOG_MENU_LABEL = "\u67E5\u770B 123 \u52A9\u624B\u66F4\u65B0\u5185\u5BB9";
+  var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
+  var SCRIPT_CHANGELOG = [
+    {
+      version: "1.3.12",
+      notes: [
+        "\u79D2\u4F20\u5BFC\u5165/\u5BFC\u51FA\u63A5\u5165\u81EA\u9002\u5E94\u9650\u901F\u95E8\uFF1A\u76EE\u5F55\u5217\u4E3E\u4E0E\u79D2\u4F20\u5199\u5165\u5404\u81EA\u6709\u5168\u5C40\u95F4\u8DDD\uFF0C\u649E\u9891\u63A7\u5168\u5C40\u51B7\u5374\u540E\u81EA\u52A8\u7EE7\u7EED\uFF0C\u4E0D\u518D\u300C\u8BF7\u6C42\u8FC7\u4E8E\u9891\u7E41\u300D\u4E2D\u65AD",
+        "\u5217\u4E3E\u6BCF\u9875 100 \u2192 500 \u6761\u3001\u5EFA\u76EE\u5F55\u4E0D\u518D\u5168\u91CF\u7FFB\u9875\u67E5\u7236\u76EE\u5F55\uFF08\u6539\u7528\u76EE\u5F55\u540D\u7D22\u5F15 + \u65B0\u5EFA\u76EE\u5F55\u8986\u76D6\u8868\uFF09\uFF0C\u540C\u4E00\u6279\u5BFC\u5165\u8BF7\u6C42\u6570\u5927\u5E45\u4E0B\u964D",
+        "\u63a5\u53e3\u7ebf\u8def\u6539\u4e3a\u5168\u81ea\u52a8\uff1a\u4efb\u52a1\u5f00\u59cb\u524d\u63a2\u6d4b\u9875\u9762\u57df\u540d / www.123865.com / api.123278.com \u8c01\u66f4\u5feb\u4e0d\u88ab\u9650\uff0c\u8fd0\u884c\u4e2d\u649e\u9650\u81ea\u52a8\u6362\u9053\uff1b\u8bbe\u7f6e\u9875\u4e0d\u518d\u63d0\u4f9b\u624b\u52a8\u9009\u8def\u4e0e\u6d4b\u901f\u5165\u53e3",
+        "\u79D2\u4F20\u672A\u547D\u4E2D\uFF08\u4E91\u7AEF\u65E0\u540C\u54C8\u5E0C\u6587\u4EF6\uFF09\u4E0D\u518D\u7B97\u5931\u8D25\uFF0C\u5355\u72EC\u4E00\u6876\u7EDF\u8BA1\uFF1B\u65E0\u5931\u8D25\u4E5F\u65E0\u672A\u547D\u4E2D\u624D\u6E05\u65AD\u70B9",
+        "\u8FDB\u5EA6\u6761\u5347\u7EA7\uFF1A\u5B9E\u65F6\u663E\u793A\u76EE\u5F55\u6570 / \u6587\u4EF6\u6570 / \u7D2F\u8BA1\u4F53\u79EF / \u901F\u7387 / \u5269\u4F59\u65F6\u95F4 / \u5F53\u524D\u6761\u76EE\uFF0C\u53EF\u5C55\u5F00\u6700\u8FD1 30 \u884C\u8FD0\u884C\u660E\u7EC6\uFF1B\u65B0\u589E\u300C\u6682\u505C/\u7EE7\u7EED\u300D",
+        "\u5BFC\u5165\u7ED3\u679C\u9875\u652F\u6301\u6309\u72B6\u6001\u7B5B\u9009\u4E0E\u4E0B\u8F7D\u660E\u7EC6 CSV\uFF1B\u65AD\u70B9\u91CC\u540C\u65F6\u4FDD\u5B58\u9650\u901F\u95E8\u6C34\u4F4D\uFF0C\u7EED\u8DD1\u4E0D\u4F1A\u5E26\u7740\u521A\u89E6\u53D1\u7684\u98CE\u63A7\u518D\u649E\u4E00\u6B21",
+        "\u65B0\u589E\u66F4\u65B0\u5185\u5BB9\u901A\u77E5\u4E0E\u83DC\u5355\u5165\u53E3\u300C\u67E5\u770B 123 \u52A9\u624B\u66F4\u65B0\u5185\u5BB9\u300D"
+      ]
+    }
+  ];
+  function scriptVersion() {
+    try {
+      if (typeof GM_info !== "undefined" && GM_info?.script?.version) return String(GM_info.script.version);
+    } catch {
+    }
+    return String(SCRIPT_CHANGELOG[0]?.version || "");
+  }
+  function changelogEntries(limit = 6) {
+    return (Array.isArray(SCRIPT_CHANGELOG) ? SCRIPT_CHANGELOG : []).slice(0, Math.max(1, Number(limit) || 6));
+  }
+  function changelogMarkup(entries) {
+    return entries.map((entry) => `<div class="c123-changelog-version">${escapeHtml(entry.version)}</div><ul class="c123-changelog-list">${(entry.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>`).join("");
+  }
+  function changelogDialogHtml(entries, version) {
+    const styles = ".c123-cl-mask{position:fixed;inset:0;z-index:2147483646;background:rgba(8,10,14,.55);display:flex;align-items:center;justify-content:center;padding:20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;}.c123-cl-box{width:min(560px,92vw);max-height:78vh;overflow:auto;padding:22px 24px;border-radius:14px;background:#151a23;color:#e8ecf4;box-shadow:0 18px 48px rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);}.c123-cl-title{font-size:17px;font-weight:600;margin:0 0 4px;}.c123-cl-sub{margin:0 0 14px;color:#96a0b3;font-size:12px;}.c123-changelog-version{margin:14px 0 6px;font-size:13px;font-weight:600;color:#7fb3ff;}.c123-changelog-list{margin:0;padding-left:20px;font-size:13px;line-height:1.7;color:#cfd6e4;}.c123-changelog-list li+li{margin-top:4px;}.c123-cl-footer{display:flex;justify-content:flex-end;gap:10px;margin-top:18px;}.c123-cl-btn{padding:8px 18px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:transparent;color:#e8ecf4;font-size:13px;cursor:pointer;}.c123-cl-btn.primary{background:#2f6feb;border-color:#2f6feb;color:#fff;}";
+    return `<style>${styles}</style><div class="c123-cl-mask" data-changelog-mask><div class="c123-cl-box" role="dialog" aria-modal="true" aria-label="123 \u52A9\u624B\u66F4\u65B0\u5185\u5BB9"><h3 class="c123-cl-title">123 \u52A9\u624B\u66F4\u65B0\u5185\u5BB9</h3><p class="c123-cl-sub">\u5F53\u524D\u7248\u672C ${escapeHtml(version || scriptVersion())}</p>${changelogMarkup(entries)}<div class="c123-cl-footer"><button class="c123-cl-btn primary" data-changelog-close>\u6211\u5DF2\u77E5\u6653</button></div></div></div>`;
+  }
+  function showChangelogDialog(options = {}) {
+    const entries = changelogEntries(options.limit || 6);
+    const host = document.createElement("div");
+    host.setAttribute("data-c123-changelog", "");
+    host.innerHTML = changelogDialogHtml(entries, options.version);
+    document.documentElement.appendChild(host);
+    const close = () => {
+      host.remove();
+      document.removeEventListener("keydown", onKey);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") close();
+    };
+    document.addEventListener("keydown", onKey);
+    host.addEventListener("click", (event) => {
+      if (event.target?.hasAttribute?.("data-changelog-close") || event.target?.hasAttribute?.("data-changelog-mask")) close();
+    });
+    return close;
+  }
+  // 升级后首次加载弹一次；已读过这个版本就不再打扰
+  function maybeShowUpdateNotes() {
+    const version = scriptVersion();
+    if (!version) return false;
+    let seen = "";
+    try {
+      seen = typeof GM_getValue === "function" ? String(GM_getValue(CHANGELOG_SEEN_KEY, "") || "") : String(localStorage.getItem(CHANGELOG_SEEN_KEY) || "");
+    } catch {
+      return false;
+    }
+    if (seen === version) return false;
+    const entries = SCRIPT_CHANGELOG.filter((entry) => entry.version === version);
+    if (!entries.length) {
+      // 没有这一版的记录（比如手动改了版本号）：静默记下已读，不弹空窗
+      try {
+        if (typeof GM_setValue === "function") GM_setValue(CHANGELOG_SEEN_KEY, version);
+        else localStorage.setItem(CHANGELOG_SEEN_KEY, version);
+      } catch {
+      }
+      return false;
+    }
+    const close = showChangelogDialog({ version, limit: 1 });
+    const ack = () => {
+      try {
+        if (typeof GM_setValue === "function") GM_setValue(CHANGELOG_SEEN_KEY, version);
+        else localStorage.setItem(CHANGELOG_SEEN_KEY, version);
+      } catch {
+      }
+      close?.();
+    };
+    const box = document.querySelector("[data-c123-changelog] [data-changelog-close]");
+    if (box) box.addEventListener("click", ack, { once: true });
+    return true;
   }
 
   // src/share-response.js
@@ -6908,11 +7730,10 @@
       const saveInterval = Math.min(30000, Math.max(1500, progressDoneCount * 2));
       if (now - progressSavedAt >= saveInterval) saveProgressNow();
     };
-    // 秒传导入并发：默认线路下限 32、上限 64（2026-09-08 实测 upload_request 复用接口 32 并发
-    // 85 req/s 全部成功、零频控）。此前跟随通用 writeConcurrency（默认 10），实际只有
-    // 10 并发白白浪费约 3 倍吞吐；现在导入固定不低于 32，显式配置更高时最高可到 64。
-    // 目录预建并发仍与 list 接口的 ~15 QPS 频控对齐（上限 12）。
-    // 镜像线路（api.laneHost）实测 16~24 线程 ≈150 req/s：并发按配置值生效、未配置默认 24（下限 8）。
+    // 秒传导入的 concurrency 是「流水深度」，不是速度手段：真正的请求速率由两把全局门保证
+    // （upload_request 走 panApiGates.write、目录列举走 panApiGates.list，撞限全门冷却），
+    // 深度只要足够在门开口时有请求可发即可，抬高它不会多打一个请求、也不会更快撞限。
+    // 镜像线路（laneHost）实测 16~24 线程 ≈150 req/s：按配置生效、未配置默认 24；默认线路 32 底。
     const lane = Boolean(api.laneHost);
     const concurrency = lane
       ? Math.min(64, Math.max(8, Number(options.concurrency) >= 16 ? Number(options.concurrency) : 24))
@@ -6945,7 +7766,7 @@
       }
       for (let depth = 0; byDepth.has(depth); depth += 1) {
         if (options.signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
-        await mapLimit(byDepth.get(depth), Math.min(12, concurrency), async (node) => {
+        await mapLimit(byDepth.get(depth), Math.min(24, concurrency), async (node) => {
           try {
             if (cache.has(node.key)) return;
             if (node.depth > 0 && !cache.has(node.parentKey)) return;
@@ -6953,10 +7774,14 @@
             const pending = (async () => {
               try {
                 const existing = await api.findChildFolder(parentId, node.name, listingCache, options.signal);
-                if (existing) return String(existing);
+                if (existing) {
+                  options.onDetail?.({ kind: "folder-existing", path: node.key, name: node.name });
+                  return String(existing);
+                }
               } catch (_) {
               }
-              return String(await api.createFolder(parentId, node.name, options.signal));
+              options.onDetail?.({ kind: "folder-create", path: node.key, name: node.name });
+              return String(await api.createFolder(parentId, node.name, options.signal, listingCache));
             })();
             cache.set(node.key, pending);
             await pending;
@@ -6975,18 +7800,46 @@
     }, { signal: options.signal });
     let done = 0;
     let lastUI = 0;
+    let okCount = 0;
+    let failCount = 0;
+    let missCount = 0;
+    let bytesDone = 0;
     const details = await mapLimit(prepared, concurrency, async (file) => {
       const name = [...commonParts, file.path].filter(Boolean).join("/");
       try {
         await api.reuseFile(file, file.parentId, options.signal);
         markProgress(file);
         file.status = "success";
+        okCount += 1;
+        bytesDone += Number(file.size) || 0;
       } catch (error) {
-        file.status = "failed";
-        file.message = error.message;
+        if (error?.fastlinkMiss) {
+          // 未命中：云端没有同哈希文件可复用，本次没有转存成功；不写断点，重跑还会再试
+          file.status = "miss";
+          file.message = "\u4E91\u7AEF\u65E0\u540C\u54C8\u5E0C\u6587\u4EF6\uFF0C\u672A\u8F6C\u5B58";
+          missCount += 1;
+        } else {
+          file.status = "failed";
+          file.message = error.message;
+          failCount += 1;
+        }
       } finally {
         file.name = name;
         done += 1;
+        options.onDetail?.({
+          kind: "import",
+          status: file.status,
+          message: file.message || "",
+          name,
+          path: name,
+          size: Number(file.size) || 0,
+          etag: String(file.etag || "").slice(0, 8),
+          ok: okCount,
+          fail: failCount,
+          miss: missCount,
+          bytes: bytesDone,
+          processed: done
+        });
         const now = Date.now();
         if (done === prepared.length || done % 20 === 0 || now - lastUI > 300) {
           lastUI = now;
@@ -6996,10 +7849,11 @@
       return file;
     }, { signal: options.signal });
     if (progress) {
-      let failedCount = 0;
-      for (const item of details) if (item.status === "failed") failedCount += 1;
-      if (failedCount) {
-        // 收尾落盘：脏分片全部落完 + 更新主记录，失败续传不丢进度
+      let unfinished = 0;
+      for (const item of details) if (item.status !== "success") unfinished += 1;
+      if (unfinished) {
+        // 收尾落盘：脏分片全部落完 + 更新主记录，失败/未命中续传不丢进度
+        // （未命中条目没写 done 集合，只统计 failed 会把断点误清、丢掉同轮成功项的进度）
         for (const index of progressDirtyShards) {
           checkpointStorageSet(FASTLINK_IMPORT_CHECKPOINT_KEY + FASTLINK_IMPORT_SHARD_SUFFIX + index, { kind: "import-shard", version: 2, shard: index, keys: progressShards[index] });
         }
@@ -7210,18 +8064,28 @@
     const dirtyShards = /* @__PURE__ */ new Set();
     let ok = 0;
     let fail = 0;
+    let miss = 0;
     let doneSkip = 0;
     let filteredOut = 0;
     let processed = 0;
+    let bytesDone = 0;
     let lastUi = 0;
     let lastSave = Date.now();
+    let lastName = "";
     let finished = false;
     const failDetails = [];
+    const missDetails = [];
+    if (resumable) {
+      // 续传先还原限速门水位（间距 + 未到期的冷却），不会刚恢复就按满速再撞一次风控
+      panApiGates.write.restore(record.pacing?.write);
+      panApiGates.list.restore(record.pacing?.list);
+      bytesDone = Number(record.bytesDone) || 0;
+    }
     const reportProgress = (force = false) => {
       const now = Date.now();
       if (!force && now - lastUi < 300) return;
       lastUi = now;
-      options.onProgress?.(0, 1, `\u6210\u529F ${ok} \u00B7 \u5931\u8D25 ${fail}${doneSkip ? ` \u00B7 \u5DF2\u5BFC\u5165\u8DF3\u8FC7 ${doneSkip}` : ""}`);
+      options.onProgress?.(0, 1, lastName);
     };
     const markDone = (file) => {
       const hex = fastlinkKeyFingerprint(fastlinkImportFileKey(file));
@@ -7243,7 +8107,17 @@
         }
         dirtyShards.clear();
         const liveShards = nextShardIndex + (shardBuffers.get(nextShardIndex)?.length ? 1 : 0);
-        checkpointStorageSet(FASTLINK_IMPORT_STREAM_CHECKPOINT_KEY, { kind: "import-stream", version: 3, savedAt: Date.now(), rootId: String(rootId || "0"), doneCount: doneSet.size, shardCount: Math.max(liveShards, nextShardIndex) });
+        checkpointStorageSet(FASTLINK_IMPORT_STREAM_CHECKPOINT_KEY, {
+          kind: "import-stream",
+          version: 3,
+          savedAt: Date.now(),
+          rootId: String(rootId || "0"),
+          doneCount: doneSet.size,
+          shardCount: Math.max(liveShards, nextShardIndex),
+          bytesDone,
+          // 限速门水位随断点落盘：续跑不带着刚触发的风控状态按满速再撞一次
+          pacing: { write: panApiGates.write.snapshot(), list: panApiGates.list.snapshot() }
+        });
         lastSave = Date.now();
       } catch {
       }
@@ -7269,17 +8143,46 @@
       await mapLimit(todo, concurrency, async (file) => {
         const parts = file.path.split("/");
         const name = [...commonParts, file.path].filter(Boolean).join("/");
+        lastName = name;
+        let status = "success";
+        let message = "";
         try {
           const parentId = await api.ensurePath(rootId, [...commonParts, ...parts.slice(0, -1)], cache, signal, listingCache);
           await api.reuseFile(file, parentId, signal);
           ok += 1;
+          bytesDone += Number(file.size) || 0;
           markDone(file);
         } catch (error) {
           if (error?.name === "AbortError") throw error;
-          fail += 1;
-          if (failDetails.length < FASTLINK_IMPORT_RESULT_DETAILS_CAP) failDetails.push({ ...file, name, status: "failed", message: error.message });
+          if (error?.fastlinkMiss) {
+            // 秒传未命中：云端没有同哈希文件可复用。不算失败、也不写 done（下次重跑还会再试）
+            miss += 1;
+            status = "miss";
+            message = "\u4E91\u7AEF\u65E0\u540C\u54C8\u5E0C\u6587\u4EF6\uFF0C\u672A\u8F6C\u5B58";
+            if (missDetails.length < FASTLINK_IMPORT_RESULT_DETAILS_CAP) missDetails.push({ path: file.path, name, size: Number(file.size) || 0, status: "miss", message });
+          } else {
+            fail += 1;
+            status = "failed";
+            message = error.message;
+            if (failDetails.length < FASTLINK_IMPORT_RESULT_DETAILS_CAP) failDetails.push({ ...file, name, status: "failed", message });
+          }
         } finally {
           reportProgress();
+          options.onDetail?.({
+            kind: "import",
+            status,
+            message,
+            name,
+            path: name,
+            size: Number(file.size) || 0,
+            etag: String(file.etag || "").slice(0, 8),
+            ok,
+            fail,
+            miss,
+            skipped: doneSkip,
+            processed,
+            bytes: bytesDone
+          });
         }
       }, { signal });
       reportProgress(true);
@@ -7296,8 +8199,10 @@
       async finish(meta = {}) {
         const invalid = meta.invalid || null;
         // 先落盘/清档、再置 finished（save 有 finished 守卫，顺序反了会让失败收尾永远不落盘）
-        if (fail === 0 && ok + doneSkip + filteredOut > 0) {
-          // 全部成功：清档，重跑幂等（范围放宽，确保尾巴分片一并清掉）
+        if (fail === 0 && miss === 0 && ok + doneSkip + filteredOut > 0) {
+          // 全部成功：清档，重跑幂等（范围放宽，确保尾巴分片一并清掉）。
+          // 有未命中时绝不清档——未命中条目没写 done 指纹，清掉会让下次重跑把已成功
+          // 的条目再转一遍，duplicate:1 语义下生成一堆"名字 (1)"副本。
           clearFastlinkStreamCheckpoint({ shardCount: nextShardIndex + shardBuffers.size + 1 });
           finished = true;
         } else if (ok + fail + doneSkip > 0) {
@@ -7310,10 +8215,12 @@
           status: fail === 0 ? "success" : ok > 0 ? "partial" : "failed",
           ok,
           fail,
-          total: ok + fail,
-          done: ok + fail,
-          details: failDetails,
-          detailsTruncated: fail > failDetails.length,
+          miss,
+          total: ok + fail + miss,
+          done: ok + fail + miss,
+          bytes: bytesDone,
+          details: [...failDetails, ...missDetails],
+          detailsTruncated: fail > failDetails.length || miss > missDetails.length,
           skipped: doneSkip,
           filteredOut,
           processed,
@@ -7474,7 +8381,9 @@
         signal: options.signal,
         filterEnabled: options.filterEnabled,
         filterExtensions: options.filterExtensions,
+        concurrency: options.concurrency,
         onProgress: (done) => options.onProgress?.(index, items.length, `${item.name}\uFF1A\u5DF2\u626B\u63CF ${done} \u4E2A\u6587\u4EF6`),
+        onDetail: options.onDetail,
         checkpoint,
         checkpointRoots: [index]
       });
@@ -7495,18 +8404,22 @@
     const checkpoint = options.checkpoint;
     const rootIndexes = (options.checkpointRoots || [0]).map((value) => Number(value));
     const rootSet = new Set(rootIndexes);
-    // 目录按层并发扫描（与秒传导入同款策略）：每层最多 concurrency 个目录同时 listAll，
-    // 显著快于旧的深度优先串行扫描；断点续传、去重、中断抢救语义保持不变。
-    // 并发实测（2026-09-08）：file/list/new 有 ~15 QPS/用户频控（code 100011，空文案），
-    // 并发再高吞吐也不会涨（实测 8/16/32 成功速率都恒定 ~15 目录/秒），8 已够饱和；
-    // 100011 本身由 request() 退避重试兜底。
-    const concurrency = Math.max(1, Math.min(16, Number(options.concurrency) || 8));
+    // 目录按层并发扫描：这里的数字是「流水深度」，不是速度手段——真正的请求速率由
+    // panApiGates.list 这把全局门保证（任意两个列举之间至少留 interval 间距，撞限全门冷却），
+    // 深度给足才能让门开口的瞬间有请求可发。实测 file/list/new 约 15 QPS/用户，
+    // 每页 500 条后 12~15 QPS 相当于每秒收 6000+ 条目，深度 24 足够吃满配额。
+    const concurrency = Math.max(1, Math.min(64, Number(options.concurrency) || 24));
+    // 风控状态跟着断点走：续扫时先还原门的间距与冷却，不会刚恢复就按满速再撞一次
+    const listGate = panApiGates.list;
+    if (checkpoint?.state?.pacing) listGate.restore(checkpoint.state.pacing);
     let files = [];
     let allFiles = files;
     let othersPending = [];
     let frontier = [];
     let completedFolders = new Set();
     let seenIds = new Set();
+    let scannedFolders = 0;
+    let scannedBytes = 0;
     if (checkpoint?.state) {
       const state = checkpoint.state;
       allFiles = Array.isArray(state.files) ? state.files : [];
@@ -7514,6 +8427,9 @@
       completedFolders = new Set(state.completedFolders || []);
       seenIds = new Set(allFiles.map((file) => String(file.id)));
       for (const entry of state.pending || []) (rootSet.has(Number(entry?.root)) ? frontier : othersPending).push(entry);
+      // 明细统计从断点值续算（否则续扫后「累计体积 / 目录数 / 速率」会从 0 重新开始）
+      scannedFolders = completedFolders.size;
+      for (const file of allFiles) scannedBytes += Number(file.size) || 0;
     } else {
       frontier = (items || []).map((item, index) => {
         const root = Number.isSafeInteger(rootIndexes[index]) ? rootIndexes[index] : 0;
@@ -7531,7 +8447,21 @@
       checkpoint.state.files = allFiles;
       checkpoint.state.completedFolders = [...completedFolders];
       checkpoint.state.pending = [...othersPending, ...frontier];
+      checkpoint.state.pacing = listGate.snapshot();
+      checkpoint.state.scannedBytes = scannedBytes;
       checkpoint.save(force);
+    };
+    const reportDetail = (entry) => {
+      options.onProgress?.(files.length, 0, entry?.fileName || "");
+      options.onDetail?.({
+        kind: "file",
+        name: String(entry?.fileName || ""),
+        path: String(entry?.path || ""),
+        size: Number(entry?.size) || 0,
+        folders: scannedFolders,
+        files: files.length,
+        bytes: scannedBytes
+      });
     };
     const pushFile = (entry) => {
       const key = String(entry.id || "");
@@ -7539,7 +8469,8 @@
       seenIds.add(key);
       allFiles.push(entry);
       if (files !== allFiles) files.push(entry);
-      options.onProgress?.(files.length, 0, entry.fileName);
+      scannedBytes += Number(entry.size) || 0;
+      reportDetail(entry);
     };
     while (frontier.length) {
       if (options.signal?.aborted) {
@@ -7560,7 +8491,10 @@
             const stale = files.filter((file) => file.path === ownPrefix || file.path.startsWith(`${ownPrefix}/`));
             if (stale.length) {
               const removed = new Set(stale);
-              for (const file of stale) seenIds.delete(String(file.id || ""));
+              for (const file of stale) {
+                seenIds.delete(String(file.id || ""));
+                scannedBytes -= Number(file.size) || 0;
+              }
               allFiles = allFiles.filter((file) => !removed.has(file));
               files = files.filter((file) => !removed.has(file));
               if (checkpoint?.state) checkpoint.state.files = allFiles;
@@ -7574,6 +8508,16 @@
             else pushFile(freshFastlinkFileEntry(child, String(child.name || ""), cleanFastlinkPath(`${ownPrefix}/${child.name}`), entry.root));
           }
           completedFolders.add(entry.id);
+          scannedFolders += 1;
+          options.onDetail?.({
+            kind: "folder",
+            path: ownPrefix,
+            name: String(entry.name || ""),
+            entries: (children || []).length,
+            folders: scannedFolders,
+            files: files.length,
+            bytes: scannedBytes
+          });
         }, { signal: options.signal });
         persist(false);
       } catch (error) {
@@ -7754,6 +8698,7 @@
       filterEnabled: options.filterEnabled,
       filterExtensions: options.filterExtensions,
       onProgress: (done) => options.onProgress?.(0, 2, `\u5DF2\u626B\u63CF ${done} \u4E2A\u6587\u4EF6`),
+      onDetail: options.onDetail,
       checkpoint: options.checkpoint || null,
       checkpointRoots: items.map((item, index) => index)
     });
@@ -19229,16 +20174,26 @@ ${end.comment}` : end.comment;
   };
 
   // src/ui/components.js
-  function renderProgress(progress, minimized = false, canMinimizeToBackground = false) {
+  function renderProgress(ui, minimized = false, canMinimizeToBackground = false) {
+    const progress = ui?.state?.progress;
     if (!progress) return "";
     const percent = Math.max(0, Math.min(100, Math.round(Number(progress.done || 0) / Math.max(1, Number(progress.total || 1)) * 100)));
+    const ledger = progress.ledger || ui.ledger || null;
+    const routeLabel = progress.routeLabel || ui.routeInfo?.label || "";
+    const pauseButton = progress.canPause ? `<button class="button ghost compact" data-action="toggle-task-pause">${icon(panRunControl.paused ? "play" : "pause", 14)}${panRunControl.paused ? "\u7EE7\u7EED" : "\u6682\u505C"}</button>` : "";
     if (minimized) return `<div class="progress-mini" role="status" aria-live="polite"><span>${icon("loading", 15, "spin")} ${escapeHtml(progress.message || "\u5904\u7406\u4E2D")} ${percent}%</span><button class="icon-button" data-action="toggle-progress-minimized" title="\u6062\u590D\u8FDB\u5EA6" aria-label="\u6062\u590D\u8FDB\u5EA6">${icon("chevronDown", 15)}</button><button class="icon-button" data-action="cancel-task" title="\u53D6\u6D88\u4EFB\u52A1" aria-label="\u53D6\u6D88\u4EFB\u52A1">${icon("close", 15)}</button></div>`;
     const minimizeAction = canMinimizeToBackground ? "minimize-background-task" : "toggle-progress-minimized";
     const minimizeTitle = canMinimizeToBackground ? "\u6700\u5C0F\u5316\u5230\u540E\u53F0" : "\u6700\u5C0F\u5316\u8FDB\u5EA6";
+    const ledgerCount = ledger ? ledger.stats().counters : null;
+    const ledgerTotal = ledgerCount ? Number(ledgerCount.files || ledgerCount.ok || 0) : 0;
+    const ledgerToggle = ledger ? `<button class="button ghost compact" data-action="toggle-progress-ledger" aria-expanded="${ui.state.progressLedgerOpen ? "true" : "false"}">${ui.state.progressLedgerOpen ? "\u6536\u8D77\u660E\u7EC6" : `\u5C55\u5F00\u660E\u7EC6\uFF08\u5DF2\u5904\u7406 ${ledgerTotal}\uFF09`}</button>` : "";
+    const routeNote = routeLabel ? `<span class="progress-route" title="\u5F53\u524D\u63A5\u53E3\u7EBF\u8DEF">${escapeHtml(routeLabel)}</span>` : "";
+    const ledgerPanel = ledger && ui.state.progressLedgerOpen ? `<div class="progress-ledger" aria-live="off">${ledger.render(30) || '<span class="ledger-empty">\u6682\u65E0\u660E\u7EC6</span>'}</div>` : "";
     return `<div class="progress-band" role="status" aria-live="polite">
-    <div class="progress-head"><span>${icon("loading", 16, "spin")} ${escapeHtml(progress.message || "\u5904\u4E2D")}</span><div class="progress-head-actions"><strong>${Number(progress.done || 0)}/${Math.max(1, Number(progress.total || 1))}</strong><button class="icon-button" data-action="${minimizeAction}" title="${minimizeTitle}" aria-label="${minimizeTitle}">${icon("chevronDown", 15)}</button></div></div>
+    <div class="progress-head"><span>${icon("loading", 16, "spin")} ${escapeHtml(progress.message || "\u5904\u7406\u4E2D")}</span><div class="progress-head-actions"><strong>${Number(progress.done || 0)}/${Math.max(1, Number(progress.total || 1))}</strong><button class="icon-button" data-action="${minimizeAction}" title="${minimizeTitle}" aria-label="${minimizeTitle}">${icon("chevronDown", 15)}</button></div></div>
     <div class="progress-track"><div class="progress-bar ${Number(progress.done || 0) === 0 ? "indeterminate" : ""}" style="width:${percent}%"></div></div>
-    <button class="button ghost compact" data-action="cancel-task">\u505C\u6B62\u540E\u7EED\u64CD\u4F5C</button>
+    <div class="progress-foot">${pauseButton}<button class="button ghost compact" data-action="cancel-task">\u505C\u6B62\u540E\u7EED\u64CD\u4F5C</button>${ledgerToggle}${routeNote}</div>
+    ${ledgerPanel}
   </div>`;
   }
   var FASTLINK_TASK_LABELS = { export: "\u751F\u6210\u79D2\u4F20", secondaryExport: "\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5", import: "\u5BFC\u5165\u79D2\u4F20", cloudImport: "\u8F6C\u5B58\u79D2\u4F20\u6587\u4EF6" };
@@ -19276,7 +20231,7 @@ ${end.comment}` : end.comment;
         ${headerTools ? `<div class="header-tools">${headerTools}</div>` : ""}
         <button class="icon-button" data-action="close" title="\u5173\u95ED" aria-label="\u5173\u95ED">${icon("close", 20)}</button>
       </header>
-      <div class="progress-slot" data-progress-slot>${renderProgress(ui.state.progress, ui.state.progressMinimized, ui.backgroundTask?.status === "running" && !ui.backgroundTask?.minimized)}</div>
+      <div class="progress-slot" data-progress-slot>${renderProgress(ui, ui.state.progressMinimized, ui.backgroundTask?.status === "running" && !ui.backgroundTask?.minimized)}</div>
       <main class="content ${options.contentClass || ""}">${options.body || ""}</main>
       ${options.footer ? `<footer class="footer">${options.footer}</footer>` : ""}
     </section>
@@ -19323,19 +20278,42 @@ ${end.comment}` : end.comment;
     if (invalid) detail.push(`\u8DF3\u8FC7 ${invalid} \u6761\u65E0\u6548\u6761\u76EE\uFF08${parts.join("\u3001") || "\u683C\u5F0F\u4E0D\u5408\u6CD5"}\uFF09`);
     return `<div class="notice warning">${icon("alert", 17)}<div>${escapeHtml(detail.join("\uFF1B"))}\u3002\u79D2\u4F20\u53EA\u5BFC\u5165\u6709\u6548\u6761\u76EE\uFF0C\u4E0D\u5F71\u54CD\u5176\u4F59\u6587\u4EF6\u3002</div></div>`;
   }
-  function resultTable(result2, page = 1) {
+  // 结果明细筛选（结果页下拉）：默认全部，只影响表格与 CSV，不改变统计数字
+  var RESULT_FILTERS = { all: "\u5168\u90E8", failed: "\u4EC5\u5931\u8D25", miss: "\u4EC5\u672A\u547D\u4E2D", success: "\u4EC5\u6210\u529F" };
+  function filterResultDetails(result2, filter = "all") {
     const details = Array.isArray(result2?.details) ? result2.details : [];
+    if (!filter || filter === "all") return details;
+    if (filter === "success") return details.filter((item) => item && item.status !== "failed" && item.status !== "miss");
+    return details.filter((item) => item?.status === filter);
+  }
+  function resultRowPath(item) {
+    return String(item?.path || item?.targetPath || item?.name || item?.fileName || "");
+  }
+  // CSV 明细导出（Excel 会按逗号切分，这里统一加 BOM 与引号转义）
+  function buildResultCsv(result2, filter = "all") {
+    const rows = filterResultDetails(result2, filter).map((item) => {
+      const cells = [resultRowPath(item), statusLabel(item?.status), String(item?.message || ""), String(Number(item?.size) || 0)];
+      return cells.map((cell) => `"${cell.replace(/"/g, '""')}"`).join(",");
+    });
+    return `\uFEFF\u9879\u76EE,\u72B6\u6001,\u8BF4\u660E,\u5927\u5C0F\n${rows.join("\n")}`;
+  }
+  function resultTable(result2, page = 1, filter = "all") {
+    const details = filterResultDetails(result2, filter);
     const pages = Math.max(1, Math.ceil(details.length / RESULT_PAGE_SIZE));
     const current = Math.min(Math.max(1, Number(page) || 1), pages);
     const visible = details.slice((current - 1) * RESULT_PAGE_SIZE, current * RESULT_PAGE_SIZE);
-    const rows = visible.map((item) => `<tr><td>${escapeHtml(item.path || item.targetPath || item.name || item.fileName || "")}</td><td class="${item.status === "failed" ? "danger" : item.status === "skipped" ? "warning" : "success"}">${item.status === "failed" ? "\u5931\u8D25" : item.status === "skipped" ? "\u5DF2\u8DF3\u8FC7" : "\u6210\u529F"}</td><td>${escapeHtml(item.message || "")}</td></tr>`).join("");
+    const rows = visible.map((item) => `<tr><td>${escapeHtml(resultRowPath(item))}</td><td class="${item.status === "failed" ? "danger" : item.status === "skipped" || item.status === "miss" ? "warning" : "success"}">${statusLabel(item?.status)}</td><td>${escapeHtml(item.message || "")}</td><td>${Number(item?.size) > 0 ? escapeHtml(formatBytes(item.size)) : ""}</td></tr>`).join("");
     const pager = pages > 1 ? `<div class="organize-pager result-pager"><button class="button compact" data-action="result-page" data-page="${current - 1}" ${current <= 1 ? "disabled" : ""}>上一页</button><span>第 ${current} / ${pages} 页 · 共 ${details.length} 项</span><button class="button compact" data-action="result-page" data-page="${current + 1}" ${current >= pages ? "disabled" : ""}>下一页</button></div>` : "";
     const skippedCount = Number(result2?.skipped) || 0;
-    return `${result2?.invalid || result2?.sanitized ? fastlinkInvalidNote(result2) : ""}<div class="result-summary"><div><span class="stat-icon success">${icon("check", 16)}</span><span>\u6210\u529F</span><strong>${Number(result2?.ok || 0)}</strong></div><div><span class="stat-icon danger">${icon("alert", 16)}</span><span>\u5931\u8D25</span><strong>${Number(result2?.fail || 0)}</strong></div>${skippedCount ? `<div><span class="stat-icon" style="color:var(--c123-muted)">${icon("restart", 16)}</span><span>\u5DF2\u5BFC\u5165\u8DF3\u8FC7</span><strong>${skippedCount}</strong></div>` : ""}</div><div class="table-wrap result-table"><table><thead><tr><th>\u9879\u76EE</th><th>\u72B6\u6001</th><th>\u8BF4\u660E</th></tr></thead><tbody>${rows}</tbody></table></div>${result2?.detailsTruncated && details.length ? `<span class="footer-note">\u5931\u8D25\u9879\u4EC5\u5C55\u793A\u524D ${details.length} \u6761\u6837\u672C\uFF0C\u5176\u4F59\u5931\u8D25\u539F\u56E0\u540C\u7C7B\u3002</span>` : ""}${pager}`;
+    const missCount = Number(result2?.miss) || 0;
+    const bytesCount = Number(result2?.bytes) || 0;
+    const totalDetails = Array.isArray(result2?.details) ? result2.details.length : 0;
+    const toolbar = totalDetails ? `<div class="result-toolbar"><label class="field inline-field"><span>筛选</span><select id="result-filter" aria-label="明细筛选">${Object.entries(RESULT_FILTERS).map(([key, label]) => `<option value="${key}" ${key === filter ? "selected" : ""}>${label}</option>`).join("")}</select></label><button class="button compact" data-action="result-csv" data-filter="${escapeHtml(filter)}">${icon("download", 15)}\u4E0B\u8F7D\u660E\u7EC6 CSV</button></div>` : "";
+    return `${result2?.invalid || result2?.sanitized ? fastlinkInvalidNote(result2) : ""}<div class="result-summary"><div><span class="stat-icon success">${icon("check", 16)}</span><span>\u6210\u529F</span><strong>${Number(result2?.ok || 0)}</strong></div><div><span class="stat-icon danger">${icon("alert", 16)}</span><span>\u5931\u8D25</span><strong>${Number(result2?.fail || 0)}</strong></div>${missCount ? `<div><span class="stat-icon warning">${icon("alert", 16)}</span><span>\u672A\u547D\u4E2D</span><strong>${missCount}</strong></div>` : ""}${skippedCount ? `<div><span class="stat-icon" style="color:var(--c123-muted)">${icon("restart", 16)}</span><span>\u5DF2\u5BFC\u5165\u8DF3\u8FC7</span><strong>${skippedCount}</strong></div>` : ""}${bytesCount ? `<div><span class="stat-icon">${icon("archiveRestore", 16)}</span><span>\u5DF2\u8F6C\u5B58\u4F53\u79EF</span><strong>${escapeHtml(formatBytes(bytesCount))}</strong></div>` : ""}</div>${toolbar}<div class="table-wrap result-table"><table><thead><tr><th>\u9879\u76EE</th><th>\u72B6\u6001</th><th>\u8BF4\u660E</th><th>\u5927\u5C0F</th></tr></thead><tbody>${rows}</tbody></table></div>${result2?.detailsTruncated && totalDetails ? `<span class="footer-note">\u6837\u672C\u4EC5\u5C55\u793A\u524D ${totalDetails} \u6761\uFF0C\u5176\u4F59\u540C\u7C7B\u539F\u56E0\u4E0D\u518D\u9010\u6761\u5217\u51FA\u3002</span>` : ""}${pager}`;
   }
   // src/ui/views/actions.js
   function statusLabel(status) {
-    return status === "success" ? "\u6210\u529F" : status === "failed" ? "\u5931\u8D25" : status === "skipped" ? "\u5DF2\u8DF3\u8FC7" : status || "--";
+    return status === "success" ? "\u6210\u529F" : status === "failed" ? "\u5931\u8D25" : status === "skipped" ? "\u5DF2\u8DF3\u8FC7" : status === "miss" ? "\u672A\u547D\u4E2D" : status || "--";
   }
   function renderLoading(ui) {
     return dialogFrame(ui, {
@@ -19381,7 +20359,7 @@ ${end.comment}` : end.comment;
     const splitPane = `${notice("\u652F\u6301\u9879\u76EE JSON\u3001123FLCPV2 \u94FE\u63A5\u548C\u65E7\u7248 V1/V2 \u6587\u672C\u3002\u6309\u76EE\u5F55\u5C42\u7EA7\u4F1A\u4E3A\u6BCF\u4E2A\u76EE\u5F55\u7EC4\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\uFF0C\u6309\u6570\u91CF\u4F1A\u6309\u6761\u76EE\u5207\u5206\uFF0C\u6309\u5B63\u96C6/\u5267\u540D\u4F1A\u4E3A\u6BCF\u90E8\u4F5C\u54C1\uFF08\u5267\u540D+\u5B63\uFF09\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\u3002", "", "download")}<div class="button-row"><button class="button" data-action="fastlink-split-file-open">${icon("folderOpen", 15)}\u9009\u62E9 JSON</button><span>${escapeHtml(state.splitFileName || "\u4E5F\u53EF\u4EE5\u76F4\u63A5\u7C98\u8D34")}</span><input id="fastlink-split-file" type="file" accept=".json,.txt,.123fastlink" hidden></div><div class="editor-surface"><textarea id="fastlink-split-input" placeholder="\u7C98\u8D34 JSON \u6216\u79D2\u4F20\u94FE\u63A5">${state.splitInput && state.splitInput.length > 2000000 ? "" : escapeHtml(state.splitInput || "")}</textarea></div>${state.splitInput && state.splitInput.length > 2000000 ? `<span class="footer-note">\u7C98\u8D34\u5185\u5BB9\u8F83\u5927\uFF08${formatBytes(stringByteSize(state.splitInput))}\uFF09\uFF0C\u5DF2\u4FDD\u7559\u4F46\u4E0D\u56DE\u663E\uFF0C\u53EF\u76F4\u63A5\u5F00\u59CB\u62C6\u5206</span>` : ""}<div class="inline-fields"><label class="field"><span>\u62C6\u5206\u65B9\u5F0F</span><select id="fastlink-split-method"><option value="folder" ${state.splitMethod === "folder" ? "selected" : ""}>\u6309\u76EE\u5F55\u5C42\u7EA7</option><option value="count" ${state.splitMethod === "count" ? "selected" : ""}>\u6309\u6587\u4EF6\u6570\u91CF</option><option value="work" ${state.splitMethod === "work" ? "selected" : ""}>\u6309\u5B63\u96C6/\u5267\u540D</option></select></label>${state.splitMethod === "work" ? "" : `<label class="field"><span>${state.splitMethod === "count" ? "\u6BCF\u4EFD\u6587\u4EF6\u6570" : "\u76EE\u5F55\u5C42\u6570"}</span><input id="fastlink-split-amount" type="number" min="1" value="${Math.max(1, Number(state.splitAmount) || 1)}"></label>`}</div>`;
     const convertPane = `${notice("\u5728 .123share \u4E0E\u9879\u76EE\u6807\u51C6 JSON \u4E4B\u95F4\u4E92\u8F6C\u3002\u8F6C\u6362\u53EA\u5728\u672C\u5730\u5B8C\u6210\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u6587\u4EF6\u3002", "", "settings")}<div class="button-row"><button class="button" data-action="fastlink-convert-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u6587\u4EF6</button><span>${escapeHtml(state.convertFileName || "\u652F\u6301 .123share / .json")}</span><input id="fastlink-convert-file" type="file" accept=".123share,.json" hidden></div><div class="editor-surface"><textarea id="fastlink-convert-input" placeholder="\u4E5F\u53EF\u4EE5\u7C98\u8D34\u6587\u4EF6\u5185\u5BB9">${escapeHtml(state.convertInput || "")}</textarea></div>${state.converted ? notice(`\u5DF2\u8F6C\u6362\u4E3A ${state.converted === "json" ? "JSON" : ".123share"} \u5E76\u5F00\u59CB\u4E0B\u8F7D\u3002`, "success", "check") : ""}`;
     const filterPane =`${notice("\u542F\u7528\u540E\uFF0C\u751F\u6210\u6216\u8F6C\u5B58\u65F6\u4F1A\u8DF3\u8FC7\u5BF9\u5E94\u6269\u5C55\u540D\u3002\u8BBE\u7F6E\u4FDD\u5B58\u5728\u9879\u76EE\u914D\u7F6E\u4E2D\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-filter="share" ${settings.filterOnShareEnabled ? "checked" : ""}>\u751F\u6210\u65F6\u542F\u7528\u8FC7\u6EE4</label><label class="check-line"><input type="checkbox" data-fastlink-filter="transfer" ${settings.filterOnTransferEnabled ? "checked" : ""}>\u8F6C\u5B58\u65F6\u542F\u7528\u8FC7\u6EE4</label></div><div class="filter-actions"><button class="button compact" data-action="fastlink-filter-all">\u5168\u9009</button><button class="button compact" data-action="fastlink-filter-none">\u5168\u4E0D\u9009</button><button class="button compact" data-action="fastlink-filter-reset">\u6062\u590D\u9ED8\u8BA4</button></div><div class="fastlink-filter-list">${filters.map((item, index) => `<label class="check-line"><input type="checkbox" data-fastlink-filter="extension" data-index="${index}" ${item.enabled ? "checked" : ""}><span>.${escapeHtml(item.ext)}</span><small>${escapeHtml(item.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B")}</small></label>`).join("")}</div>`;
-    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="check-line"><input type="checkbox" data-fastlink-setting="fastLane" ${settings.fastLane ? "checked" : ""}>\u5BFC\u5165/\u5BFC\u51FA\u76F4\u8FDE api.123278.com \u7EBF\u8DEF\uFF08\u5B9E\u6D4B 16~24 \u7EBF\u7A0B\u7EA6 150 \u6B21/\u79D2\uFF0C\u9AD8\u4E8E\u9ED8\u8BA4\u57DF\u540D\u7684 32 \u5E76\u53D1 85 \u6B21/\u79D2\uFF1B\u8BF7\u6C42\u5931\u8D25\u81EA\u52A8\u56DE\u9000\u9ED8\u8BA4\u57DF\u540D\uFF09</label><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? settings.seedFolderName ? `${settings.seedFolderName}\uFF08${settings.seedFolderId}\uFF09` : `ID ${settings.seedFolderId}` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002\u7EBF\u8DEF\u5E76\u53D1\uFF1A\u9ED8\u8BA4\u57DF\u540D\u56FA\u5B9A 32\uFF1B\u76F4\u8FDE\u7EBF\u8DEF\u4E0B\u300C\u5199\u5165\u5E76\u53D1\u300D\u8BBE\u7F6E \u226516 \u65F6\u751F\u6548\uFF0C\u5426\u5219\u7528 24\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
+    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? settings.seedFolderName ? `${settings.seedFolderName}\uFF08${settings.seedFolderId}\uFF09` : `ID ${settings.seedFolderId}` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002\u5E76\u53D1\u53EA\u662F\u6D41\u6C34\u6DF1\u5EA6\uFF0C\u5B9E\u9645\u901F\u7387\u7531\u5185\u7F6E\u9650\u901F\u95E8\u7EDF\u4E00\u4FDD\u8BC1\uFF08\u649E\u9891\u63A7\u4F1A\u5168\u5C40\u51B7\u5374\u540E\u81EA\u52A8\u6062\u590D\uFF09\uFF1B\u300C\u5199\u5165\u5E76\u53D1\u300D\u5728\u76F4\u8FDE\u7EBF\u8DEF\u4E0A \u226516 \u65F6\u751F\u6548\uFF0C\u5426\u5219\u9ED8\u8BA4 24\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
     const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"], ["library", "\u5F71\u5E93\u641C\u7D22", "film"]];
     const libraryPane = (() => {
       const lib = state.library ||= librarySearchState();
@@ -19431,8 +20409,8 @@ ${end.comment}` : end.comment;
       title: result2.title || "\u4EFB\u52A1\u7ED3\u679C",
       subtitle: result2.fail ? "\u90E8\u5206\u9879\u76EE\u672A\u5B8C\u6210" : "\u64CD\u4F5C\u5DF2\u5B8C\u6210",
       iconName: result2.fail ? "alert" : "check",
-      metrics: [metric("\u6210\u529F", String(result2.ok || 0), "check", "success"), metric("\u5931\u8D25", String(result2.fail || 0), "alert", "danger")],
-      body: resultTable(result2, ui.state.resultPage),
+      metrics: [metric("\u6210\u529F", String(result2.ok || 0), "check", "success"), metric("\u5931\u8D25", String(result2.fail || 0), "alert", "danger")].concat(result2.miss ? [metric("\u672A\u547D\u4E2D", String(result2.miss), "alert", "warning")] : []),
+      body: resultTable(result2, ui.state.resultPage, ui.state.resultFilter || "all"),
       footer: `<span class="footer-note">\u6587\u4EF6\u5217\u8868\u5DF2\u8BF7\u6C42\u5237\u65B0</span><div class="footer-actions"><button class="button primary" data-action="close">\u5B8C\u6210</button></div>`
     });
   }
@@ -20264,6 +21242,18 @@ ${end.comment}` : end.comment;
   .progress-bar::after { content:""; position:absolute; inset:0; background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent); transform:translateX(-100%); animation:shimmer 2s cubic-bezier(.4,0,.2,1) infinite; }
   .progress-bar.indeterminate { width:32% !important; animation:progress-slide 1.3s ease-in-out infinite; }
   .progress-bar.indeterminate::after { display:none; }
+  .progress-foot { grid-column:1/-1; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .progress-route { margin-left:auto; color:var(--muted); font-size:11px; padding:3px 8px; border:1px solid var(--glass-border); border-radius:var(--radius-full); white-space:nowrap; }
+  .progress-ledger { grid-column:1/-1; max-height:190px; overflow-y:auto; padding:8px 10px; border:1px solid var(--glass-border); border-radius:var(--radius-sm); background:var(--surface-2); font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11px; line-height:1.6; }
+  .ledger-line { display:flex; gap:8px; white-space:pre-wrap; word-break:break-all; }
+  .ledger-time { flex:0 0 auto; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .ledger-line.success .ledger-time,.ledger-line.success { color:var(--text); }
+  .ledger-line.warning { color:#e6a23c; }
+  .ledger-line.danger { color:#f56c6c; }
+  .ledger-empty { color:var(--muted); }
+  .result-toolbar { display:flex; align-items:flex-end; gap:10px; margin:10px 0 8px; }
+  .result-toolbar .inline-field { flex:0 0 auto; min-width:150px; }
+  .result-toolbar .inline-field > span { margin-bottom:4px; }
   @keyframes shimmer { 0% { transform:translateX(-100%); } 100% { transform:translateX(100%); } }
   @keyframes progress-slide { from { transform:translateX(-110%); } to { transform:translateX(325%); } }
   .spin { animation:spin 1s linear infinite; } @keyframes spin { to { transform:rotate(360deg); } }
@@ -20861,6 +21851,7 @@ ${end.comment}` : end.comment;
   };
   var VIDEO_FILE_PATTERN = /\.(?:mkv|mp4|avi|mov|rmvb|wmv|flv|webm|m4v|mpeg|mpg|3gp|ts|m2ts|mts)$/i;
   var SCROLL_STATE_SELECTORS = [
+    ".progress-ledger",
     ".organize-detail",
     ".poster-grid",
     ".candidate-rail",
@@ -21507,8 +22498,42 @@ ${end.comment}` : end.comment;
       if (this.state.progress) this.state.progress.message = "\u6B63\u5728\u505C\u6B62\u540E\u7EED\u64CD\u4F5C";
       this.renderTransient();
     }
+    // 暂停/继续秒传长任务：只切全局闸门，请求在门口排队等待，断点照常落盘（不取消、不丢进度）
+    toggleTaskPause() {
+      if (!this.ledger) return;
+      const paused = panRunControl.toggle();
+      this.ledger.note(paused ? "\u5DF2\u6682\u505C\uFF0C\u70B9\u51FB\u300C\u7EE7\u7EED\u300D\u6062\u590D" : "", paused ? "warning" : "");
+      this.renderTransient();
+    }
+    // 一次秒传任务的账本：明细日志 + 计数 + 速率/ETA，并把 request() 的频控等待透出到进度条
+    beginFastlinkLedger(kind, routeInfo) {
+      this.ledger = createRunLedger({ limit: 200, verboseLimit: 800 });
+      this.ledger.setVerbose(Boolean((this.config.fastlinkTools || {}).debugMode));
+      this.routeInfo = routeInfo || null;
+      setApiPaceListener((info) => {
+        if (!this.ledger) return;
+        this.ledger.pace(info);
+        if (info?.routeChanged) this.routeInfo = { label: `\u7EBF\u8DEF ${driveRouteLabel(info.routeChanged)}`, kind: info.routeChanged };
+      });
+      return this.ledger;
+    }
+    endFastlinkLedger() {
+      this.ledger = null;
+      this.routeInfo = null;
+      setApiPaceListener(null);
+      panRunControl.resume();
+    }
     setProgress(done, total, message) {
-      this.state.progress = { done: Number(done || 0), total: Math.max(1, Number(total || 1)), message: String(message || "\u5904\u7406\u4E2D") };
+      const text2 = String(message || "\u5904\u7406\u4E2D");
+      const summary = this.ledger ? this.ledger.summary(text2) : text2;
+      this.state.progress = {
+        done: Number(done || 0),
+        total: Math.max(1, Number(total || 1)),
+        message: summary || text2,
+        canPause: Boolean(this.ledger),
+        routeLabel: this.routeInfo?.label || ""
+      };
+      if (this.ledger) this.ledger.progress(done, total, text2);
       const now = Date.now();
       const urgent = done === 0 || Number(done) >= Number(total) || now - this.lastProgressRender >= 100;
       if (urgent) {
@@ -21532,6 +22557,7 @@ ${end.comment}` : end.comment;
       this.state.progress = null;
       this.state.progressMinimized = false;
       this.abortController = null;
+      this.endFastlinkLedger();
     }
     hasActiveBackgroundTask() {
       return this.backgroundTask?.status === "running" || this.backgroundTask?.status === "cancelling";
@@ -21556,12 +22582,24 @@ ${end.comment}` : end.comment;
     }
     async runFastlinkTask(kind, worker) {
       const task = this.startFastlinkTask(kind);
-      // 秒传线路窗口：导入/导出任务期间把网盘请求切到镜像域名（api.123278.com），
-      // 任务结束（含失败/取消）恢复；request() 内置故障回退，撞坏自动摘除
-      const laneWanted = ["import", "cloudImport", "export"].includes(kind) && (this.config.fastlinkTools || {}).fastLane === true && !fastlaneState.dead;
-      if (laneWanted) this.api.laneHost = FASTLANE_HOST;
+      // 秒传线路窗口：导入/导出任务期间按探测结果选择接口域名（哪条最快最宽松就走哪条，
+      // 运行中撞限还会自动换道），任务结束（含失败/取消）恢复。设置页不提供手动选路。
+      const laneWanted = ["import", "cloudImport", "export"].includes(kind);
+      let routeInfo = null;
+      if (laneWanted) {
+        const tools = this.config.fastlinkTools || {};
+        let applied = null;
+        try {
+          // routePreference = "mirror" 是留给旧配置（fastLane 开关）的兼容位：只走镜像域名、不自动换道
+          applied = await beginDriveRoute(this.api, { fastLane: tools.routePreference === "mirror" || tools.fastLane === true });
+        } catch {
+          applied = null;
+        }
+        if (applied) routeInfo = { kind: applied.kind, label: `\u7EBF\u8DEF ${driveRouteLabel(applied.kind)}${applied.auto ? "\uFF08\u81EA\u52A8\uFF09" : ""}` };
+      }
+      const ledger = this.beginFastlinkLedger(kind, routeInfo);
       try {
-        return { task, result: await this.runTask(worker, { backgroundTask: task }) };
+        return { task, result: await this.runTask((signal) => worker(signal, { ledger }), { backgroundTask: task }) };
       } catch (error) {
         const backgrounded = task.minimized;
         if (this.backgroundTask === task) {
@@ -21574,7 +22612,12 @@ ${end.comment}` : end.comment;
         throw error;
       } finally {
         if (laneWanted) this.api.laneHost = "";
+        this.endFastlinkLedger();
       }
+    }
+    // 各秒传流程统一用这个明细回调（账本不存在时静默忽略，非秒传任务不受影响）
+    fastlinkDetail(event) {
+      if (this.ledger) this.ledger.detail(event);
     }
     minimizeBackgroundTask() {
       const task = this.backgroundTask;
@@ -21665,7 +22708,7 @@ ${end.comment}` : end.comment;
     }
     renderTransient() {
       const progressSlot = this.root?.querySelector("[data-progress-slot]");
-      if (progressSlot) progressSlot.innerHTML = renderProgress(this.state.progress, this.state.progressMinimized, this.backgroundTask?.status === "running" && !this.backgroundTask?.minimized);
+      if (progressSlot) progressSlot.innerHTML = renderProgress(this, this.state.progressMinimized, this.backgroundTask?.status === "running" && !this.backgroundTask?.minimized);
       const backgroundSlot = this.root?.querySelector("[data-background-task-slot]");
       if (backgroundSlot) backgroundSlot.innerHTML = renderBackgroundTask(this);
       const currentToasts = this.root?.querySelector(".toast-stack");
@@ -21727,6 +22770,7 @@ ${end.comment}` : end.comment;
     setResult(title, result2) {
       this.state.result = { ...result2, title };
       this.state.resultPage = 1;
+      this.state.resultFilter = "all";
       this.state.view = "result";
       this.render();
     }
@@ -22056,6 +23100,7 @@ ${end.comment}` : end.comment;
             signal,
             ...this.fastlinkExportOptions(),
             checkpoint,
+            onDetail: (event) => this.fastlinkDetail(event),
             onProgress: (done, total, message) => this.setProgress(done, total, message)
           });
         });
@@ -22165,7 +23210,8 @@ ${end.comment}` : end.comment;
           concurrency: this.config.requests.writeConcurrency,
           importProgress: true,
           ...this.fastlinkTransferOptions(),
-          onProgress: (done, total, name) => this.setProgress(done, total, `\u5BFC\u5165\u79D2\u4F20\uFF1A${name}`)
+          onDetail: (event) => this.fastlinkDetail(event),
+          onProgress: (done, total, name) => this.setProgress(done, total, name ? `\u5BFC\u5165\u79D2\u4F20\uFF1A${truncateMiddle(name, 40)}` : "\u5BFC\u5165\u79D2\u4F20")
         });
       });
       if (outcome.error) return;
@@ -22267,7 +23313,8 @@ ${end.comment}` : end.comment;
           concurrency: this.config.requests.writeConcurrency,
           importProgress: true,
           ...this.fastlinkTransferOptions(),
-          onProgress: (done, total, name) => this.setProgress(done, total, `\u79D2\u4F20\u5BFC\u5165\uFF1A${name}`)
+          onDetail: (event) => this.fastlinkDetail(event),
+          onProgress: (done, total, name) => this.setProgress(done, total, name ? `\u79D2\u4F20\u5BFC\u5165\uFF1A${truncateMiddle(name, 40)}` : "\u79D2\u4F20\u5BFC\u5165")
         });
       });
       if (outcome.error) return;
@@ -22330,6 +23377,7 @@ ${end.comment}` : end.comment;
             useJson: settings.secondaryUseJson !== false,
             ...this.fastlinkExportOptions(),
             checkpoint,
+            onDetail: (event) => this.fastlinkDetail(event),
             onProgress: (done, total, message) => this.setProgress(done, total, message)
           });
         });
@@ -22362,7 +23410,8 @@ ${end.comment}` : end.comment;
           concurrency: this.config.requests.writeConcurrency,
           importProgress: true,
           ...this.fastlinkTransferOptions(),
-          onProgress: (done, total, name) => this.setProgress(done, total, name)
+          onDetail: (event) => this.fastlinkDetail(event),
+          onProgress: (done, total, name) => this.setProgress(done, total, name ? truncateMiddle(name, 40) : "\u8F6C\u5B58\u79D2\u4F20\u6587\u4EF6")
         });
       });
       if (outcome.error) return;
@@ -23143,6 +24192,13 @@ ${end.comment}` : end.comment;
           if (event.target === control) this.close();
         },
         "cancel-task": () => this.cancelTask(),
+        "toggle-task-pause": () => this.toggleTaskPause(),
+        "toggle-progress-ledger": () => {
+          if (!this.ledger) return;
+          this.state.progressLedgerOpen = !this.state.progressLedgerOpen;
+          this.ledger.setVerbose(this.state.progressLedgerOpen || Boolean((this.config.fastlinkTools || {}).debugMode));
+          this.renderTransient();
+        },
         "minimize-background-task": () => this.minimizeBackgroundTask(),
         "background-task-open": () => this.openBackgroundTask(),
         "background-task-cancel": () => this.cancelTask(),
@@ -23403,6 +24459,16 @@ ${end.comment}` : end.comment;
           this.render();
         },
         "fastlink-filter-reset": () => {
+          // 恢复默认 = 连自动选出来的线路偏好与探测缓存一起清掉（下一次秒传任务重新探测线路）
+          try {
+            checkpointStorageRemove(DRIVE_ROUTE_CACHE_KEY);
+          } catch {
+          }
+          driveRouteState.order = ["mirror", "canonical", "page"];
+          driveRouteState.cursor = 0;
+          driveRouteState.probedAt = 0;
+          driveRouteState.listLimit = 0;
+          driveRouteState.detail = {};
           this.fastlink.filterDraft = structuredClone(DEFAULT_CONFIG.fastlinkTools);
           this.render();
         },
@@ -23466,6 +24532,14 @@ ${end.comment}` : end.comment;
           if (!group) return;
           this.organize.filePages[group.id] = Math.max(1, Number(control.dataset.page) || 1);
           this.render();
+        },
+        "result-csv": (control) => {
+          const result2 = this.state.result;
+          if (!result2 || !Array.isArray(result2.details) || !result2.details.length) {
+            this.toast("\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u660E\u7EC6", "info");
+            return;
+          }
+          downloadText("\u79D2\u4F20\u660E\u7EC6.csv", buildResultCsv(result2, control.dataset.filter || this.state.resultFilter || "all"));
         },
         "result-page": (control) => {
           this.state.resultPage = Math.max(1, Number(control.dataset.page) || 1);
@@ -24028,7 +25102,7 @@ ${end.comment}` : end.comment;
       if (!action) return;
       const handler = this.actionHandlers[action];
       if (!handler) return;
-      if (this.state.progress && !["cancel-task", "toggle-progress-minimized", "minimize-background-task", "background-task-open", "background-task-cancel", "background-task-dismiss", "stop"].includes(action)) return;
+      if (this.state.progress && !["cancel-task", "toggle-task-pause", "toggle-progress-ledger", "toggle-progress-minimized", "minimize-background-task", "background-task-open", "background-task-cancel", "background-task-dismiss", "stop"].includes(action)) return;
       try {
         await handler(control, event);
       } catch (error) {
@@ -24042,6 +25116,12 @@ ${end.comment}` : end.comment;
     async handleChange(event) {
       const target = event.target;
       try {
+        if (target.id === "result-filter") {
+          this.state.resultFilter = target.value || "all";
+          this.state.resultPage = 1;
+          this.render();
+          return;
+        }
         if (target.id === "cleaner-scope" && this.cleaner) {
           this.cleaner.scope = target.value;
           this.cleaner.inventory = null;
@@ -24588,6 +25668,13 @@ ${end.comment}` : end.comment;
         ui.init();
         registerSettingsMenu(ui);
         bridge.init();
+        // 升级后首次加载提示一次更新内容（已读过的版本不再弹；出错也不影响启动）
+        setTimeout(() => {
+          try {
+            maybeShowUpdateNotes();
+          } catch {
+          }
+        }, 1200);
       } catch (error) {
         console.error("[123 \u52A9\u624B] \u542F\u52A8\u5931\u8D25", error);
       }

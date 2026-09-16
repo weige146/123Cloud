@@ -34,11 +34,28 @@ const sandbox = {
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: "123-helper.user.js" });
 vm.runInContext(`
-globalThis.__fastlinkLane = { Pan123Api, importFastlink, FASTLANE_HOST, fastlaneState };
+globalThis.__fastlinkLane = { Pan123Api, importFastlink, FASTLANE_HOST, fastlaneState, panApiGates };
 `, sandbox, { filename: "driver.js" });
-const { Pan123Api, importFastlink, FASTLANE_HOST, fastlaneState } = sandbox.__fastlinkLane;
+const { Pan123Api, importFastlink, FASTLANE_HOST, fastlaneState, panApiGates } = sandbox.__fastlinkLane;
+
+// 本文件考的是「打到哪个域名、cookie、重试次数」，不该被新的全局限速门排队干扰：
+// 每个用例前把间距调成 0、清掉冷却与排队时隙（门的机制由 gate-pacing / request-gate 两个测试覆盖）。
+const resetGates = () => {
+  for (const gate of Object.values(panApiGates)) {
+    gate.lanes = {
+      default: { baseInterval: 0, maxInterval: 0, jitterMs: 0 },
+      page: { baseInterval: 0, maxInterval: 0, jitterMs: 0 },
+      canonical: { baseInterval: 0, maxInterval: 0, jitterMs: 0 },
+      mirror: { baseInterval: 0, maxInterval: 0, jitterMs: 0 }
+    };
+    gate.cooldownUntil = 0;
+    gate.nextFree = 0;
+    gate.reset();
+  }
+};
 
 const makeApi = (fetchImpl) => {
+  resetGates();
   const api = new Pan123Api({ host: "https://www.123pan.cn", retryAttempts: 4 });
   api.credentials = () => ({ token: "t", loginUuid: "u" });
   sandbox.fetch = fetchImpl;
@@ -123,7 +140,9 @@ const etag = (n) => String(n).padStart(8, "0").repeat(4);
   const pending = api.listPage("0", 1, { signal: controller.signal });
   controller.abort();
   await assert.rejects(pending, (error) => error.name === "AbortError");
-  assert.equal(urls.length, 1, "取消不应再打默认域名");
+  // 取消可能发生在取号阶段（限速门），所以只看「有没有偷打默认域名」
+  assert.ok(urls.length <= 1, `取消后不该继续发请求（实际 ${urls.length} 次）`);
+  assert.ok(!urls.some((url) => !url.startsWith(FASTLANE_HOST)), "用户取消不该回退打默认域名");
   assert.equal(fastlaneState.dead, false, "用户取消不算镜像故障");
   console.log("ok 用户取消：原样中止，不误判线路故障");
 }
