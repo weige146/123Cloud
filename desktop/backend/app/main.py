@@ -2686,12 +2686,22 @@ async def search_library(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     lib: str = "",
+    mediaType: str = "",
+    genre: str = "",
+    region: str = "",
+    decade: int = 0,
+    sort: str = "",
+    language: str = "",
+    status: str = "",
+    resolution: str = "",
+    edition: str = "",
+    rating: float = 0,
     token: str = "",
 ) -> Dict[str, Any]:
     _guard_library_token(request, token)
     total, results = await asyncio.to_thread(
         movie_library_db.search, q, page, size, cat, sub, _split_lib_filter(lib),
-        mediaType, genre, region, decade, sort, language, status, "", edition, rating,
+        mediaType, genre, region, decade, sort, language, status, resolution, edition, rating,
     )
     return {"ok": True, "total": total, "page": page, "size": size, "dirs": results}
 

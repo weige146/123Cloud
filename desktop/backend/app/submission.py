@@ -2775,12 +2775,13 @@ async def publish_submission_draft(store: SessionStore, bot_token: str, config: 
         message_id = telegram_message_id(sent)
         if message_id <= 0:
             raise ValueError("Telegram 未返回频道消息 ID")
+        photo_message_id = safe_int(sent.get("photoMessageId")) if isinstance(sent, dict) else 0
 
         seed_message_ids: List[int] = []
         try:
             seed_message_ids = await send_submission_seed_documents(bot_token, chat_id, draft, message_id)
         except Exception:
-            await delete_telegram_messages(bot_token, chat_id, [message_id, *seed_message_ids])
+            await delete_telegram_messages(bot_token, chat_id, [message_id, *([photo_message_id] if photo_message_id > 0 else []), *seed_message_ids])
             raise
 
         draft["status"] = "published"
@@ -2796,7 +2797,7 @@ async def publish_submission_draft(store: SessionStore, bot_token: str, config: 
                 "Local channel publication cleanup finished with warning",
                 extra={"draft_id": str(draft.get("id") or ""), "channel_chat_id": str(chat_id), "message_id": message_id, "warning": history_warning},
             )
-        record_submission_publication(store, config, draft, channel, chat_id, message_id, seed_message_ids)
+        record_submission_publication(store, config, draft, channel, chat_id, message_id, ([photo_message_id] if photo_message_id > 0 else []) + seed_message_ids)
         schedule_published_submission_history_cleanup(store, config, draft, chat_id, message_id)
         return {"action": "publish", "ok": True, "channelId": str(channel.get("id") or ""), "messageId": message_id, "seedMessageIds": seed_message_ids}
 
@@ -3093,7 +3094,11 @@ def build_publish_markup(draft: Dict[str, Any], config: Dict[str, Any]) -> Optio
 
 
 async def send_telegram_photo_via_client(config: Dict[str, Any], chat_id: str, photo: str, caption: str, parse_mode: str = "HTML") -> Any:
-    """通过 Telegram Client API (Telethon) 发送带长文案的海报，caption 上限 4096 字符。"""
+    """通过 Telegram Client API (Telethon) 发送带长文案的海报，caption 上限 4096 字符。
+
+    注意：内联按钮是 bot 专属，用户账号发的消息 Telegram 会静默丢弃按钮，
+    所以这条路径只能用于不带分享按钮的帖子（send_telegram_rich_message 负责分流）。
+    """
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
@@ -3164,8 +3169,10 @@ async def send_telegram_photo_then_edit_caption(
 async def send_telegram_rich_message(bot_token: str, chat_id: Any, caption: str, photo: Optional[str], reply_markup: Optional[Dict[str, Any]], parse_mode: Optional[str] = "HTML", config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     TELEGRAM_PHOTO_CAPTION_LIMIT = 1024
     if photo:
-        # 优先使用 Client API 发送，支持 4096 字符 caption，海报与长文案合并显示
-        if config and len(caption) > TELEGRAM_PHOTO_CAPTION_LIMIT:
+        # 内联按钮是 bot 专属：用户账号（Client API）发的消息 Telegram 会静默丢掉按钮，
+        # 带分享按钮的帖子必须走 Bot API（超长文案拆"海报+文字"，按钮挂在文字消息上）；
+        # 无按钮的帖子才用 Client API 把海报与 4096 长文案合并成一条。
+        if config and not reply_markup and len(caption) > TELEGRAM_PHOTO_CAPTION_LIMIT:
             try:
                 result = await send_telegram_photo_via_client(config, str(chat_id), photo, caption, parse_mode=parse_mode or "HTML")
                 return {"message_id": telegram_message_id(result)} if result else {}
@@ -3173,11 +3180,16 @@ async def send_telegram_rich_message(bot_token: str, chat_id: Any, caption: str,
                 logger.warning("TG Client API 发送海报失败，回退 Bot API: %s", error)
         # Bot API: caption 超长时先单独发海报，再发文字，避免海报丢失
         if len(caption) > TELEGRAM_PHOTO_CAPTION_LIMIT:
+            photo_message_id = 0
             try:
-                await send_telegram_photo(bot_token, chat_id, photo, "", reply_markup=None)
+                photo_message_id = telegram_message_id(await send_telegram_photo(bot_token, chat_id, photo, "", reply_markup=None))
             except Exception:
                 pass
-            return await send_telegram_text(bot_token, chat_id, caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            sent = await send_telegram_text(bot_token, chat_id, caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            if photo_message_id > 0 and isinstance(sent, dict):
+                # 海报消息没有文字，旧帖清理按 TMDB 标记文字匹配不到，随发布记录一起落库便于日后连带删除
+                return {**sent, "photoMessageId": photo_message_id}
+            return sent
         return await send_telegram_photo_then_edit_caption(bot_token, chat_id, photo, caption, reply_markup)
     return await send_telegram_text(bot_token, chat_id, caption, parse_mode=parse_mode, reply_markup=reply_markup)
 

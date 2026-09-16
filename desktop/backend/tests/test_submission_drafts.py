@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -28,6 +29,8 @@ from app.submission import (
     share_media_cache_key,
     publish_submission_draft,
     inspect_web_share,
+    submission_publication_identity,
+    submission_publication_message_ids,
     build_submission_resource_name,
     recognize_submission_metadata,
     render_submission_caption,
@@ -961,6 +964,96 @@ class SubmissionDraftTests(unittest.TestCase):
             publications = store.find_submission_publications("-1002", identity["identityKey"], 0)
             self.assertEqual([item["messageId"] for item in publications], [99])
             self.assertEqual(publications[0]["seedMessageIds"], [100])
+
+
+class TelethonPublishButtonsTests(unittest.TestCase):
+    """长文案频道路由：内联按钮是 bot 专属（用户账号发的消息 Telegram 静默丢按钮），
+    带分享按钮的帖子必须走 Bot API，只有无按钮的帖子才用 Client API 合并长文案。"""
+
+    def test_rich_message_long_caption_with_buttons_keeps_bot_api_split(self):
+        calls = []
+
+        async def fake_telegram_post(token, method, payload, timeout=20.0):
+            calls.append((method, payload))
+            if method == "sendPhoto":
+                return {"message_id": 11}
+            if method == "sendMessage":
+                return {"message_id": 12}
+            return {}
+
+        long_caption = "🎬 " + "剧情".join(["长"] * 600)
+        markup = {"inline_keyboard": [[{"text": "123网盘", "url": "https://www.123pan.com/s/abc?pwd=ONWA"}]]}
+        via_client = AsyncMock(return_value=types.SimpleNamespace(id=77))
+        with patch("app.submission.send_telegram_photo_via_client", via_client), patch("app.submission.telegram_post", side_effect=fake_telegram_post):
+            result = asyncio.run(
+                send_telegram_rich_message(
+                    "telegram-token", "-1002", long_caption, "https://image.example/poster.jpg", markup, parse_mode="HTML", config={"telegramApi": {"apiId": 1}}
+                )
+            )
+
+        self.assertEqual(result, {"message_id": 12, "photoMessageId": 11})
+        via_client.assert_not_awaited()
+        self.assertEqual([method for method, _payload in calls], ["sendPhoto", "sendMessage"])
+        self.assertEqual(calls[0][1]["caption"], "")
+        self.assertEqual(calls[1][1]["reply_markup"], markup)
+
+    def test_rich_message_long_caption_without_buttons_uses_client_merge(self):
+        calls = []
+
+        async def fake_telegram_post(token, method, payload, timeout=20.0):
+            calls.append(method)
+            return {}
+
+        long_caption = "🎬 " + "剧情".join(["长"] * 600)
+        via_client = AsyncMock(return_value=types.SimpleNamespace(id=77))
+        with patch("app.submission.send_telegram_photo_via_client", via_client), patch("app.submission.telegram_post", side_effect=fake_telegram_post):
+            result = asyncio.run(
+                send_telegram_rich_message(
+                    "telegram-token", "-1002", long_caption, "https://image.example/poster.jpg", None, parse_mode="HTML", config={"telegramApi": {"apiId": 1}}
+                )
+            )
+
+        self.assertEqual(result, {"message_id": 77})
+        via_client.assert_awaited_once()
+        self.assertEqual(calls, [])
+
+    def test_publish_records_split_photo_message_for_later_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            config = {
+                "botToken": "telegram-token",
+                "allowedUserIds": [123456],
+                "templates": {"shareName": "123", "caption": "🎬 <b>{title}</b>\n👤 分享：{shareLink}"},
+                "channels": [
+                    {"id": "pub", "title": "公开", "chatId": "-1002", "enabled": True, "isDefault": True, "role": "public_completed"}
+                ],
+            }
+            store.write_submission_config(config)
+            draft = {
+                "id": "draft1",
+                "status": "draft",
+                "ownerChatId": 123456,
+                "ownerUserId": 123456,
+                "sourceMessageId": 10,
+                "previewMessageId": 20,
+                "interactionMessageIds": [],
+                "share": {"provider": "123pan", "cleanUrl": "https://www.123pan.com/s/abc?pwd=ONWA"},
+                "metadata": {"title": "电影", "year": "2026", "mediaType": "movie", "quality": "2160p", "source": "WEB-DL"},
+                "media": {"title": "电影", "year": "2026", "mediaType": "movie", "tmdbId": 1, "genres": [], "overview": ""},
+                "caption": "预览",
+                "text": "预览",
+            }
+            save_submission_draft(store, draft)
+            rich_message = AsyncMock(return_value={"message_id": 99, "photoMessageId": 98})
+            with patch("app.submission.check_telegram_chat_access", AsyncMock(return_value="")), patch(
+                "app.submission.send_telegram_rich_message", rich_message
+            ), patch("app.submission.telegram_post", AsyncMock(return_value={})):
+                result = asyncio.run(publish_submission_draft(store, "telegram-token", config, get_submission_draft(store, "draft1")))
+
+            self.assertTrue(result["ok"])
+            publications = store.find_submission_publications("-1002", submission_publication_identity(draft, config)["identityKey"], 0)
+            self.assertEqual(len(publications), 1)
+            self.assertIn(98, submission_publication_message_ids(publications[0]))
 
 
 class RecognitionCollisionTests(unittest.TestCase):
