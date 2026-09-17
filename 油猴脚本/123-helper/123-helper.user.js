@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.12
+// @version      1.3.13
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -6272,16 +6272,24 @@
       ui.bridge.updateConfig(next);
       ui.toast?.(`\u9875\u9762\u7EAF\u51C0\u7248\u5DF2${next.appearance.purePageMode ? "\u5F00\u542F" : "\u5173\u95ED"}`, "success");
     });
-    const changelogMenu = GM_registerMenuCommand(CHANGELOG_MENU_LABEL, () => showChangelogDialog());
-    return [settingsMenu, recordsMenu, purePageMenu, changelogMenu].filter(Boolean);
+    return [settingsMenu, recordsMenu, purePageMenu].filter(Boolean);
   }
 
   // —— 更新内容通知 ——
-  // 版本升级后首次加载弹一次「这次改了什么」，点「我已知晓」记下已读版本；菜单里可随时回看。
+  // 安装/升级后首次加载自动弹一次最新版本的更新说明，点「我已知晓」记下已读版本，已读不再弹；
+  // 没有常驻菜单入口（维护者 2026-09-17：撤掉「查看 123 助手更新内容」菜单）。
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
-  var CHANGELOG_MENU_LABEL = "\u67E5\u770B 123 \u52A9\u624B\u66F4\u65B0\u5185\u5BB9";
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.3.13",
+      notes: [
+        "\u6574\u7406\u9047\u5230\u91CD\u540D\u66F4\u4FDD\u9669\uFF1A\u5982\u679C\u76EE\u6807\u6587\u4EF6\u5939\u91CC\u5DF2\u7ECF\u6709\u540C\u540D\u6587\u4EF6\uFF08\u6BD4\u5982\u7B2C\u4E00\u6B21\u6574\u7406\u3001\u6216\u8005\u9884\u89C8\u4E4B\u540E\u6587\u4EF6\u5939\u91CC\u53C8\u591A\u4E86\u6587\u4EF6\uFF09\uFF0C\u4F1A\u81EA\u52A8\u628A\u8FD9\u4E2A\u6587\u4EF6\u79FB\u8FDB\u56DE\u6536\u7AD9\uFF0C\u4E0D\u4F1A\u518D\u51FA\u73B0\u300C\u540D\u5B57(1)\u300D\u8FD9\u79CD\u91CD\u590D\u6587\u4EF6",
+        "\u8FD9\u4E2A\u68C0\u67E5\u6BCF\u4E2A\u76EE\u6807\u6587\u4EF6\u5939\u53EA\u505A\u4E00\u6B21\uFF0C\u51E0\u4E4E\u4E0D\u4F1A\u62D6\u6162\u6574\u7406",
+        "\u9884\u89C8\u91CC\u624B\u52A8\u6539\u540D\u6539\u51FA\u4E86\u91CD\u540D\u4E5F\u4F1A\u88AB\u62E6\u4E0B\uFF1B\u8FDB\u4E86\u56DE\u6536\u7AD9\u7684\u6587\u4EF6\uFF0C\u968F\u65F6\u53EF\u4EE5\u5728\u300C\u64CD\u4F5C\u8BB0\u5F55\u300D\u91CC\u4E00\u952E\u8FD8\u539F",
+        "\u66F4\u65B0\u63D0\u793A\u66F4\u7701\u5FC3\uFF1A\u5347\u7EA7\u540E\u53EA\u81EA\u52A8\u5F39\u4E00\u6B21\u6700\u65B0\u7248\u7684\u66F4\u65B0\u8BF4\u660E\uFF0C\u6CB9\u7334\u83DC\u5355\u91CC\u4E0D\u518D\u653E\u300C\u67E5\u770B\u66F4\u65B0\u5185\u5BB9\u300D\u5165\u53E3"
+      ]
+    },
     {
       version: "1.3.12",
       notes: [
@@ -18704,6 +18712,67 @@ ${end.comment}` : end.comment;
         }
       }
     }, { signal: options.signal });
+    // 执行阶段复查：预检基于预览时的快照——首整时目标目录还不存在、预览与执行之间
+    // 目录也可能变动，漏网同名在平台 duplicate:1 语义下会静默变成「名字(1)」副本。
+    // 这里在目录建好后实时核对一次，与预检同判：后到者跳过并移入回收站。
+    // 成本 = 每个目标目录一次列举（同目录任务共享缓存，库内目录通常一页 500 条即完），
+    // 不是按文件逐个查；列举失败的目录退回预检结论，不阻塞整理。
+    const recheckListings = /* @__PURE__ */ new Map();
+    const recheckByDir = /* @__PURE__ */ new Map();
+    for (const task of tasks.filter((item) => item.targetDir && !item.failed && !item.discarded && !item.discard && !item.conflictDiscard)) {
+      const key = String(task.targetDir);
+      if (!recheckByDir.has(key)) recheckByDir.set(key, []);
+      recheckByDir.get(key).push(task);
+    }
+    const recheckConflicts = [];
+    await mapLimit([...recheckByDir.values()], concurrency, async (group) => {
+      const dirId = String(group[0].targetDir);
+      let pending = recheckListings.get(dirId);
+      if (!pending) {
+        pending = api.listAll(dirId, { signal: options.signal }).catch((error) => {
+          recheckListings.delete(dirId);
+          throw error;
+        });
+        recheckListings.set(dirId, pending);
+      }
+      let files;
+      try {
+        files = await pending;
+      } catch (_) {
+        return;
+      }
+      const entries = files.map((file) => [String(file.name || "").toLocaleLowerCase(), String(file.id)]);
+      const seen = /* @__PURE__ */ new Set();
+      for (const task of group) {
+        const name = String(task.newName || "").toLocaleLowerCase();
+        const inTaskDuplicate = seen.has(name);
+        const existing = inTaskDuplicate ? null : entries.find(([candidate, id]) => candidate === name && id !== String(task.id));
+        if (inTaskDuplicate || existing) {
+          task.conflictDiscard = true;
+          task.conflictAction = inTaskDuplicate ? "\u672C\u6B21\u4EFB\u52A1\u4E2D\u5DF2\u6709\u540C\u540D\u76EE\u6807\uFF0C\u5F53\u524D\u6587\u4EF6\u5C06\u8DF3\u8FC7\u5E76\u79FB\u5165\u56DE\u6536\u7AD9" : "\u6267\u884C\u65F6\u590D\u67E5\u53D1\u73B0\u76EE\u6807\u76EE\u5F55\u5DF2\u5B58\u5728\u540C\u540D\u6587\u4EF6\uFF0C\u5F53\u524D\u6587\u4EF6\u5C06\u8DF3\u8FC7\u5E76\u79FB\u5165\u56DE\u6536\u7AD9";
+          recheckConflicts.push(task);
+          continue;
+        }
+        seen.add(name);
+      }
+    }, { signal: options.signal });
+    if (recheckConflicts.length) {
+      processed += recheckConflicts.length;
+      try {
+        await api.trash(recheckConflicts, options.signal);
+        for (const task of recheckConflicts) task.discarded = true;
+      } catch {
+        await mapLimit(recheckConflicts, concurrency, async (task) => {
+          try {
+            await api.trash([task], options.signal);
+            task.discarded = true;
+          } catch (error) {
+            task.failed = true;
+            task.error = error.message;
+          }
+        }, { signal: options.signal });
+      }
+    }
     const byDir = /* @__PURE__ */ new Map();
     for (const task of tasks.filter((item) => item.targetDir && !item.failed && !item.discarded)) {
       if (String(task.parentId || task.parentFileId || "0") === String(task.targetDir)) {
