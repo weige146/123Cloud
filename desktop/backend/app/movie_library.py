@@ -600,6 +600,68 @@ def normalize_region(codes: Any) -> str:
     return region or ""
 
 
+# ---------- 频道归类（media_type 列存中文频道：电影/电视剧/纪录片/综艺/动漫/儿童） ----------
+
+# TMDB genre id：16 动画、99 纪录；剧集专属 10762 儿童、10763 新闻、10764 真人秀、10767 脱口秀
+_ANIMATION_IDS = {16}
+_DOCUMENTARY_IDS = {99}
+_KIDS_IDS = {10762}
+_VARIETY_IDS = {10763, 10764, 10767}
+# TMDB genres 的中文名（zh-CN）与英文名兜底（用户自配 token 且语言非中文时）
+_ANIMATION_NAMES = {"动画", "Animation"}
+_DOCUMENTARY_NAMES = {"纪录", "纪录片", "Documentary"}
+_KIDS_NAMES = {"儿童", "Kids"}
+_VARIETY_NAMES = {"真人秀", "脱口秀", "新闻", "Reality", "Talk", "News"}
+
+
+def _genre_ids_and_names(info: Dict[str, Any]) -> Tuple[set, set]:
+    ids: set = set()
+    names: set = set()
+    for g in (info.get("genres") or []):
+        if isinstance(g, dict):
+            try:
+                ids.add(int(g.get("id") or 0))
+            except (TypeError, ValueError):
+                pass
+            if g.get("name"):
+                names.add(str(g["name"]).strip())
+    return ids, names
+
+
+def normalize_channel(matched_type: str, info: Dict[str, Any]) -> str:
+    """TMDB 详情 → 中文频道。内容类型优先（动画→动漫、纪录→纪录片，电影剧集都适用），
+    剧集再按 儿童/综艺 细分，其余 movie=电影、tv=电视剧。"""
+    ids, names = _genre_ids_and_names(info)
+    if ids & _ANIMATION_IDS or names & _ANIMATION_NAMES:
+        return "动漫"
+    if ids & _DOCUMENTARY_IDS or names & _DOCUMENTARY_NAMES:
+        return "纪录片"
+    if str(matched_type or "") == "tv":
+        if ids & _KIDS_IDS or names & _KIDS_NAMES:
+            return "儿童"
+        if ids & _VARIETY_IDS or names & _VARIETY_NAMES:
+            return "综艺"
+        return "电视剧"
+    return "电影"
+
+
+def channel_from_stored(matched_type: str, genre_names: Any) -> str:
+    """已入库的旧数据回填：media_type（movie/tv）+ genres 中文名数组 → 中文频道。
+    旧 genres 由 zh-CN 请求写入，所以只匹配中文名就够。"""
+    names = {str(n).strip() for n in (genre_names or []) if str(n).strip()}
+    if names & _ANIMATION_NAMES:
+        return "动漫"
+    if names & _DOCUMENTARY_NAMES:
+        return "纪录片"
+    if str(matched_type or "") == "tv":
+        if names & _KIDS_NAMES:
+            return "儿童"
+        if names & _VARIETY_NAMES:
+            return "综艺"
+        return "电视剧"
+    return "电影"
+
+
 # TMDB original_language（ISO-639-1）→ 中文语言桶；未映射但有值 → 其他；空 → 空串。
 _LANG_MAP = {
     "zh": "中文", "yue": "粤语", "en": "英语", "ja": "日语", "ko": "韩语",
@@ -697,5 +759,296 @@ def infer_technical(names: Iterable[str]) -> Tuple[str, str]:
     for name in names:
         update_tech_state(state, name)
     return tech_result(state)
+
+
+# ---------- 细粒度技术属性（对齐油猴脚本整理识别，详情页展示用，不改库） ----------
+# 每组按「优先级从高到低」排列，作品级取全部文件里命中的最高一档
+
+_TECH_RESOURCE = (
+    (r"UHD[ ._-]?BLU[ ._-]?RAY[ ._-]?REMUX", "UHD BluRay Remux"),
+    (r"BLU[ ._-]?RAY[ ._-]?REMUX", "BluRay Remux"),
+    (r"BD[ ._-]?REMUX", "BluRay Remux"),
+    (r"REMUX", "Remux"),
+    (r"UHD[ ._-]?BLU[ ._-]?RAY", "UHD BluRay"),
+    (r"ULTRA[ ._-]HD[ ._-]?BLU[ ._-]?RAY", "UHD BluRay"),
+    (r"BLU[ ._-]?RAY", "BluRay"),
+    (r"WEB[ ._-]?DL", "WEB-DL"),
+    (r"WEB[ ._-]?RIP", "WEBRip"),
+    (r"UHD[ ._-]?TV", "UHDTV"),
+    (r"H[ ._-]?D[ ._-]?TV", "HDTV"),
+    (r"BD[ ._-]?RIP", "BDRip"),
+    (r"HD[ ._-]?RIP", "HDRip"),
+    (r"DVD[ ._-]?RIP", "DVDRip"),
+)
+_TECH_DYNAMIC = (
+    (r"HDR10\+|HDR[ ._-]?10\+", "HDR10+"),
+    (r"HDR10|HDR[ ._-]?10P", "HDR10"),
+    (r"HDR[ ._-]?VIVID", "HDR.Vivid"),
+    (r"HDR", "HDR"),
+    (r"HLG", "HLG"),
+    (r"SDR", "SDR"),
+    (r"EDR", "EDR"),
+)
+_TECH_VIDEO = (
+    (r"AV1", "AV1"),
+    (r"HEVC", "HEVC"),
+    (r"H[ ._-]?265|X[ ._-]?265", "H265"),
+    (r"AVC", "AVC"),
+    (r"H[ ._-]?264|X[ ._-]?264", "H264"),
+    (r"MPEG[ ._-]?2", "MPEG-2"),
+    (r"VC[ ._-]?1", "VC-1"),
+)
+_TECH_AUDIO = (
+    (r"TRUEHD", "TrueHD"),
+    (r"DTS[ ._-]?X|DTS[ ._-]?X", "DTS.X"),
+    (r"DTS[ ._-]?HD[ ._-]?MA", "DTS.HD.MA"),
+    (r"DTS[ ._-]?HD[ ._-]?HRA", "DTS.HD.HRA"),
+    (r"EAC3|DDP|DD\+", "DDP"),
+    (r"\bAC3\b|DD\b|DOLBY[ ._-]?DIGITAL", "DD"),
+    (r"\bDTS\b", "DTS"),
+    (r"FLAC", "FLAC"),
+    (r"\bAAC\b", "AAC"),
+    (r"LPCM|\bPCM\b", "LPCM"),
+    (r"OPUS", "Opus"),
+    (r"AV3A", "AV3A"),
+)
+_TECH_EDITIONS = (
+    (r"IMAX", "IMAX"),
+    (r"CRITERION", "CC"),
+    (r"DIRECTORS?[ ._-]?CUT", "Director's Cut"),
+    (r"EXTENDED", "Extended"),
+    (r"THEATRICAL", "Theatrical"),
+    (r"UNRATED", "Unrated"),
+    (r"OPEN[ ._-]?MATTE", "Open Matte"),
+    (r"HYBRID", "Hybrid"),
+    (r"REMASTERED|RESTORED", "Remastered"),
+    (r"PROPER", "PROPER"),
+    (r"REPACK", "REPACK"),
+    (r"RERIP", "RERIP"),
+)
+_TECH_VIDEO_FORMAT = (
+    (r"4320P|8K", "4320p"),
+    (r"2160P|\b4K\b|\bUHD\b", "2160p"),
+    (r"1080[PI]", "1080p"),
+    (r"720P", "720p"),
+    (r"480P|576P", "480p"),
+)
+
+
+def _tech_first_match(upper: str, table) -> str:
+    """按优先级返回首个命中的输出名；都不中返回空。"""
+    for pattern, label in table:
+        if re.search(pattern, upper):
+            return label
+    return ""
+
+
+def new_detail_state() -> Dict[str, Any]:
+    """细粒度技术属性的增量状态袋（流式导入逐文件喂，导入结束取结果）。"""
+    return {
+        "resource": ("", 1 << 30), "dynamic": ("", 1 << 30),
+        "video": ("", 1 << 30), "audio": ("", 1 << 30),
+        "dolby": "", "hq": "", "fps": "", "editions": [],
+    }
+
+
+def update_detail_state(state: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """喂一个文件名，更新各属性的「最高档」与并集。"""
+    upper = str(name or "").upper()
+    if not upper:
+        return state
+    for key, table in (("resource", _TECH_RESOURCE), ("dynamic", _TECH_DYNAMIC),
+                       ("video", _TECH_VIDEO), ("audio", _TECH_AUDIO)):
+        label = _tech_first_match(upper, table)
+        if label:
+            rank = next(i for i, (_, l) in enumerate(table) if l == label)
+            if rank < state[key][1]:
+                state[key] = (label, rank)
+    if not state["dolby"] and re.search(r"DOVI|DOLBY[ ._-]?VISION|(?<![A-Z0-9])DV(?![A-Z0-9])", upper):
+        state["dolby"] = "DV"
+    if not state["hq"] and re.search(r"(?<![A-Z0-9])HQ(?![A-Z0-9])", upper):
+        state["hq"] = "HQ"
+    editions = state["editions"]
+    for pattern, label in _TECH_EDITIONS:
+        if label not in editions and re.search(pattern, upper):
+            editions.append(label)
+    if not state["fps"]:
+        m = re.search(r"(\d{2,3}(?:\.\d{1,3})?)FPS", upper)
+        if m:
+            value = m.group(1)
+            if "." in value and float(value) > 120:
+                # 左最匹配把前面的版本号并进来了（如 265.25fps）：只留 fps 紧前一段
+                value = m.group(0).rpartition(".")[2]
+            state["fps"] = value.lower().rstrip("fps") + "fps"
+    return state
+
+
+def detail_state_result(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "resourceType": state["resource"][0],
+        "dolbyVision": state["dolby"],
+        "dynamicRange": state["dynamic"][0],
+        "videoCodec": state["video"][0],
+        "audioCodec": state["audio"][0],
+        "frameRate": state["fps"],
+        "highQuality": state["hq"],
+        "originalEdition": list(state["editions"]),
+    }
+
+
+def infer_technical_detailed(names: Iterable[str]) -> Dict[str, Any]:
+    """从文件名集合提取作品级技术属性（对齐 123 助手整理识别的字段）。
+
+    返回 {resourceType, dolbyVision, dynamicRange, videoCodec, audioCodec,
+    frameRate, highQuality, originalEdition[]}；某属性没识别出来就是空值/空数组。"""
+    state = new_detail_state()
+    for name in names:
+        update_detail_state(state, name)
+    return detail_state_result(state)
+
+
+# ---------- 季/集解析（影库播放用，纯函数无新依赖） ----------
+
+# S01E02 / s1e2 / S01.E02（一个正则同时拿季和集）
+_RE_SEASON_EPISODE = re.compile(r"(?<![0-9a-z])s(\d{1,3})[\s._-]*e(\d{1,4})(?![0-9])", re.I)
+# 1x02 / 10x08（季x集）
+_RE_EPISODE_CROSS = re.compile(r"(?<![0-9])(\d{1,3})x(\d{1,4})(?![0-9])", re.I)
+# E02 / EP02 / EP.02 / E 02（只带集号；前面不能是字母数字，防误命中 Se7en / 1080E 之类）
+_RE_EPISODE_ONLY = re.compile(r"(?<![a-z0-9])e(?:p)?[\s._-]?(\d{1,4})(?![0-9])", re.I)
+# 第 03 集 / 第3话 / 第一集（中文数字）
+_RE_EPISODE_ZH = re.compile(r"第\s*(\d{1,4})\s*[集话話]")
+_RE_EPISODE_ZH_CN = re.compile(r"第\s*([一二三四五六七八九十]{1,3})\s*[集话話]")
+# 季号：优先取路径里离文件最近的目录名（Season 1 / S01 / 第 2 季 / 第二季）
+_RE_SEASON_SEG = re.compile(r"^season[\s._-]*(\d{1,3})", re.I)
+_RE_SEASON_SEG_S = re.compile(r"^s(\d{1,3})(?![0-9a-z])", re.I)
+_RE_SEASON_ZH = re.compile(r"第\s*(\d{1,3})\s*季")
+_RE_SEASON_ZH_CN = re.compile(r"第\s*([一二三四五六七八九十]{1,3})\s*季")
+
+_CN_NUMERAL = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _chinese_numeral(text: str) -> Optional[int]:
+    """一~九十九的中文数字 → 阿拉伯数字（十/十五/二十/二十一…），解析不了返回 None。"""
+    s = str(text or "")
+    if not s:
+        return None
+    if s == "十":
+        return 10
+    if "十" in s:
+        left, _, right = s.partition("十")
+        tens = _CN_NUMERAL.get(left, 1) if left else 1
+        ones = _CN_NUMERAL.get(right, 0) if right else 0
+        if (not left or left in _CN_NUMERAL) and (not right or right in _CN_NUMERAL):
+            return tens * 10 + ones
+        return None
+    if len(s) == 1 and s in _CN_NUMERAL:
+        return _CN_NUMERAL[s]
+    return None
+
+
+def _season_from_segment(segment: str) -> Optional[int]:
+    """从单级目录名解析季号；不是季目录返回 None。"""
+    seg = str(segment or "").strip()
+    if not seg:
+        return None
+    m = _RE_SEASON_SEG.match(seg) or _RE_SEASON_SEG_S.match(seg) or _RE_SEASON_ZH.search(seg)
+    if m:
+        return int(m.group(1))
+    m = _RE_SEASON_ZH_CN.search(seg)
+    if m:
+        return _chinese_numeral(m.group(1))
+    return None
+
+
+def parse_season_episode(path: str, file_name: str = "") -> Tuple[Optional[int], Optional[int]]:
+    """从文件路径解析 (季, 集)；解析不出集号返回 (None, None)，有集无季默认第 1 季。
+
+    季号来源优先级：文件名里的 SxxExx / N x M > 文件名里的「第 N 季」>
+    路径中离文件最近的一级季目录（Season N / SNN / 第 N 季 / 第N季中文数字）。
+    """
+    p = str(path or "")
+    name = str(file_name or "") or p.rsplit("/", 1)[-1]
+    season: Optional[int] = None
+    episode: Optional[int] = None
+    m = _RE_SEASON_EPISODE.search(name)
+    if m:
+        season, episode = int(m.group(1)), int(m.group(2))
+    else:
+        m = _RE_EPISODE_CROSS.search(name)
+        if m:
+            season, episode = int(m.group(1)), int(m.group(2))
+    if episode is None:
+        m = _RE_EPISODE_ONLY.search(name)
+        if m:
+            episode = int(m.group(1))
+        else:
+            m = _RE_EPISODE_ZH.search(name)
+            if m:
+                episode = int(m.group(1))
+            else:
+                m = _RE_EPISODE_ZH_CN.search(name)
+                if m:
+                    episode = _chinese_numeral(m.group(1))
+        if episode is None:
+            return None, None
+        # 集号有了再找季：先看文件名自带的「第 N 季」，再沿路径向外找季目录
+        m = _RE_SEASON_ZH.search(name) or _RE_SEASON_ZH_CN.search(name)
+        if m:
+            season = int(m.group(1)) if m.re is _RE_SEASON_ZH else _chinese_numeral(m.group(1))
+    if season is None:
+        for seg in reversed([s for s in p.split("/") if s][:-1]):
+            season = _season_from_segment(seg)
+            if season is not None:
+                break
+    if season is None:
+        season = 1
+    return season, episode
+
+
+def natural_key(text: str) -> Tuple:
+    """自然排序键：数字段按数值比较（E2 排在 E10 前面）。"""
+    return tuple(int(p) if p.isdigit() else p for p in re.split(r"(\d+)", str(text or "").lower()))
+
+
+def season_episode_label(season: int, episode: int) -> str:
+    """S01E02 式标签；季为 0（电影）时只返回文件名不适合的场景由调用方处理。"""
+    if season and episode:
+        return f"S{int(season):02d}E{int(episode):02d}"
+    if episode:
+        return f"E{int(episode):02d}"
+    return ""
+
+
+def order_play_items(files: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """播放排序（纯函数）：过滤视频文件、解析季集，产出可播放结构。
+
+    剧集（任一文件解析出集号）：{"isSeries": True, "seasons": {季: [条目…]}, "standalone": None}
+      条目 = {"season", "episode", "file"(默认版本=体积最大), "alternates"(其余版本)}，按集号自然排序。
+      解析不出集号的视频（花絮等）不进播放列表。
+    电影（全都解析不出集号）：{"isSeries": False, "seasons": {}, "standalone": 最大体积的视频文件}
+    """
+    parsed: List[Tuple[int, int, Dict[str, Any]]] = []
+    unparsed: List[Dict[str, Any]] = []
+    for f in files:
+        if not isinstance(f, dict) or not f.get("isVideo"):
+            continue
+        season, episode = parse_season_episode(str(f.get("path") or ""), str(f.get("fileName") or ""))
+        if episode is None:
+            unparsed.append(f)
+        else:
+            parsed.append((season or 1, episode, f))
+    if not parsed:
+        standalone = max(unparsed, key=lambda f: (int(f.get("size") or 0), natural_key(str(f.get("fileName") or ""))), default=None)
+        return {"isSeries": False, "seasons": {}, "standalone": standalone}
+    grouped: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    for season, episode, f in parsed:
+        grouped.setdefault((season, episode), []).append(f)
+    seasons: Dict[int, List[Dict[str, Any]]] = {}
+    for (season, episode), group in grouped.items():
+        group.sort(key=lambda f: (-int(f.get("size") or 0), natural_key(str(f.get("fileName") or ""))))
+        seasons.setdefault(season, []).append({"season": season, "episode": episode, "file": group[0], "alternates": group[1:]})
+    for season, entries in seasons.items():
+        entries.sort(key=lambda e: (e["episode"], natural_key(str(e["file"].get("fileName") or ""))))
+    return {"isSeries": True, "seasons": seasons, "standalone": None}
 
 

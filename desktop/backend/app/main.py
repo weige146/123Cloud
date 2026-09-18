@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 from starlette.staticfiles import StaticFiles as _StarletteStaticFiles
 
@@ -32,7 +32,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
 setup_logging(DATA_DIR)
 
 from .directlink import read_directlink_status, serve_directlink_file, submit_arbitrary_urls_offline, submit_directlink_offline
-from . import library_transfer, movie_library, movie_library_db
+from . import library_playback, library_transfer, movie_library, movie_library_db
 from .pan115 import CODE_RE as PAN123_CODE_RE, empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
 from .pan115_cookie import (
     PAN115_QR_DEVICES,
@@ -1998,10 +1998,15 @@ async def reuse_sha1_pool_items(request: PoolReuseRequest) -> Dict[str, Any]:
 
 
 class LibraryConfigRequest(BaseModel):
-    transferIntervalMs: int = 200
-    transferConcurrency: int = 5
-    exportDir: str = ""
-    videoExtensions: str = ""
+    # 全部 Optional：None=未传（保留现值），传了才覆盖——部分字段的保存（如选播放器后自动保存）
+    # 不会误清其他设置；传空串=清空该项（播放器回自动检测、目录回默认）
+    transferIntervalMs: Optional[int] = None
+    transferConcurrency: Optional[int] = None
+    exportDir: Optional[str] = None
+    videoExtensions: Optional[str] = None
+    playerPath: Optional[str] = None
+    autoTrash: Optional[bool] = None
+    playCachePath: Optional[str] = None
     token: str = ""
     clearToken: bool = False
 
@@ -2023,6 +2028,15 @@ def normalize_movie_library_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         "exportDir": str(cfg.get("exportDir") or "").strip(),
         # 视频扩展名白名单补遗：逗号/空格分隔，导入时与内置默认合并
         "videoExtensions": str(cfg.get("videoExtensions") or "").strip(),
+        # 播放：本地播放器路径（空=自动检测 IINA/mpv/VLC）、看完自动移入回收站、播放缓存目录
+        # （默认网盘「秒传」目录；早期本地构建存过「影库播放」的自动迁移成默认值）
+        "playerPath": str(cfg.get("playerPath") or "").strip(),
+        "autoTrash": bool(cfg.get("autoTrash", True)),
+        "playCachePath": (
+            library_playback.DEFAULT_PLAY_CACHE_PATH
+            if str(cfg.get("playCachePath") or "").strip() == library_playback.LEGACY_PLAY_CACHE_PATH
+            else str(cfg.get("playCachePath") or "").strip() or library_playback.DEFAULT_PLAY_CACHE_PATH
+        ),
     }
 
 
@@ -2048,6 +2062,15 @@ def _guard_library_token(request: Request, provided: str = "") -> None:
     if supplied and hmac.compare_digest(supplied, expected):
         return
     raise HTTPException(status_code=401, detail="影库访问令牌不正确：请在客户端设置里核对令牌")
+
+
+# 影库播放编排服务（点播/播放列表/进度回传/看完移回收站），providers 复用上面两个函数；
+# web_session_provider 带出油猴「推送登录会话」存档，OpenAPI 直链失败时用网页版接口兜底
+playback_service = library_playback.PlaybackService(
+    client_provider=_authorized_pan123_client,
+    config_provider=_library_config,
+    web_session_provider=lambda: store.read_value(PAN_WEB_SESSION_KEY),
+)
 
 
 # ===== 网页端登录会话中转（123 助手「会话复用」）=====
@@ -2140,6 +2163,9 @@ async def read_library_config(request: Request) -> Dict[str, Any]:
             "transferConcurrency": cfg.get("transferConcurrency", 5),
             "exportDir": cfg.get("exportDir", ""),
             "videoExtensions": cfg.get("videoExtensions", ""),
+            "playerPath": cfg.get("playerPath", ""),
+            "autoTrash": bool(cfg.get("autoTrash", True)),
+            "playCachePath": cfg.get("playCachePath", library_playback.DEFAULT_PLAY_CACHE_PATH),
             "tokenSet": bool(token),
             # 令牌明文只回给本机管理页；远程浏览器/脚本只能拿到打码预览
             "token": token if loopback else "",
@@ -2158,12 +2184,17 @@ async def write_library_config(request: LibraryConfigRequest, request_obj: Reque
         new_token = ""
     else:
         new_token = current["token"]  # 留空 = 保留现有令牌，避免远程管理页误清
+    # 没传的字段（None）保留现值：部分字段保存（选播放器自动保存、固定导出目录）不误清其他设置
     payload = normalize_movie_library_config({
         "movieLibrary": {
-            "transferIntervalMs": request.transferIntervalMs,
-            "transferConcurrency": request.transferConcurrency,
-            "exportDir": str(request.exportDir or "").strip() or current.get("exportDir", ""),
-            "videoExtensions": str(request.videoExtensions or "").strip() or current.get("videoExtensions", ""),
+            "transferIntervalMs": current["transferIntervalMs"] if request.transferIntervalMs is None else request.transferIntervalMs,
+            "transferConcurrency": current.get("transferConcurrency", 5) if request.transferConcurrency is None else request.transferConcurrency,
+            "exportDir": current.get("exportDir", "") if request.exportDir is None else str(request.exportDir).strip(),
+            "videoExtensions": current.get("videoExtensions", "") if request.videoExtensions is None else str(request.videoExtensions).strip(),
+            # playerPath 传空串 = 清空自定义（回到自动检测）
+            "playerPath": current.get("playerPath", "") if request.playerPath is None else str(request.playerPath).strip(),
+            "autoTrash": bool(current.get("autoTrash", True)) if request.autoTrash is None else bool(request.autoTrash),
+            "playCachePath": current.get("playCachePath", library_playback.DEFAULT_PLAY_CACHE_PATH) if request.playCachePath is None else (str(request.playCachePath).strip() or library_playback.DEFAULT_PLAY_CACHE_PATH),
             "token": new_token,
         }
     })
@@ -2179,6 +2210,9 @@ async def write_library_config(request: LibraryConfigRequest, request_obj: Reque
         "transferConcurrency": saved_cfg.get("transferConcurrency", 5),
         "exportDir": saved_cfg.get("exportDir", ""),
         "videoExtensions": saved_cfg.get("videoExtensions", ""),
+        "playerPath": saved_cfg.get("playerPath", ""),
+        "autoTrash": bool(saved_cfg.get("autoTrash", True)),
+        "playCachePath": saved_cfg.get("playCachePath", library_playback.DEFAULT_PLAY_CACHE_PATH),
         "tokenSet": bool(saved_cfg["token"]),
         "token": saved_cfg["token"] if loopback else "",
         "tokenPreview": None if loopback else _mask_token(saved_cfg["token"]),
@@ -2446,6 +2480,64 @@ async def library_tmdb_detail(
     return {"ok": True, "detail": best}
 
 
+async def _tmdb_fetch_season(tmdb_id: int, season: int) -> Optional[Dict[str, Any]]:
+    """查 TMDB 剧集某季详情（季海报 + 分集名）：配置 TOKEN 优先，失败回退内置公开 Key。"""
+    token, lang = _tmdb_credentials()
+    attempts = []
+    if token:
+        attempts.append((
+            f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}?language={lang}",
+            {"Authorization": f"Bearer {token}"},
+        ))
+    attempts.append((
+        f"https://api.tmdb.org/3/tv/{tmdb_id}/season/{season}?api_key={TMDB_BUILTIN_KEY}&language=zh-CN",
+        {},
+    ))
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for url, headers in attempts:
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    continue
+                return resp.json()
+            except Exception:
+                continue
+    return None
+
+
+@app.get("/api/library/tmdb/{tmdb_id}/season/{season}")
+async def library_tmdb_season(
+    request: Request,
+    tmdb_id: int,
+    season: int,
+    token: str = "",
+) -> Dict[str, Any]:
+    """TMDB 季详情（季海报/分集名），sqlite 缓存；详情页季海报墙与集列表用。"""
+    _guard_library_token(request, token)
+    cache_key = f"movieTmdbSeason:{tmdb_id}:{season}"
+    cached = store.read_value(cache_key)
+    if isinstance(cached, dict):
+        return {"ok": True, "season": cached}
+    info = await _tmdb_fetch_season(tmdb_id, season)
+    if not info:
+        return {"ok": True, "season": None}
+    normalized = {
+        "seasonNumber": int(info.get("season_number") or season),
+        "name": str(info.get("name") or f"第 {season} 季"),
+        "posterUrl": f"https://image.tmdb.org/t/p/w342{info['poster_path']}" if info.get("poster_path") else "",
+        "episodes": [
+            {
+                "episode": int(e.get("episode_number") or 0),
+                "name": str(e.get("name") or ""),
+                "airDate": str(e.get("air_date") or ""),
+            }
+            for e in (info.get("episodes") or []) if isinstance(e, dict)
+        ],
+    }
+    store.write_value(cache_key, normalized)
+    return {"ok": True, "season": normalized}
+
+
 # ===== 影库分类充实（后台懒回填队列）=====
 
 def _tmdb_enrich_fields(info: Dict[str, Any], matched_type: str) -> Dict[str, Any]:
@@ -2454,7 +2546,8 @@ def _tmdb_enrich_fields(info: Dict[str, Any], matched_type: str) -> Dict[str, An
     date = str(info.get("release_date") or info.get("first_air_date") or "")
     poster = f"https://image.tmdb.org/t/p/w185{info['poster_path']}" if info.get("poster_path") else ""
     return {
-        "media_type": matched_type,
+        # media_type 存中文频道（电影/电视剧/纪录片/综艺/动漫/儿童），不再存 movie/tv
+        "media_type": movie_library.normalize_channel(matched_type, info),
         "genres": genres,
         "region": movie_library.normalize_region(info.get("origin_country")),
         "poster_path": poster,
@@ -2696,12 +2789,13 @@ async def search_library(
     resolution: str = "",
     edition: str = "",
     rating: float = 0,
+    tech: str = "",
     token: str = "",
 ) -> Dict[str, Any]:
     _guard_library_token(request, token)
     total, results = await asyncio.to_thread(
         movie_library_db.search, q, page, size, cat, sub, _split_lib_filter(lib),
-        mediaType, genre, region, decade, sort, language, status, resolution, edition, rating,
+        mediaType, genre, region, decade, sort, language, status, resolution, edition, rating, tech,
     )
     return {"ok": True, "total": total, "page": page, "size": size, "dirs": results}
 
@@ -2720,13 +2814,14 @@ async def read_library_facets(
     resolution: str = "",
     edition: str = "",
     rating: float = 0,
+    tech: str = "",
     token: str = "",
 ) -> Dict[str, Any]:
     """分类维度候选计数（优爱腾式交叉筛选），供前端动态渲染筛选条。"""
     _guard_library_token(request, token)
     facets = await asyncio.to_thread(
         movie_library_db.facets, mediaType, genre, region, decade, _split_lib_filter(lib), q,
-        language, status, resolution, edition, rating,
+        language, status, resolution, edition, rating, tech,
     )
     return {"ok": True, "facets": facets}
 
@@ -2826,6 +2921,302 @@ async def cancel_library_transfer_task(request: LibraryTransferTaskRequest, requ
     if not library_transfer.transfer_manager.request_cancel(request.taskId):
         raise HTTPException(status_code=400, detail="任务不存在或已结束")
     return {"ok": True}
+
+
+# ===== 影库播放：海报墙点播 → 本地播放器 + 播放记录 + 看完移回收站 =====
+
+
+class LibraryPlayStartRequest(BaseModel):
+    dir: str = ""
+    season: int = 0
+    episode: int = 0
+    filePath: str = ""
+    resume: bool = False
+    token: str = ""
+
+
+class LibraryProgressMarkRequest(BaseModel):
+    dir: str = ""
+    filePath: str = ""
+    watched: bool = True
+    token: str = ""
+
+
+class LibraryProgressMarkUntilRequest(BaseModel):
+    dir: str = ""
+    season: int = 0
+    episode: int = 0
+    token: str = ""
+
+
+class LibraryWorksDeleteRequest(BaseModel):
+    dirs: List[str] = Field(default_factory=list)
+    token: str = ""
+
+
+class LibraryCategoryDeleteRequest(BaseModel):
+    cat: str = ""
+    sub: str = ""
+    token: str = ""
+
+
+class LibraryBackupImportRequest(BaseModel):
+    path: str = ""
+    token: str = ""
+
+
+@app.post("/api/library/play/start")
+async def start_library_play(request: LibraryPlayStartRequest, request_obj: Request) -> Dict[str, Any]:
+    """海报墙点播：把当季文件转存进网盘播放缓存目录，生成 m3u 交给本地播放器。"""
+    _guard_library_token(request_obj, request.token)
+    dir_name = str(request.dir or "").strip()
+    if not dir_name:
+        raise HTTPException(status_code=400, detail="缺少作品目录")
+    try:
+        await _authorized_pan123_client()
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"123 网盘还没授权，暂时不能播放：请到「设置 → 123 网盘授权」完成登录（{error}）",
+        )
+    # 播放列表地址必须用 127.0.0.1：管理页若从 localhost 打开，request.base_url 会是
+    # http://localhost:…，播放器解析 localhost 优先走 IPv6(::1)，而后端只监听 127.0.0.1，
+    # 播放器连接被拒（服务端无任何请求日志）。端口取真实请求的 Host 头。
+    host_header = str(request_obj.headers.get("host") or "")
+    port = host_header.rpartition(":")[2] if ":" in host_header else ""
+    if not port.isdigit():
+        port = str(os.environ.get("CLOUD123_PORT") or "8000")
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        result = await playback_service.start_play(
+            dir_name, request.season or None, request.episode or None,
+            str(request.filePath or "").strip(), bool(request.resume), base_url,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, **result}
+
+
+@app.get("/api/library/play/structure")
+async def read_library_play_structure(request: Request, dir: str = Query(...), token: str = "") -> Dict[str, Any]:
+    """作品的可播放结构：剧集按季分组的集列表（含已看/断点/备选版本），电影为单条目。"""
+    _guard_library_token(request, token)
+    info = await asyncio.to_thread(movie_library_db.list_files, dir)
+    if info is None:
+        raise HTTPException(status_code=404, detail="作品不存在（可能已被删除，请重新搜索）")
+    ordered = movie_library.order_play_items(info.get("files") or [])
+    records = await asyncio.to_thread(movie_library_db.list_playback, dir)
+    by_path = {str(r.get("filePath") or ""): r for r in records}
+
+    def entry_out(entry: Dict[str, Any]) -> Dict[str, Any]:
+        f = entry.get("file") or {}
+        record = by_path.get(str(f.get("path") or "")) or by_path.get(str(f.get("fileName") or "")) or {}
+        return {
+            "season": int(entry.get("season") or 0),
+            "episode": int(entry.get("episode") or 0),
+            "fileName": str(f.get("fileName") or ""),
+            "path": str(f.get("path") or ""),
+            "size": int(f.get("size") or 0),
+            "watched": bool(record.get("watched")),
+            "positionSec": round(float(record.get("positionSec") or 0), 1),
+            "durationSec": round(float(record.get("durationSec") or 0), 1),
+            "alternates": [
+                {"fileName": str(a.get("fileName") or ""), "path": str(a.get("path") or ""),
+                 "size": int(a.get("size") or 0)}
+                for a in (entry.get("alternates") or [])
+            ],
+        }
+
+    seasons_out = [
+        {"season": season, "episodes": [entry_out(e) for e in episodes]}
+        for season, episodes in sorted((ordered.get("seasons") or {}).items())
+    ]
+    standalone = entry_out({"season": 0, "episode": 0, "file": ordered.get("standalone"), "alternates": []}) \
+        if ordered.get("standalone") else None
+    # 细粒度技术属性（对齐油猴脚本整理识别：DV/HDR/编码/帧率/地区版…），详情 chips 展示
+    tech = await asyncio.to_thread(
+        movie_library.infer_technical_detailed,
+        [str(f.get("fileName") or "") for f in (info.get("files") or []) if isinstance(f, dict) and f.get("isVideo")],
+    )
+    return {
+        "ok": True,
+        "isSeries": bool(ordered.get("isSeries")),
+        "title": info.get("title") or "",
+        "tmdbId": info.get("tmdbId"),
+        "seasons": seasons_out,
+        "standalone": standalone,
+        "tech": tech,
+        "active": playback_service.active_for(dir),
+    }
+
+
+# 播放器拉播放列表/直链：会话 id 本身就是凭证（128 位随机、后端默认只监听本机）。
+# 播放器发不了自定义 header，这两个接口不走影库令牌门卫。
+@app.get("/api/library/play/{session_id}/playlist.m3u")
+async def library_play_playlist(session_id: str) -> Response:
+    text = playback_service.playlist_m3u(session_id)
+    if text is None:
+        logger.warning("影库播放：播放器拉播放列表失败（会话 %s 不存在或已过期）", session_id[:8])
+        raise HTTPException(status_code=404, detail="播放会话不存在或已过期")
+    logger.info("影库播放：播放器已拉取播放列表（会话 %s，%d 个条目）", session_id[:8], text.count("#EXTINF"))
+    return Response(content=text, media_type="audio/x-mpegurl")
+
+
+@app.get("/api/library/play/{session_id}/{index}")
+async def library_play_redirect(session_id: str, index: int) -> RedirectResponse:
+    """每一集开播时按需取 123 直链并 302（直链 55 秒缓存，不怕过期）。"""
+    try:
+        url = await playback_service.resolve_item(session_id, index)
+    except ValueError as error:
+        logger.warning("影库播放：播放器拉第 %s 项失败：%s", index, error)
+        raise HTTPException(status_code=404, detail=str(error))
+    return RedirectResponse(url, status_code=302)
+
+
+@app.get("/api/library/progress")
+async def read_library_progress(request: Request, dir: str = Query(...), token: str = "") -> Dict[str, Any]:
+    """作品播放记录（断点/已看）与正在播放的会话信息。"""
+    _guard_library_token(request, token)
+    payload = await playback_service.progress_payload(dir)
+    return {"ok": True, **payload}
+
+
+@app.post("/api/library/progress/mark")
+async def mark_library_progress(request: LibraryProgressMarkRequest, request_obj: Request) -> Dict[str, Any]:
+    """手动标记已看/未看；标已看同样会把网盘里的文件移入回收站。"""
+    _guard_library_token(request_obj, request.token)
+    try:
+        await playback_service.mark_watched(request.dir, request.filePath, request.watched)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True}
+
+
+@app.post("/api/library/progress/mark-until")
+async def mark_library_progress_until(request: LibraryProgressMarkUntilRequest, request_obj: Request) -> Dict[str, Any]:
+    """「看到第 N 集」一键标记：该季 1..N 标已看、之后标未看；新标已看的文件照常移回收站。"""
+    _guard_library_token(request_obj, request.token)
+    try:
+        result = await playback_service.mark_watched_until(request.dir, request.season, request.episode)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, **result}
+
+
+@app.get("/api/library/progress/summary")
+async def read_library_progress_summary(request: Request, dirs: str = Query(""), token: str = "") -> Dict[str, Any]:
+    """海报墙角标的批量播放摘要（dirs 用 | 分隔，最多 100 个）。"""
+    _guard_library_token(request, token)
+    dir_list = [d for d in str(dirs or "").split("|") if d][:100]
+    summaries = await asyncio.to_thread(movie_library_db.playback_summaries, dir_list)
+    return {"ok": True, "summaries": summaries}
+
+
+@app.get("/api/library/progress/continue")
+async def read_library_progress_continue(request: Request, limit: int = 12, token: str = "") -> Dict[str, Any]:
+    """「继续观看」栏：最近播放过的作品（附播放摘要）。"""
+    _guard_library_token(request, token)
+    limit = max(1, min(24, int(limit or 12)))
+    items = await asyncio.to_thread(movie_library_db.latest_playback_works, limit)
+    summaries = await asyncio.to_thread(movie_library_db.playback_summaries, [i["dir"] for i in items])
+    for item in items:
+        item["summary"] = summaries.get(item["dir"]) or {}
+    return {"ok": True, "items": items}
+
+
+# ===== 影库删除与备份恢复：删除只在海报墙管理模式做（按来源删的入口已取消） =====
+
+
+@app.post("/api/library/works/delete")
+async def delete_library_works(request: LibraryWorksDeleteRequest, request_obj: Request) -> Dict[str, Any]:
+    """海报墙多选删除作品（连同文件与播放记录级联，只动本地数据库不动网盘）。"""
+    _guard_library_token(request_obj, request.token)
+    dirs = [str(d or "").strip() for d in (request.dirs or []) if str(d or "").strip()]
+    if not dirs:
+        raise HTTPException(status_code=400, detail="请先勾选要删除的作品")
+    if len(dirs) > 200:
+        raise HTTPException(status_code=400, detail="一次最多删除 200 个作品，请分批操作")
+    result = await asyncio.to_thread(movie_library_db.delete_works, dirs)
+    logger.info(
+        "影库删除：%d 个作品、%d 个文件、%d 条播放记录已从数据库移除",
+        result["works"], result["files"], result["playback"],
+    )
+    return {"ok": True, **result}
+
+
+@app.post("/api/library/category/delete")
+async def delete_library_category(request: LibraryCategoryDeleteRequest, request_obj: Request) -> Dict[str, Any]:
+    """删除整个分类（cat 或 cat/sub）下的全部作品。"""
+    _guard_library_token(request_obj, request.token)
+    try:
+        result = await asyncio.to_thread(
+            movie_library_db.delete_category, request.cat, request.sub,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    if not result["works"]:
+        raise HTTPException(status_code=404, detail="这个分类下没有作品")
+    logger.info(
+        "影库删除分类「%s%s」：%d 个作品、%d 个文件、%d 条播放记录已移除",
+        request.cat, f"/{request.sub}" if request.sub else "", result["works"], result["files"], result["playback"],
+    )
+    return {"ok": True, **result}
+
+
+@app.post("/api/library/backup/export")
+async def export_library_backup(request: LibraryTokenRequest, request_obj: Request) -> Dict[str, Any]:
+    """导出影库数据库备份（作品 + 文件 + 播放记录 + TMDB 整理结果，一个独立 sqlite 文件）。"""
+    _guard_library_token(request_obj, request.token)
+    cfg = _library_config()
+    export_dir = str(cfg.get("exportDir") or "").strip() or os.path.join(str(DATA_DIR), "秒传文件导出")
+    os.makedirs(export_dir, exist_ok=True)
+    fname = f"影库备份-{time.strftime('%Y%m%d-%H%M%S')}.db"
+    fpath = os.path.join(export_dir, fname)
+    try:
+        counts = await asyncio.to_thread(movie_library_db.export_backup, fpath)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    size_bytes = os.path.getsize(fpath)
+    logger.info(
+        "影库备份：已导出 %s（%d 个作品、%d 个文件、%d 条播放记录，%.1f MB）",
+        fname, counts.get("library_works", 0), counts.get("library_work_files", 0),
+        counts.get("library_playback", 0), size_bytes / 1048576,
+    )
+    return {
+        "ok": True,
+        "file": fname,
+        "path": export_dir,
+        "sizeBytes": size_bytes,
+        "works": counts.get("library_works", 0),
+        "files": counts.get("library_work_files", 0),
+        "playback": counts.get("library_playback", 0),
+    }
+
+
+@app.post("/api/library/backup/import")
+async def import_library_backup(request: LibraryBackupImportRequest, request_obj: Request) -> Dict[str, Any]:
+    """从备份文件恢复：已存在的作品跳过（保留先入库的），播放记录保留较新的一条。"""
+    _guard_library_token(request_obj, request.token)
+    src = str(request.path or "").strip()
+    if not src:
+        raise HTTPException(status_code=400, detail="请先选择备份文件")
+    try:
+        result = await asyncio.to_thread(movie_library_db.import_backup, src)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    logger.info(
+        "影库恢复：从备份导入 %d 个作品（跳过已存在 %d 个）、%d 个文件、%d 条播放记录",
+        result.get("library_works", 0), result.get("library_works_skipped", 0),
+        result.get("library_work_files", 0), result.get("library_playback", 0),
+    )
+    return {
+        "ok": True,
+        "works": result.get("library_works", 0),
+        "worksSkipped": result.get("library_works_skipped", 0),
+        "files": result.get("library_work_files", 0),
+        "playback": result.get("library_playback", 0),
+        "sources": result.get("library_sources", 0),
+    }
 
 
 @app.post("/api/transfer/kick")

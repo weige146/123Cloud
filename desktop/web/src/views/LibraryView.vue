@@ -11,14 +11,20 @@ import {
   pan115HelperApi,
   type LibraryCategory,
   type LibraryConfig,
+  type LibraryContinueItem,
   type LibraryEnrichStats,
   type LibraryFacets,
   type LibraryFile,
   type LibraryLibInfo,
+  type LibraryPlaybackSummary,
+  type LibraryPlayEntry,
+  type LibraryPlayStartResult,
+  type LibraryPlayStructure,
   type LibraryStatus,
   type LibraryTransferTask,
   type LibraryWork,
   type TmdbDetail,
+  type TmdbSeasonInfo,
 } from "@/api";
 import { formatBytes } from "@/utils/format";
 import { useGlobalState } from "@/composables/useGlobalState";
@@ -56,11 +62,16 @@ const uploading = ref(false);
 const libraryFileInput = ref<HTMLInputElement | null>(null);
 const exportDirInput = ref("");
 const videoExtensionsInput = ref("");
+const playerPathInput = ref("");
+const autoTrashInput = ref(true);
+const playCachePathInput = ref("秒传");
+const pickingPlayer = ref(false);
 const openingExportDir = ref(false);
 
 interface DesktopBridge {
   pickFolder?: (payload?: { title?: string }) => Promise<{ cancelled?: boolean; path?: string }>;
   pickFiles?: (payload?: { title?: string; filters?: Array<{ name: string; extensions: string[] }> }) => Promise<{ cancelled?: boolean; paths?: string[] }>;
+  pickPlayer?: (payload?: { title?: string }) => Promise<{ cancelled?: boolean; paths?: string[] }>;
 }
 function desktopBridge(): DesktopBridge | undefined {
   return (window as unknown as { cloud123?: DesktopBridge }).cloud123;
@@ -87,6 +98,9 @@ async function loadConfig() {
   configTransferConcurrency.value = data.config.transferConcurrency || 5;
   exportDirInput.value = data.config.exportDir || "";
   videoExtensionsInput.value = data.config.videoExtensions || "";
+  playerPathInput.value = data.config.playerPath || "";
+  autoTrashInput.value = data.config.autoTrash !== false;
+  playCachePathInput.value = data.config.playCachePath || "秒传";
   // 本机直接回填明文令牌，重启后一眼可见它还在；留空保存=保留现有令牌
   if (data.config.token) {
     configTokenInput.value = data.config.token;
@@ -101,6 +115,9 @@ async function saveConfig() {
       transferConcurrency: Number(configTransferConcurrency.value) || 5,
       exportDir: exportDirInput.value.trim(),
       videoExtensions: videoExtensionsInput.value.trim(),
+      playerPath: playerPathInput.value.trim(),
+      autoTrash: autoTrashInput.value,
+      playCachePath: playCachePathInput.value.trim(),
       token: configTokenInput.value.trim(),
       clearToken: configClearToken.value,
     });
@@ -190,15 +207,55 @@ async function importFromFolder() {
   }
 }
 
-async function deleteSource(name: string) {
-  const ok = await confirm(`删除影库来源「${name}」？其下所有作品与文件会一并移除。`, "删除影库来源");
-  if (!ok) return;
+// ===== 影库数据库备份与恢复（重装客户端后一键找回：TMDB 整理结果 + 播放记录都在备份里） =====
+const backingUp = ref(false);
+const restoring = ref(false);
+
+async function exportBackup() {
+  if (backingUp.value) return;
+  backingUp.value = true;
   try {
-    await libraryApi.deleteSource(name, apiToken.value);
-    notifySuccess(`已删除 ${name}`);
-    await Promise.all([loadStatus(), loadCategories(), loadSources(), loadFacets(), loadEnrich()]);
+    const data = await libraryApi.backupExport(apiToken.value);
+    notifySuccess(
+      `备份已导出：${data.file}（${data.works.toLocaleString()} 个作品 · ${data.files.toLocaleString()} 个文件 · ${data.playback} 条播放记录）`,
+    );
   } catch (error) {
-    notifyError(`删除失败：${error instanceof Error ? error.message : String(error)}`);
+    notifyError(`导出失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    backingUp.value = false;
+  }
+}
+
+async function importBackup() {
+  if (restoring.value) return;
+  const bridge = desktopBridge();
+  if (!bridge?.pickFiles) {
+    notifyError("浏览器模式不支持选择备份文件，请在客户端里操作");
+    return;
+  }
+  const picked = await bridge.pickFiles({
+    title: "选择影库备份文件（影库备份-日期时间.db）",
+    filters: [{ name: "影库备份", extensions: ["db"] }],
+  });
+  const path = picked?.paths?.[0];
+  if (!path) return;
+  const ok = await confirm("从备份恢复影库？已存在的作品会跳过，播放记录保留较新的一条。", "恢复影库备份");
+  if (!ok) return;
+  restoring.value = true;
+  try {
+    const data = await libraryApi.backupImport(path, apiToken.value);
+    notifySuccess(
+      `恢复完成：导入 ${data.works.toLocaleString()} 个作品（跳过已存在 ${data.worksSkipped.toLocaleString()} 个）`
+      + `${data.playback ? `、${data.playback} 条播放记录` : ""}`,
+    );
+    await Promise.all([
+      loadStatus(), loadCategories(), loadSources(), loadFacets(), loadEnrich(),
+      searchWorks(), loadContinue(), loadConfig(),
+    ]);
+  } catch (error) {
+    notifyError(`恢复失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    restoring.value = false;
   }
 }
 
@@ -232,6 +289,50 @@ async function openExportDir() {
   } finally {
     openingExportDir.value = false;
   }
+}
+
+async function saveAutoTrash(value: boolean | null) {
+  autoTrashInput.value = value !== false;
+  try {
+    const data = await libraryApi.putConfig({ autoTrash: autoTrashInput.value });
+    config.value = data.config;
+  } catch (error) {
+    notifyError(`保存失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function savePlayerPath(value: string) {
+  // 选完/切换立即保存（部分字段提交，其他设置不受影响）；不保存重进就丢了
+  playerPathInput.value = value;
+  try {
+    const data = await libraryApi.putConfig({ playerPath: value });
+    config.value = data.config;
+    if (value) notifySuccess(`播放器已固定：${value === "system" ? "系统默认播放器" : value}`);
+    else notifySuccess("已回到自动检测（IINA → mpv → VLC）");
+  } catch (error) {
+    notifyError(`保存失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function pickPlayerPath() {
+  const bridge = desktopBridge();
+  if (!bridge?.pickPlayer) {
+    notifyError("浏览器模式不支持选择播放器，请直接粘贴播放器程序路径后点保存");
+    return;
+  }
+  pickingPlayer.value = true;
+  try {
+    // 可直接选 /Applications 里的应用（IINA 会自动用它的命令行工具，其他如 Infuse.app），也可选 mpv 等程序
+    const result = await bridge.pickPlayer({ title: "选择播放器（可直接选 Applications 里的应用）" });
+    if (result?.paths?.length) await savePlayerPath(result.paths[0]);
+  } finally {
+    pickingPlayer.value = false;
+  }
+}
+
+function useSystemPlayer() {
+  // system = 交给 macOS/Windows 的默认播放器打开（不指定具体应用）
+  void savePlayerPath("system");
 }
 
 // ===== 状态 =====
@@ -290,17 +391,18 @@ const searchNotice = ref("");
 
 // ===== 分类维度筛选（对标优爱腾：频道/类型/地区/年代） =====
 const facets = ref<LibraryFacets>({
-  channels: [], genres: [], regions: [], languages: [], statuses: [],
-  resolutions: [], editions: [], decades: [], ratings: [],
+  channels: [], genres: [], regions: [], languages: [],
+  resolutions: [], editions: [], effects: [], videoCodecs: [], audioCodecs: [],
+  decades: [], ratings: [],
 });
 const activeMedia = ref("");       // "" | movie | tv
 const activeGenre = ref("");       // 类型/题材中文名（单选）
 const activeRegion = ref("");      // 地区中文桶
 const activeDecade = ref<number | "">(""); // 起始年（如 2020 表示 2020s）
 const activeLanguage = ref("");    // 语言中文桶
-const activeStatus = ref("");      // 剧集更新状态
 const activeResolution = ref("");  // 分辨率 4K/1080p/720p/SD
 const activeEdition = ref("");     // 片源版本 REMUX/BluRay/WEB-DL/...
+const activeTech = ref("");        // 技术属性 "字段:值"（dolbyVision:DV / dynamicRange:HDR10+ / videoCodec:H265 / audioCodec:TrueHD）
 const activeRating = ref(0);       // 评分下限 9/8/7，0=不限
 const sortMode = ref("");          // "" 默认 / popularity 热度 / rating 评分 / title 片名 / recent 最新入库
 
@@ -315,13 +417,13 @@ const detailWork = ref<LibraryWork | null>(null);
 
 const activeFilterCount = computed(
   () => [activeMedia.value, activeGenre.value, activeRegion.value, activeLanguage.value,
-    activeStatus.value, activeResolution.value, activeEdition.value].filter(Boolean).length
+    activeResolution.value, activeEdition.value, activeTech.value].filter(Boolean).length
     + (activeDecade.value === "" ? 0 : 1)
     + (activeRating.value > 0 ? 1 : 0),
 );
 const hasBrowseFilters = computed(() => activeFilterCount.value > 0);
 
-const CHANNEL_LABEL: Record<string, string> = { movie: "电影", tv: "剧集" };
+const CHANNEL_LABEL: Record<string, string> = { movie: "电影", tv: "电视剧", 剧集: "电视剧" };
 function channelLabel(k: string | number): string {
   return CHANNEL_LABEL[String(k)] || String(k);
 }
@@ -383,10 +485,10 @@ async function loadFacets() {
       region: activeRegion.value,
       decade: activeDecade.value === "" ? 0 : Number(activeDecade.value),
       language: activeLanguage.value,
-      status: activeStatus.value,
       resolution: activeResolution.value,
       edition: activeEdition.value,
       rating: activeRating.value,
+      tech: activeTech.value,
       lib: libFilter.value.join(","),
       q: keyword.value.trim(),
       token: apiToken.value,
@@ -438,9 +540,9 @@ function toggleGenre(v: string) { activeGenre.value = activeGenre.value === v ? 
 function toggleRegion(v: string) { activeRegion.value = activeRegion.value === v ? "" : v; onFilterChange(); }
 function toggleDecade(v: number) { activeDecade.value = activeDecade.value === v ? "" : v; onFilterChange(); }
 function toggleLanguage(v: string) { activeLanguage.value = activeLanguage.value === v ? "" : v; onFilterChange(); }
-function toggleStatus(v: string) { activeStatus.value = activeStatus.value === v ? "" : v; onFilterChange(); }
 function toggleResolution(v: string) { activeResolution.value = activeResolution.value === v ? "" : v; onFilterChange(); }
 function toggleEdition(v: string) { activeEdition.value = activeEdition.value === v ? "" : v; onFilterChange(); }
+function toggleTech(v: string) { activeTech.value = activeTech.value === v ? "" : v; onFilterChange(); }
 function toggleRating(v: number) { activeRating.value = activeRating.value === v ? 0 : v; onFilterChange(); }
 function clearFilters() {
   activeMedia.value = "";
@@ -448,9 +550,9 @@ function clearFilters() {
   activeRegion.value = "";
   activeDecade.value = "";
   activeLanguage.value = "";
-  activeStatus.value = "";
   activeResolution.value = "";
   activeEdition.value = "";
+  activeTech.value = "";
   activeRating.value = 0;
   onFilterChange();
 }
@@ -471,9 +573,9 @@ async function searchWorks(record = false) {
       region: activeRegion.value,
       decade: activeDecade.value === "" ? 0 : Number(activeDecade.value),
       language: activeLanguage.value,
-      status: activeStatus.value,
       edition: activeEdition.value,
       rating: activeRating.value,
+      tech: activeTech.value,
       sort: sortMode.value,
       page: page.value,
       size: pageSize.value,
@@ -482,6 +584,7 @@ async function searchWorks(record = false) {
     });
     works.value = data.dirs || [];
     totalWorks.value = data.total;
+    void loadProgressSummaries();
     if (data.total === 0) {
       searchNotice.value = keyword.value.trim()
         ? "没有找到匹配的片名"
@@ -513,24 +616,31 @@ const resultInfo = computed(() => {
     activeGenre.value,
     activeRegion.value,
     activeLanguage.value,
-    activeStatus.value,
     activeResolution.value,
     activeEdition.value,
+    activeTech.value ? techChipLabel(activeTech.value) : "",
     activeDecade.value === "" ? "" : decadeLabel(activeDecade.value),
     activeRating.value > 0 ? ratingLabel(activeRating.value) : "",
   ].filter(Boolean);
   return `${parts.length ? parts.join(" · ") : "全部"} 共 ${totalWorks.value.toLocaleString()} 个作品 · ${SORT_LABEL[sortMode.value]}`;
 });
 
-// 详情弹层：点击海报打开，展开文件列表 + TMDB 详情（评分/类型/简介）
+// 详情弹层：点击海报打开，展开文件列表 + TMDB 详情（评分/类型/简介）+ 季海报墙
 function openDetail(work: LibraryWork) {
   detailWork.value = work;
   detailOpen.value = true;
+  detailSeason.value = null;
+  playStructure.value = null;
+  seasonInfos.value = {};
   void toggleWorkFiles(work);
+  void loadPlayStructure(work);
 }
 function closeDetail() {
   detailOpen.value = false;
   detailWork.value = null;
+  playStructure.value = null;
+  playStructureDir.value = "";
+  detailSeason.value = null;
 }
 
 function goToPage(next: number) {
@@ -602,7 +712,7 @@ async function fetchTmdbDetail(work: LibraryWork): Promise<TmdbDetail | null> {
 }
 
 // 作品海报组件：失败/无图时回退为类型 emoji 占位（剧集📺/电影🎬）
-const TV_CATS = ["电视剧", "剧集", "动漫", "短剧"];
+const TV_CATS = ["电视剧", "剧集", "动漫", "短剧", "纪录片", "综艺", "儿童"];
 const WorkPoster = defineComponent({
   name: "WorkPoster",
   props: {
@@ -914,6 +1024,379 @@ async function pollTransferTask(taskId: string) {
   transferTimer = window.setInterval(tick, 1500);
 }
 
+// ===== 播放：海报墙点播 / 播放记录 / 季海报墙（后端转存当季 → 本地播放器拉 m3u） =====
+const playBusy = ref("");
+const progressSummaries = ref<Record<string, LibraryPlaybackSummary>>({});
+const continueItems = ref<LibraryContinueItem[]>([]);
+const playStructure = ref<LibraryPlayStructure | null>(null);
+const playStructureLoading = ref(false);
+const playStructureDir = ref("");
+const detailSeason = ref<number | null>(null); // null = 季卡片网格；数字 = 该季集列表
+const seasonInfos = ref<Record<number, TmdbSeasonInfo | null>>({});
+let playRefreshTimer: number | undefined;
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+function fmtClock(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h ? `${h}:${pad2(m)}:${pad2(s)}` : `${m}:${pad2(s)}`;
+}
+
+async function loadProgressSummaries() {
+  const dirs = works.value.map((w) => w.dir).slice(0, 100);
+  if (!dirs.length) {
+    progressSummaries.value = {};
+    return;
+  }
+  try {
+    const data = await libraryApi.progressSummary(dirs, apiToken.value);
+    progressSummaries.value = data.summaries || {};
+  } catch {
+    /* 静默：角标只是锦上添花 */
+  }
+}
+
+async function loadContinue() {
+  try {
+    const data = await libraryApi.progressContinue(apiToken.value, 12);
+    continueItems.value = (data.items || []).filter((item) => item.recordCount > 0);
+  } catch {
+    /* 静默 */
+  }
+}
+
+interface PlayBadge { kind: "playing" | "resume" | "seen" | "seen-partial"; label: string }
+
+function playBadge(work: LibraryWork): PlayBadge | null {
+  const summary = progressSummaries.value[work.dir];
+  if (!summary || !summary.recordCount) return null;
+  if (work.videoCount > 0 && summary.watchedCount >= work.videoCount) {
+    return { kind: "seen", label: "已看完" };
+  }
+  // 「续看」直接给下一个没看的集，和点播放的实际起播一致
+  if (summary.nextEpisode) {
+    const tag = summary.nextSeason ? `S${pad2(summary.nextSeason)}E${pad2(summary.nextEpisode)}` : `E${pad2(summary.nextEpisode)}`;
+    return { kind: "resume", label: `续看 ${tag}` };
+  }
+  if (!summary.lastEpisode && !summary.lastSeason) return null;
+  const tag = summary.lastSeason ? `S${pad2(summary.lastSeason)}E${pad2(summary.lastEpisode)}` : "";
+  if (summary.lastWatched) {
+    return { kind: "seen-partial", label: tag ? `看到 ${tag}` : "已看过" };
+  }
+  return { kind: "resume", label: tag ? `续看 ${tag}` : "继续看" };
+}
+
+function continueWork(item: LibraryContinueItem): LibraryWork {
+  return {
+    dir: item.dir, title: item.title, year: item.year, tmdbId: item.tmdbId,
+    mediaType: item.mediaType, videoCount: item.videoCount,
+  } as LibraryWork;
+}
+
+function continueLabel(item: LibraryContinueItem): string {
+  const summary = item.summary as LibraryPlaybackSummary | undefined;
+  if (summary && summary.nextEpisode) {
+    const tag = summary.nextSeason ? `S${pad2(summary.nextSeason)}E${pad2(summary.nextEpisode)}` : `E${pad2(summary.nextEpisode)}`;
+    return `续看 ${tag}`;
+  }
+  if (summary && summary.lastSeason) {
+    return `${summary.lastWatched ? "看到" : "续看"} S${pad2(summary.lastSeason)}E${pad2(summary.lastEpisode)}`;
+  }
+  return "继续播放";
+}
+
+function episodeProgress(entry: LibraryPlayEntry): number {
+  if (entry.watched) return 100;
+  if (!entry.durationSec || !entry.positionSec) return 0;
+  return Math.min(100, Math.round((entry.positionSec / entry.durationSec) * 100));
+}
+
+function currentSeason() {
+  if (!playStructure.value || detailSeason.value == null) return null;
+  return playStructure.value.seasons.find((s) => s.season === detailSeason.value) || null;
+}
+
+// 筛选值 "dolbyVision:DV" → 显示 "DV"
+function techChipLabel(tech: string): string {
+  return tech.split(":")[1] || tech;
+}
+
+// 详情技术属性标签（文件名细识别）：[资源类型, DV, HDR, 视频/音频编码, 帧率, HQ, 地区版…]
+const techLabels = computed<string[]>(() => {
+  const tech = playStructure.value?.tech;
+  if (!tech) return [];
+  return [
+    tech.resourceType,
+    tech.dolbyVision,
+    tech.dynamicRange,
+    tech.videoCodec,
+    tech.audioCodec,
+    tech.frameRate,
+    tech.highQuality,
+    ...(tech.originalEdition || []),
+  ].filter(Boolean);
+});
+
+function episodeName(season: number, episode: number): string {
+  const info = seasonInfos.value[season];
+  return info?.episodes?.find((e) => e.episode === episode)?.name || "";
+}
+
+async function loadPlayStructure(work: LibraryWork, silent = false) {
+  playStructureDir.value = work.dir;
+  if (!silent) playStructureLoading.value = true;
+  try {
+    const data = await libraryApi.playStructure(work.dir, apiToken.value);
+    if (playStructureDir.value !== work.dir) return;
+    playStructure.value = data;
+    // TMDB 季海报与分集名（失败静默：海报墙退化为「第 N 季」卡片）
+    if (data.tmdbId && data.seasons.length) {
+      await Promise.all(data.seasons.map(async (s) => {
+        if (seasonInfos.value[s.season] !== undefined) return;
+        try {
+          const result = await libraryApi.tmdbSeason(data.tmdbId as number, s.season, apiToken.value);
+          seasonInfos.value[s.season] = result.season || null;
+        } catch {
+          seasonInfos.value[s.season] = null;
+        }
+      }));
+    }
+  } catch (error) {
+    if (!silent) notifyError(`读取剧集结构失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    playStructureLoading.value = false;
+  }
+}
+
+function openSeason(season: number) {
+  detailSeason.value = season;
+}
+
+function backToSeasons() {
+  detailSeason.value = null;
+}
+
+function seasonPosterUrl(season: number): string {
+  return seasonInfos.value[season]?.posterUrl || "";
+}
+
+async function startPlay(work: LibraryWork, payload: { season?: number; episode?: number; filePath?: string; resume?: boolean }) {
+  if (playBusy.value) return;
+  playBusy.value = work.dir;
+  try {
+    const result: LibraryPlayStartResult = await libraryApi.playStart({
+      dir: work.dir,
+      season: payload.season,
+      episode: payload.episode,
+      filePath: payload.filePath,
+      resume: payload.resume,
+      token: apiToken.value,
+    });
+    notifySuccess(
+      `已交给 ${result.playerLabel} 播放：《${result.title}》从 ${result.startLabel} 开始`
+      + `${result.resumeSeconds ? `（续播 ${fmtClock(result.resumeSeconds)}）` : ""}，共 ${result.itemCount} 个文件`,
+    );
+    if (result.note) window.setTimeout(() => notifyError(result.note), 1200);
+    if (result.missed?.length) {
+      notifyError(`${result.missed.length} 个文件没转存成功（秒传未命中），已跳过`);
+    }
+    await Promise.all([
+      loadProgressSummaries(),
+      loadContinue(),
+      playStructureDir.value === work.dir ? loadPlayStructure(work, true) : Promise.resolve(),
+    ]);
+  } catch (error) {
+    notifyError(`播放失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    playBusy.value = "";
+  }
+}
+
+function playWork(work: LibraryWork) {
+  // 海报墙默认播放：有记录则从第一个没看完的集续播，没有则从 S01E01 开始
+  void startPlay(work, { resume: true });
+}
+
+function playSeason(work: LibraryWork, season: number) {
+  void startPlay(work, { season });
+}
+
+function playEpisode(work: LibraryWork, entry: LibraryPlayEntry) {
+  if (entry.season) void startPlay(work, { season: entry.season, episode: entry.episode });
+  else void startPlay(work, { filePath: entry.path });
+}
+
+function playFilePath(work: LibraryWork, filePath: string) {
+  void startPlay(work, { filePath });
+}
+
+async function toggleEpisodeWatched(work: LibraryWork, entry: LibraryPlayEntry) {
+  try {
+    await libraryApi.progressMark(work.dir, entry.path, !entry.watched, apiToken.value);
+    entry.watched = !entry.watched;
+    if (entry.watched) entry.positionSec = 0;
+    void loadProgressSummaries();
+  } catch (error) {
+    notifyError(`标记失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// 「看到第 N 集」：一键把该季 1..N 标已看、之后标未看（新标已看的文件照常移回收站）
+const markUntilSeason = ref<number | null>(null);
+const markUntilEpisode = ref(1);
+const markingUntil = ref(false);
+
+function openMarkUntil(season: number) {
+  const current = currentSeason();
+  const firstUnwatched = current?.episodes.find((e) => !e.watched);
+  markUntilSeason.value = season;
+  markUntilEpisode.value = firstUnwatched?.episode || current?.episodes[current.episodes.length - 1]?.episode || 1;
+}
+
+async function confirmMarkUntil(work: LibraryWork) {
+  const season = markUntilSeason.value;
+  if (!season || markingUntil.value) return;
+  const ok = await confirm(
+    `标记「看到 S${pad2(season)}E${pad2(markUntilEpisode.value)}」？`
+    + ` 这一集之前的都会标成已看（对应文件移入回收站${config.value?.autoTrash === false ? "——已关闭自动清理，本次不回收" : ""}），之后的标成未看。`,
+    "标记看到哪一集",
+  );
+  if (!ok) return;
+  markingUntil.value = true;
+  try {
+    const data = await libraryApi.progressMarkUntil(work.dir, season, markUntilEpisode.value, apiToken.value);
+    notifySuccess(
+      `已标记看到 S${pad2(season)}E${pad2(markUntilEpisode.value)}`
+      + `（新标已看 ${data.markedWatched} 集、取消已看 ${data.markedUnwatched} 集${data.trashed ? `、回收 ${data.trashed} 个文件` : ""}）`,
+    );
+    markUntilSeason.value = null;
+    await Promise.all([loadPlayStructure(work, true), loadProgressSummaries(), loadContinue()]);
+  } catch (error) {
+    notifyError(`标记失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    markingUntil.value = false;
+  }
+}
+
+watch(detailOpen, (open) => {
+  window.clearInterval(playRefreshTimer);
+  if (open) {
+    // 播放中每 5 秒静默刷新集列表（已看/断点由播放器回传，后台随时更新）
+    playRefreshTimer = window.setInterval(() => {
+      const structure = playStructure.value;
+      if (detailWork.value && structure?.active) {
+        void loadPlayStructure(detailWork.value, true);
+        void loadProgressSummaries();
+      }
+    }, 5000);
+  }
+});
+
+// ===== 海报墙管理模式：多选删作品 / 整分类删（删除入口只在这里，按来源删的旧入口已取消） =====
+const manageMode = ref(false);
+const selectedWorkDirs = ref<Set<string>>(new Set());
+const deletingWorks = ref(false);
+const deletingCategory = ref(false);
+const categoryDeleteTarget = ref("");
+
+const categoryOptions = computed(() => {
+  const options: Array<{ title: string; value: string; count: number }> = [];
+  for (const cat of categories.value) {
+    if (!cat.name || cat.name === "全部文件") continue;
+    options.push({ title: cat.name, value: cat.name, count: cat.count });
+    for (const sub of cat.subs || []) {
+      options.push({ title: `${cat.name} / ${sub.name}`, value: `${cat.name}/${sub.name}`, count: sub.count });
+    }
+  }
+  return options;
+});
+
+function toggleManage() {
+  manageMode.value = !manageMode.value;
+  if (!manageMode.value) selectedWorkDirs.value = new Set();
+}
+
+function toggleWorkSelect(work: LibraryWork) {
+  const next = new Set(selectedWorkDirs.value);
+  if (next.has(work.dir)) next.delete(work.dir);
+  else next.add(work.dir);
+  selectedWorkDirs.value = next;
+}
+
+const allPageSelected = computed(
+  () => works.value.length > 0 && works.value.every((w) => selectedWorkDirs.value.has(w.dir)),
+);
+
+function selectAllPage() {
+  selectedWorkDirs.value = allPageSelected.value
+    ? new Set()
+    : new Set([...selectedWorkDirs.value, ...works.value.map((w) => w.dir)]);
+}
+
+async function refreshAfterDeletion() {
+  await Promise.all([
+    loadStatus(), loadCategories(), loadSources(), loadFacets(), loadEnrich(),
+    searchWorks(), loadContinue(),
+  ]);
+}
+
+async function deleteSelectedWorks() {
+  const dirs = Array.from(selectedWorkDirs.value);
+  if (!dirs.length) {
+    notifyError("请先点选要删除的作品");
+    return;
+  }
+  const ok = await confirm(
+    `删除选中的 ${dirs.length} 个作品？会连同文件与播放记录一起从本地数据库移除（不影响网盘里的文件，也不影响秒传 JSON 原文件）。`,
+    "删除作品",
+  );
+  if (!ok) return;
+  deletingWorks.value = true;
+  try {
+    const data = await libraryApi.worksDelete(dirs, apiToken.value);
+    notifySuccess(`已删除 ${data.works} 个作品${data.files ? `、${data.files.toLocaleString()} 个文件` : ""}`);
+    selectedWorkDirs.value = new Set();
+    await refreshAfterDeletion();
+  } catch (error) {
+    notifyError(`删除失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    deletingWorks.value = false;
+  }
+}
+
+async function deleteChosenCategory() {
+  const value = categoryDeleteTarget.value;
+  if (!value) {
+    notifyError("先选择要删除的分类");
+    return;
+  }
+  const separator = value.indexOf("/");
+  const cat = separator < 0 ? value : value.slice(0, separator);
+  const sub = separator < 0 ? "" : value.slice(separator + 1);
+  const label = sub ? `「${cat} / ${sub}」` : `「${cat}」`;
+  const ok = await confirm(
+    `删除分类${label}下的全部作品？连同文件与播放记录一起从本地数据库移除，删完就找不回来了（网盘文件不受影响）。`,
+    "删除整个分类",
+  );
+  if (!ok) return;
+  deletingCategory.value = true;
+  try {
+    const data = await libraryApi.categoryDelete(cat, sub, apiToken.value);
+    notifySuccess(`已删除分类${label}：${data.works} 个作品${data.files ? `、${data.files.toLocaleString()} 个文件` : ""}`);
+    categoryDeleteTarget.value = "";
+    await refreshAfterDeletion();
+  } catch (error) {
+    notifyError(`删除失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    deletingCategory.value = false;
+  }
+}
+
 // ===== 存储分析 =====
 const storageRings = computed(() => {
   let offset = 25;
@@ -954,9 +1437,9 @@ function saveUiState() {
       activeRegion: activeRegion.value,
       activeDecade: activeDecade.value,
       activeLanguage: activeLanguage.value,
-      activeStatus: activeStatus.value,
       activeResolution: activeResolution.value,
       activeEdition: activeEdition.value,
+      activeTech: activeTech.value,
       activeRating: activeRating.value,
       sortMode: sortMode.value,
       page: page.value,
@@ -976,9 +1459,9 @@ function restoreUiState() {
     activeRegion.value = String(state.activeRegion || "");
     activeDecade.value = state.activeDecade === "" || state.activeDecade == null ? "" : Number(state.activeDecade);
     activeLanguage.value = String(state.activeLanguage || "");
-    activeStatus.value = String(state.activeStatus || "");
     activeResolution.value = String(state.activeResolution || "");
     activeEdition.value = String(state.activeEdition || "");
+    activeTech.value = String(state.activeTech || "");
     activeRating.value = Number(state.activeRating || 0);
     sortMode.value = String(state.sortMode || "");
     page.value = Math.max(1, Number(state.page) || 1);
@@ -989,8 +1472,8 @@ function restoreUiState() {
 }
 
 watch(
-  [tab, activeMedia, activeGenre, activeRegion, activeDecade, activeLanguage, activeStatus,
-    activeResolution, activeEdition, activeRating, sortMode, page, keyword],
+  [tab, activeMedia, activeGenre, activeRegion, activeDecade, activeLanguage,
+    activeResolution, activeEdition, activeTech, activeRating, sortMode, page, keyword],
   saveUiState,
 );
 
@@ -998,7 +1481,7 @@ onMounted(async () => {
   restoreUiState();
   await Promise.all([
     loadConfig(), loadStatus(), loadCategories(), loadSources(),
-    loadFacets(), loadEnrich(), searchWorks(),
+    loadFacets(), loadEnrich(), searchWorks(), loadContinue(),
   ]);
   statusTimer = window.setInterval(loadStatus, 30000);
   enrichTimer = window.setInterval(loadEnrich, 8000);
@@ -1008,6 +1491,7 @@ onUnmounted(() => {
   window.clearInterval(statusTimer);
   window.clearInterval(enrichTimer);
   window.clearInterval(transferTimer);
+  window.clearInterval(playRefreshTimer);
   window.clearTimeout(searchDebounce);
 });
 </script>
@@ -1031,6 +1515,29 @@ onUnmounted(() => {
         <StatTile label="文件数" :value="status?.fileCount ?? 0" icon="mdi-file-multiple-outline" tone="info" />
         <StatTile label="总大小" :value="status?.totalSizeLabel || '0 B'" icon="mdi-harddisk" tone="success" />
       </div>
+
+      <GlassCard
+        v-if="continueItems.length"
+        accent="success" icon="mdi-play" title="继续观看"
+        desc="最近播放过的作品，点一下从上次看到的地方继续（后台会先自动转存当季文件，再交给本地播放器）。"
+      >
+        <div class="continue-rail">
+          <div v-for="item in continueItems" :key="item.dir" class="continue-card" @click="playWork(continueWork(item))">
+            <div class="continue-poster">
+              <WorkPoster :work="continueWork(item)" :fetch-poster="fetchPoster" />
+            </div>
+            <div class="continue-info">
+              <div class="continue-title" :title="item.title">{{ item.title }}</div>
+              <div class="continue-sub">{{ continueLabel(item) }}</div>
+              <v-btn
+                size="x-small" color="primary" variant="tonal" prepend-icon="mdi-play"
+                :loading="playBusy === item.dir" :disabled="Boolean(playBusy)"
+                @click.stop="playWork(continueWork(item))"
+              >播放</v-btn>
+            </div>
+          </div>
+        </div>
+      </GlassCard>
 
       <GlassCard accent="group" icon="mdi-magnify" title="海报墙" desc="按 TMDB 分类（频道 / 类型 / 地区 / 年代）筛选浏览；点击海报查看详情、导出或转存。片名搜索仍可用。">
         <div class="search-row">
@@ -1057,6 +1564,12 @@ onUnmounted(() => {
           />
           <v-btn color="primary" prepend-icon="mdi-magnify" :loading="searching" @click="runSearch">搜索</v-btn>
           <v-btn variant="outlined" prepend-icon="mdi-refresh" :loading="scanning" @click="refreshLibrary">刷新</v-btn>
+          <v-btn
+            variant="outlined"
+            :prepend-icon="manageMode ? 'mdi-check' : 'mdi-check-circle-outline'"
+            :color="manageMode ? 'error' : undefined"
+            @click="toggleManage"
+          >{{ manageMode ? "完成" : "管理" }}</v-btn>
         </div>
 
         <div v-if="!keyword.trim() && history.length" class="history-row">
@@ -1176,20 +1689,6 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div v-if="facets.statuses.length" class="facet-row">
-            <span class="facet-label">状态</span>
-            <div class="facet-chips">
-              <button
-                v-for="s in facets.statuses"
-                :key="s.name"
-                type="button"
-                class="cat-chip"
-                :class="{ active: activeStatus === String(s.name) }"
-                @click="toggleStatus(String(s.name))"
-              >{{ s.name }}<small>{{ s.count }}</small></button>
-            </div>
-          </div>
-
           <div v-if="facets.resolutions.length" class="facet-row">
             <span class="facet-label">画质</span>
             <div class="facet-chips">
@@ -1221,6 +1720,48 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <div v-if="facets.effects.length" class="facet-row">
+            <span class="facet-label">特效</span>
+            <div class="facet-chips">
+              <button
+                v-for="e in facets.effects"
+                :key="`fx-${e.name}`"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeTech === (e.name === 'DV' ? 'dolbyVision:DV' : `dynamicRange:${e.name}`) }"
+                @click="toggleTech(e.name === 'DV' ? 'dolbyVision:DV' : `dynamicRange:${e.name}`)"
+              >{{ e.name }}<small>{{ e.count }}</small></button>
+            </div>
+          </div>
+
+          <div v-if="facets.videoCodecs.length" class="facet-row">
+            <span class="facet-label">编码</span>
+            <div class="facet-chips">
+              <button
+                v-for="c in facets.videoCodecs"
+                :key="`vc-${c.name}`"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeTech === `videoCodec:${c.name}` }"
+                @click="toggleTech(`videoCodec:${c.name}`)"
+              >{{ c.name }}<small>{{ c.count }}</small></button>
+            </div>
+          </div>
+
+          <div v-if="facets.audioCodecs.length" class="facet-row">
+            <span class="facet-label">音轨</span>
+            <div class="facet-chips">
+              <button
+                v-for="a in facets.audioCodecs"
+                :key="`ac-${a.name}`"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeTech === `audioCodec:${a.name}` }"
+                @click="toggleTech(`audioCodec:${a.name}`)"
+              >{{ a.name }}<small>{{ a.count }}</small></button>
+            </div>
+          </div>
+
           <div v-if="facets.ratings.length" class="facet-row">
             <span class="facet-label">评分</span>
             <div class="facet-chips">
@@ -1235,9 +1776,36 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div v-if="!facets.channels.length && !facets.genres.length && !facets.regions.length && !facets.decades.length && !facets.languages.length && !facets.statuses.length && !facets.resolutions.length && !facets.editions.length && !facets.ratings.length" class="muted-hint">
+          <div v-if="!facets.channels.length && !facets.genres.length && !facets.regions.length && !facets.decades.length && !facets.languages.length && !facets.resolutions.length && !facets.editions.length && !facets.effects.length && !facets.videoCodecs.length && !facets.audioCodecs.length && !facets.ratings.length" class="muted-hint">
             还没有可用的分类维度——导入带 {tmdb-N} / [tmdb-N] 标记的影库文件后，点「立即整理」拉取 TMDB 分类即可出现。
           </div>
+        </div>
+
+        <div v-if="manageMode" class="manage-bar">
+          <v-btn size="small" variant="text" @click="selectAllPage">{{ allPageSelected ? "取消全选本页" : "全选本页" }}</v-btn>
+          <span class="muted-hint">已选 {{ selectedWorkDirs.size }} 个作品</span>
+          <v-btn
+            size="small" color="error" variant="tonal" prepend-icon="mdi-delete-outline"
+            :loading="deletingWorks" :disabled="!selectedWorkDirs.size"
+            @click="deleteSelectedWorks"
+          >删除所选</v-btn>
+          <v-spacer />
+          <v-select
+            v-model="categoryDeleteTarget"
+            :items="categoryOptions"
+            item-title="title"
+            item-value="value"
+            label="按分类删除"
+            variant="outlined"
+            density="compact"
+            hide-details
+            class="category-delete-select"
+          />
+          <v-btn
+            size="small" color="error" variant="outlined" prepend-icon="mdi-delete-outline"
+            :loading="deletingCategory" :disabled="!categoryDeleteTarget"
+            @click="deleteChosenCategory"
+          >删除该分类</v-btn>
         </div>
 
         <div v-if="resultInfo" class="result-info">{{ resultInfo }}</div>
@@ -1245,12 +1813,32 @@ onUnmounted(() => {
 
         <div v-if="searching" class="empty-state"><p>加载中…</p></div>
         <div v-else-if="works.length" class="poster-grid">
-          <div v-for="work in works" :key="work.dir" class="poster-card" @click="openDetail(work)">
+          <div
+            v-for="work in works"
+            :key="work.dir"
+            class="poster-card"
+            :class="{ selecting: manageMode, picked: manageMode && selectedWorkDirs.has(work.dir) }"
+            @click="manageMode ? toggleWorkSelect(work) : openDetail(work)"
+          >
             <div class="poster-box">
               <WorkPoster :work="work" :fetch-poster="fetchPoster" />
+              <span v-if="manageMode" class="poster-pick-mark" :class="{ on: selectedWorkDirs.has(work.dir) }">
+                <v-icon :icon="selectedWorkDirs.has(work.dir) ? 'mdi-check-circle' : 'mdi-circle-outline'" size="22" />
+              </span>
               <span v-if="work.mediaType" class="poster-badge">{{ channelLabel(work.mediaType) }}</span>
               <span v-else-if="work.tmdbStatus === 'pending'" class="poster-badge pending">整理中…</span>
               <span v-else-if="!work.tmdbId" class="poster-badge uncategorized">未分类</span>
+              <span v-if="playBadge(work)" class="poster-play-badge" :class="playBadge(work)!.kind">{{ playBadge(work)!.label }}</span>
+              <button
+                v-if="!manageMode"
+                type="button" class="poster-play-btn"
+                :title="playBadge(work)?.kind === 'resume' ? '继续观看' : '播放（默认第一季第一集）'"
+                :disabled="Boolean(playBusy)"
+                @click.stop="playWork(work)"
+              >
+                <v-icon :icon="playBadge(work)?.kind === 'resume' ? 'mdi-restore' : 'mdi-play'" size="22" />
+                <span v-if="playBusy === work.dir" class="poster-play-busy">转存中…</span>
+              </button>
             </div>
             <div class="poster-title" :title="work.dir">{{ work.title }}</div>
             <div class="poster-sub">{{ work.year || "—" }}</div>
@@ -1352,6 +1940,48 @@ onUnmounted(() => {
         </FormField>
       </GlassCard>
 
+      <GlassCard icon="mdi-play" title="播放" desc="点海报墙「播放」时，客户端会把当季文件秒传进网盘的「秒传」目录，再交给本地播放器连续播放；每集开播时才取 123 直链。">
+        <FormField label="本地播放器（留空 = 自动检测 IINA → mpv → VLC；可选任意应用，如 Infuse）">
+          <div class="port-row">
+            <v-text-field
+              v-model="playerPathInput"
+              label="播放器（应用或程序路径）"
+              placeholder="留空自动检测；可选 /Applications 里的应用，如 /Applications/Infuse.app"
+              variant="outlined"
+              density="compact"
+              hide-details
+              class="grow"
+            />
+            <v-btn variant="outlined" prepend-icon="mdi-folder-open-outline" :loading="pickingPlayer" @click="pickPlayerPath">选择播放器…</v-btn>
+            <v-btn variant="text" @click="useSystemPlayer">系统默认</v-btn>
+            <v-btn variant="text" @click="savePlayerPath('')">自动检测</v-btn>
+          </div>
+        </FormField>
+        <FormField hint="mpv / IINA 能把播放进度回传给客户端：断点续播、看完自动记已看并移入回收站；其他播放器（Infuse、VLC、系统默认等）没有进度回传，续播只到集，已看在集列表里手动标记。">
+          <v-switch
+            :model-value="autoTrashInput"
+            color="primary" density="compact" hide-details
+            label="看完的剧集自动移入 123 网盘回收站（回收站里可找回）"
+            @update:model-value="saveAutoTrash"
+          />
+        </FormField>
+        <FormField label="播放缓存目录（网盘根目录下，转存当季文件用；默认用原有的「秒传」目录）">
+          <div class="port-row">
+            <v-text-field
+              v-model="playCachePathInput"
+              label="播放缓存目录"
+              placeholder="秒传"
+              variant="outlined"
+              density="compact"
+              hide-details
+              class="grow"
+            />
+            <v-btn color="primary" prepend-icon="mdi-content-save" :loading="configSaving" @click="saveConfig">保存</v-btn>
+          </div>
+        </FormField>
+        <div class="muted-hint">播放要先用「设置 → 123 网盘授权」完成授权（秒传与取直链都走它）。</div>
+      </GlassCard>
+
       <GlassCard icon="mdi-key-outline" title="访问令牌" desc="开放局域网/外网访问时建议配置：影库搜索、文件、导出与转存接口将要求携带令牌。油猴脚本里填同一串令牌即可。">
         <FormGrid>
           <FormField hint="留空保存 = 保留现有令牌；勾选清除则删除。本机管理页始终能看到明文。">
@@ -1376,16 +2006,13 @@ onUnmounted(() => {
         </FormGrid>
       </GlassCard>
 
-      <GlassCard v-if="libs.length" icon="mdi-bookshelf" title="已导入影库" desc="每个导入的文件一个来源；删除来源会一并移除其作品与文件（其他来源不受影响）。">
-        <div class="hub-offline-list">
-          <div v-for="lib in libs" :key="lib.name" class="hub-offline-row">
-            <span class="lib-name"><v-icon icon="mdi-file-code-outline" size="16" />{{ lib.name }}</span>
-            <span class="share-item-meta">
-              {{ lib.fileCount }} 个作品 · {{ formatBytes(lib.totalSize) }} · 导入于 {{ lib.loadDate }}
-              <v-btn size="x-small" variant="text" color="error" prepend-icon="mdi-delete-outline" @click="deleteSource(lib.name)">删除</v-btn>
-            </span>
-          </div>
+      <GlassCard icon="mdi-database-outline" title="备份与恢复" desc="把影库数据库（作品、文件、TMDB 整理结果、播放记录）导出成一个备份文件；重装客户端后导入即可全部找回，不用重新整理分类，播放记录也都在。">
+        <div class="button-row">
+          <v-btn color="primary" prepend-icon="mdi-download" :loading="backingUp" @click="exportBackup">导出数据库备份</v-btn>
+          <v-btn variant="outlined" prepend-icon="mdi-upload" :loading="restoring" @click="importBackup">从备份恢复…</v-btn>
+          <v-btn variant="text" prepend-icon="mdi-folder-open-outline" :loading="openingExportDir" @click="openExportDir">打开导出目录</v-btn>
         </div>
+        <div class="muted-hint">备份文件（影库备份-日期时间.db）写在导出目录里；恢复时已存在的作品会跳过，播放记录保留较新的一条。</div>
       </GlassCard>
     </div>
 
@@ -1405,9 +2032,11 @@ onUnmounted(() => {
               <v-chip v-if="detailWork.mediaType" size="small" color="primary" variant="tonal">{{ channelLabel(detailWork.mediaType) }}</v-chip>
               <v-chip v-if="detailWork.region" size="small" variant="tonal">{{ detailWork.region }}</v-chip>
               <v-chip v-if="detailWork.language" size="small" variant="outlined">{{ detailWork.language }}</v-chip>
-              <v-chip v-if="detailWork.airStatus" size="small" variant="outlined">{{ detailWork.airStatus }}</v-chip>
               <v-chip v-if="detailWork.resolution" size="small" variant="outlined">{{ detailWork.resolution }}</v-chip>
-              <v-chip v-if="detailWork.edition" size="small" variant="outlined">{{ detailWork.edition }}</v-chip>
+              <!-- 资源类型优先用文件名细识别（UHD BluRay Remux 等），识别不出退化用入库版本；后面跟 DV/HDR/编码/帧率等 -->
+              <v-chip v-if="techLabels.length" size="small" variant="outlined">{{ techLabels[0] }}</v-chip>
+              <v-chip v-else-if="detailWork.edition" size="small" variant="outlined">{{ detailWork.edition }}</v-chip>
+              <v-chip v-for="label in techLabels.slice(1)" :key="label" size="small" variant="outlined">{{ label }}</v-chip>
               <v-chip v-if="detailInfo && detailInfo.voteAverage" size="small" color="warning" variant="tonal">⭐ {{ detailInfo.voteAverage.toFixed(1) }}</v-chip>
               <v-chip v-if="detailWork.tmdbId" size="small" variant="text" class="tmdb-chip">TMDB:{{ detailWork.tmdbId }}</v-chip>
               <v-chip v-if="!detailWork.tmdbId" size="small" color="grey" variant="tonal">未分类</v-chip>
@@ -1420,6 +2049,12 @@ onUnmounted(() => {
             <div class="detail-meta muted-hint">{{ detailWork.videoCount }} 个视频 · {{ detailWork.count }} 个文件 · {{ formatBytes(detailWork.totalSize) }}</div>
             <div class="work-path" :title="detailWork.dir">{{ detailWork.dir }}</div>
             <div class="detail-actions">
+              <v-btn
+                size="small" color="primary" variant="tonal"
+                :prepend-icon="playBadge(detailWork)?.kind === 'resume' ? 'mdi-restore' : 'mdi-play'"
+                :loading="playBusy === detailWork.dir" :disabled="Boolean(playBusy)"
+                @click="playWork(detailWork)"
+              >{{ playBadge(detailWork)?.kind === "resume" ? "继续播放" : "播放" }}</v-btn>
               <v-btn size="small" variant="outlined" prepend-icon="mdi-download" :loading="exporting === detailWork.dir" @click="exportWork(detailWork)">导出全部</v-btn>
               <v-btn size="small" color="success" variant="tonal" prepend-icon="mdi-fast-forward" :loading="transferBusy === detailWork.dir" :disabled="Boolean(transferBusy)" @click="submitTransferWork(detailWork)">转存全部</v-btn>
               <v-spacer />
@@ -1427,6 +2062,128 @@ onUnmounted(() => {
             </div>
           </div>
         </div>
+
+        <v-divider />
+
+        <!-- 季海报墙 / 集列表（Emby 式：季卡片 → 集列表选集播放） -->
+        <v-card-text v-if="playStructureLoading" class="detail-seasons">
+          <div class="empty-state"><p>剧集结构加载中…</p></div>
+        </v-card-text>
+        <v-card-text v-else-if="playStructure" class="detail-seasons">
+          <div v-if="playStructure.active" class="play-active-line">
+            <v-icon icon="mdi-play" size="16" />
+            正在用 {{ playStructure.active.playerLabel }} 播放：{{ playStructure.active.fileName }}
+            <template v-if="playStructure.active.positionSec">（{{ fmtClock(playStructure.active.positionSec) }}）</template>
+          </div>
+
+          <template v-if="playStructure.isSeries">
+            <template v-if="detailSeason == null">
+              <div class="season-grid">
+                <div
+                  v-for="s in playStructure.seasons"
+                  :key="s.season"
+                  class="season-card"
+                  @click="openSeason(s.season)"
+                >
+                  <div class="season-poster">
+                    <img v-if="seasonPosterUrl(s.season)" :src="seasonPosterUrl(s.season)" loading="lazy" :alt="`第 ${s.season} 季`" />
+                    <div v-else class="season-poster-fallback"><v-icon icon="mdi-movie-open-outline" size="28" /><span>第 {{ s.season }} 季</span></div>
+                    <span class="season-count">{{ s.episodes.filter((e) => e.watched).length }}/{{ s.episodes.length }}</span>
+                    <button
+                      type="button" class="season-play-btn"
+                      :disabled="Boolean(playBusy)"
+                      :title="`播放第 ${s.season} 季（从本季第一集开始）`"
+                      @click.stop="playSeason(detailWork, s.season)"
+                    ><v-icon icon="mdi-play" size="18" /></button>
+                  </div>
+                  <div class="season-name">{{ seasonInfos[s.season]?.name || `第 ${s.season} 季` }}</div>
+                  <div class="season-sub">{{ s.episodes.length }} 集 · 已看 {{ s.episodes.filter((e) => e.watched).length }}</div>
+                </div>
+              </div>
+            </template>
+
+            <template v-else-if="currentSeason()">
+              <div class="season-head">
+                <v-btn size="small" variant="text" prepend-icon="mdi-chevron-left" @click="backToSeasons">全部季</v-btn>
+                <strong>{{ seasonInfos[detailSeason]?.name || `第 ${detailSeason} 季` }}</strong>
+                <span class="muted-hint">{{ currentSeason()!.episodes.filter((e) => e.watched).length }}/{{ currentSeason()!.episodes.length }} 已看</span>
+                <v-spacer />
+                <template v-if="markUntilSeason === detailSeason">
+                  <span class="muted-hint">我看到</span>
+                  <v-select
+                    v-model="markUntilEpisode"
+                    :items="currentSeason()!.episodes.map((e) => ({ title: `第 ${e.episode} 集`, value: e.episode }))"
+                    item-title="title"
+                    item-value="value"
+                    variant="outlined"
+                    density="compact"
+                    hide-details
+                    class="mark-until-select"
+                  />
+                  <v-btn size="small" color="primary" variant="tonal" :loading="markingUntil" @click="confirmMarkUntil(detailWork)">确定</v-btn>
+                  <v-btn size="small" variant="text" @click="markUntilSeason = null">取消</v-btn>
+                </template>
+                <v-btn v-else size="small" variant="outlined" prepend-icon="mdi-check-all" @click="openMarkUntil(detailSeason!)">看到哪一集…</v-btn>
+                <v-btn
+                  size="small" color="primary" variant="tonal" prepend-icon="mdi-play"
+                  :loading="playBusy === detailWork.dir" :disabled="Boolean(playBusy)"
+                  @click="playSeason(detailWork, detailSeason!)"
+                >播放本季</v-btn>
+              </div>
+              <div class="episode-list">
+                <div
+                  v-for="ep in currentSeason()!.episodes"
+                  :key="ep.path"
+                  class="episode-row"
+                  :class="{ watched: ep.watched, current: playStructure.active && playStructure.active.season === ep.season && playStructure.active.episode === ep.episode }"
+                >
+                  <button
+                    type="button" class="episode-check"
+                    :class="{ on: ep.watched }"
+                    :title="ep.watched ? '点这里改回未看' : '点这里标记为已看（已看的文件会移入 123 回收站）'"
+                    @click="toggleEpisodeWatched(detailWork, ep)"
+                  >
+                    <v-icon :icon="ep.watched ? 'mdi-check-circle' : 'mdi-circle-outline'" size="20" />
+                    <span>{{ ep.watched ? "已看" : "未看" }}</span>
+                  </button>
+                  <div class="episode-main" @click="playEpisode(detailWork, ep)">
+                    <div class="episode-title">
+                      第 {{ ep.episode }} 集<template v-if="episodeName(ep.season, ep.episode)"> · {{ episodeName(ep.season, ep.episode) }}</template>
+                      <span v-if="ep.positionSec && !ep.watched" class="episode-resume">续播 {{ fmtClock(ep.positionSec) }}</span>
+                      <span v-if="ep.alternates.length" class="episode-alt">{{ ep.alternates.length }} 个版本</span>
+                    </div>
+                    <div class="episode-file" :title="ep.path">{{ ep.fileName }} · {{ formatBytes(ep.size) }}</div>
+                    <div v-if="episodeProgress(ep)" class="episode-progress"><div :style="{ width: `${episodeProgress(ep)}%` }" /></div>
+                  </div>
+                  <v-btn icon="mdi-play" size="small" variant="tonal" :disabled="Boolean(playBusy)" title="从这一集开始播放" @click="playEpisode(detailWork, ep)" />
+                </div>
+              </div>
+            </template>
+          </template>
+
+          <template v-else-if="playStructure.standalone">
+            <div class="movie-play-row">
+              <v-btn
+                color="primary" variant="tonal" prepend-icon="mdi-play"
+                :loading="playBusy === detailWork.dir" :disabled="Boolean(playBusy)"
+                @click="playWork(detailWork)"
+              >{{ playBadge(detailWork)?.kind === "resume" ? "继续播放" : "播放" }}</v-btn>
+              <button
+                v-if="playStructure.standalone" type="button" class="episode-check standalone-check"
+                :class="{ on: playStructure.standalone.watched }"
+                :title="playStructure.standalone.watched ? '点这里改回未看' : '点这里标记为已看（已看的文件会移入 123 回收站）'"
+                @click="toggleEpisodeWatched(detailWork, playStructure.standalone)"
+              >
+                <v-icon :icon="playStructure.standalone.watched ? 'mdi-check-circle' : 'mdi-circle-outline'" size="20" />
+                <span>{{ playStructure.standalone.watched ? "已看完" : "标记已看" }}</span>
+              </button>
+              <span v-if="playStructure.standalone.positionSec && !playStructure.standalone.watched" class="muted-hint">
+                上次看到 {{ fmtClock(playStructure.standalone.positionSec) }}
+              </span>
+              <span class="muted-hint">{{ playStructure.standalone.fileName }} · {{ formatBytes(playStructure.standalone.size) }}</span>
+            </div>
+          </template>
+        </v-card-text>
 
         <v-divider />
 
@@ -1456,6 +2213,12 @@ onUnmounted(() => {
                 <span class="share-item-meta">
                   <v-chip v-if="detailVersions.length" size="x-small" variant="tonal" class="mr-2">{{ versionLabel(file.fileName) }}</v-chip>
                   {{ formatBytes(file.size) }}{{ file.isVideo ? " · 视频" : "" }}
+                  <v-btn
+                    v-if="file.isVideo" icon="mdi-play" size="x-small" variant="text"
+                    title="把这个文件交给本地播放器"
+                    :disabled="Boolean(playBusy) || playBusy === detailWork.dir"
+                    @click.stop.prevent="playFilePath(detailWork, file.path || file.fileName)"
+                  />
                 </span>
               </label>
             </div>
@@ -2161,5 +2924,374 @@ onUnmounted(() => {
 .storage-size {
   color: var(--text-secondary);
   font-size: 12px;
+}
+
+/* ===== 播放：继续观看栏 / 海报播放按钮 / 季海报墙 / 集列表 ===== */
+.continue-rail {
+  display: flex;
+  gap: 14px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+
+.continue-card {
+  display: flex;
+  gap: 10px;
+  min-width: 230px;
+  max-width: 230px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.continue-card:hover {
+  border-color: var(--primary, #5b8def);
+}
+
+.continue-poster {
+  width: 62px;
+  flex-shrink: 0;
+}
+
+.continue-poster :deep(.work-poster) {
+  width: 100%;
+  border-radius: 6px;
+}
+
+.continue-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.continue-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.continue-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.poster-play-btn {
+  position: absolute;
+  inset: auto auto 8px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(10, 12, 18, 0.72);
+  color: #fff;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  backdrop-filter: blur(4px);
+}
+
+.poster-card:hover .poster-play-btn {
+  opacity: 1;
+}
+
+.poster-play-btn:hover {
+  transform: scale(1.06);
+  background: var(--primary, #5b8def);
+}
+
+.poster-play-busy {
+  font-size: 11px;
+}
+
+.poster-play-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #fff;
+  background: rgba(65, 198, 169, 0.9);
+  pointer-events: none;
+}
+
+.poster-play-badge.seen {
+  background: rgba(91, 141, 239, 0.92);
+}
+
+.poster-play-badge.seen-partial {
+  background: rgba(138, 147, 159, 0.92);
+}
+
+.detail-seasons {
+  padding-top: 12px;
+  padding-bottom: 4px;
+}
+
+.play-active-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
+.season-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+  gap: 14px;
+}
+
+.season-card {
+  cursor: pointer;
+  text-align: center;
+}
+
+.season-poster {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: rgba(127, 127, 127, 0.08);
+}
+
+.season-poster img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.season-poster-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 100%;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.season-count {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: #fff;
+  background: rgba(10, 12, 18, 0.72);
+}
+
+.season-play-btn {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: rgba(10, 12, 18, 0.45);
+  color: #fff;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.season-card:hover .season-play-btn {
+  opacity: 1;
+}
+
+.season-name {
+  margin-top: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.season-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.season-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.mark-until-select {
+  max-width: 130px;
+}
+
+.episode-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.episode-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: var(--radius-control);
+  border: 1px solid transparent;
+}
+
+.episode-row:hover {
+  border-color: var(--border);
+  background: rgba(127, 127, 127, 0.06);
+}
+
+.episode-row.watched .episode-title,
+.episode-row.watched .episode-file {
+  color: var(--text-secondary);
+}
+
+.episode-row.current {
+  border-color: var(--primary, #5b8def);
+}
+
+.episode-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.episode-check:hover {
+  color: var(--primary, #5b8def);
+}
+
+.episode-check span {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.episode-check.on {
+  color: #2ea886;
+}
+
+.standalone-check {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.episode-main {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.episode-title {
+  font-size: 13px;
+  font-weight: 550;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.episode-resume {
+  font-size: 11px;
+  color: var(--primary, #5b8def);
+}
+
+.episode-alt {
+  font-size: 11px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+}
+
+.episode-file {
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.episode-progress {
+  margin-top: 4px;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.2);
+  overflow: hidden;
+}
+
+.episode-progress > div {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary, #5b8def);
+}
+
+.movie-play-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+/* ===== 海报墙管理模式：多选删作品 / 整分类删 ===== */
+.manage-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-control);
+  background: rgba(127, 127, 127, 0.06);
+}
+
+.category-delete-select {
+  max-width: 280px;
+}
+
+.poster-card.selecting {
+  border-radius: 8px;
+  outline: 2px dashed transparent;
+  outline-offset: 2px;
+  transition: outline-color 0.12s ease;
+}
+
+.poster-card.picked {
+  outline-color: var(--primary, #5b8def);
+}
+
+.poster-pick-mark {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 2;
+  color: rgba(255, 255, 255, 0.85);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+  pointer-events: none;
+}
+
+.poster-pick-mark.on {
+  color: var(--primary, #5b8def);
 }
 </style>

@@ -24,7 +24,7 @@ import {
   mdiTagMultiple, mdiTagMultipleOutline, mdiTagRemove, mdiTagTextOutline, mdiThemeLightDark, mdiTimerCog,
   mdiTools, mdiTrashCanOutline, mdiTrendingDown, mdiTrendingUp, mdiTruck, mdiVideo, mdiViewDashboardOutline,
   mdiVolumeHigh, mdiWeatherNight, mdiWhiteBalanceSunny,
-  mdiAccount, mdiAccountSwitchOutline, mdiAutoFix, mdiBookshelf, mdiCellphoneArrowDown, mdiChartDonut, mdiCheck, mdiChevronLeft, mdiCloudCheckOutline, mdiCloudDownloadOutline, mdiCloudOutline, mdiCloudSyncOutline, mdiConsole, mdiConsoleLine, mdiDatabaseOutline, mdiDockLeft, mdiDownload, mdiFastForward, mdiFileCodeOutline, mdiFileHidden, mdiFlash, mdiFolderArrowRightOutline, mdiFolderOpenOutline, mdiFolderOutline, mdiFolderSearchOutline, mdiHarddisk, mdiKeyChange, mdiKeyOutline, mdiLan, mdiLinkVariant, mdiLinkVariantOff, mdiMessageOutline, mdiMoonWaningCrescent, mdiMovieOpenOutline, mdiOpenInNew, mdiPause, mdiPlay, mdiProgressDownload, mdiReload, mdiRestart, mdiRestore, mdiServer, mdiShieldCheckOutline, mdiSnowflake, mdiSnowflakeOff, mdiSwapHorizontal, mdiTextBoxOutline, mdiTimerCogOutline, mdiTruckFast, mdiTuneVariant, mdiUpload,
+  mdiAccount, mdiAccountSwitchOutline, mdiAutoFix, mdiBookshelf, mdiCellphoneArrowDown, mdiChartDonut, mdiCheck, mdiCheckAll, mdiChevronLeft, mdiCloudCheckOutline, mdiCloudDownloadOutline, mdiCloudOutline, mdiCloudSyncOutline, mdiConsole, mdiConsoleLine, mdiDatabaseOutline, mdiDockLeft, mdiDownload, mdiFastForward, mdiFileCodeOutline, mdiFileHidden, mdiFlash, mdiFolderArrowRightOutline, mdiFolderOpenOutline, mdiFolderOutline, mdiFolderSearchOutline, mdiHarddisk, mdiKeyChange, mdiKeyOutline, mdiLan, mdiLinkVariant, mdiLinkVariantOff, mdiMessageOutline, mdiMoonWaningCrescent, mdiMovieOpenOutline, mdiOpenInNew, mdiPause, mdiPlay, mdiProgressDownload, mdiReload, mdiRestart, mdiRestore, mdiServer, mdiShieldCheckOutline, mdiSnowflake, mdiSnowflakeOff, mdiSwapHorizontal, mdiTextBoxOutline, mdiTimerCogOutline, mdiTruckFast, mdiTuneVariant, mdiUpload,
 } from "@mdi/js";
 
 const iconPaths: Record<string, string> = {
@@ -196,6 +196,7 @@ const iconPaths: Record<string, string> = {
   "mdi-bookshelf": mdiBookshelf,
   "mdi-chart-donut": mdiChartDonut,
   "mdi-check": mdiCheck,
+  "mdi-check-all": mdiCheckAll,
   "mdi-cloud-download-outline": mdiCloudDownloadOutline,
   "mdi-download": mdiDownload,
   "mdi-fast-forward": mdiFastForward,

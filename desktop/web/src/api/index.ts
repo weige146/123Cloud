@@ -221,9 +221,13 @@ export interface LibraryFacets {
   genres: LibraryFacetItem[];
   regions: LibraryFacetItem[];
   languages: LibraryFacetItem[];
-  statuses: LibraryFacetItem[];
+  // 「更新中/已完结」状态维度已下线（TMDB 数据不准），后端仍返回空数组占位
+  statuses?: LibraryFacetItem[];
   resolutions: LibraryFacetItem[];
   editions: LibraryFacetItem[];
+  effects: LibraryFacetItem[];
+  videoCodecs: LibraryFacetItem[];
+  audioCodecs: LibraryFacetItem[];
   decades: LibraryFacetItem[];
   ratings: LibraryFacetItem[];
 }
@@ -283,9 +287,110 @@ export interface LibraryConfig {
   transferConcurrency: number;
   exportDir: string;
   videoExtensions: string;
+  playerPath: string;
+  autoTrash: boolean;
+  playCachePath: string;
   tokenSet: boolean;
   token: string;
   tokenPreview: string | null;
+}
+
+export interface LibraryPlayEntry {
+  season: number;
+  episode: number;
+  fileName: string;
+  path: string;
+  size: number;
+  watched: boolean;
+  positionSec: number;
+  durationSec: number;
+  alternates: Array<{ fileName: string; path: string; size: number }>;
+}
+
+export interface LibraryTechInfo {
+  resourceType: string;
+  dolbyVision: string;
+  dynamicRange: string;
+  videoCodec: string;
+  audioCodec: string;
+  frameRate: string;
+  highQuality: string;
+  originalEdition: string[];
+}
+
+export interface LibraryPlayStructure {
+  isSeries: boolean;
+  title: string;
+  tmdbId: number | null;
+  seasons: Array<{ season: number; episodes: LibraryPlayEntry[] }>;
+  standalone: LibraryPlayEntry | null;
+  tech?: LibraryTechInfo;
+  active: {
+    sessionId: string;
+    playerLabel: string;
+    fileName: string;
+    season: number;
+    episode: number;
+    positionSec: number;
+  } | null;
+}
+
+export interface LibraryPlayStartResult {
+  sessionId: string;
+  player: string;
+  playerLabel: string;
+  title: string;
+  season: number;
+  startLabel: string;
+  itemCount: number;
+  transferred: number;
+  reused: number;
+  missed: string[];
+  resumeSeconds: number;
+  note: string;
+}
+
+export interface LibraryPlaybackRecord {
+  filePath: string;
+  season: number;
+  episode: number;
+  cloudFileId: number;
+  positionSec: number;
+  durationSec: number;
+  watched: boolean;
+  updatedAt: string;
+}
+
+export interface LibraryPlaybackSummary {
+  recordCount: number;
+  watchedCount: number;
+  lastSeason: number;
+  lastEpisode: number;
+  lastWatched: boolean;
+  lastPositionSec: number;
+  lastDurationSec: number;
+  nextSeason: number;
+  nextEpisode: number;
+}
+
+export interface LibraryContinueItem {
+  dir: string;
+  title: string;
+  year: number | null;
+  tmdbId: number | null;
+  mediaType: string;
+  videoCount: number;
+  recordCount: number;
+  watchedCount: number;
+  updatedAt: string;
+  summary: LibraryPlaybackSummary | Record<string, never>;
+}
+
+export interface TmdbSeasonInfo {
+  seasonNumber: number;
+  name: string;
+  posterUrl: string;
+  episodes: Array<{ episode: number; name: string; airDate: string }>;
 }
 
 export interface LibraryFastlinkJson {
@@ -358,7 +463,7 @@ export const libraryApi = {
     api.post<{ ok: boolean }>("/api/library/sources/delete", { name, token }),
   categories: (token: string) =>
     api.get<{ ok: boolean; categories: LibraryCategory[] }>(`/api/library/categories${libraryTokenQuery(token)}`),
-  facets: (params: { mediaType?: string; genre?: string; region?: string; decade?: number; lib?: string; q?: string; language?: string; status?: string; resolution?: string; edition?: string; rating?: number; token?: string }) => {
+  facets: (params: { mediaType?: string; genre?: string; region?: string; decade?: number; lib?: string; q?: string; language?: string; status?: string; resolution?: string; edition?: string; rating?: number; tech?: string; token?: string }) => {
     const query = new URLSearchParams();
     if (params.mediaType) query.set("mediaType", params.mediaType);
     if (params.genre) query.set("genre", params.genre);
@@ -369,6 +474,7 @@ export const libraryApi = {
     if (params.resolution) query.set("resolution", params.resolution);
     if (params.edition) query.set("edition", params.edition);
     if (params.rating) query.set("rating", String(params.rating));
+    if (params.tech) query.set("tech", params.tech);
     if (params.lib) query.set("lib", params.lib);
     if (params.q) query.set("q", params.q);
     if (params.token) query.set("token", params.token);
@@ -381,7 +487,7 @@ export const libraryApi = {
     api.post<{ ok: boolean; processed: number; stats: LibraryEnrichStats }>("/api/library/enrich/start", { token }),
   enrichReset: (token: string, refreshAll = false) =>
     api.post<{ ok: boolean; requeued: number; stats: LibraryEnrichStats }>("/api/library/enrich/reset", { token, refreshAll }),
-  search: (params: { q?: string; cat?: string; sub?: string; page?: number; size?: number; lib?: string; mediaType?: string; genre?: string; region?: string; decade?: number; sort?: string; language?: string; status?: string; edition?: string; rating?: number; token?: string }) => {
+  search: (params: { q?: string; cat?: string; sub?: string; page?: number; size?: number; lib?: string; mediaType?: string; genre?: string; region?: string; decade?: number; sort?: string; language?: string; status?: string; edition?: string; rating?: number; tech?: string; token?: string }) => {
     const query = new URLSearchParams();
     if (params.q) query.set("q", params.q);
     if (params.cat) query.set("cat", params.cat);
@@ -395,6 +501,7 @@ export const libraryApi = {
     if (params.status) query.set("status", params.status);
     if (params.edition) query.set("edition", params.edition);
     if (params.rating) query.set("rating", String(params.rating));
+    if (params.tech) query.set("tech", params.tech);
     query.set("page", String(params.page ?? 1));
     query.set("size", String(params.size ?? 20));
     if (params.lib) query.set("lib", params.lib);
@@ -445,6 +552,46 @@ export const libraryApi = {
     ),
   transferCancel: (taskId: string, token: string) =>
     api.post<{ ok: boolean }>("/api/library/transfer/cancel", { taskId, token }),
+  playStart: (payload: { dir: string; season?: number; episode?: number; filePath?: string; resume?: boolean; token: string }) =>
+    api.post<{ ok: boolean } & LibraryPlayStartResult>("/api/library/play/start", payload),
+  playStructure: (dir: string, token: string) =>
+    api.get<{ ok: boolean } & LibraryPlayStructure>(
+      `/api/library/play/structure?dir=${encodeURIComponent(dir)}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  progress: (dir: string, token: string) =>
+    api.get<{ ok: boolean; records: LibraryPlaybackRecord[]; active: LibraryPlayStructure["active"] }>(
+      `/api/library/progress?dir=${encodeURIComponent(dir)}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  progressMark: (dir: string, filePath: string, watched: boolean, token: string) =>
+    api.post<{ ok: boolean }>("/api/library/progress/mark", { dir, filePath, watched, token }),
+  progressMarkUntil: (dir: string, season: number, episode: number, token: string) =>
+    api.post<{ ok: boolean; markedWatched: number; markedUnwatched: number; trashed: number }>(
+      "/api/library/progress/mark-until", { dir, season, episode, token },
+    ),
+  progressSummary: (dirs: string[], token: string) =>
+    api.get<{ ok: boolean; summaries: Record<string, LibraryPlaybackSummary> }>(
+      `/api/library/progress/summary?dirs=${encodeURIComponent(dirs.join("|"))}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  progressContinue: (token: string, limit = 12) =>
+    api.get<{ ok: boolean; items: LibraryContinueItem[] }>(
+      `/api/library/progress/continue?limit=${limit}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  tmdbSeason: (tmdbId: number, season: number, token: string) =>
+    api.get<{ ok: boolean; season: TmdbSeasonInfo | null }>(
+      `/api/library/tmdb/${tmdbId}/season/${season}${token ? `?token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  worksDelete: (dirs: string[], token: string) =>
+    api.post<{ ok: boolean; works: number; files: number; playback: number }>("/api/library/works/delete", { dirs, token }),
+  categoryDelete: (cat: string, sub: string, token: string) =>
+    api.post<{ ok: boolean; works: number; files: number; playback: number }>("/api/library/category/delete", { cat, sub, token }),
+  backupExport: (token: string) =>
+    api.post<{ ok: boolean; file: string; path: string; sizeBytes: number; works: number; files: number; playback: number }>(
+      "/api/library/backup/export", { token },
+    ),
+  backupImport: (path: string, token: string) =>
+    api.post<{ ok: boolean; works: number; worksSkipped: number; files: number; playback: number; sources: number }>(
+      "/api/library/backup/import", { path, token },
+    ),
   importFile: async (name: string, content: string, token: string) => {
     const query = new URLSearchParams({ name });
     if (token) query.set("token", token);

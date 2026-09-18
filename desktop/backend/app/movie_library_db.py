@@ -17,11 +17,23 @@ import sqlite3
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .movie_library import (
-    VIDEO_EXT, fmt_size, new_tech_state, norm, parse_dir_name, pinyin_keys,
-    split_category, split_work, tech_result, update_tech_state, video_ext_set,
+    VIDEO_EXT, channel_from_stored, detail_state_result, fmt_size, infer_technical_detailed,
+    new_detail_state, new_tech_state, norm, parse_dir_name, pinyin_keys,
+    split_category, split_work, tech_result, update_detail_state, update_tech_state, video_ext_set,
 )
 
 logger = logging.getLogger(__name__)
+
+_TECH_KEYS = ("resourceType", "dolbyVision", "dynamicRange", "videoCodec", "audioCodec",
+              "frameRate", "highQuality", "originalEdition")
+
+
+def _tech_json(tech: Dict[str, Any]) -> str:
+    """技术属性紧凑 JSON；全空存空串（迁移回填只扫 tech='' 的行）。"""
+    import json as _json
+    if not any(tech.get(k) for k in _TECH_KEYS):
+        return ""
+    return _json.dumps(tech, ensure_ascii=False, separators=(",", ":"))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS library_sources (
@@ -58,6 +70,7 @@ CREATE TABLE IF NOT EXISTS library_works (
     popularity REAL NOT NULL DEFAULT 0,
     tmdb_status TEXT NOT NULL DEFAULT 'none',
     enrich_attempts INTEGER NOT NULL DEFAULT 0,
+    tech TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS library_work_files (
@@ -70,12 +83,26 @@ CREATE TABLE IF NOT EXISTS library_work_files (
     is_video INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (dir, path)
 );
+CREATE TABLE IF NOT EXISTS library_playback (
+    dir TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    season INTEGER NOT NULL DEFAULT 0,
+    episode INTEGER NOT NULL DEFAULT 0,
+    cloud_file_id INTEGER NOT NULL DEFAULT 0,
+    position_sec REAL NOT NULL DEFAULT 0,
+    duration_sec REAL NOT NULL DEFAULT 0,
+    watched INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (dir, file_path)
+);
 CREATE INDEX IF NOT EXISTS idx_library_works_norm ON library_works(norm_title);
 CREATE INDEX IF NOT EXISTS idx_library_works_pinyin ON library_works(pinyin);
 CREATE INDEX IF NOT EXISTS idx_library_works_pinyin_first ON library_works(pinyin_first);
 CREATE INDEX IF NOT EXISTS idx_library_works_cat ON library_works(cat, sub);
 CREATE INDEX IF NOT EXISTS idx_library_works_source ON library_works(source);
 CREATE INDEX IF NOT EXISTS idx_library_work_files_dir ON library_work_files(dir);
+CREATE INDEX IF NOT EXISTS idx_library_playback_dir ON library_playback(dir);
+CREATE INDEX IF NOT EXISTS idx_library_playback_updated ON library_playback(updated_at);
 """
 
 
@@ -129,6 +156,61 @@ class LibraryDb:
                 "UPDATE library_works SET tmdb_status = 'pending'"
                 " WHERE tmdb_id IS NOT NULL AND (tmdb_status IS NULL OR tmdb_status = 'none')"
             )
+            # media_type 旧值 movie/tv 升级成中文频道（电影/电视剧/纪录片/综艺/动漫/儿童）：
+            # genres 里已存 TMDB 中文名，直接推断回填，不用重拉 TMDB；跑完不再命中 movie/tv，天然幂等
+            stale = conn.execute(
+                "SELECT dir, media_type, genres FROM library_works WHERE media_type IN ('movie', 'tv')"
+            ).fetchall()
+            if stale:
+                import json as _json
+                with conn:
+                    for row in stale:
+                        try:
+                            genre_names = _json.loads(row["genres"] or "[]")
+                        except Exception:
+                            genre_names = []
+                        conn.execute(
+                            "UPDATE library_works SET media_type = ? WHERE dir = ?",
+                            (channel_from_stored(str(row["media_type"]), genre_names), row["dir"]),
+                        )
+            # library_playback 旧脏数据：个别写入没带季/集号把列清成了 0，按 file_path 重新解析回填
+            # （season/episode 列决定续看角标与集列表排序，0 会让「续看」算错）
+            from .movie_library import parse_season_episode as _pse
+            bad_rows = conn.execute(
+                "SELECT dir, file_path, season, episode FROM library_playback WHERE season = 0 AND episode = 0"
+            ).fetchall()
+            if bad_rows:
+                with conn:
+                    for row in bad_rows:
+                        p_season, p_episode = _pse(str(row["file_path"]))
+                        if p_episode is not None:
+                            conn.execute(
+                                "UPDATE library_playback SET season = ?, episode = ? WHERE dir = ? AND file_path = ?",
+                                (p_season, p_episode, row["dir"], row["file_path"]),
+                            )
+            # tech 列（杜比视界/HDR/编码/帧率等，筛选与详情用）：补列后对没算过的作品按文件名回填
+            if "tech" not in existing:
+                conn.execute("ALTER TABLE library_works ADD COLUMN tech TEXT NOT NULL DEFAULT ''")
+            need_tech = conn.execute(
+                "SELECT COUNT(*) AS c FROM library_works WHERE tech = ''").fetchone()["c"]
+            if need_tech:
+                import json as _json
+                files = conn.execute(
+                    "SELECT dir, file_name FROM library_work_files WHERE is_video = 1 ORDER BY dir"
+                ).fetchall()
+                names_by_dir: Dict[str, List[str]] = {}
+                for row in files:
+                    names_by_dir.setdefault(str(row["dir"]), []).append(str(row["file_name"]))
+                with conn:
+                    for dir_name, names in names_by_dir.items():
+                        tech = infer_technical_detailed(names)
+                        if any(tech.get(k) for k in ("resourceType", "dolbyVision", "dynamicRange",
+                                                     "videoCodec", "audioCodec", "frameRate",
+                                                     "highQuality", "originalEdition")):
+                            conn.execute(
+                                "UPDATE library_works SET tech = ? WHERE dir = ?",
+                                (_json.dumps(tech, ensure_ascii=False, separators=(",", ":")), dir_name),
+                            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30)
@@ -169,14 +251,16 @@ class LibraryDb:
                         skipped += 1
                         continue
                     cat, sub = split_category(work_dir)
+                    tech_json = _tech_json(infer_technical_detailed(
+                        [str(f.get("fileName") or "") for f in info["files"]]))
                     connection.execute(
                         "INSERT INTO library_works (dir, title, norm_title, year, tmdb_id, cat, sub, pinyin, pinyin_first,"
-                        " file_count, video_count, total_size, resolution, edition, tmdb_status, source)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        " file_count, video_count, total_size, resolution, edition, tmdb_status, tech, source)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (work_dir, info["title"], norm(info["title"]), info["year"], info["tmdb_id"], cat, sub,
                          info["pinyin"], info["pinyin_first"], info["count"], info["video_count"], info["total_size"],
                          info.get("resolution") or "", info.get("edition") or "",
-                         "pending" if info["tmdb_id"] else "none", name),
+                         "pending" if info["tmdb_id"] else "none", tech_json, name),
                     )
                     for f in info["files"]:
                         fpath = str(f.get("path") or "")
@@ -237,6 +321,7 @@ class LibraryDb:
         fallback_root = common_path.rsplit("/", 1)[-1] if common_path else ""
         stats: Dict[str, List[int]] = {}
         tech: Dict[str, Dict[str, Any]] = {}
+        detail_tech: Dict[str, Dict[str, Any]] = {}
         verdicts: Dict[str, bool] = {}
         added_files = added_size = 0
         connection = self._connect()
@@ -274,6 +359,7 @@ class LibraryDb:
                     g[2] += size
                     if is_video:
                         update_tech_state(tech.setdefault(root, new_tech_state()), fname)
+                        update_detail_state(detail_tech.setdefault(root, new_detail_state()), fname)
                     if len(batch) >= batch_size:
                         connection.executemany(
                             "INSERT OR REPLACE INTO library_work_files (dir, path, file_name, etag, size, s3_key_flag, is_video)"
@@ -294,14 +380,15 @@ class LibraryDb:
                     title, year, tmdb_id = parse_dir_name(root)
                     pinyin_full, pinyin_first = pinyin_keys(title)
                     resolution, edition = tech_result(tech.get(root) or new_tech_state())
+                    tech_json = _tech_json(detail_state_result(detail_tech.get(root) or new_detail_state()))
                     work_rows.append((root, title, norm(title), year, tmdb_id, cat, sub,
                                       pinyin_full, pinyin_first, count, video_count, total_size,
-                                      resolution, edition, "pending" if tmdb_id else "none", name))
+                                      resolution, edition, "pending" if tmdb_id else "none", tech_json, name))
                 if work_rows:
                     connection.executemany(
                         "INSERT INTO library_works (dir, title, norm_title, year, tmdb_id, cat, sub, pinyin, pinyin_first,"
-                        " file_count, video_count, total_size, resolution, edition, tmdb_status, source)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", work_rows)
+                        " file_count, video_count, total_size, resolution, edition, tmdb_status, tech, source)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", work_rows)
                 added = len(work_rows)
                 skipped = sum(1 for v in verdicts.values() if v)
                 connection.execute(
@@ -362,7 +449,7 @@ class LibraryDb:
 
     def _classification_clauses(self, media_type: str, genre: str, region: str, decade: int,
                                 language: str = "", air_status: str = "", resolution: str = "",
-                                edition: str = "", rating: float = 0) -> Tuple[List[str], List[Any]]:
+                                edition: str = "", rating: float = 0, tech: str = "") -> Tuple[List[str], List[Any]]:
         where: List[str] = []
         params: List[Any] = []
         if media_type:
@@ -392,15 +479,28 @@ class LibraryDb:
         if rating and rating > 0:
             where.append("vote_average >= ?")
             params.append(float(rating))
+        if tech:
+            # tech 形如 "dolbyVision:DV" / "dynamicRange:HDR10+" / "videoCodec:H265"；
+            # 按 JSON 键值精确匹配，避免 HDR 命中 HDR10 这类前缀误伤
+            field, _, value = tech.partition(":")
+            field, value = field.strip(), value.strip()
+            if field and value:
+                if field == "originalEdition":
+                    where.append("tech LIKE ?")
+                    params.append(f'%"{value}"%')
+                else:
+                    where.append("tech LIKE ?")
+                    params.append(f'%"{field}":"{value}"%')
         return where, params
 
     def search(self, q: str, page: int, size: int, cat: str = "", sub: str = "",
                libs: Optional[List[str]] = None, media_type: str = "", genre: str = "",
                region: str = "", decade: int = 0, sort: str = "", language: str = "",
                air_status: str = "", resolution: str = "", edition: str = "",
-               rating: float = 0):
+               rating: float = 0, tech: str = ""):
         """片名/拼音模糊搜索 + 分类维度筛选 + 分页。q 为空且无筛选=浏览。
-        sort：popularity(热度)/rating(评分)/recent(入库顺序)/title(拼音)/year，空=默认。"""
+        sort：popularity(热度)/rating(评分)/recent(入库顺序)/title(拼音)/year，空=默认。
+        tech：技术属性筛选，"字段:值"（如 dolbyVision:DV / dynamicRange:HDR10+ / videoCodec:H265）。"""
         nq = norm(q) if q else ""
         where: List[str] = []
         params: List[Any] = []
@@ -411,7 +511,7 @@ class LibraryDb:
                 where.append("sub = ?")
                 params.append(sub)
         cls_where, cls_params = self._classification_clauses(
-            media_type, genre, region, decade, language, air_status, resolution, edition, rating)
+            media_type, genre, region, decade, language, air_status, resolution, edition, rating, tech)
         where += cls_where
         params += cls_params
         if libs:
@@ -474,7 +574,7 @@ class LibraryDb:
     def facets(self, media_type: str = "", genre: str = "", region: str = "",
                decade: int = 0, libs: Optional[List[str]] = None, q: str = "",
                language: str = "", air_status: str = "", resolution: str = "",
-               edition: str = "", rating: float = 0) -> Dict[str, Any]:
+               edition: str = "", rating: float = 0, tech: str = "") -> Dict[str, Any]:
         """各分类维度的候选计数，用于前端动态筛选条。某维度的选项反映其它维度的当前选择
         （交叉筛选），但不含该维度自身选择——像优爱腾点了某频道后其它筛选项随之收窄。"""
         import json as _json
@@ -482,14 +582,15 @@ class LibraryDb:
         state = {
             "media_type": media_type, "genre": genre, "region": region, "decade": decade,
             "language": language, "air_status": air_status, "resolution": resolution,
-            "edition": edition, "rating": rating,
+            "edition": edition, "rating": rating, "tech": tech,
         }
 
         def fetch(exclude: str) -> List[sqlite3.Row]:
             vals = {k: (type(state[k])() if k == exclude else state[k]) for k in state}
             where, params = self._classification_clauses(
                 vals["media_type"], vals["genre"], vals["region"], vals["decade"],
-                vals["language"], vals["air_status"], vals["resolution"], vals["edition"], vals["rating"],
+                vals["language"], vals["air_status"], vals["resolution"], vals["edition"],
+                vals["rating"], vals["tech"],
             )
             if libs:
                 where.append(f"source IN ({','.join('?' for _ in libs)})")
@@ -503,7 +604,7 @@ class LibraryDb:
             try:
                 return connection.execute(
                     "SELECT media_type, genres, region, year, language, air_status, resolution,"
-                    f" edition, vote_average FROM library_works {where_sql}", params).fetchall()
+                    f" edition, vote_average, tech FROM library_works {where_sql}", params).fetchall()
             finally:
                 connection.close()
 
@@ -518,9 +619,37 @@ class LibraryDb:
         channels = count_by("media_type", lambda r: r["media_type"])
         regions = count_by("region", lambda r: r["region"])
         languages = count_by("language", lambda r: r["language"])
-        statuses = count_by("air_status", lambda r: r["air_status"])
         resolutions = count_by("resolution", lambda r: r["resolution"])
         editions = count_by("edition", lambda r: r["edition"])
+
+        # 技术属性维度（tech 列 JSON）：特效=DV+动态范围合并一行、视频编码、音轨
+        active_tech_field = str(state["tech"]).partition(":")[0]
+        if active_tech_field not in ("dolbyVision", "dynamicRange", "videoCodec", "audioCodec", "originalEdition"):
+            active_tech_field = ""
+
+        def count_tech_field(field: str) -> Dict[str, int]:
+            out: Dict[str, int] = {}
+            for r in fetch("tech"):
+                try:
+                    t = _json.loads(r["tech"] or "{}")
+                except Exception:
+                    continue
+                if not isinstance(t, dict):
+                    continue
+                v = t.get(field)
+                if v:
+                    out[str(v)] = out.get(str(v), 0) + 1
+            return out
+
+        effects: Dict[str, int] = {}
+        if active_tech_field != "dolbyVision":  # 特效行排除与当前筛选同字段的值（保持交叉筛选语义）
+            for v, c in count_tech_field("dolbyVision").items():
+                effects[v] = effects.get(v, 0) + c
+        if active_tech_field != "dynamicRange":
+            for v, c in count_tech_field("dynamicRange").items():
+                effects[v] = effects.get(v, 0) + c
+        video_codecs = count_tech_field("videoCodec")
+        audio_codecs = count_tech_field("audioCodec")
 
         genres: Dict[str, int] = {}
         for r in fetch("genre"):
@@ -557,9 +686,13 @@ class LibraryDb:
             "genres": top(genres),
             "regions": top(regions),
             "languages": top(languages),
-            "statuses": top(statuses),
+            # 「更新中/已完结」来自 TMDB 不准，已下线：不再返回 statuses 维度（air_status 字段保留不删）
+            "statuses": [],
             "resolutions": top(resolutions),
             "editions": top(editions),
+            "effects": top(effects),
+            "videoCodecs": top(video_codecs),
+            "audioCodecs": top(audio_codecs),
             "decades": [{"name": d, "count": c} for d, c in sorted(decades.items(), reverse=True)],
             "ratings": [{"name": b, "count": ratings[b]} for b in (9, 8, 7) if b in ratings],
         }
@@ -612,13 +745,14 @@ class LibraryDb:
             if work is None:
                 return None
             rows = connection.execute(
-                "SELECT path, file_name, etag, size, is_video FROM library_work_files WHERE dir = ? ORDER BY path",
+                "SELECT path, file_name, etag, size, s3_key_flag, is_video FROM library_work_files WHERE dir = ? ORDER BY path",
                 (dirname,)).fetchall()
             files = [{
                 "fileName": r["file_name"],
                 "path": r["path"],
                 "etag": r["etag"],
                 "size": r["size"],
+                "s3KeyFlag": r["s3_key_flag"] or "",
                 "isVideo": bool(r["is_video"]),
             } for r in rows]
             return {
@@ -871,6 +1005,303 @@ class LibraryDb:
         finally:
             connection.close()
 
+    # ---------- 播放记录（library_playback） ----------
+    def upsert_playback(self, dirname: str, file_path: str, season: int = 0, episode: int = 0,
+                        cloud_file_id: Optional[int] = None, position_sec: Optional[float] = None,
+                        duration_sec: Optional[float] = None, watched: Optional[bool] = None) -> None:
+        """写入/更新一条播放记录；None 的字段保留原值（cloud_file_id/position/duration/watched）。"""
+        from datetime import datetime, timezone as _tz
+        now = datetime.now(_tz.utc).isoformat()
+        connection = self._connect()
+        try:
+            with connection:
+                existing = connection.execute(
+                    "SELECT cloud_file_id, position_sec, duration_sec, watched FROM library_playback"
+                    " WHERE dir = ? AND file_path = ?", (dirname, file_path)).fetchone()
+                if existing is None:
+                    connection.execute(
+                        "INSERT INTO library_playback (dir, file_path, season, episode, cloud_file_id,"
+                        " position_sec, duration_sec, watched, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (dirname, file_path, int(season or 0), int(episode or 0),
+                         int(cloud_file_id or 0), float(position_sec or 0), float(duration_sec or 0),
+                         1 if watched else 0, now))
+                else:
+                    connection.execute(
+                        "UPDATE library_playback SET season = ?, episode = ?,"
+                        " cloud_file_id = ?, position_sec = ?, duration_sec = ?, watched = ?, updated_at = ?"
+                        " WHERE dir = ? AND file_path = ?",
+                        (int(season or 0), int(episode or 0),
+                         int(cloud_file_id) if cloud_file_id is not None else existing["cloud_file_id"],
+                         float(position_sec) if position_sec is not None else existing["position_sec"],
+                         float(duration_sec) if duration_sec is not None else existing["duration_sec"],
+                         (1 if watched else 0) if watched is not None else existing["watched"],
+                         now, dirname, file_path))
+        finally:
+            connection.close()
+
+    def get_playback(self, dirname: str, file_path: str) -> Optional[Dict[str, Any]]:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM library_playback WHERE dir = ? AND file_path = ?", (dirname, file_path)).fetchone()
+            return self._playback_row(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def list_playback(self, dirname: str) -> List[Dict[str, Any]]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM library_playback WHERE dir = ? ORDER BY season, episode, file_path",
+                (dirname,)).fetchall()
+            return [self._playback_row(r) for r in rows]
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _playback_row(r: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "filePath": r["file_path"], "season": int(r["season"] or 0), "episode": int(r["episode"] or 0),
+            "cloudFileId": int(r["cloud_file_id"] or 0),
+            "positionSec": float(r["position_sec"] or 0), "durationSec": float(r["duration_sec"] or 0),
+            "watched": bool(r["watched"]), "updatedAt": str(r["updated_at"] or ""),
+        }
+
+    def playback_summaries(self, dirs: List[str]) -> Dict[str, Dict[str, Any]]:
+        """批量取作品的播放摘要（海报墙角标用）：
+        recordCount/watchedCount/last* 兼容展示，next* = 下一个没看的集（续看角标直接给行动指引）。"""
+        out: Dict[str, Dict[str, Any]] = {}
+        dirs = [d for d in (dirs or []) if d]
+        if not dirs:
+            return out
+        marks = ",".join("?" for _ in dirs)
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"SELECT dir, file_path, season, episode, watched, position_sec, duration_sec, updated_at"
+                f" FROM library_playback WHERE dir IN ({marks}) ORDER BY updated_at", dirs).fetchall()
+            files = connection.execute(
+                f"SELECT dir, file_name FROM library_work_files WHERE is_video = 1 AND dir IN ({marks})", dirs).fetchall()
+        finally:
+            connection.close()
+        for r in rows:
+            s = out.setdefault(str(r["dir"]), {"recordCount": 0, "watchedCount": 0, "lastSeason": 0,
+                                               "lastEpisode": 0, "lastWatched": False,
+                                               "lastPositionSec": 0.0, "lastDurationSec": 0.0,
+                                               "nextSeason": 0, "nextEpisode": 0})
+            s["recordCount"] += 1
+            if r["watched"]:
+                s["watchedCount"] += 1
+            s["lastSeason"] = int(r["season"] or 0)
+            s["lastEpisode"] = int(r["episode"] or 0)
+            s["lastWatched"] = bool(r["watched"])
+            s["lastPositionSec"] = float(r["position_sec"] or 0)
+            s["lastDurationSec"] = float(r["duration_sec"] or 0)
+        # 下一个没看的集：全集（按季/集排序、同集多版本取一次）中第一个没有「已看记录」的；
+        # 全看完了就不给 next（前端显示已看完）
+        from .movie_library import parse_season_episode
+        watched_sets: Dict[str, set] = {}
+        episodes_by_dir: Dict[str, set] = {}
+        for r in rows:
+            if r["watched"]:
+                season, episode = int(r["season"] or 0), int(r["episode"] or 0)
+                if (season, episode) == (0, 0) and r["file_path"]:
+                    # 历史脏数据兜底：列被清 0 的记录按文件路径解析
+                    p_season, p_episode = parse_season_episode(str(r["file_path"]))
+                    if p_episode is not None:
+                        season, episode = p_season, p_episode
+                watched_sets.setdefault(str(r["dir"]), set()).add((season, episode))
+        for r in files:
+            season, episode = parse_season_episode(str(r["file_name"]))
+            if episode is not None:
+                episodes_by_dir.setdefault(str(r["dir"]), set()).add((season, episode))
+        for d, episodes in episodes_by_dir.items():
+            s = out.setdefault(d, {"recordCount": 0, "watchedCount": 0, "lastSeason": 0,
+                                   "lastEpisode": 0, "lastWatched": False,
+                                   "lastPositionSec": 0.0, "lastDurationSec": 0.0,
+                                   "nextSeason": 0, "nextEpisode": 0})
+            watched = watched_sets.get(d, set())
+            for season, episode in sorted(episodes):
+                if (season, episode) not in watched:
+                    s["nextSeason"], s["nextEpisode"] = season, episode
+                    break
+        return out
+
+    def latest_playback_works(self, limit: int = 12) -> List[Dict[str, Any]]:
+        """「继续观看」栏：最近播放过的作品（join 作品表取标题/海报信息），未全部看完的优先。"""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT p.dir AS dir, MAX(p.updated_at) AS last_at, COUNT(*) AS record_count,"
+                " SUM(p.watched) AS watched_count"
+                " FROM library_playback p JOIN library_works w ON w.dir = p.dir"
+                " GROUP BY p.dir ORDER BY last_at DESC LIMIT ?",
+                (max(1, int(limit)),)).fetchall()
+            works = connection.execute(
+                "SELECT dir, title, year, tmdb_id, video_count, media_type FROM library_works").fetchall()
+        finally:
+            connection.close()
+        work_by_dir = {str(w["dir"]): w for w in works}
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            w = work_by_dir.get(str(r["dir"]))
+            if w is None:
+                continue
+            out.append({
+                "dir": r["dir"], "title": w["title"], "year": w["year"], "tmdbId": w["tmdb_id"],
+                "mediaType": w["media_type"] or "", "videoCount": int(w["video_count"] or 0),
+                "recordCount": int(r["record_count"] or 0), "watchedCount": int(r["watched_count"] or 0),
+                "updatedAt": str(r["last_at"] or ""),
+            })
+        return out
+
+    def clear_playback(self, dirname: str = "") -> None:
+        """清播放记录；dirname 为空清全部。"""
+        connection = self._connect()
+        try:
+            with connection:
+                if dirname:
+                    connection.execute("DELETE FROM library_playback WHERE dir = ?", (dirname,))
+                else:
+                    connection.execute("DELETE FROM library_playback")
+        finally:
+            connection.close()
+
+    def watched_cloud_ids(self, dirname: str, paths: List[str]) -> Dict[str, int]:
+        """查一组文件路径当前的网盘文件 ID（新标已看时移回收站用），无记录的路径不返回。"""
+        out: Dict[str, int] = {}
+        if not paths:
+            return out
+        marks = ",".join("?" for _ in paths)
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"SELECT file_path, cloud_file_id FROM library_playback"
+                f" WHERE dir = ? AND file_path IN ({marks})", [dirname, *paths]).fetchall()
+        finally:
+            connection.close()
+        for r in rows:
+            if int(r["cloud_file_id"] or 0) > 0:
+                out[str(r["file_path"])] = int(r["cloud_file_id"])
+        return out
+
+    # ---------- 删除与备份恢复（海报墙管理模式 / 重装恢复用） ----------
+    _BACKUP_TABLES = ("library_sources", "library_works", "library_work_files", "library_playback")
+
+    def delete_works(self, dirs: List[str]) -> Dict[str, int]:
+        """按作品目录批量删除（连同文件与播放记录级联）；返回各表删除条数。"""
+        cleaned = [str(d or "").strip() for d in (dirs or []) if str(d or "").strip()]
+        if not cleaned:
+            return {"works": 0, "files": 0, "playback": 0}
+        marks = ",".join("?" for _ in cleaned)
+        connection = self._connect()
+        try:
+            with connection:
+                works = connection.execute(f"DELETE FROM library_works WHERE dir IN ({marks})", cleaned).rowcount
+                files = connection.execute(f"DELETE FROM library_work_files WHERE dir IN ({marks})", cleaned).rowcount
+                playback = connection.execute(f"DELETE FROM library_playback WHERE dir IN ({marks})", cleaned).rowcount
+            return {"works": max(0, works or 0), "files": max(0, files or 0), "playback": max(0, playback or 0)}
+        finally:
+            connection.close()
+
+    def delete_category(self, cat: str, sub: str = "") -> Dict[str, int]:
+        """删除整个分类（cat 或 cat/sub）下的全部作品；返回删除条数。"""
+        cat = str(cat or "").strip()
+        if not cat or cat == "全部文件":
+            raise ValueError("请指定要删除的分类")
+        where = ["cat = ?"]
+        params: List[Any] = [cat]
+        if str(sub or "").strip():
+            where.append("sub = ?")
+            params.append(str(sub).strip())
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"SELECT dir FROM library_works WHERE {' AND '.join(where)}", params).fetchall()
+        finally:
+            connection.close()
+        return self.delete_works([str(r["dir"]) for r in rows])
+
+    def export_backup(self, dest_path: str) -> Dict[str, int]:
+        """把影库四张表原样导出成一个独立 sqlite 备份文件（含 TMDB 整理结果与播放记录）。"""
+        dest = str(dest_path or "").strip()
+        if not dest:
+            raise ValueError("缺少备份文件保存路径")
+        if os.path.exists(dest):
+            os.remove(dest)  # sqlite 建表是 IF NOT EXISTS，必须先清掉旧文件防止混入旧数据
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        backup = sqlite3.connect(dest)
+        try:
+            backup.executescript(_SCHEMA)
+        finally:
+            backup.close()
+        counts: Dict[str, int] = {}
+        connection = self._connect()
+        try:
+            connection.execute("ATTACH DATABASE ? AS bak", (dest,))
+            try:
+                with connection:
+                    for table in self._BACKUP_TABLES:
+                        connection.execute(f"INSERT INTO bak.{table} SELECT * FROM main.{table}")
+                        counts[table] = int(connection.execute(
+                            f"SELECT COUNT(*) FROM bak.{table}").fetchone()[0] or 0)
+            finally:
+                connection.execute("DETACH DATABASE bak")
+        finally:
+            connection.close()
+        return counts
+
+    def import_backup(self, src_path: str) -> Dict[str, int]:
+        """从备份文件恢复：已存在的作品跳过（保留先入库的），播放记录保留较新的一条。"""
+        src = str(src_path or "").strip()
+        if not src or not os.path.isfile(src):
+            raise ValueError("找不到备份文件")
+        probe = sqlite3.connect(src)
+        try:
+            tables = {str(r[0]) for r in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "library_works" not in tables or "library_work_files" not in tables:
+                raise ValueError("不是影库备份文件（缺少影库数据表）")
+        except sqlite3.DatabaseError as error:
+            raise ValueError(f"打不开这个备份文件：{error}")
+        finally:
+            probe.close()
+        connection = self._connect()
+        result: Dict[str, int] = {}
+        try:
+            connection.execute("ATTACH DATABASE ? AS bak", (src,))
+            try:
+                with connection:
+                    for table in self._BACKUP_TABLES:
+                        if table not in tables:
+                            result[table] = 0
+                            continue
+                        total = int(connection.execute(f"SELECT COUNT(*) FROM bak.{table}").fetchone()[0] or 0)
+                        if table == "library_playback":
+                            # SELECT 形式的 upsert 需要占位 WHERE 消除 ON CONFLICT 歧义；
+                            # 同一条记录保留 updated_at 较新的那份（本地新就不被旧备份覆盖）
+                            cursor = connection.execute(
+                                "INSERT INTO main.library_playback SELECT * FROM bak.library_playback WHERE true"
+                                " ON CONFLICT(dir, file_path) DO UPDATE SET"
+                                " season=excluded.season, episode=excluded.episode,"
+                                " cloud_file_id=excluded.cloud_file_id, position_sec=excluded.position_sec,"
+                                " duration_sec=excluded.duration_sec, watched=excluded.watched,"
+                                " updated_at=excluded.updated_at"
+                                " WHERE excluded.updated_at > library_playback.updated_at")
+                            result[table] = max(0, cursor.rowcount or 0)
+                        else:
+                            cursor = connection.execute(
+                                f"INSERT OR IGNORE INTO main.{table} SELECT * FROM bak.{table}")
+                            inserted = max(0, cursor.rowcount or 0)
+                            result[table] = inserted
+                            result[f"{table}_skipped"] = max(0, total - inserted)
+            finally:
+                connection.execute("DETACH DATABASE bak")
+        except sqlite3.DatabaseError as error:
+            raise ValueError(f"备份文件与当前版本不兼容：{error}")
+        finally:
+            connection.close()
+        return result
+
 
 # ---- 模块级单例（main 启动时 init 一次） ----
 _default_db: Optional[LibraryDb] = None
@@ -910,16 +1341,16 @@ def totals() -> Dict[str, Any]:
 def search(q: str, page: int, size: int, cat: str = "", sub: str = "", libs: Optional[List[str]] = None,
            media_type: str = "", genre: str = "", region: str = "", decade: int = 0, sort: str = "",
            language: str = "", air_status: str = "", resolution: str = "", edition: str = "",
-           rating: float = 0):
+           rating: float = 0, tech: str = ""):
     return _db().search(q, page, size, cat, sub, libs, media_type, genre, region, decade, sort,
-                        language, air_status, resolution, edition, rating)
+                        language, air_status, resolution, edition, rating, tech)
 
 
 def facets(media_type: str = "", genre: str = "", region: str = "", decade: int = 0,
            libs: Optional[List[str]] = None, q: str = "", language: str = "", air_status: str = "",
-           resolution: str = "", edition: str = "", rating: float = 0) -> Dict[str, Any]:
+           resolution: str = "", edition: str = "", rating: float = 0, tech: str = "") -> Dict[str, Any]:
     return _db().facets(media_type, genre, region, decade, libs, q, language, air_status,
-                        resolution, edition, rating)
+                        resolution, edition, rating, tech)
 
 
 def categories(libs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -968,3 +1399,50 @@ def transfer_files(dirs: List[str], include_files: Optional[List[str]] = None) -
 
 def works_exist(dirs: List[str]) -> bool:
     return _db().works_exist(dirs)
+
+
+def upsert_playback(dirname: str, file_path: str, season: int = 0, episode: int = 0,
+                    cloud_file_id: Optional[int] = None, position_sec: Optional[float] = None,
+                    duration_sec: Optional[float] = None, watched: Optional[bool] = None) -> None:
+    return _db().upsert_playback(dirname, file_path, season, episode, cloud_file_id,
+                                 position_sec, duration_sec, watched)
+
+
+def get_playback(dirname: str, file_path: str) -> Optional[Dict[str, Any]]:
+    return _db().get_playback(dirname, file_path)
+
+
+def list_playback(dirname: str) -> List[Dict[str, Any]]:
+    return _db().list_playback(dirname)
+
+
+def playback_summaries(dirs: List[str]) -> Dict[str, Dict[str, Any]]:
+    return _db().playback_summaries(dirs)
+
+
+def latest_playback_works(limit: int = 12) -> List[Dict[str, Any]]:
+    return _db().latest_playback_works(limit)
+
+
+def clear_playback(dirname: str = "") -> None:
+    return _db().clear_playback(dirname)
+
+
+def watched_cloud_ids(dirname: str, paths: List[str]) -> Dict[str, int]:
+    return _db().watched_cloud_ids(dirname, paths)
+
+
+def delete_works(dirs: List[str]) -> Dict[str, int]:
+    return _db().delete_works(dirs)
+
+
+def delete_category(cat: str, sub: str = "") -> Dict[str, int]:
+    return _db().delete_category(cat, sub)
+
+
+def export_backup(dest_path: str) -> Dict[str, int]:
+    return _db().export_backup(dest_path)
+
+
+def import_backup(src_path: str) -> Dict[str, int]:
+    return _db().import_backup(src_path)

@@ -468,6 +468,15 @@ function registerIpc() {
     if (result.canceled || !result.filePaths.length) return { cancelled: true };
     return { paths: result.filePaths };
   });
+  // 选本地播放器：程序文件或 macOS 的 .app 应用包（如 Infuse）都能选
+  ipcMain.handle("app:pickPlayer", async (_event, payload) => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: String((payload && payload.title) || "选择播放器"),
+      properties: ["openFile", "openDirectory"],
+    });
+    if (result.canceled || !result.filePaths.length) return { cancelled: true };
+    return { paths: result.filePaths };
+  });
   // 123 OAuth 授权弹窗：加载 123 官方授权页（账号密码在官方页输入），
   // 监听到跳回授权中转站回调地址（含 ?code= 或 #token）即截获并回传渲染层。
   let pan123OauthWindow = null;

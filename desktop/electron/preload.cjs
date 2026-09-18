@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld("cloud123", {
   openDataDir: () => ipcRenderer.invoke("app:openDataDir"),
   pickFolder: (payload) => ipcRenderer.invoke("app:pickFolder", payload),
   pickFiles: (payload) => ipcRenderer.invoke("app:pickFiles", payload),
+  pickPlayer: (payload) => ipcRenderer.invoke("app:pickPlayer", payload),
   openPan123Oauth: (payload) => ipcRenderer.invoke("app:openPan123Oauth", payload),
   getLogs: () => ipcRenderer.invoke("app:getLogs"),
   getPortConfig: () => ipcRenderer.invoke("app:getPortConfig"),

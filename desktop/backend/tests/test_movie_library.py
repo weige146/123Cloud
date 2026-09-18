@@ -974,12 +974,99 @@ class LibraryEnrichTests(unittest.TestCase):
             "genres": [{"id": 1, "name": "动作"}, {"id": 2, "name": "科幻"}, {"id": 3}],
         }
         fields = main._tmdb_enrich_fields(info, "movie")
-        self.assertEqual(fields["media_type"], "movie")
+        self.assertEqual(fields["media_type"], "电影")  # media_type 存中文频道
         self.assertEqual(fields["genres"], ["动作", "科幻"])
         self.assertEqual(fields["region"], "欧美")  # 首个命中 US
         self.assertEqual(fields["year"], 2018)
         self.assertEqual(fields["poster_path"], "https://image.tmdb.org/t/p/w185/abc.jpg")
         self.assertAlmostEqual(fields["vote_average"], 6.8)
+
+    def test_tmdb_enrich_channel_buckets(self):
+        """频道六分：动画→动漫、纪录→纪录片（电影剧集都适用），剧集按 儿童/综艺 细分。"""
+        cases = [
+            ({"genres": [{"id": 16, "name": "动画"}]}, "tv", "动漫"),
+            ({"genres": [{"id": 16, "name": "动画"}]}, "movie", "动漫"),
+            ({"genres": [{"id": 99, "name": "纪录"}]}, "tv", "纪录片"),
+            ({"genres": [{"id": 99, "name": "Documentary"}]}, "movie", "纪录片"),
+            ({"genres": [{"id": 10762, "name": "儿童"}, {"id": 10759, "name": "动作冒险"}]}, "tv", "儿童"),
+            ({"genres": [{"id": 10764, "name": "真人秀"}]}, "tv", "综艺"),
+            ({"genres": [{"id": 10767, "name": "脱口秀"}]}, "tv", "综艺"),
+            ({"genres": [{"id": 18, "name": "剧情"}]}, "tv", "电视剧"),
+            ({"genres": [{"id": 28, "name": "动作"}]}, "movie", "电影"),
+            ({"genres": []}, "tv", "电视剧"),
+            ({"genres": []}, "movie", "电影"),
+        ]
+        for info, matched, expected in cases:
+            fields = main._tmdb_enrich_fields(info, matched)
+            self.assertEqual(fields["media_type"], expected, (matched, info))
+
+    def test_infer_technical_detailed(self):
+        """细粒度属性识别（对齐油猴整理字段）：资源类型/DV/HDR/编码/帧率/地区版。"""
+        tech = movie_library.infer_technical_detailed([
+            "Show.S01E01.UHD.BluRay.REMUX.2160p.HEVC.DTS-HD.MA.7.1.DoVi.HDR10.mkv",
+            "Show.S01E02.2160p.WEB-DL.H265.DDP.5.1.HDR10+.mkv",
+        ])
+        self.assertEqual(tech["resourceType"], "UHD BluRay Remux")  # 优先级高于 WEB-DL
+        self.assertEqual(tech["dolbyVision"], "DV")
+        self.assertEqual(tech["dynamicRange"], "HDR10+")  # HDR10+ 优先于 HDR10
+        self.assertEqual(tech["videoCodec"], "HEVC")
+        self.assertEqual(tech["audioCodec"], "DTS.HD.MA")  # 优先级高于 DDP
+        self.assertEqual(tech["frameRate"], "")
+
+        tech2 = movie_library.infer_technical_detailed([
+            "Movie.2160p.UHD.BluRay.H.265.23.976fps.TrueHD.IMAX.mkv",
+            "Movie.REMUX.1080p.AVC.25fps.REPACK.mkv",
+        ])
+        self.assertEqual(tech2["resourceType"], "Remux")  # REMUX 档位高于 UHD BluRay
+        self.assertEqual(tech2["videoCodec"], "H265")  # H.265 → H265；作品级取优先级最高（H265 > AVC）
+        self.assertEqual(tech2["audioCodec"], "TrueHD")
+        self.assertEqual(tech2["frameRate"], "23.976fps")
+        self.assertIn("IMAX", tech2["originalEdition"])
+        self.assertIn("REPACK", tech2["originalEdition"])
+
+    def test_infer_technical_detailed_frame_rate_fix(self):
+        """帧率修复：H.265.25fps 的点分版本号不并进数字（265.25fps → 25fps）。"""
+        tech = movie_library.infer_technical_detailed(["Show.S01E01.H.265.25fps.1080p.mkv"])
+        self.assertEqual(tech["frameRate"], "25fps")
+        tech2 = movie_library.infer_technical_detailed(["Show.23.976fps.mkv"])
+        self.assertEqual(tech2["frameRate"], "23.976fps")
+        tech3 = movie_library.infer_technical_detailed(["Show.1080p.mkv"])
+        self.assertEqual(tech3["frameRate"], "")
+
+    def test_channel_from_stored_migration(self):
+        """旧数据（media_type=movie/tv + genres 中文名）回填中文频道。"""
+        from app.movie_library import channel_from_stored
+        cases = [
+            ("movie", ["动画", "科幻"], "动漫"),
+            ("tv", ["动画"], "动漫"),
+            ("movie", ["纪录"], "纪录片"),
+            ("tv", ["儿童"], "儿童"),
+            ("tv", ["真人秀"], "综艺"),
+            ("tv", ["剧情"], "电视剧"),
+            ("movie", ["剧情"], "电影"),
+            ("tv", [], "电视剧"),
+            ("movie", [], "电影"),
+        ]
+        for matched, genres, expected in cases:
+            self.assertEqual(channel_from_stored(matched, genres), expected, (matched, genres))
+
+    def test_media_type_channel_migration_on_open(self):
+        """旧库打开（触发 _migrate）时 media_type 的 movie/tv 自动回填成中文频道，幂等。"""
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "old.db"
+            db = LibraryDb(db_path)
+            db.import_payload("库.json", _fastlink_payload("", [
+                {"path": f"{WORK_A}/v.mkv", "fileName": "v.mkv", "etag": _etag(1), "size": 1},
+            ]))
+            db.apply_enrichment(WORK_A, {"media_type": "movie", "genres": ["动画", "科幻"]})
+            LibraryDb(db_path)  # 重新打开触发迁移
+            conn = __import__("sqlite3").connect(db_path)
+            try:
+                value = conn.execute("SELECT media_type FROM library_works WHERE dir = ?", (WORK_A,)).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(value, "动漫")
 
     def test_enrich_status_route(self):
         original_store = main.store
@@ -1082,10 +1169,11 @@ class LibraryFacetsTests(unittest.TestCase):
         movie_library_db.init(Path(self._directory.name) / "cloud123.db")
         main.store = SessionStore(Path(self._directory.name))
         facets = asyncio.run(main.read_library_facets(_StubRequest()))
-        self.assertEqual(self._names(facets["facets"]["channels"]), {"movie": 2, "tv": 1})
-        result = asyncio.run(main.search_library(_StubRequest(), mediaType="tv", page=1, size=20))
+        self.assertEqual(self._names(facets["facets"]["channels"]), {"电影": 2, "电视剧": 1})  # media_type 存中文频道
+        result = asyncio.run(main.search_library(_StubRequest(), mediaType="电视剧", page=1, size=20))
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["dirs"][0]["dir"], W_TV_1)
+        # 频道搜索按中文名（新值），旧的 movie/tv 值迁移后不再命中
 
 
 class LibraryDimTests(unittest.TestCase):
@@ -1184,6 +1272,47 @@ class LibraryDimTests(unittest.TestCase):
             f = db.facets()
             self.assertEqual({i["name"]: i["count"] for i in f["ratings"]}, {9: 1, 8: 1, 7: 2})
 
+    def test_tech_filter_and_facets(self):
+        """tech 列：导入写入、旧库迁移回填、tech 筛选与特效/编码/音轨 facets 计数。"""
+        from app.movie_library_db import LibraryDb
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "t.db"
+            db = LibraryDb(db_path)
+            db.import_payload("库.json", _fastlink_payload("", [
+                {"path": "电影/A/A (2020) {tmdb-1}/A.UHD.BluRay.REMUX.2160p.DoVi.HDR10.HEVC.TrueHD.23.976fps.mkv",
+                 "fileName": "A.UHD.BluRay.REMUX.2160p.DoVi.HDR10.HEVC.TrueHD.23.976fps.mkv", "etag": _etag(1), "size": 1},
+                {"path": "电影/B/B (2021) {tmdb-2}/B.2160p.WEB-DL.H.265.DDP.HDR10+.mkv",
+                 "fileName": "B.2160p.WEB-DL.H.265.DDP.HDR10+.mkv", "etag": _etag(2), "size": 2},
+            ]))
+            # tech 列已随导入写入
+            row = db.search("", 1, 50, tech="dolbyVision:DV")[1]
+            self.assertEqual(len(row), 1)
+            self.assertEqual(row[0]["dir"], "电影/A/A (2020) {tmdb-1}")
+            # HDR 是 HDR10/HDR10+ 的前缀：键值精确匹配不会误伤
+            self.assertEqual(len(db.search("", 1, 50, tech="dynamicRange:HDR")[1]), 0)
+            self.assertEqual(len(db.search("", 1, 50, tech="dynamicRange:HDR10+")[1]), 1)
+            self.assertEqual(len(db.search("", 1, 50, tech="videoCodec:H265")[1]), 1)
+            self.assertEqual(len(db.search("", 1, 50, tech="audioCodec:TrueHD")[1]), 1)
+            self.assertEqual(len(db.search("", 1, 50, tech="originalEdition:IMAX")[1]), 0)
+            f = db.facets()
+            self.assertEqual({i["name"]: i["count"] for i in f["effects"]},
+                             {"DV": 1, "HDR10": 1, "HDR10+": 1})
+            self.assertEqual({i["name"]: i["count"] for i in f["videoCodecs"]}, {"HEVC": 1, "H265": 1})
+            self.assertEqual({i["name"]: i["count"] for i in f["audioCodecs"]}, {"TrueHD": 1, "DDP": 1})
+            # 交叉筛选：选中 HDR10+ 后特效行隐藏同字段（dynamicRange）全部选项，只剩 DV
+            f2 = db.facets(tech="dynamicRange:HDR10+")
+            self.assertEqual({i["name"]: i["count"] for i in f2["effects"]}, {"DV": 1})
+            self.assertEqual(f2["videoCodecs"][0]["count"], 1)
+
+            # 旧库（tech 为空）重开触发迁移回填
+            import sqlite3 as _sq
+            conn = _sq.connect(db_path)
+            conn.execute("UPDATE library_works SET tech = ''")
+            conn.commit()
+            conn.close()
+            LibraryDb(db_path)
+            self.assertEqual(len(db.search("", 1, 50, tech="dolbyVision:DV")[1]), 1)
+
     def test_facets_new_dimensions(self):
         from app.movie_library_db import LibraryDb
         with tempfile.TemporaryDirectory() as d:
@@ -1202,7 +1331,7 @@ class LibraryDimTests(unittest.TestCase):
                                      "language": "中文", "air_status": "已完结", "popularity": 20})
             f = db.facets()
             self.assertEqual({i["name"]: i["count"] for i in f["languages"]}, {"英语": 1, "中文": 1})
-            self.assertEqual({i["name"]: i["count"] for i in f["statuses"]}, {"已完结": 1})
+            self.assertEqual(f["statuses"], [])  # 「更新中/已完结」维度已下线
             self.assertEqual({i["name"]: i["count"] for i in f["resolutions"]}, {"4K": 1, "1080p": 1})
             self.assertEqual({i["name"]: i["count"] for i in f["editions"]}, {"BluRay": 1, "WEB-DL": 1})
             # 选电影频道：语言收窄到英语、地区欧美；状态（仅 tv）变空
