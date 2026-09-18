@@ -308,7 +308,9 @@ class PlaybackServiceTests(unittest.TestCase):
             asyncio.run(service.start_play(WORK_TV, file_path="不存在的文件.mkv", base_url="x"))
 
     def test_detect_player_custom_paths(self):
-        with unittest.mock.patch.object(library_playback.os.path, "isdir", return_value=True), \
+        # .app 分支只在 macOS 生效：CI 是 Linux，必须显式 mock platform.system
+        with unittest.mock.patch.object(library_playback.platform, "system", return_value="Darwin"), \
+                unittest.mock.patch.object(library_playback.os.path, "isdir", return_value=True), \
                 unittest.mock.patch.object(library_playback.os.path, "isfile", side_effect=lambda p: p.endswith("Contents/MacOS/Infuse")), \
                 unittest.mock.patch.object(library_playback.shutil, "which", return_value=None):
             detected = REAL_DETECT_PLAYER("/Applications/Infuse.app")
