@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.14
+// @version      1.3.15
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -5273,8 +5273,19 @@
     if (!entry) return null;
     return structureFromCureTmdbEntry(Number(tmdbId), entry);
   }
-  function mediaBangumiSearchKeyword(media) {
-    return String(media?.chineseTitles?.[0] || media?.title || media?.originalTitle || "").trim();
+  // 依次尝试的关键词：中文标题 → 原名（日文/英文）→ 其他中文别名，
+  // Bangumi 搜索对日文名很准，中文译名对不上时原名往往能中。
+  function mediaBangumiSearchKeywords(media) {
+    const output = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const value of [media?.chineseTitles?.[0] || media?.title, media?.originalTitle, ...(Array.isArray(media?.chineseTitles) ? media.chineseTitles.slice(1) : [])]) {
+      const keyword = String(value || "").replace(/\s+/g, " ").trim();
+      if (!keyword || seen.has(keyword)) continue;
+      seen.add(keyword);
+      output.push(keyword);
+      if (output.length >= 3) break;
+    }
+    return output;
   }
   async function loadBangumiStructureForMedia(media) {
     const tmdbId = Number(media?.id ?? media?.tmdbId ?? 0);
@@ -5282,11 +5293,24 @@
     const cacheKey = `${BANGUMI_STRUCTURE_CACHE_PREFIX}${tmdbId}`;
     const cached = structureCacheStoreGet(cacheKey);
     if (cached?.source === "bangumi") return cached;
-    const keyword = mediaBangumiSearchKeyword(media);
-    if (!keyword) return null;
-    const candidates = await bangumiClient.searchSubjects(keyword);
-    const matched = matchBangumiSubject(candidates, media);
-    if (!matched) return null;
+    let matched = null;
+    let searchError = null;
+    for (const keyword of mediaBangumiSearchKeywords(media)) {
+      let candidates;
+      try {
+        candidates = await bangumiClient.searchSubjects(keyword);
+      } catch (error) {
+        searchError = searchError || error;
+        continue;
+      }
+      matched = matchBangumiSubject(candidates, media);
+      if (matched) break;
+    }
+    if (!matched) {
+      // 全部关键词网络失败 → 抛错（弹窗给重试）；确实搜不到 → 返回 null（弹窗说明未匹配）
+      if (searchError) throw searchError;
+      return null;
+    }
     const anchor = await bangumiClient.subject(matched.id);
     const subjects = await buildBangumiChainSubjects(anchor, (id) => bangumiClient.subject(id).catch(() => null), async (id) => {
       try {
@@ -6517,6 +6541,16 @@
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.3.15",
+      notes: [
+        "动漫拆季改用真实分季数据：整理的「单季顺序拆多季 / 单季跳序拆多季」现在会去 Bangumi（走公共反代，被墙也能用）和 CureTMDb 社区分季表查这部番到底分几期，选好数据源再拆，拆之前每个数据源有多少季多少集都列出来给你看",
+        "拆分改成对号入座：每集按集数找到它在真实结构里的位置再编号，缺一集不再让后面整批错位一格；TMDB 把多期并成一季的番（比如只有一季 291 集的）现在也能拆了",
+        "「多季合并一季」也用真实数据：狐妖小红娘这类 TMDB 只有一季、文件却分 S1-S13 的，S13E05 会折算成全作累计集数 S01E172，只整理其中一季也能算对",
+        "剧集组策略加保险：文件季号和剧集组对不上时（比如文件 S13、剧集组里只有第一季）不再硬猜集号，宁可不匹配也不错配",
+        "集号本来就对的文件不再被重编号；单季合并型作品（比如 366 集一季的）会提示改用合并策略，不会硬拆"
+      ]
+    },
     {
       version: "1.3.14",
       notes: [
@@ -19578,7 +19612,8 @@ ${end.comment}` : end.comment;
       strategyResult = computeGroupStrategyAssignments(strategy, group.files, media, {
         fallbackSeason: Number(fields.season || 1),
         episodeGroupDetail: strategy.episodeGroupId ? options.episodeGroupCache?.[strategy.episodeGroupId] : null,
-        mergeAssignments: strategy.kind === "merge" ? options.strategyAssignments?.[group.id] : null
+        mergeAssignments: strategy.kind === "merge" ? options.strategyAssignments?.[group.id] : null,
+        structureCache: options.structureCache
       });
       for (const message of strategyResult.warnings) warnings.push(`${group.title}\uFF1A${message}`);
     }
@@ -19750,7 +19785,8 @@ ${end.comment}` : end.comment;
     const strategyResult = organizeStrategyActive(strategy) ? computeGroupStrategyAssignments(strategy, group.files, group.media, {
       fallbackSeason: Number(fields.season || 1),
       episodeGroupDetail: strategy.episodeGroupId ? options.episodeGroupCache?.[strategy.episodeGroupId] : null,
-      mergeAssignments: strategy.kind === "merge" ? options.strategyAssignments?.[group.id] : null
+      mergeAssignments: strategy.kind === "merge" ? options.strategyAssignments?.[group.id] : null,
+      structureCache: options.structureCache
     }) : null;
     const collectionName = fields.mediaType === "movie" ? String(group.media?.collectionName || "").trim() : "";
     const collectionEnabled = Boolean(collectionName) && (options.collectionByGroup?.[group.id] ?? config.library.collectionFolder === true);
@@ -20367,17 +20403,20 @@ ${end.comment}` : end.comment;
   var TMDB_EPISODE_GROUP_TYPES = { 1: "\u9996\u64AD\u987A\u5E8F", 2: "\u7EDD\u5BF9\u987A\u5E8F", 3: "DVD \u987A\u5E8F", 4: "\u6570\u5B57/\u6D41\u5A92\u4F53\u987A\u5E8F", 5: "\u6545\u4E8B\u7EBF", 6: "\u5236\u4F5C\u987A\u5E8F" };
   var ORGANIZE_STRATEGY_KINDS = [
     { kind: "default", title: "\u9ED8\u8BA4\u7B56\u7565\uFF1A\u8BC6\u522B\u5230\u7684\u5B63\u96C6", desc: "\u4F8B\uFF1A\u6309\u7167\u6587\u4EF6\u540D\u548C\u6587\u4EF6\u5939\u540D\u6B63\u5E38\u8BC6\u522B\u7684\u5B63\u96C6\u4FE1\u606F\uFF0C\u5982\u201C\u6743\u529B\u7684\u6E38\u620F.S06E05\u201D\u4E3A\u7B2C6\u5B63\u7B2C5\u96C6\u3002" },
-    { kind: "splitSequential", title: "\u62C6\u5206\u7B56\u7565\uFF1A\u5355\u5B63\u987A\u5E8F\u62C6\u591A\u5B63", desc: "\u4F8B\uFF1A\u9002\u7528\u7C7B\u4F3C\u52A8\u6F2B\u201C\u9F99\u73E0Z\u201D\uFF0C\u539F\u6587\u4EF61\u5B63\uFF0C\u5171291\u96C6\uFF0C\u6309 TMDB \u5B98\u65B9\u5404\u5B63\u96C6\u6570\u987A\u5E8F\u62C6\u5206\u4E3A\u591A\u5B63\uFF0C\u6BCF\u5B63\u4ECE\u7B2C1\u96C6\u5F00\u59CB\u91CD\u65B0\u7F16\u53F7\u3002" },
-    { kind: "splitKeep", title: "\u62C6\u5206\u7B56\u7565\uFF1A\u5355\u5B63\u8DF3\u5E8F\u62C6\u591A\u5B63", desc: "\u4F8B\uFF1A\u9002\u7528\u7C7B\u4F3C\u52A8\u6F2B\u201C\u6D77\u8D3C\u738B\u201D\uFF0C\u539F\u6587\u4EF61\u5B63\uFF0C\u51711119\u96C6\uFF08\u7EDD\u5BF9\u96C6\u6570\uFF09\uFF0C\u6309 TMDB \u5404\u5B63\u96C6\u6570\u8303\u56F4\u53EA\u6539\u5B63\u53F7\uFF0C\u4E0D\u6539\u96C6\u53F7\u3002" },
-    { kind: "merge", title: "\u5408\u5E76\u7B56\u7565\uFF1A\u591A\u5B63\u5408\u5E76\u4E00\u5B63", desc: "\u4F8B\uFF1A\u9002\u7528\u7C7B\u4F3C\u52A8\u6F2B\u201C\u540D\u4FA6\u63A2\u67EF\u5357\u201D\uFF0C\u539F\u6587\u4EF6\u6709\u591A\u5B63\uFF0C\u5408\u5E76\u4E3A\u4E00\u5B63\u540E\uFF0C\u96C6\u4FE1\u606F\u6309\u987A\u5E8F\u7D2F\u52A0\uFF1B\u5176\u4ED6\u540C\u540D\u5206\u7EC4\u7684\u6587\u4EF6\u4F1A\u4E00\u5E76\u7EB3\u5165\u8FDE\u7EED\u7F16\u53F7\u3002" },
+    { kind: "splitSequential", title: "\u62C6\u5206\u7B56\u7565\uFF1A\u5355\u5B63\u987A\u5E8F\u62C6\u591A\u5B63", desc: "\u4F8B\uFF1A\u52A8\u6F2B\u201C\u9F99\u73E0Z\u201D\u539F\u6587\u4EF61\u5B63 291 \u96C6\uFF0C\u6309\u771F\u5B9E\u5206\u5B63\u6570\u636E\uFF08Bangumi / CureTMDb / TMDB\uFF09\u628A\u6BCF\u96C6\u5BF9\u53F7\u5165\u5EA7\u62C6\u5230\u6B63\u786E\u7684\u5B63\uFF0C\u7F3A\u96C6\u4E0D\u4F1A\u9519\u4F4D\u3002" },
+    { kind: "splitKeep", title: "\u62C6\u5206\u7B56\u7565\uFF1A\u5355\u5B63\u8DF3\u5E8F\u62C6\u591A\u5B63", desc: "\u4F8B\uFF1A\u52A8\u6F2B\u201C\u6D77\u8D3C\u738B\u201D\u539F\u6587\u4EF61\u5B63 1119 \u96C6\uFF08\u7EDD\u5BF9\u96C6\u6570\uFF09\uFF0C\u6309\u771F\u5B9E\u5206\u5B63\u6570\u636E\u7684\u7D2F\u8BA1\u533A\u95F4\u53EA\u6539\u5B63\u53F7\u3001\u4E0D\u6539\u96C6\u53F7\u3002" },
+    { kind: "merge", title: "\u5408\u5E76\u7B56\u7565\uFF1A\u591A\u5B63\u5408\u5E76\u4E00\u5B63", desc: "\u4F8B\uFF1A\u52A8\u6F2B\u201C\u72D0\u5996\u5C0F\u7EA2\u5A18\u201D\u539F\u6587\u4EF6 S01-S13 \u800C TMDB \u53EA\u6709\u4E00\u5B63\uFF0C\u6309\u771F\u5B9E\u5206\u5B63\u6570\u636E\u628A\u6BCF\u5B63\u6298\u7B97\u6210\u5168\u4F5C\u7D2F\u8BA1\u96C6\u6570\u5408\u8FDB\u53BB\uFF08S13E05 \u2192 S01E172\uFF09\uFF0C\u53EA\u6574\u7406\u5176\u4E2D\u4E00\u5B63\u4E5F\u80FD\u7B97\u5BF9\u3002" },
     { kind: "episodeGroup", title: "\u5267\u96C6\u7EC4\u7B56\u7565\uFF1A\u6309 TMDB \u5267\u96C6\u7EC4", desc: "\u8BFB\u53D6\u8BE5\u5267\u5728 TMDB \u7684\u5267\u96C6\u7EC4\uFF08DVD \u987A\u5E8F\u3001\u7EDD\u5BF9\u987A\u5E8F\u3001\u6545\u4E8B\u7EBF\u7B49\uFF09\uFF0C\u5267\u96C6\u7EC4\u7684\u5B50\u7EC4\u4F5C\u4E3A\u76EE\u6807\u5B63\uFF0C\u7EC4\u5185\u987A\u5E8F\u4F5C\u4E3A\u96C6\u53F7\u3002" }
   ];
+  var STRATEGY_SOURCE_LABELS = { curetmdb: "CureTMDb", bangumi: "Bangumi", tmdb: "TMDB" };
   function organizeStrategyLabel(strategy) {
     if (!strategy || !strategy.kind || strategy.kind === "default") return "\u9ED8\u8BA4\u7B56\u7565";
     const meta = ORGANIZE_STRATEGY_KINDS.find((item) => item.kind === strategy.kind);
     if (!meta) return "\u81EA\u5B9A\u4E49\u7B56\u7565";
     if (strategy.kind === "episodeGroup") return `\u5267\u96C6\u7EC4\uFF1A${strategy.episodeGroupName || "\u5DF2\u9009\u62E9"}`;
-    return meta.title.split("\uFF1A").slice(1).join("\uFF1A") || meta.title;
+    const label = meta.title.split("\uFF1A").slice(1).join("\uFF1A") || meta.title;
+    const source = STRATEGY_SOURCE_LABELS[strategy.structureSource];
+    return (strategyUsesStructure(strategy.kind) && source) ? `${label}\uFF08${source}\uFF09` : label;
   }
   function organizeStrategyActive(strategy) {
     return Boolean(strategy && strategy.kind && strategy.kind !== "default");
@@ -20387,6 +20426,54 @@ ${end.comment}` : end.comment;
       season: Number(season.season_number ?? season.seasonNumber ?? 0),
       count: Number(season.episode_count ?? season.episodeCount ?? 0)
     })).filter((item) => Number.isInteger(item.season) && item.season > 0 && Number.isInteger(item.count) && item.count > 0).sort((left, right) => left.season - right.season);
+  }
+  // 拆分策略吃的是「结构」：{ source, sourceLabel, name, detail, seasons:[{season,count,name,date}], incomplete }。
+  // source: curetmdb（CureTMDb 社区分季表）> bangumi（Bangumi 续集链）> tmdb（TMDB 官方季）。
+  function kindIsSplitStrategy(kind) {
+    return kind === "splitSequential" || kind === "splitKeep";
+  }
+  // 吃真实分季结构的策略：两种拆分 + 多季合并一季（合并用结构算累计集数偏移）。
+  function strategyUsesStructure(kind) {
+    return kindIsSplitStrategy(kind) || kind === "merge";
+  }
+  function tmdbStructureFromMedia(media) {
+    const capacities = tmdbSeasonCapacities(media);
+    const seasons = capacities.map((capacity) => {
+      const raw = (Array.isArray(media?.seasons) ? media.seasons : []).find((season) => Number(season?.season_number ?? season?.seasonNumber ?? 0) === capacity.season);
+      return { season: capacity.season, count: capacity.count, name: String(raw?.name || ""), date: String(raw?.air_date || raw?.airDate || "") };
+    });
+    return { source: "tmdb", sourceLabel: "TMDB \u5B98\u65B9\u5206\u5B63", name: String(media?.title || ""), detail: "TMDB \u5B98\u65B9\u5B63\u96C6\u6570\u636E", seasons, incomplete: false };
+  }
+  function splitSeasonBounds(structure) {
+    const bounds = [];
+    let total = 0;
+    for (const season of Array.isArray(structure?.seasons) ? structure.seasons : []) {
+      const count = Math.floor(Number(season?.count ?? 0));
+      if (!Number.isInteger(count) || count <= 0) continue;
+      const number = Math.floor(Number(season?.season ?? 0));
+      bounds.push({ season: number, from: total + 1, to: total + count, count });
+      total += count;
+    }
+    return bounds;
+  }
+  function strategyStructureCacheKey(media, source) {
+    return `tv:${Number(media?.id ?? media?.tmdbId ?? 0)}:${source}`;
+  }
+  function resolveStrategyStructure(strategy, media, structureCache) {
+    const source = strategy?.structureSource || "tmdb";
+    const structure = structureCache?.[strategyStructureCacheKey(media, source)];
+    if (structure && Array.isArray(structure.seasons) && structure.seasons.length) return structure;
+    return tmdbStructureFromMedia(media);
+  }
+  function structureIsSingleSeason(structure) {
+    return splitSeasonBounds(structure).length <= 1;
+  }
+  function structureSeasonChipsText(structure) {
+    const seasons = (Array.isArray(structure?.seasons) ? structure.seasons : []).filter((season) => Number(season?.count ?? 0) > 0);
+    if (!seasons.length) return "\u65E0\u6B63\u7247\u5B63\u6570\u636E";
+    const chips = seasons.slice(0, 12).map((season) => `S${season.season} ${season.count}\u96C6`);
+    if (seasons.length > 12) chips.push(`\u2026\u5171 ${seasons.length} \u5B63`);
+    return chips.join(" \xB7 ");
   }
   function strategyIsSpecialFile(file) {
     const name = String(file?.name || "");
@@ -20423,59 +20510,110 @@ ${end.comment}` : end.comment;
       reason
     };
   }
-  function planSplitSequentialAssignments(items, capacities, reason) {
-    if (!capacities.length) return { assignments: /* @__PURE__ */ new Map(), warnings: ["\u672A\u8BFB\u53D6\u5230 TMDB \u5404\u5B63\u96C6\u6570\uFF0C\u65E0\u6CD5\u6309\u5B63\u62C6\u5206"] };
+  function splitSingleSeasonWarning(structure) {
+    const bounds = splitSeasonBounds(structure);
+    const only = bounds[0];
+    return `${structure?.sourceLabel || "\u5206\u5B63\u6570\u636E"}\u91CC\u8BE5\u4F5C\u54C1\u53EA\u6709\u4E00\u5B63\uFF08S${only.season} \u5171 ${only.count} \u96C6\uFF09\uFF0C\u65E0\u9700\u62C6\u5206\uFF1B\u8981\u628A\u591A\u5B63\u5E76\u6210\u4E00\u5B63\u8BF7\u6539\u7528\u300C\u5408\u5E76\u7B56\u7565\u300D`;
+  }
+  // 结构里真的只登记了一期才算「无需拆分」；连载中后续期集数未知时
+  // （bounds 只剩一季）仍要继续拆，覆盖已知集数。
+  function splitStructureIsTriviallySingle(structure) {
+    return (Array.isArray(structure?.seasons) ? structure.seasons : []).length === 1;
+  }
+  // 单季顺序拆多季（对号入座）：把每个文件的集号当作该作品的累计集数，在真实分季
+  // 结构里反查目标季集（等价 curetmdbanime 的 absolute_episode 策略）。文件自身的
+  // SxxEyy 在结构里本来就合法 → 原样保留；否则按绝对集号落位并重新编号；没有集号
+  // 的文件排在已入座位置之后顺序占位。缺集不会让后续文件错位（旧顺序占位算法的
+  // 核心缺陷）。
+  function planSplitSequentialAssignments(items, structure, reason) {
+    const bounds = splitSeasonBounds(structure);
+    if (!bounds.length) return { assignments: /* @__PURE__ */ new Map(), warnings: ["\u672A\u8BFB\u53D6\u5230\u771F\u5B9E\u5206\u5B63\u6570\u636E\uFF0C\u65E0\u6CD5\u6309\u5B63\u62C6\u5206"] };
     if (!items.length) return { assignments: /* @__PURE__ */ new Map(), warnings: [] };
+    if (bounds.length === 1 && splitStructureIsTriviallySingle(structure)) return { assignments: /* @__PURE__ */ new Map(), warnings: [splitSingleSeasonWarning(structure)] };
     const warnings = [];
-    const seasons = items.map((item) => item.season).filter((season) => season > 0);
-    const startSeason = seasons.length ? Math.min(...seasons) : 1;
-    let index = capacities.findIndex((capacity) => capacity.season >= startSeason);
-    if (index < 0) {
-      index = 0;
-      warnings.push(`TMDB \u6CA1\u6709\u7B2C ${startSeason} \u5B63\u53CA\u4E4B\u540E\u7684\u6B63\u7247\u5B63\uFF0C\u5DF2\u4ECE\u7B2C ${capacities[0].season} \u5B63\u5F00\u59CB\u62C6\u5206`);
-    }
-    let position = 0;
-    let consumed = 0;
-    let overflow = false;
-    const overflowTotal = capacities.reduce((sum, capacity) => sum + capacity.count, 0);
+    const pushWarningOnce = (list, message, seen) => {
+      if (!seen.has(message)) {
+        seen.add(message);
+        list.push(message);
+      }
+    };
+    if (structure?.incomplete) warnings.push("\u5206\u5B63\u6570\u636E\u91CC\u6700\u65B0\u4E00\u671F\u96C6\u6570\u672A\u77E5\uFF08\u53EF\u80FD\u8FDE\u8F7D\u4E2D\uFF09\uFF0C\u62C6\u5206\u53EA\u8986\u76D6\u5DF2\u77E5\u7684\u96C6\u6570");
+    const seenWarnings = new Set();
+    const total = bounds[bounds.length - 1].to;
+    const lastSeason = bounds[bounds.length - 1].season;
     const assignments = /* @__PURE__ */ new Map();
+    const seenAbsolute = /* @__PURE__ */ new Map();
+    let cursor = 0;
+    let overflowWarned = false;
+    const boundForSeason = (season) => bounds.find((bound) => bound.season === season) || null;
+    const boundForAbsolute = (absolute) => bounds.find((bound) => absolute >= bound.from && absolute <= bound.to) || null;
+    const seatOverflow = (item) => {
+      pushWarningOnce(warnings, `\u6587\u4EF6\u8D85\u51FA\u603B\u96C6\u6570\uFF08${total} \u96C6\uFF09\uFF0C\u8D85\u51FA\u90E8\u5206\u5DF2\u987A\u5EF6\u5230\u6700\u540E\u4E00\u5B63`, seenWarnings);
+      assignments.set(item.file.id, strategySeasonEpisodeMatch(lastSeason, cursor + 1, cursor + item.span, reason));
+      cursor += item.span;
+    };
+    // 把 item 放到累计集号 absolute 上：整段落在同一季直接落位；跨到下一季则整条
+    // 挪到下一季从第 1 集重新编号（与旧顺序占位行为一致）。成功返回 true。
+    const seatAbsolute = (item, absolute) => {
+      const bound = boundForAbsolute(absolute);
+      if (!bound) return false;
+      if (absolute + item.span - 1 <= bound.to) {
+        assignments.set(item.file.id, strategySeasonEpisodeMatch(bound.season, absolute - bound.from + 1, absolute - bound.from + item.span, reason));
+        seenAbsolute.set(absolute, (seenAbsolute.get(absolute) || 0) + 1);
+        cursor = Math.max(cursor, absolute + item.span - 1);
+        return true;
+      }
+      const next = bounds[bounds.indexOf(bound) + 1];
+      if (!next) return false;
+      assignments.set(item.file.id, strategySeasonEpisodeMatch(next.season, 1, item.span, reason));
+      seenAbsolute.set(absolute, (seenAbsolute.get(absolute) || 0) + 1);
+      cursor = Math.max(cursor, next.from + item.span - 1);
+      return true;
+    };
+    const seatDuplicate = (item, label) => {
+      pushWarningOnce(warnings, `\u96C6\u53F7\u5B58\u5728\u91CD\u590D\uFF08${label}\uFF09\uFF0C\u91CD\u590D\u6587\u4EF6\u5DF2\u987A\u5EF6\u7F16\u53F7\uFF0C\u8BF7\u6838\u5BF9\u7ED3\u679C`, seenWarnings);
+      if (cursor >= total || !seatAbsolute(item, cursor + 1)) seatOverflow(item);
+    };
     for (const item of items) {
-      if (!overflow) {
-        const capacity = capacities[index];
-        if (!capacity) overflow = true;
-        else if (position > 0 && position + item.span > capacity.count) {
-          index += 1;
-          position = 0;
-          if (!capacities[index]) overflow = true;
-        } else if (position >= capacity.count) {
-          index += 1;
-          position = 0;
-          if (!capacities[index]) overflow = true;
+      const episode = item.episode === Number.MAX_SAFE_INTEGER ? 0 : item.episode;
+      const ownBound = item.season > 0 ? boundForSeason(item.season) : null;
+      if (episode > 0 && ownBound && episode <= ownBound.count) {
+        // 季集本来就合法 → 原样保留
+        const absolute = ownBound.from + episode - 1;
+        if (seenAbsolute.get(absolute)) {
+          seatDuplicate(item, `S${String(item.season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`);
+          continue;
         }
-        if (overflow) warnings.push(`\u6587\u4EF6\u8D85\u51FA TMDB \u603B\u96C6\u6570\uFF08${overflowTotal} \u96C6\uFF09\uFF0C\u8D85\u51FA\u90E8\u5206\u5DF2\u987A\u5EF6\u5230\u6700\u540E\u4E00\u5B63`);
+        if (episode + item.span - 1 <= ownBound.count) {
+          assignments.set(item.file.id, strategySeasonEpisodeMatch(item.season, episode, episode + item.span - 1, reason));
+          seenAbsolute.set(absolute, (seenAbsolute.get(absolute) || 0) + 1);
+          cursor = Math.max(cursor, absolute + item.span - 1);
+        } else if (!seatAbsolute(item, absolute)) seatOverflow(item);
+        continue;
       }
-      if (overflow) {
-        const last = capacities[capacities.length - 1];
-        const season = last ? last.season : Math.max(1, startSeason);
-        assignments.set(item.file.id, strategySeasonEpisodeMatch(season, consumed + 1, consumed + item.span, reason));
-      } else {
-        const capacity = capacities[index];
-        assignments.set(item.file.id, strategySeasonEpisodeMatch(capacity.season, position + 1, position + item.span, reason));
-        position += item.span;
+      if (episode > 0 && episode <= total) {
+        if (seenAbsolute.get(episode)) {
+          seatDuplicate(item, `E${String(episode).padStart(2, "0")}`);
+          continue;
+        }
+        if (!seatAbsolute(item, episode)) seatOverflow(item);
+        continue;
       }
-      consumed += item.span;
+      if (episode > 0) {
+        seatOverflow(item);
+        continue;
+      }
+      if (cursor >= total || !seatAbsolute(item, cursor + 1)) seatOverflow(item);
     }
     return { assignments, warnings };
   }
-  function planSplitKeepAssignments(items, capacities, reason) {
-    if (!capacities.length) return { assignments: /* @__PURE__ */ new Map(), warnings: ["\u672A\u8BFB\u53D6\u5230 TMDB \u5404\u5B63\u96C6\u6570\uFF0C\u65E0\u6CD5\u6309\u5B63\u62C6\u5206"] };
+  function planSplitKeepAssignments(items, structure, reason) {
+    const bounds = splitSeasonBounds(structure);
+    if (!bounds.length) return { assignments: /* @__PURE__ */ new Map(), warnings: ["\u672A\u8BFB\u53D6\u5230\u771F\u5B9E\u5206\u5B63\u6570\u636E\uFF0C\u65E0\u6CD5\u6309\u5B63\u62C6\u5206"] };
+    if (bounds.length === 1 && splitStructureIsTriviallySingle(structure)) return { assignments: /* @__PURE__ */ new Map(), warnings: [splitSingleSeasonWarning(structure)] };
     const warnings = [];
-    const bounds = [];
-    let total = 0;
-    for (const capacity of capacities) {
-      bounds.push({ season: capacity.season, from: total + 1, to: total + capacity.count });
-      total += capacity.count;
-    }
+    if (structure?.incomplete) warnings.push("\u5206\u5B63\u6570\u636E\u91CC\u6700\u65B0\u4E00\u671F\u96C6\u6570\u672A\u77E5\uFF08\u53EF\u80FD\u8FDE\u8F7D\u4E2D\uFF09\uFF0C\u62C6\u5206\u53EA\u8986\u76D6\u5DF2\u77E5\u7684\u96C6\u6570");
+    if (structure?.source === "bangumi" || structure?.source === "curetmdb") warnings.push("\u8BE5\u5206\u5B63\u6570\u636E\u6309\u671F\u91CD\u65B0\u7F16\u53F7\uFF0C\u8DF3\u5E8F\u62C6\u5206\u53EA\u6539\u5B63\u53F7\u4E0D\u6539\u96C6\u53F7\uFF0C\u7ED3\u679C\u53EF\u80FD\u5BF9\u4E0D\u4E0A\uFF1B\u5EFA\u8BAE\u6539\u7528\u300C\u5355\u5B63\u987A\u5E8F\u62C6\u591A\u5B63\u300D");
     const assignments = /* @__PURE__ */ new Map();
     const seenEpisodes = /* @__PURE__ */ new Map();
     let beyond = 0;
@@ -20488,11 +20626,17 @@ ${end.comment}` : end.comment;
       const season = bound ? bound.season : bounds[bounds.length - 1].season;
       assignments.set(item.file.id, strategySeasonEpisodeMatch(season, episode, episode + item.span - 1, reason));
     }
-    if (beyond) warnings.push(`${beyond} \u4E2A\u6587\u4EF6\u8D85\u51FA TMDB \u603B\u96C6\u6570\uFF08${total} \u96C6\uFF09\uFF0C\u5DF2\u4FDD\u7559\u5728\u6700\u540E\u4E00\u5B63`);
+    if (beyond) warnings.push(`${beyond} \u4E2A\u6587\u4EF6\u8D85\u51FA\u603B\u96C6\u6570\uFF08${bounds[bounds.length - 1].to} \u96C6\uFF09\uFF0C\u5DF2\u4FDD\u7559\u5728\u6700\u540E\u4E00\u5B63`);
     if ([...seenEpisodes.values()].some((count) => count > 1)) warnings.push("\u96C6\u53F7\u5B58\u5728\u91CD\u590D\uFF0C\u6587\u4EF6\u53EF\u80FD\u4E0D\u662F\u7EDD\u5BF9\u96C6\u6570\u7F16\u53F7\uFF0C\u8BF7\u6838\u5BF9\u7ED3\u679C");
     return { assignments, warnings };
   }
-  function planMergeAssignments(items, options = {}, reason) {
+  function planMergeAssignments(items, options = {}, reason, structure) {
+    // 接了真实分季数据（Bangumi 期链 / CureTMDb 社区表）→ 按真实结构对号入座：
+    // 文件 S13E05 = 前 12 期累计集数 + 5，合并到 TMDB 单季后就是 S01E172。
+    // 没有真实数据（TMDB 官方季）→ 保持旧行为：从最小季号起顺序累加。
+    if (structure && (structure.source === "bangumi" || structure.source === "curetmdb") && splitSeasonBounds(structure).length) {
+      return planMergeStructureAssignments(items, structure, reason, options);
+    }
     const warnings = [];
     const seasons = items.map((item) => item.season).filter((season) => season > 0);
     const baseSeason = Number(options.targetSeason) > 0 ? Math.floor(Number(options.targetSeason)) : seasons.length ? Math.max(1, Math.min(...seasons)) : 1;
@@ -20501,6 +20645,51 @@ ${end.comment}` : end.comment;
     for (const item of items) {
       assignments.set(item.file.id, strategySeasonEpisodeMatch(baseSeason, counter, counter + item.span - 1, reason));
       counter += item.span;
+    }
+    return { assignments, warnings };
+  }
+  // 多季合并一季（真实结构对号入座）：文件自身的 SxxEyy 在结构里定位出全作累计
+  // 集数，全部并进单一目标季（默认第 1 季），集号 = 累计集数。只整理其中一季的
+  // 文件也能算对（偏移来自结构，不依赖其他季的文件在场）。
+  function planMergeStructureAssignments(items, structure, reason, options = {}) {
+    const bounds = splitSeasonBounds(structure);
+    const warnings = [];
+    const pushWarningOnce = (message, seen) => {
+      if (!seen.has(message)) {
+        seen.add(message);
+        warnings.push(message);
+      }
+    };
+    const seenWarnings = /* @__PURE__ */ new Set();
+    if (structure?.incomplete) warnings.push("\u5206\u5B63\u6570\u636E\u91CC\u6700\u65B0\u4E00\u671F\u96C6\u6570\u672A\u77E5\uFF08\u53EF\u80FD\u8FDE\u8F7D\u4E2D\uFF09\uFF0C\u5408\u5E76\u53EA\u8986\u76D6\u5DF2\u77E5\u7684\u96C6\u6570");
+    const total = bounds[bounds.length - 1].to;
+    const targetSeason = Number(options.targetSeason) > 0 ? Math.floor(Number(options.targetSeason)) : bounds[0].season;
+    const assignments = /* @__PURE__ */ new Map();
+    const seenAbsolute = /* @__PURE__ */ new Map();
+    let cursor = 0;
+    const boundForSeason = (season) => bounds.find((bound) => bound.season === season) || null;
+    const seenCount = (absolute) => seenAbsolute.get(absolute) || 0;
+    const seatAt = (item, absolute) => {
+      seenAbsolute.set(absolute, seenCount(absolute) + 1);
+      assignments.set(item.file.id, strategySeasonEpisodeMatch(targetSeason, absolute, absolute + item.span - 1, reason));
+      cursor = Math.max(cursor, absolute + item.span - 1);
+    };
+    for (const item of items) {
+      const episode = item.episode === Number.MAX_SAFE_INTEGER ? 0 : item.episode;
+      const ownBound = item.season > 0 ? boundForSeason(item.season) : null;
+      let absolute = null;
+      if (episode > 0 && ownBound && episode <= ownBound.count) absolute = ownBound.from + episode - 1;
+      else if (episode > 0 && bounds.length === 1 && episode <= total) absolute = episode;
+      if (absolute !== null) {
+        if (seenCount(absolute)) {
+          pushWarningOnce("\u96C6\u53F7\u5B58\u5728\u91CD\u590D\uFF0C\u91CD\u590D\u6587\u4EF6\u5DF2\u987A\u5EF6\u7F16\u53F7\uFF0C\u8BF7\u6838\u5BF9\u7ED3\u679C", seenWarnings);
+          seatAt(item, cursor + 1);
+        } else seatAt(item, absolute);
+        continue;
+      }
+      if (episode > 0 && ownBound) pushWarningOnce(`\u6709\u6587\u4EF6\u7684\u96C6\u53F7\u8D85\u51FA\u5206\u5B63\u6570\u636E\u91CC\u5BF9\u5E94\u671F\u7684\u96C6\u6570\uFF0C\u8FD9\u4E9B\u6587\u4EF6\u5DF2\u6309\u987A\u5E8F\u6392\u5230\u5DF2\u5165\u5EA7\u4F4D\u7F6E\u4E4B\u540E\uFF0C\u8BF7\u6838\u5BF9`, seenWarnings);
+      else if (episode > 0) pushWarningOnce(`\u6709\u6587\u4EF6\u7684\u5B63\u53F7\u4E0D\u5728\u5206\u5B63\u6570\u636E\u91CC\uFF0C\u5DF2\u6309\u987A\u5E8F\u6392\u5230\u5DF2\u5165\u5EA7\u4F4D\u7F6E\u4E4B\u540E\uFF0C\u8BF7\u6838\u5BF9`, seenWarnings);
+      seatAt(item, cursor + 1);
     }
     return { assignments, warnings };
   }
@@ -20552,11 +20741,17 @@ ${end.comment}` : end.comment;
     }
     const assignments = /* @__PURE__ */ new Map();
     let unmatched = 0;
+    const originSeasons = new Set(episodes.map((episode) => episode.originSeasonNumber).filter((number) => number > 0));
     for (const item of items) {
       const hint = parseEpisodeHint(item.file.name, options.fallbackSeason || 1);
+      // 文件带显式季号、但剧集组的原始季里没有这个季（狐妖小红娘式：文件 S13
+      // 而 TMDB 只有一季）→ 集号不能当剧集组顺序号兜底，否则 S13E05 会被错配
+      // 到全剧第 5 集；这种文件只信季集精确 / 播出日期 / 集名，对不上保留原识别。
+      const explicitSeason = parseSeasonEpisode(item.file.name, 0).season;
+      const seasonKnownInGroup = explicitSeason <= 0 || originSeasons.has(explicitSeason);
       let episode = null;
       if (hint.season > 0 && hint.episode > 0) episode = (byOriginKey.get(`${hint.season}x${hint.episode}`) || [])[0] || null;
-      if (!episode && hint.episode > 0) {
+      if (!episode && hint.episode > 0 && seasonKnownInGroup) {
         const candidates = byEpisodeNumber.get(hint.episode) || [];
         if (candidates.length === 1) episode = candidates[0];
         else if (candidates.length > 1) episode = candidates.find((candidate) => hint.season > 0 && candidate.originSeasonNumber === hint.season) || (hint.date ? candidates.find((candidate) => candidate.airDate === hint.date) : null) || candidates[0];
@@ -20579,15 +20774,199 @@ ${end.comment}` : end.comment;
     if (unmatched) warnings.push(`${unmatched} \u4E2A\u6587\u4EF6\u672A\u80FD\u5339\u914D\u5230\u5267\u96C6\u7EC4\u96C6\u6570\uFF0C\u5DF2\u4FDD\u7559\u539F\u8BC6\u522B\u7ED3\u679C`);
     return { assignments, warnings };
   }
+  // —— 真实分季数据（CureTMDb 社区表 + Bangumi 续集链）——
+  // CureTMDb tv.json：{ "TMDB 剧集 id": { name, seasons: [{ season_number, name, episode_count }] } }
+  function parseCureTmdbTvJson(raw) {
+    const output = {};
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return output;
+    for (const [key, entry] of Object.entries(raw)) {
+      const tmdbId = Number(key);
+      if (!Number.isInteger(tmdbId) || tmdbId <= 0 || !entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const seasons = [];
+      const seen = /* @__PURE__ */ new Set();
+      for (const season of Array.isArray(entry.seasons) ? entry.seasons : []) {
+        const number = Math.floor(Number(season?.season_number ?? season?.season ?? 0));
+        const count = Math.floor(Number(season?.episode_count ?? season?.count ?? 0));
+        if (!Number.isInteger(number) || number < 0 || seen.has(number)) continue;
+        if (number > 0 && (!Number.isInteger(count) || count <= 0)) continue;
+        seen.add(number);
+        seasons.push({ season: number, count: Number.isInteger(count) && count > 0 ? count : 0, name: String(season?.name || "") });
+      }
+      if (!seasons.length) continue;
+      output[String(tmdbId)] = { name: String(entry.name || ""), seasons };
+    }
+    return output;
+  }
+  function structureFromCureTmdbEntry(tmdbId, entry) {
+    const seasons = (entry?.seasons || []).filter((season) => season.season > 0 && season.count > 0).map((season) => ({ season: season.season, count: season.count, name: season.name, date: "" }));
+    return { source: "curetmdb", sourceLabel: "CureTMDb \u793E\u533A\u5206\u5B63", name: String(entry?.name || ""), detail: `\u793E\u533A\u4EBA\u5DE5\u7EF4\u62A4\u7684\u5206\u5B63\u6570\u636E\uFF08TMDB ${Number(tmdbId) || 0}\uFF09`, seasons, incomplete: false };
+  }
+  // 标题归一复用 episodeGroupNameKey（简体 + 小写 + 去掉字母数字汉字以外的字符）。
+  function bangumiSubjectTitleKeys(subject) {
+    return [subject?.name_cn, subject?.name].map((value) => episodeGroupNameKey(value)).filter(Boolean);
+  }
+  // 正片平台：TV（电视番）+ WEB（网盘番/国产动画——Bangumi 里凡人修仙传等都是 WEB）。
+  // 剧场版 / OVA / 游戏等一律不算，防止把电影串进剧的期链。
+  function bangumiPlatformIsSeries(platform) {
+    const value = String(platform || "").trim().toUpperCase();
+    return value === "TV" || value === "WEB";
+  }
+  function mediaBangumiTitleKeys(media) {
+    const output = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const value of [media?.title, media?.originalTitle, ...(Array.isArray(media?.chineseTitles) ? media.chineseTitles : [])]) {
+      const key = episodeGroupNameKey(value);
+      if (key.length < 2 || seen.has(key)) continue;
+      seen.add(key);
+      output.push(key);
+    }
+    return output;
+  }
+  // 在 Bangumi 搜索结果里挑与 TMDB 剧集对应的条目：动画（type 2）+ 正片平台
+  // （TV/WEB）+ 标题两级匹配（归一化完全相等 > 一方包含另一方，兼容「凡人修仙传
+  // 」vs「凡人修仙传之凡人风起天南」）+ 首播年与 TMDB 年份差 ≤1。排序：精确 >
+  // 包含 > 年份近 > 标题更短（裸标题通常是第一期）> 日期更早 > 译名命中。
+  function matchBangumiSubject(candidates, media) {
+    const list = (Array.isArray(candidates) ? candidates : []).filter((item) => Number(item?.type ?? 0) === 2 && bangumiPlatformIsSeries(item?.platform));
+    if (!list.length) return null;
+    const mediaKeys = mediaBangumiTitleKeys(media);
+    if (!mediaKeys.length) return null;
+    const mediaYear = Number(String(media?.year || "").slice(0, 4));
+    const scored = [];
+    for (const subject of list) {
+      const keys = bangumiSubjectTitleKeys(subject);
+      let quality = 0;
+      for (const mediaKey of mediaKeys) {
+        for (const key of keys) {
+          if (key === mediaKey) quality = Math.max(quality, 2);
+          else if ((key.includes(mediaKey) || mediaKey.includes(key)) && quality < 2) quality = Math.max(quality, 1);
+        }
+      }
+      if (!quality) continue;
+      const subjectYear = Number(String(subject?.date || "").slice(0, 4));
+      if (Number.isInteger(mediaYear) && mediaYear > 0 && Number.isInteger(subjectYear) && subjectYear > 0 && Math.abs(subjectYear - mediaYear) > 1) continue;
+      const nameCn = episodeGroupNameKey(subject?.name_cn);
+      scored.push({
+        subject,
+        quality,
+        year: Number.isInteger(subjectYear) && subjectYear > 0 ? subjectYear : 9999,
+        nameLength: (nameCn || keys[0] || "").length,
+        date: String(subject?.date || ""),
+        nameCnHit: Boolean(nameCn) && mediaKeys.includes(nameCn)
+      });
+    }
+    if (!scored.length) return null;
+    scored.sort((left, right) => right.quality - left.quality || Math.abs(left.year - (mediaYear || left.year)) - Math.abs(right.year - (mediaYear || right.year)) || left.nameLength - right.nameLength || left.date.localeCompare(right.date) || Number(right.nameCnHit) - Number(left.nameCnHit));
+    return scored[0].subject;
+  }
+  // 「狐妖小红娘1 下沙篇」式命名：锚点与续集共享系列词干，但各自带期号
+  // （小红娘1/2/3…），互不包含。从锚点名里剥出「系列词干 + 期号」的词干段，
+  // 候选名若 = 同一词干 + 新期号开头也算相容；「龙珠z/龙珠gt」的 gt 不是
+  // 期号，仍被拒。
+  function bangumiSequelNameCompatible(candidateKey, anchorKey) {
+    if (candidateKey === anchorKey) return false;
+    if (candidateKey.includes(anchorKey) || anchorKey.includes(candidateKey)) return true;
+    const numbering = anchorKey.match(/(?:\u7B2C[0-9\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D\u5341\u767E\u5343]+[\u5B63\u671F\u90E8\u7BC7]|[0-9]{1,3}|[\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D\u5341]{1,3}[\u5B63\u671F\u90E8\u7BC7])/);
+    if (!numbering || numbering.index < 2) return false;
+    const stem = anchorKey.slice(0, numbering.index);
+    if (!candidateKey.startsWith(stem)) return false;
+    return /^(?:\u7B2C[0-9\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D\u5341\u767E\u5343]+|[0-9]{1,3}|[\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D\u5341]{1,3}[\u5B63\u671F\u90E8\u7BC7])/.test(candidateKey.slice(stem.length));
+  }
+  // 续集候选：relation 必须是「续集」且为动画条目；名字与作品词干相容（一方包含
+  // 另一方或「系列名+期号」式，防"龙珠Z"串到"龙珠GT"；词干取锚点——即匹配到的
+  // 第一期——的标题，长 cour 名互不包含会断链）；日期不回退。关联列表不带
+  // platform/eps，候选需再拉条目详情确认是正片并取集数（由 buildBangumiChainSubjects 完成）。
+  function bangumiSequelCandidates(current, relations, seriesKey) {
+    const stem = String(seriesKey || "").trim() || bangumiSubjectTitleKeys(current)[0];
+    if (!stem) return [];
+    const currentDate = String(current?.date || "");
+    const output = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const item of Array.isArray(relations) ? relations : []) {
+      if (String(item?.relation || "") !== "\u7EED\u96C6") continue;
+      if (Number(item?.type ?? 0) !== 2) continue;
+      const id = Number(item?.id ?? 0);
+      if (!Number.isInteger(id) || id <= 0 || seen.has(id)) continue;
+      const key = episodeGroupNameKey(item?.name_cn || item?.name || "");
+      if (!key) continue;
+      if (!bangumiSequelNameCompatible(key, stem)) continue;
+      const nextDate = String(item?.date || "");
+      if (currentDate && nextDate && nextDate < currentDate) continue;
+      seen.add(id);
+      output.push({ id, date: nextDate });
+    }
+    return output;
+  }
+  // 从锚点条目沿「续集」正向串出全部 TV 期（不做前传回溯：同一 IP 的不同作如
+  // 龙珠/龙珠Z 会串台；搜索匹配已用 TMDB 首播年锚定第一期）。护栏：链长 ≤40、
+  // 每期必须 platform=TV 且有集数、日期不回退。
+  async function buildBangumiChainSubjects(anchor, fetchSubject, fetchRelations) {
+    if (!anchor || Number(anchor?.id ?? 0) <= 0) return [];
+    if (!bangumiPlatformIsSeries(anchor?.platform)) return [];
+    const seriesKey = bangumiSubjectTitleKeys(anchor)[0];
+    const chain = [];
+    const visited = /* @__PURE__ */ new Set();
+    let current = anchor;
+    while (current && chain.length < 40) {
+      const id = Number(current.id ?? 0);
+      if (!id || visited.has(id)) break;
+      visited.add(id);
+      chain.push({
+        id,
+        name: String(current.name || ""),
+        nameCn: String(current.name_cn || ""),
+        date: String(current.date || ""),
+        eps: Number(current.eps ?? 0),
+        totalEpisodes: Number(current.total_episodes ?? 0)
+      });
+      let relations = [];
+      try {
+        relations = await fetchRelations(id);
+      } catch {
+        relations = [];
+      }
+      let advanced = false;
+      for (const candidate of bangumiSequelCandidates(current, relations, seriesKey)) {
+        if (visited.has(candidate.id)) continue;
+        const detail = await fetchSubject(candidate.id).catch(() => null);
+        if (!detail || Number(detail?.type ?? 0) !== 2 || !bangumiPlatformIsSeries(detail?.platform)) continue;
+        const detailDate = String(detail?.date || "");
+        if (String(current.date || "") && detailDate && detailDate < String(current.date || "")) continue;
+        current = { ...detail, id: candidate.id };
+        advanced = true;
+        break;
+      }
+      if (!advanced) break;
+    }
+    return chain;
+  }
+  function structureFromBangumiChain(subjects) {
+    const list = Array.isArray(subjects) ? subjects : [];
+    const seasons = list.map((subject, index) => ({
+      season: index + 1,
+      count: Number(subject?.eps ?? 0) > 0 ? Number(subject.eps) : Number(subject?.totalEpisodes ?? subject?.total_episodes ?? 0) > 0 ? Number(subject?.totalEpisodes ?? subject?.total_episodes ?? 0) : 0,
+      name: String(subject?.nameCn ?? subject?.name_cn ?? subject?.name ?? ""),
+      date: String(subject?.date ?? "")
+    }));
+    return {
+      source: "bangumi",
+      sourceLabel: "Bangumi \u671F\u7ED3\u6784",
+      name: String(list[0]?.nameCn || list[0]?.name_cn || list[0]?.name || ""),
+      detail: list.length > 1 ? `\u6309 Bangumi \u7EED\u96C6\u5173\u7CFB\u4E32\u51FA ${list.length} \u671F` : "Bangumi \u53EA\u6709\u4E00\u671F",
+      seasons,
+      incomplete: seasons.some((season) => season.count <= 0)
+    };
+  }
   function computeGroupStrategyAssignments(strategy, files, media, context = {}) {
     const kind = strategy?.kind || "default";
     if (!organizeStrategyActive({ kind })) return { assignments: /* @__PURE__ */ new Map(), inherit: /* @__PURE__ */ new Map(), warnings: [] };
     const reason = `\u7B56\u7565\uFF1A${organizeStrategyLabel(strategy)}`;
     const items = strategyEpisodeItems(files, context.fallbackSeason || 1);
+    const structure = context.structure || resolveStrategyStructure(strategy, media, context.structureCache);
     let result;
-    if (kind === "splitSequential") result = planSplitSequentialAssignments(items, tmdbSeasonCapacities(media), reason);
-    else if (kind === "splitKeep") result = planSplitKeepAssignments(items, tmdbSeasonCapacities(media), reason);
-    else if (kind === "merge") result = context.mergeAssignments ? { assignments: context.mergeAssignments, warnings: [] } : planMergeAssignments(items, strategy, reason);
+    if (kind === "splitSequential") result = planSplitSequentialAssignments(items, structure, reason);
+    else if (kind === "splitKeep") result = planSplitKeepAssignments(items, structure, reason);
+    else if (kind === "merge") result = context.mergeAssignments ? { assignments: context.mergeAssignments, warnings: [] } : planMergeAssignments(items, strategy, reason, structure);
     else if (kind === "episodeGroup") result = context.episodeGroupDetail ? matchEpisodeGroupFiles(items, context.episodeGroupDetail, reason, { fallbackSeason: context.fallbackSeason || 1 }) : { assignments: /* @__PURE__ */ new Map(), warnings: ["\u5267\u96C6\u7EC4\u6570\u636E\u5C1A\u672A\u52A0\u8F7D\uFF0C\u8BF7\u91CD\u65B0\u5E94\u7528\u7B56\u7565"] };
     else result = { assignments: /* @__PURE__ */ new Map(), warnings: [] };
     // 旁挂字幕等非视频文件跟随同季集的主文件：按「原始 SxxEyy → 策略目标」建立继承表。
@@ -20598,7 +20977,7 @@ ${end.comment}` : end.comment;
     }
     return { assignments: result.assignments, inherit, warnings: result.warnings || [] };
   }
-  function prepareMergeStrategyAssignments(groups2, strategies, mergeScopes = {}) {
+  function prepareMergeStrategyAssignments(groups2, strategies, mergeScopes = {}, structureCache = null) {
     const output = {};
     const groupList = Array.isArray(groups2) ? groups2 : [];
     const groupById = new Map(groupList.map((item) => [item.id, item]));
@@ -20617,7 +20996,7 @@ ${end.comment}` : end.comment;
           if (file) files.push(file);
         }
       }
-      const computed = computeGroupStrategyAssignments(strategy, files, group.media, { fallbackSeason: Number(group.fields?.season || 1) }).assignments;
+      const computed = computeGroupStrategyAssignments(strategy, files, group.media, { fallbackSeason: Number(group.fields?.season || 1), structureCache }).assignments;
       // 合并范围里的每个分组都要拿到自己的分配表：被并入的分组本身没有策略
       // 记录，靠 strategyAssignments 里出现自己的 groupId 走「虚拟合并策略」。
       for (const part of scope) {
@@ -22170,7 +22549,15 @@ ${end.comment}` : end.comment;
       else if (dialog.episodeGroupsList?.length) groupList = `<div class="strategy-groups"><p class="strategy-groups-title">\u9009\u62E9\u5267\u96C6\u7EC4\uFF08\u5B50\u7EC4\u5C06\u4F5C\u4E3A\u76EE\u6807\u5B63\uFF0C\u7EC4\u5185\u987A\u5E8F\u4F5C\u4E3A\u96C6\u53F7\uFF09</p>${dialog.episodeGroupsList.map((item) => `<button type="button" class="strategy-card sub ${dialog.episodeGroupId === item.id ? "picked" : ""}" data-action="organize-strategy-group-pick" data-gid="${escapeHtml(item.id)}"><span class="strategy-copy"><strong>${escapeHtml(item.name || "\u672A\u547D\u540D\u5267\u96C6\u7EC4")}</strong><small>${escapeHtml([TMDB_EPISODE_GROUP_TYPES[item.type] || (item.type ? `\u7C7B\u578B ${item.type}` : ""), item.groupCount ? `${item.groupCount} \u5B50\u7EC4` : "", item.episodeCount ? `${item.episodeCount} \u96C6` : ""].filter(Boolean).join(" \xB7 "))}</small>${item.description ? `<small class="strategy-desc">${escapeHtml(item.description)}</small>` : ""}</span><span class="strategy-check">${icon("check", 15)}</span></button>`).join("")}</div>`;
       else groupList = `<div class="strategy-groups-loading">\u8BE5\u5267\u5728 TMDB \u6CA1\u6709\u53EF\u7528\u7684\u5267\u96C6\u7EC4</div>`;
     }
-    return `<div class="dialog-layer" data-action="organize-strategy-cancel"><section class="mini-dialog strategy-dialog" role="dialog" aria-modal="true" aria-label="\u5207\u6362\u6574\u7406\u7B56\u7565" data-action="stop"><header><h3>\u5207\u6362\u7B56\u7565</h3><button class="icon-button" data-action="organize-strategy-cancel" aria-label="\u5173\u95ED">${icon("close", 16)}</button></header><div class="mini-dialog-body strategy-body">${cards}${groupList}</div><footer class="strategy-footer"><button class="button" data-action="organize-plan-reset" data-group="${escapeHtml(group.id)}">${icon("restart", 14)}\u9ED8\u8BA4\u7B56\u7565</button><div class="button-row"><button class="button" data-action="organize-strategy-cancel">\u53D6\u6D88</button><button class="button primary" data-action="organize-strategy-apply" data-group="${escapeHtml(group.id)}"${dialog.applying ? " disabled" : ""}>${dialog.applying ? `${icon("loading", 14, "spin")}\u5E94\u7528\u4E2D\u2026` : "\u786E\u5B9A"}</button></div></footer></section></div>`;
+    let structureList = "";
+    if (strategyUsesStructure(dialog.pick)) {
+      const media = group.media;
+      if (!media?.id || (media.mediaType || group.fields.mediaType) !== "tv") structureList = notice("\u8BF7\u5148\u901A\u8FC7\u300C\u67E5\u8BE2\u56DE\u5199\u300D\u9009\u62E9\u4E00\u4E2A TMDB \u5267\u96C6\uFF0C\u518D\u9009\u62E9\u5206\u5B63\u6570\u636E\u3002", "warning");
+      else if (dialog.structuresLoading) structureList = `<div class="strategy-groups-loading">${icon("loading", 18, "spin")} \u6B63\u5728\u8BFB\u53D6\u771F\u5B9E\u5206\u5B63\u6570\u636E\u2026</div>`;
+      else if (dialog.structuresList?.length) structureList = `<div class="strategy-groups"><p class="strategy-groups-title">\u9009\u62E9\u5206\u5B63\u6570\u636E\uFF08\u62C6\u5206\u6309\u8FD9\u4EFD\u5B63\u96C6\u8868\u5BF9\u53F7\u5165\u5EA7\uFF09</p>${dialog.structuresInfo ? `<p class="strategy-groups-title">${escapeHtml(dialog.structuresInfo)}</p>` : ""}${dialog.structuresError ? `${notice(dialog.structuresError, "error")}<button class="button compact" data-action="organize-strategy-reload" data-group="${escapeHtml(group.id)}">${icon("refresh", 14)}\u91CD\u8BD5</button>` : ""}${dialog.structuresList.map((item) => `<button type="button" class="strategy-card sub ${dialog.structureSource === item.source ? "picked" : ""}" data-action="organize-strategy-structure-pick" data-source="${escapeHtml(item.source)}"><span class="strategy-copy"><strong>${escapeHtml(item.sourceLabel || item.source)}</strong><small>${escapeHtml(structureSeasonChipsText(item))}</small>${item.name ? `<small class="strategy-desc">${escapeHtml([item.name, item.detail].filter(Boolean).join(" \xB7 "))}</small>` : ""}${structureIsSingleSeason(item) ? `<small class="strategy-desc">${dialog.pick === "merge" ? "\u5355\u671F\u7ED3\u6784\uFF1A\u96C6\u53F7\u5373\u5168\u4F5C\u7D2F\u8BA1\u96C6\u6570\uFF0C\u5408\u5E76\u540E\u6309\u539F\u96C6\u53F7\u7F16\u5165\u5355\u5B63" : "\u5355\u5B63\u7ED3\u6784\uFF0C\u65E0\u9700\u62C6\u5206\uFF1B\u591A\u5B63\u5408\u5E76\u578B\u4F5C\u54C1\u8BF7\u7528\u5408\u5E76\u7B56\u7565"}</small>` : ""}${item.incomplete ? `<small class="strategy-desc">\u6700\u65B0\u4E00\u671F\u96C6\u6570\u672A\u77E5\uFF0C\u53EF\u80FD\u8FDE\u8F7D\u4E2D</small>` : ""}</span><span class="strategy-check">${icon("check", 15)}</span></button>`).join("")}</div>`;
+      else if (dialog.structuresError) structureList = `<div class="strategy-groups-status">${notice(dialog.structuresError, "error")}<button class="button compact" data-action="organize-strategy-reload" data-group="${escapeHtml(group.id)}">${icon("refresh", 14)}\u91CD\u8BD5</button></div>`;
+    }
+    return `<div class="dialog-layer" data-action="organize-strategy-cancel"><section class="mini-dialog strategy-dialog" role="dialog" aria-modal="true" aria-label="\u5207\u6362\u6574\u7406\u7B56\u7565" data-action="stop"><header><h3>\u5207\u6362\u7B56\u7565</h3><button class="icon-button" data-action="organize-strategy-cancel" aria-label="\u5173\u95ED">${icon("close", 16)}</button></header><div class="mini-dialog-body strategy-body">${cards}${structureList}${groupList}</div><footer class="strategy-footer"><button class="button" data-action="organize-plan-reset" data-group="${escapeHtml(group.id)}">${icon("restart", 14)}\u9ED8\u8BA4\u7B56\u7565</button><div class="button-row"><button class="button" data-action="organize-strategy-cancel">\u53D6\u6D88</button><button class="button primary" data-action="organize-strategy-apply" data-group="${escapeHtml(group.id)}"${dialog.applying ? " disabled" : ""}>${dialog.applying ? `${icon("loading", 14, "spin")}\u5E94\u7528\u4E2D\u2026` : "\u786E\u5B9A"}</button></div></footer></section></div>`;
   }
 
   // src/ui/views/records.js
@@ -25100,8 +25487,9 @@ ${end.comment}` : end.comment;
         episodePlans: this.organize.episodePlans,
         strategies: this.organize.strategies,
         episodeGroupCache: this.organize.episodeGroupCache,
+        structureCache: this.organize.structureCache,
         collectionByGroup: this.organize.collectionByGroup,
-        strategyAssignments: prepareMergeStrategyAssignments(this.organize.preview?.groups || [], this.organize.strategies, this.organize.mergeScopes),
+        strategyAssignments: prepareMergeStrategyAssignments(this.organize.preview?.groups || [], this.organize.strategies, this.organize.mergeScopes, this.organize.structureCache),
         metadataByGroup: this.organize.metadataByGroup,
         excludedGroupIds: this.organize.excludedGroupIds,
         excludedItemIds: this.organize.excludedItemIds,
@@ -25139,6 +25527,7 @@ ${end.comment}` : end.comment;
         strategies: {},
         mergeScopes: {},
         episodeGroupCache: {},
+        structureCache: {},
         collectionByGroup: {},
         strategyDialog: null,
         manualNames: {},
@@ -25261,6 +25650,52 @@ ${end.comment}` : end.comment;
       } finally {
         if (this.organize?.strategyDialog === dialog) {
           dialog.episodeGroupsLoading = false;
+          this.render();
+        }
+      }
+    }
+    // 拉取拆分策略可用的分季数据：CureTMDb 社区表 + Bangumi 续集链并行读，
+    // TMDB 官方结构永远兜底在列表末尾；读到的结构顺手写进 structureCache 供
+    // 预览重算使用。两个外部源都失败时保留 TMDB 并给出错误提示与重试。
+    async loadOrganizeSplitStructures() {
+      const dialog = this.organize?.strategyDialog;
+      if (!dialog || dialog.structuresLoading) return;
+      const group = this.organize.preview?.groups.find((item) => item.id === dialog.groupId);
+      const media = group?.media;
+      if (!media?.id || (media.mediaType || group?.fields?.mediaType) !== "tv") {
+        dialog.structuresError = "\u8BF7\u5148\u901A\u8FC7\u300C\u67E5\u8BE2\u56DE\u5199\u300D\u9009\u62E9\u4E00\u4E2A TMDB \u5267\u96C6";
+        this.render();
+        return;
+      }
+      dialog.structuresLoading = true;
+      dialog.structuresError = "";
+      dialog.structuresInfo = "";
+      this.render();
+      try {
+        const [cureResult, bangumiResult] = await Promise.allSettled([loadCureTmdbTvStructure(media.id), loadBangumiStructureForMedia(media)]);
+        const list = [];
+        const notes = [];
+        const errors = [];
+        if (cureResult.status === "fulfilled" && cureResult.value) list.push(cureResult.value);
+        else if (cureResult.status === "rejected") errors.push(`CureTMDb\uFF1A${cureResult.reason?.message || "\u8BFB\u53D6\u5931\u8D25"}`);
+        if (bangumiResult.status === "fulfilled" && bangumiResult.value) list.push(bangumiResult.value);
+        else if (bangumiResult.status === "fulfilled") notes.push("Bangumi \u6CA1\u6709\u5339\u914D\u5230\u8FD9\u90E8\u5267\uFF08\u6807\u9898\u4E0D\u4E00\u81F4\u6216\u672A\u6536\u5F55\uFF09\uFF0C\u53EA\u80FD\u7528 TMDB \u5B98\u65B9\u5206\u5B63");
+        else errors.push(`Bangumi\uFF1A${bangumiResult.reason?.message || "\u8BFB\u53D6\u5931\u8D25"}`);
+        list.push(tmdbStructureFromMedia(media));
+        for (const structure of list) this.organize.structureCache[strategyStructureCacheKey(media, structure.source)] = structure;
+        dialog.structuresList = list;
+        dialog.structuresInfo = notes.join("\uFF1B");
+        if (!list.some((item) => item.source !== "tmdb")) dialog.structuresError = errors.join("\uFF1B");
+        else if (errors.length) dialog.structuresInfo = [...errors, ...notes].join("\uFF1B");
+        if (!dialog.structureSource || !list.some((item) => item.source === dialog.structureSource)) {
+          // 合并策略：单期结构（柯南式全作一entry）也照样有用，真实源无论单多期都优先
+          const prefer = (source) => list.find((item) => item.source === source && (dialog.pick === "merge" || !structureIsSingleSeason(item)));
+          const preferred = prefer("curetmdb") || prefer("bangumi") || list.find((item) => item.source === "curetmdb") || list[0];
+          dialog.structureSource = preferred.source;
+        }
+      } finally {
+        if (this.organize?.strategyDialog === dialog) {
+          dialog.structuresLoading = false;
           this.render();
         }
       }
@@ -26221,8 +26656,15 @@ ${end.comment}` : end.comment;
             episodeGroupsList: null,
             episodeGroupsLoading: false,
             episodeGroupsError: "",
+            structureSource: current?.structureSource || "",
+            structuresList: null,
+            structuresLoading: false,
+            structuresError: "",
+            structuresInfo: "",
             applying: false
           };
+          // 打开弹窗就预取分季数据（带 24h 缓存），选拆分策略时卡片立即可见
+          void this.loadOrganizeSplitStructures();
           this.render();
         },
         "organize-strategy-pick": (control) => {
@@ -26230,6 +26672,13 @@ ${end.comment}` : end.comment;
           if (!dialog) return;
           dialog.pick = control.dataset.kind || "default";
           if (dialog.pick === "episodeGroup" && !dialog.episodeGroupsList && !dialog.episodeGroupsLoading && !dialog.episodeGroupsError) void this.loadOrganizeEpisodeGroups();
+          if (strategyUsesStructure(dialog.pick) && !dialog.structuresList && !dialog.structuresLoading) void this.loadOrganizeSplitStructures();
+          this.render();
+        },
+        "organize-strategy-structure-pick": (control) => {
+          const dialog = this.organize.strategyDialog;
+          if (!dialog) return;
+          dialog.structureSource = control.dataset.source || "";
           this.render();
         },
         "organize-strategy-group-pick": (control) => {
@@ -26240,7 +26689,9 @@ ${end.comment}` : end.comment;
           this.render();
         },
         "organize-strategy-reload": () => {
-          void this.loadOrganizeEpisodeGroups();
+          const dialog = this.organize.strategyDialog;
+          if (dialog && kindIsSplitStrategy(dialog.pick)) void this.loadOrganizeSplitStructures();
+          else void this.loadOrganizeEpisodeGroups();
         },
         "organize-strategy-cancel": () => {
           if (!this.organize.strategyDialog) return;
@@ -26275,11 +26726,28 @@ ${end.comment}` : end.comment;
             }
             this.organize.strategies[groupId] = { kind: "episodeGroup", episodeGroupId: dialog.episodeGroupId, episodeGroupName: dialog.episodeGroupName };
           } else if (pick === "merge") {
-            this.organize.strategies[groupId] = { kind: "merge" };
-          } else if (pick === "splitSequential") {
-            this.organize.strategies[groupId] = { kind: "splitSequential" };
-          } else if (pick === "splitKeep") {
-            this.organize.strategies[groupId] = { kind: "splitKeep" };
+            if (!dialog.structuresList && !dialog.structuresLoading) {
+              dialog.applying = true;
+              this.render();
+              await this.loadOrganizeSplitStructures();
+              dialog.applying = false;
+            }
+            const structureSource = dialog.structureSource || dialog.structuresList?.[0]?.source || "tmdb";
+            this.organize.strategies[groupId] = { kind: "merge", structureSource };
+          } else if (pick === "splitSequential" || pick === "splitKeep") {
+            if (!dialog.structuresList && !dialog.structuresLoading) {
+              dialog.applying = true;
+              this.render();
+              await this.loadOrganizeSplitStructures();
+              dialog.applying = false;
+            }
+            const structureSource = dialog.structureSource || dialog.structuresList?.[0]?.source || "tmdb";
+            const chosenStructure = dialog.structuresList?.find((item) => item.source === structureSource);
+            if (chosenStructure && structureIsSingleSeason(chosenStructure)) {
+              this.toast(`\u300C${chosenStructure.sourceLabel || structureSource}\u300D\u91CC\u8BE5\u5267\u53EA\u6709\u4E00\u5B63\uFF0C\u65E0\u9700\u62C6\u5206\uFF1B\u8981\u628A\u591A\u5B63\u5E76\u6210\u4E00\u5B63\u8BF7\u7528\u300C\u5408\u5E76\u7B56\u7565\u300D`, "warning");
+              return;
+            }
+            this.organize.strategies[groupId] = { kind: pick, structureSource };
           } else {
             delete this.organize.strategies[groupId];
             delete this.organize.mergeScopes[groupId];
