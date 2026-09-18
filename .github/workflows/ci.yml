@@ -13,8 +13,6 @@ jobs:
   tests:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -29,25 +27,12 @@ jobs:
       - name: Install backend dependencies
         run: python -m pip install -e './desktop/backend[dev]'
       - name: Run backend tests
-        id: pytest
         working-directory: desktop/backend
-        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
-          python -m pytest -q --tb=short 2>&1 | tee pytest.out; test ${PIPESTATUS[0]} -eq 0
-      - name: Commit failure log back to repo
-        if: steps.pytest.outcome == 'failure'
-        working-directory: desktop/backend
-        run: |
-          git config user.email "ci@123cloud.local"
-          git config user.name "ci-log-bot"
-          git add pytest.out
-          git commit -m "ci: pytest 失败日志（py${{ matrix.python-version }}）[skip ci]"
-          git push
-      - name: Fail if tests failed
-        if: steps.pytest.outcome == 'failure'
-        run: exit 1
+          # 失败时把输出尾部写进 run Summary（页面匿名可见），便于远程定位
+          python -m pytest -q --tb=short 2>&1 | tee /tmp/pytest.out || { tail -n 100 /tmp/pytest.out >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"; exit 1; }
       - uses: actions/setup-node@v4
         with:
           node-version: 20
