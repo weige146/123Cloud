@@ -314,10 +314,12 @@ class PlaybackServiceTests(unittest.TestCase):
                 unittest.mock.patch.object(library_playback.os.path, "isfile", side_effect=lambda p: p.endswith("Contents/MacOS/Infuse")), \
                 unittest.mock.patch.object(library_playback.shutil, "which", return_value=None):
             detected = REAL_DETECT_PLAYER("/Applications/Infuse.app")
+            # 「系统默认」也放进 mac mock 块：Linux 下会回退 xdg-open
+            system_mac = REAL_DETECT_PLAYER("system")
         self.assertEqual(detected["kind"], "infuse")  # Infuse 特判：单集模式 + 官方跳转协议
         self.assertEqual(detected["label"], "Infuse")
-        self.assertEqual(REAL_DETECT_PLAYER("system")["kind"], "system")
-        self.assertEqual(REAL_DETECT_PLAYER("system")["path"], "/usr/bin/open")
+        self.assertEqual(system_mac["kind"], "system")
+        self.assertEqual(system_mac["path"], "/usr/bin/open")
         # 选了不存在的程序 → 空（start_play 会直接报错，不白转存）
         self.assertEqual(REAL_DETECT_PLAYER("/Applications/不存在.app")["kind"], "")
 

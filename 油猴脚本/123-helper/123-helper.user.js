@@ -5124,6 +5124,183 @@
     }
   };
 
+  // src/tmdb.js — Bangumi 真实分季数据 + CureTMDb 社区分季表（动漫拆分策略的数据源）。
+  // Bangumi 官方 api.bgm.tv 在大陆被墙，默认走公共反代 bgmapi.anibt.net（响应里的图片域
+  // 也会被反代改写成 bgmimg.anibt.net），失败自动回退官方域名；路径与官方 v0 API 一致：
+  // 搜索 POST /v0/search/subjects（复数）、条目 GET /v0/subjects/{id}、关联 GET /v0/subjects/{id}/subjects。
+  var BANGUMI_API_HOSTS = ["https://bgmapi.anibt.net", "https://api.bgm.tv"];
+  var BANGUMI_UA = "123-helper/1.3 (+https://greasyfork.org/zh-CN/scripts/592236)";
+  var BANGUMI_REQUEST_TIMEOUT = 15e3;
+  var bangumiActiveHost = "";
+  function bangumiRequest(method, path, body) {
+    const hosts = bangumiActiveHost ? [bangumiActiveHost, ...BANGUMI_API_HOSTS.filter((host) => host !== bangumiActiveHost)] : [...BANGUMI_API_HOSTS];
+    return new Promise((resolve, reject) => {
+      const attempts = [];
+      const run = (index) => {
+        if (index >= hosts.length) {
+          reject(attempts[attempts.length - 1] || new Error("Bangumi \u8BF7\u6C42\u5931\u8D25"));
+          return;
+        }
+        const host = hosts[index];
+        const url = `${host}${path}`;
+        const dispatch = typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : null;
+        const finish = (attempt) => {
+          attempts.push(attempt);
+          run(index + 1);
+        };
+        const parseJson = (text) => {
+          try {
+            return JSON.parse(text || "{}");
+          } catch {
+            return {};
+          }
+        };
+        const send = () => {
+          if (dispatch) {
+            dispatch({
+              method,
+              url,
+              headers: { "Content-Type": "application/json", "User-Agent": BANGUMI_UA },
+              data: body === void 0 ? void 0 : JSON.stringify(body),
+              timeout: BANGUMI_REQUEST_TIMEOUT,
+              onload: (response) => {
+                const data = parseJson(response.responseText);
+                if (response.status >= 200 && response.status < 300) {
+                  bangumiActiveHost = host;
+                  resolve(data);
+                } else if (response.status >= 500 || response.status === 0) finish(new Error(`Bangumi HTTP ${response.status}`));
+                else reject(new Error(data?.error || data?.title || `Bangumi HTTP ${response.status}`));
+              },
+              onerror: () => finish(new Error("Bangumi \u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25")),
+              ontimeout: () => finish(new Error("Bangumi \u8BF7\u6C42\u8D85\u65F6"))
+            });
+          } else {
+            fetch(url, { method, headers: { "Content-Type": "application/json", "User-Agent": BANGUMI_UA }, body: body === void 0 ? void 0 : JSON.stringify(body) }).then(async (response) => {
+              const data = parseJson(await response.text().catch(() => ""));
+              if (response.status >= 200 && response.status < 300) {
+                bangumiActiveHost = host;
+                resolve(data);
+              } else if (response.status >= 500 || response.status === 0) finish(new Error(`Bangumi HTTP ${response.status}`));
+              else reject(new Error(data?.error || data?.title || `Bangumi HTTP ${response.status}`));
+            }).catch(() => finish(new Error("Bangumi \u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25")));
+          }
+        };
+        send();
+      };
+      run(0);
+    });
+  }
+  var BangumiClient = class {
+    constructor() {
+      this.cache = /* @__PURE__ */ new Map();
+    }
+    cacheGet(key) {
+      const cached = this.cache.get(key);
+      if (cached && Date.now() - cached.time < 36e5) return cached.value;
+      return null;
+    }
+    cacheSet(key, value) {
+      this.cache.set(key, { time: Date.now(), value });
+      if (this.cache.size > 128) this.cache.delete(this.cache.keys().next().value);
+    }
+    async searchSubjects(keyword) {
+      const key = `search:${keyword}`;
+      const cached = this.cacheGet(key);
+      if (cached) return cached;
+      const data = await bangumiRequest("POST", "/v0/search/subjects", { keyword });
+      const list = Array.isArray(data?.data) ? data.data : [];
+      this.cacheSet(key, list);
+      return list;
+    }
+    async subject(id) {
+      const key = `subject:${id}`;
+      const cached = this.cacheGet(key);
+      if (cached) return cached;
+      const value = await bangumiRequest("GET", `/v0/subjects/${id}`);
+      this.cacheSet(key, value);
+      return value;
+    }
+    async subjectRelations(id) {
+      const key = `relations:${id}`;
+      const cached = this.cacheGet(key);
+      if (cached) return cached;
+      const value = await bangumiRequest("GET", `/v0/subjects/${id}/subjects`);
+      const list = Array.isArray(value) ? value : [];
+      this.cacheSet(key, list);
+      return list;
+    }
+  };
+  var bangumiClient = new BangumiClient();
+  var CURE_TMDB_TV_JSON_URL = "https://raw.githubusercontent.com/wikrin/CureTMDb/main/tv.json";
+  var CURE_TMDB_TV_CACHE_KEY = "Cloud123.Helper.CureTmdbTvJson";
+  var CURE_TMDB_TV_CACHE_TTL = 24 * 60 * 60 * 1000;
+  var BANGUMI_STRUCTURE_CACHE_PREFIX = "Cloud123.Helper.BangumiStructure:";
+  var BANGUMI_STRUCTURE_CACHE_TTL = 24 * 60 * 60 * 1000;
+  function structureCacheStoreGet(key) {
+    try {
+      const raw = checkpointStorageGet(key);
+      if (!raw || !Number(raw.time) || Date.now() - Number(raw.time) > BANGUMI_STRUCTURE_CACHE_TTL) return null;
+      return raw.value ?? null;
+    } catch {
+      return null;
+    }
+  }
+  function structureCacheStoreSet(key, value) {
+    try {
+      checkpointStorageSet(key, { time: Date.now(), value });
+    } catch {
+    }
+  }
+  async function loadCureTmdbTvMap() {
+    try {
+      const cached = checkpointStorageGet(CURE_TMDB_TV_CACHE_KEY);
+      if (cached && Number(cached.time) && Date.now() - Number(cached.time) <= CURE_TMDB_TV_CACHE_TTL && cached.value) return cached.value;
+    } catch {
+    }
+    const raw = await gmRequest(CURE_TMDB_TV_JSON_URL).catch(() => null);
+    if (!raw || typeof raw !== "object") throw new Error("CureTMDb \u793E\u533A\u5206\u5B63\u8868\u8BFB\u53D6\u5931\u8D25");
+    const parsed = parseCureTmdbTvJson(raw);
+    if (!Object.keys(parsed).length) throw new Error("CureTMDb \u793E\u533A\u5206\u5B63\u8868\u683C\u5F0F\u4E3A\u7A7A");
+    try {
+      checkpointStorageSet(CURE_TMDB_TV_CACHE_KEY, { time: Date.now(), value: parsed });
+    } catch {
+    }
+    return parsed;
+  }
+  async function loadCureTmdbTvStructure(tmdbId) {
+    const map = await loadCureTmdbTvMap();
+    const entry = map[String(Number(tmdbId))];
+    if (!entry) return null;
+    return structureFromCureTmdbEntry(Number(tmdbId), entry);
+  }
+  function mediaBangumiSearchKeyword(media) {
+    return String(media?.chineseTitles?.[0] || media?.title || media?.originalTitle || "").trim();
+  }
+  async function loadBangumiStructureForMedia(media) {
+    const tmdbId = Number(media?.id ?? media?.tmdbId ?? 0);
+    if (!tmdbId) return null;
+    const cacheKey = `${BANGUMI_STRUCTURE_CACHE_PREFIX}${tmdbId}`;
+    const cached = structureCacheStoreGet(cacheKey);
+    if (cached?.source === "bangumi") return cached;
+    const keyword = mediaBangumiSearchKeyword(media);
+    if (!keyword) return null;
+    const candidates = await bangumiClient.searchSubjects(keyword);
+    const matched = matchBangumiSubject(candidates, media);
+    if (!matched) return null;
+    const anchor = await bangumiClient.subject(matched.id);
+    const subjects = await buildBangumiChainSubjects(anchor, (id) => bangumiClient.subject(id).catch(() => null), async (id) => {
+      try {
+        return await bangumiClient.subjectRelations(id);
+      } catch {
+        return [];
+      }
+    });
+    if (!subjects.length) return null;
+    const structure = structureFromBangumiChain(subjects);
+    structureCacheStoreSet(cacheKey, structure);
+    return structure;
+  }
+
   // node_modules/mediainfo.js/dist/esm-bundle/index.js
   var import_meta = {};
   function isError(error) {
