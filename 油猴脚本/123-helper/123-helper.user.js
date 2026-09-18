@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.13
+// @version      1.3.14
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -1866,6 +1866,65 @@
         if (options.signal?.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
       }
       return output;
+    }
+    // 官方分享搜索（2026-09 上线，2026-09-18 对真实分享实测）：分享页同源 /api/search/link，
+    // 免登录、无签名；服务端全树搜索，文件结果自带 Etag+Size 可直出秒传。URL 上的时间戳
+    // 参数只是缓存穿透，可省；next 游标是官方返回的不透明串（含 &#*& 分隔符），
+    // searchParams.set 会自动编码。撞 429/100011 由 shareApiGate 全局冷却（与分享扫描同门）。
+    async searchPublicShare(query, options = {}) {
+      if (query && typeof query === "object") {
+        options = query;
+        query = options.query;
+      }
+      const searchQuery = String(query || "").trim();
+      if (!searchQuery) throw new Error("搜索关键词不能为空");
+      const shareKey = options.shareKey;
+      const sharePwd = options.sharePwd || "";
+      if (!shareKey) throw new Error("分享 Key 不能为空");
+      const data = await this.request("GET", "/api/search/link", {
+        signal: options.signal,
+        auth: false,
+        signed: false,
+        attempts: 2,
+        backoffCap: 4e3,
+        credentialsMode: "include",
+        pacing: options.pacing === null ? null : options.pacing || shareApiGate,
+        onPace: options.onPace,
+        query: {
+          share_key: shareKey,
+          query: searchQuery,
+          limit: String(options.limit || 30),
+          next: options.next == null || options.next === "" ? "0" : String(options.next),
+          ...sharePwd ? { share_pwd: sharePwd } : {},
+          parent_file_id: String(options.parentFileId ?? "0"),
+          ...options.category ? { file_category: String(options.category) } : {}
+        }
+      });
+      // 网关把接口路径回成网页 HTML 之类（data 非 JSON 对象、或 code/data 都没有）时按错误处理，
+      // 不能当成空结果
+      if (!data || typeof data !== "object" || Array.isArray(data) || (data.data === void 0 && data.code === void 0)) throw new Error("分享搜索接口返回异常内容");
+      const body = data?.data || {};
+      const list = body.InfoList || body.infoList || body.fileList || body.list || [];
+      const files = (Array.isArray(list) ? list : []).map((item) => {
+        const name = String(item.FileName ?? item.fileName ?? "").trim() || "未知文件";
+        return {
+          id: String(item.FileId ?? item.fileId ?? ""),
+          name,
+          type: Number(item.Type ?? item.type) === 1 ? 1 : 0,
+          size: Number(item.Size ?? item.size ?? 0),
+          etag: String(item.Etag ?? item.etag ?? ""),
+          s3KeyFlag: String(item.S3KeyFlag ?? item.s3KeyFlag ?? ""),
+          parentId: String(item.ParentFileId ?? item.parentFileId ?? "0"),
+          parentName: String(item.ParentName ?? item.parentName ?? "").trim(),
+          highlight: String(item.HighLight ?? item.highlight ?? ""),
+          updateAt: String(item.UpdateAt ?? item.updateAt ?? "")
+        };
+      }).filter((item) => item.id || item.name);
+      return {
+        files,
+        total: Number(body.Total ?? body.total ?? files.length),
+        next: String(body.Next ?? body.next ?? "-1")
+      };
     }
     async fileInfos(fileIds, signal) {
       const output = [];
@@ -6282,6 +6341,14 @@
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
     {
+      version: "1.3.14",
+      notes: [
+        "分享页搜索回来了：改用 123 官方新上线的分享搜索接口，输入关键词直接搜整个分享（十几 TB 的大分享也是秒出结果），不用再等脚本把整个分享慢慢扫一遍",
+        "搜索结果可以直接勾选生成秒传 JSON：文件结果自带特征值、不用扫描直接出，勾的是文件夹就只扫那个文件夹；结果也能一键导出 CSV",
+        "搜索框支持按图片 / 视频 / 文档 / 文件夹等类型筛选，点文件夹结果可以把搜索范围收进这个文件夹里，搜完点「返回整个分享」随时退出来"
+      ]
+    },
+    {
       version: "1.3.13",
       notes: [
         "\u6574\u7406\u9047\u5230\u91CD\u540D\u66F4\u4FDD\u9669\uFF1A\u5982\u679C\u76EE\u6807\u6587\u4EF6\u5939\u91CC\u5DF2\u7ECF\u6709\u540C\u540D\u6587\u4EF6\uFF08\u6BD4\u5982\u7B2C\u4E00\u6B21\u6574\u7406\u3001\u6216\u8005\u9884\u89C8\u4E4B\u540E\u6587\u4EF6\u5939\u91CC\u53C8\u591A\u4E86\u6587\u4EF6\uFF09\uFF0C\u4F1A\u81EA\u52A8\u628A\u8FD9\u4E2A\u6587\u4EF6\u79FB\u8FDB\u56DE\u6536\u7AD9\uFF0C\u4E0D\u4F1A\u518D\u51FA\u73B0\u300C\u540D\u5B57(1)\u300D\u8FD9\u79CD\u91CD\u590D\u6587\u4EF6",
@@ -6317,7 +6384,9 @@
     return entries.map((entry) => `<div class="c123-changelog-version">${escapeHtml(entry.version)}</div><ul class="c123-changelog-list">${(entry.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("")}</ul>`).join("");
   }
   function changelogDialogHtml(entries, version) {
-    const styles = ".c123-cl-mask{position:fixed;inset:0;z-index:2147483646;background:rgba(8,10,14,.55);display:flex;align-items:center;justify-content:center;padding:20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;}.c123-cl-box{width:min(560px,92vw);max-height:78vh;overflow:auto;padding:22px 24px;border-radius:14px;background:#151a23;color:#e8ecf4;box-shadow:0 18px 48px rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);}.c123-cl-title{font-size:17px;font-weight:600;margin:0 0 4px;}.c123-cl-sub{margin:0 0 14px;color:#96a0b3;font-size:12px;}.c123-changelog-version{margin:14px 0 6px;font-size:13px;font-weight:600;color:#7fb3ff;}.c123-changelog-list{margin:0;padding-left:20px;font-size:13px;line-height:1.7;color:#cfd6e4;}.c123-changelog-list li+li{margin-top:4px;}.c123-cl-footer{display:flex;justify-content:flex-end;gap:10px;margin-top:18px;}.c123-cl-btn{padding:8px 18px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:transparent;color:#e8ecf4;font-size:13px;cursor:pointer;}.c123-cl-btn.primary{background:#2f6feb;border-color:#2f6feb;color:#fff;}";
+    // 与脚本设置 / 整理预览同款「Liquid Glass」主题：色板、圆角、阴影、按钮、入场动画
+    // 全部对齐 ui/styles.js 的单层令牌（弹窗独立于主面板 Shadow DOM，令牌直接内联）
+    const styles = ".c123-cl-mask{position:fixed;inset:0;z-index:2147483646;background:rgba(15,25,45,.34);display:flex;align-items:center;justify-content:center;padding:20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;backdrop-filter:blur(24px) saturate(140%);-webkit-backdrop-filter:blur(24px) saturate(140%);}@supports not (backdrop-filter:blur(1px)){.c123-cl-mask{background:rgba(15,25,45,.48);}}.c123-cl-box{width:min(560px,92vw);max-height:78vh;overflow:auto;padding:24px 26px;border-radius:20px;background-color:#f2f6fa;background-image:linear-gradient(160deg,rgba(255,255,255,.68),rgba(255,255,255,.22) 46%,rgba(255,255,255,.44));backdrop-filter:blur(32px) saturate(170%);-webkit-backdrop-filter:blur(32px) saturate(170%);color:#152238;border:1px solid rgba(60,90,140,.22);box-shadow:inset 0 1px 0 rgba(255,255,255,.85),0 24px 68px -24px rgba(16,34,64,.32),0 8px 22px -8px rgba(16,34,64,.14);animation:c123-cl-in .38s cubic-bezier(.32,.72,0,1);}@keyframes c123-cl-in{from{opacity:0;transform:translateY(14px) scale(.97);}to{opacity:1;transform:none;}}.c123-cl-title{font-size:16px;font-weight:600;margin:0 0 4px;letter-spacing:-.008em;}.c123-cl-sub{margin:0 0 14px;color:#5f7089;font-size:12px;}.c123-changelog-version{margin:14px 0 6px;font-size:13px;font-weight:600;color:#007aff;}.c123-changelog-list{margin:0;padding-left:20px;font-size:13px;line-height:1.7;color:#2a3a55;}.c123-changelog-list li+li{margin-top:6px;}.c123-cl-footer{display:flex;justify-content:flex-end;gap:10px;margin-top:20px;}.c123-cl-btn{min-height:36px;padding:8px 16px;border-radius:999px;border:1px solid rgba(60,90,140,.22);background:rgba(255,255,255,.44);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);color:#152238;font-size:13px;font-weight:500;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,.75),0 1px 0 rgba(255,255,255,.45),0 3px 8px rgba(16,34,64,.08);transition:transform .16s cubic-bezier(.2,.8,.2,1);}.c123-cl-btn:hover{transform:translateY(-1px);}.c123-cl-btn.primary{color:#fff;border-color:transparent;background:linear-gradient(160deg,#2b95ff 0%,#0069d9 100%);box-shadow:0 6px 16px -6px rgba(0,122,255,.28),inset 0 1px 0 rgba(255,255,255,.28);}";
     return `<style>${styles}</style><div class="c123-cl-mask" data-changelog-mask><div class="c123-cl-box" role="dialog" aria-modal="true" aria-label="123 \u52A9\u624B\u66F4\u65B0\u5185\u5BB9"><h3 class="c123-cl-title">123 \u52A9\u624B\u66F4\u65B0\u5185\u5BB9</h3><p class="c123-cl-sub">\u5F53\u524D\u7248\u672C ${escapeHtml(version || scriptVersion())}</p>${changelogMarkup(entries)}<div class="c123-cl-footer"><button class="c123-cl-btn primary" data-changelog-close>\u6211\u5DF2\u77E5\u6653</button></div></div></div>`;
   }
   function showChangelogDialog(options = {}) {
@@ -9003,6 +9072,8 @@
     if (options.api && !target.__CLOUD123_PUBLIC_SHARE_TOOL_OBSERVER__) {
       const ensure = () => {
         ensurePublicShareJsonButton(target, options);
+        ensurePublicShareSearch(target, options);
+        ensureOfficialResultsActions(target, options);
       };
       const start = () => {
         if (!target.body) return (target.defaultView || globalThis).requestAnimationFrame(start);
@@ -9017,6 +9088,1184 @@
     return firstInstall;
   }
 
+  // src/public-share-search.js
+  // 分享页搜索（1.3.14 重做）：v1.2.0 的实现是「递归扫描整个分享建内存索引」，大分享要打
+  // 几千个请求才能搜一次；现在改用官方 2026-09 上线的分享搜索接口 /api/search/link
+  // （分享页同源、免登录、服务端全树搜索，实测 15TB 分享搜 mkv 一次请求返回 Total=3425）。
+  // UI 骨架沿用 v1.2.0：搜索框 + 结果下拉 + 分类 chips + 排序 + 复制路径；
+  // 行内定位（虚拟列表逐级打开目录）因官方接口不返回祖先路径而移除，改为：
+  // 点文件夹结果 = 把搜索范围收进该文件夹；勾选结果可直接生成秒传 JSON（文件结果自带
+  // Etag + Size 零扫描直出，文件夹结果只扫该子树，复用 collectPublicShareFiles）。
+  var SEARCH_DEBOUNCE_MS = 250;
+  var SEARCH_RESULT_PAGE_SIZE = 60;
+  var SEARCH_RESULT_HARD_LIMIT = 2000;
+  var SEARCH_PAGE_LIMIT = 30;
+  // file_category 映射（2026-09-18 对真实分享实测：1=图片 2=视频 5=文件夹，7 命中字幕=其他；
+  // 3=文档/4=音频/6=压缩包 按官方 tab 顺序推断，暂无内容样本，映射错了只影响对应一个 chip）
+  var SEARCH_TYPE_FILTERS = [
+    { key: "all", label: "全部" },
+    { key: "image", label: "图片", category: 1 },
+    { key: "video", label: "视频", category: 2 },
+    { key: "doc", label: "文档", category: 3 },
+    { key: "audio", label: "音频", category: 4 },
+    { key: "folder", label: "文件夹", category: 5 },
+    { key: "zip", label: "压缩包", category: 6 },
+    { key: "other", label: "其他", category: 7 }
+  ];
+  var SEARCH_SORT_LABELS = { relevance: "相关度", name: "名称", size: "大小" };
+    var PUBLIC_SHARE_SEARCH_CSS = `
+  /* Liquid Glass · Apple 配色令牌（与 Shadow DOM 主题同源） */
+  :root {
+    --c123-accent:#007aff; --c123-accent-strong:#0062cc;
+    --c123-accent-soft:rgba(0,122,255,.12); --c123-accent-glow:rgba(0,122,255,.24);
+    --c123-text:#152238; --c123-muted:#5f7089; --c123-danger:#d70015;
+    --c123-glass:rgba(255,255,255,.5); --c123-glass-strong:rgba(255,255,255,.74);
+    --c123-border:rgba(60,90,140,.22); --c123-highlight:rgba(255,255,255,.8);
+    --c123-shadow:0 14px 34px -12px rgba(16,34,64,.26),0 2px 8px rgba(16,34,64,.1);
+    --c123-shadow-sm:0 4px 14px rgba(16,34,64,.1);
+    --c123-radius:12px;
+  }
+  :root[data-c123-theme="dark"] {
+    --c123-accent:#0a84ff; --c123-accent-strong:#6db3ff;
+    --c123-accent-soft:rgba(10,132,255,.2); --c123-accent-glow:rgba(10,132,255,.32);
+    --c123-text:#eef5ff; --c123-muted:#a9bacf; --c123-danger:#ff6b61;
+    --c123-glass:rgba(26,40,62,.62); --c123-glass-strong:rgba(30,46,72,.8);
+    --c123-border:rgba(175,200,235,.22); --c123-highlight:rgba(255,255,255,.14);
+    --c123-shadow:0 16px 40px -14px rgba(0,0,0,.5),0 2px 8px rgba(0,0,0,.3);
+    --c123-shadow-sm:0 4px 14px rgba(0,0,0,.32);
+  }
+  @media (prefers-color-scheme:dark) {
+    :root:not([data-c123-theme="light"]):not([data-c123-theme="dark"]) {
+      --c123-accent:#0a84ff; --c123-accent-strong:#6db3ff;
+      --c123-accent-soft:rgba(10,132,255,.2); --c123-accent-glow:rgba(10,132,255,.32);
+      --c123-text:#eef5ff; --c123-muted:#a9bacf; --c123-danger:#ff6b61;
+      --c123-glass:rgba(26,40,62,.62); --c123-glass-strong:rgba(30,46,72,.8);
+      --c123-border:rgba(175,200,235,.22); --c123-highlight:rgba(255,255,255,.14);
+      --c123-shadow:0 16px 40px -14px rgba(0,0,0,.5),0 2px 8px rgba(0,0,0,.3);
+      --c123-shadow-sm:0 4px 14px rgba(0,0,0,.32);
+    }
+  }
+  .content-operate-container {
+    overflow: visible !important;
+  }
+
+  .c123-public-search {
+    position: relative; z-index: 80; flex: 0 0 320px; width: 320px; margin-left: auto;
+    color: var(--c123-text); font-size: 14px;
+  }
+
+  .c123-public-search-field {
+    display: flex; align-items: center; gap: 9px; height: 40px; padding: 0 12px;
+    background: var(--c123-glass); border: 1px solid var(--c123-border); border-radius: var(--c123-radius);
+    box-shadow: inset 0 1px 0 var(--c123-highlight), var(--c123-shadow-sm);
+    backdrop-filter: blur(16px) saturate(150%); -webkit-backdrop-filter: blur(16px) saturate(150%);
+    transition: border-color .18s ease, box-shadow .18s ease, background .18s ease;
+  }
+
+  .c123-public-search-field:focus-within {
+    border-color: var(--c123-accent); box-shadow: 0 0 0 3.5px var(--c123-accent-soft), inset 0 1px 0 var(--c123-highlight);
+  }
+
+  .c123-public-search-icon { flex: 0 0 auto; color: var(--c123-muted); }
+
+  .c123-public-search-input {
+    min-width: 0; width: 100%; height: 100%; padding: 0;
+    background: transparent; border: 0; outline: 0; font: inherit;
+  }
+
+  .c123-public-search-input { color: var(--c123-text); }
+  .c123-public-search-input::placeholder { color: var(--c123-muted); }
+  .c123-public-search-input::-webkit-search-cancel-button { display: none; }
+
+  .c123-public-search-clear {
+    display: none; place-items: center; flex: 0 0 auto; width: 24px; height: 24px; padding: 0;
+    color: var(--c123-muted); background: transparent; border: 0; border-radius: 50%; cursor: pointer;
+  }
+
+  .c123-public-search[data-has-query="true"] .c123-public-search-clear { display: grid; }
+  .c123-public-search-clear:hover { color: var(--c123-text); background: var(--c123-accent-soft); }
+
+  .c123-public-search-results {
+    position: absolute; top: 47px; right: 0; display: flex; flex-direction: column;
+    width: min(480px, calc(100vw - 32px)); max-height: min(440px, calc(100vh - 190px));
+    overflow: hidden; background: var(--c123-glass-strong); border: 1px solid var(--c123-border);
+    border-radius: 14px; box-shadow: inset 0 1px 0 var(--c123-highlight), var(--c123-shadow);
+    backdrop-filter: blur(24px) saturate(150%); -webkit-backdrop-filter: blur(24px) saturate(150%);
+  }
+
+  .c123-public-search-results[hidden] { display: none !important; }
+
+  .c123-public-search-summary {
+    flex: 0 0 auto; min-height: 37px; padding: 9px 12px 8px; color: var(--c123-muted);
+    border-bottom: 1px solid var(--c123-border); font-size: 12px; line-height: 20px;
+  }
+
+  .c123-public-search-summary[data-tone="error"] { color: var(--c123-danger); }
+
+  .c123-public-search-list {
+    flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; padding: 5px;
+    overscroll-behavior-y: contain; scrollbar-gutter: stable; touch-action: pan-y;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .c123-public-search-result {
+    display: grid; grid-template-columns: 32px minmax(0, 1fr) 26px; gap: 10px; width: 100%; align-items: center;
+    padding: 9px 10px; color: inherit; text-align: left; background: transparent;
+    border: 1px solid transparent; border-radius: 9px; cursor: pointer;
+    transition: background .16s ease, border-color .16s ease, transform .16s ease;
+  }
+
+  .c123-public-search-result:hover,
+  .c123-public-search-result:focus-visible { background: var(--c123-accent-soft); border-color: color-mix(in srgb, var(--c123-accent) 20%, transparent); outline: 0; }
+
+  .c123-public-search-result-icon {
+    display: grid; place-items: center; width: 32px; height: 32px; color: var(--c123-accent);
+    background: var(--c123-accent-soft); border: 1px solid color-mix(in srgb, var(--c123-accent) 16%, transparent); border-radius: 9px;
+  }
+
+  .c123-public-search-result[data-type="file"] .c123-public-search-result-icon {
+    color: var(--c123-muted); background: color-mix(in srgb, var(--c123-muted) 10%, transparent);
+    border-color: color-mix(in srgb, var(--c123-muted) 16%, transparent);
+  }
+
+  .c123-public-search-result-copy { min-width: 0; }
+  .c123-public-search-result-name {
+    display: block; overflow: hidden; color: var(--c123-text); font-weight: 600;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  .c123-public-search-result-path {
+    flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--c123-muted); font-size: 12px;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  .c123-public-search-filters {
+    display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+    padding: 8px 12px 7px; border-bottom: 1px solid var(--c123-border);
+  }
+
+  .c123-public-search-filters[hidden] { display: none !important; }
+
+  .c123-public-search-chip {
+    padding: 3px 10px; color: var(--c123-muted); font-size: 12px; line-height: 18px;
+    background: transparent; border: 1px solid var(--c123-border); border-radius: 999px; cursor: pointer;
+    transition: color .15s ease, background .15s ease, border-color .15s ease;
+  }
+
+  .c123-public-search-chip:hover { color: var(--c123-text); border-color: var(--c123-accent); }
+  .c123-public-search-chip:focus-visible { outline: 0; border-color: var(--c123-accent); box-shadow: 0 0 0 2px var(--c123-accent-soft); }
+  .c123-public-search-chip[data-active="true"] { color: #fff; background: var(--c123-accent); border-color: var(--c123-accent); }
+
+  .c123-public-search-sort {
+    margin-left: auto; padding: 3px 8px; color: var(--c123-muted); font-size: 12px; line-height: 18px;
+    background: transparent; border: 0; border-radius: 7px; cursor: pointer; white-space: nowrap;
+  }
+
+  .c123-public-search-sort:hover { color: var(--c123-accent); background: var(--c123-accent-soft); }
+
+  .c123-public-search-refresh {
+    display: inline-grid; place-items: center; width: 22px; height: 22px; padding: 0; margin-left: 6px;
+    color: var(--c123-muted); background: transparent; border: 0; border-radius: 6px; cursor: pointer; vertical-align: -5px;
+  }
+
+  .c123-public-search-refresh:hover { color: var(--c123-accent); background: var(--c123-accent-soft); }
+  .c123-public-search-refresh[hidden] { display: none !important; }
+
+  .c123-public-search-result-meta {
+    display: flex; align-items: center; gap: 6px; min-width: 0; margin-top: 3px;
+  }
+
+  .c123-public-search-result-ext {
+    flex: 0 0 auto; padding: 0 5px; color: var(--c123-accent); font-size: 10px; font-weight: 600;
+    line-height: 16px; letter-spacing: .04em; background: var(--c123-accent-soft); border-radius: 4px;
+  }
+
+  .c123-public-search-result[data-type="file"] .c123-public-search-result-ext {
+    color: var(--c123-muted); background: color-mix(in srgb, var(--c123-muted) 10%, transparent);
+  }
+
+  .c123-public-search-result-size { flex: 0 0 auto; color: var(--c123-muted); font-size: 12px; }
+
+  .c123-public-search-result-meta > :not(:first-child)::before {
+    content: "\\B7"; margin-right: 6px; color: var(--c123-muted); opacity: .7;
+  }
+
+  .c123-public-search-result mark {
+    padding: 0 1px; color: var(--c123-accent); background: var(--c123-accent-soft); border-radius: 3px;
+  }
+
+  .c123-public-search-result[data-active="true"],
+  .c123-public-search-result[data-active="true"]:hover {
+    background: var(--c123-accent-soft); border-color: color-mix(in srgb, var(--c123-accent) 32%, transparent);
+  }
+
+  .c123-public-search-copy {
+    display: grid; place-items: center; width: 26px; height: 26px; padding: 0; color: var(--c123-muted);
+    background: transparent; border: 0; border-radius: 7px; cursor: pointer;
+    opacity: 0; visibility: hidden;
+    transition: opacity .15s ease, visibility .15s ease;
+  }
+
+  .c123-public-search-result:hover .c123-public-search-copy,
+  .c123-public-search-result[data-active="true"] .c123-public-search-copy { opacity: 1; visibility: visible; }
+  .c123-public-search-copy:hover { color: var(--c123-accent); background: var(--c123-accent-soft); }
+
+  .c123-public-search-retry {
+    margin-left: 7px; padding: 2px 7px; color: var(--c123-accent); background: transparent;
+    border: 1px solid currentColor; border-radius: 6px; cursor: pointer;
+  }
+
+  .c123-public-search-target {
+    position: relative; z-index: 1; animation: c123-public-search-highlight 3s ease-out;
+  }
+
+  @keyframes c123-public-search-highlight {
+    0%, 36% { background: color-mix(in srgb, var(--c123-accent) 22%, transparent); box-shadow: inset 3px 0 var(--c123-accent); }
+    100% { background: transparent; box-shadow: inset 3px 0 transparent; }
+  }
+
+  @media (max-width: 700px) {
+    .content-operate-container { flex-wrap: wrap !important; gap: 10px; }
+    .c123-public-search { flex-basis: 100%; width: 100%; margin-left: 0; }
+    .c123-public-search-results { right: auto; left: 0; width: 100%; max-height: min(390px, calc(100vh - 170px)); }
+    .c123-public-search-filters { padding: 7px 10px 6px; }
+    .c123-public-search-copy { opacity: 1; visibility: visible; }
+  }
+  /* 1.3.14 新增：结果行勾选框、批量操作、范围 pill */
+  .c123-public-search-check { flex: 0 0 auto; width: 14px; height: 14px; margin: 0; accent-color: var(--c123-accent); cursor: pointer; }
+  .c123-public-search-scope { display: inline-flex; align-items: center; gap: 6px; align-self: flex-start; margin: 6px 0 0; padding: 4px 10px; border: 1px solid var(--c123-border); border-radius: 999px; background: var(--c123-accent-soft); color: var(--c123-text); font-size: 12px; cursor: pointer; }
+  .c123-public-search-scope:hover { border-color: var(--c123-accent); }
+  .c123-public-search-actions { display: inline-flex; gap: 6px; margin-left: auto; }
+  .c123-public-search-action { padding: 3px 10px; border: 1px solid var(--c123-border); border-radius: 8px; background: transparent; color: var(--c123-muted); font-size: 12px; cursor: pointer; }
+  .c123-public-search-action:hover:not(:disabled) { color: var(--c123-text); border-color: var(--c123-accent); background: var(--c123-accent-soft); }
+  .c123-public-search-action:disabled { opacity: 0.45; cursor: default; }
+  /* 面板化改造：脚本不注入自己的输入框，面板挂在官方搜索框容器正下方，显隐跟随结果区 */
+  .c123-public-search { display: flex; flex-direction: column; position: absolute; top: calc(100% + 6px); right: 0; min-width: min(580px, 92vw); max-width: min(580px, 92vw); max-height: min(500px, calc(100vh - 140px)); overflow: hidden; z-index: 1200; padding: 0; border: 1px solid var(--c123-border); border-radius: 14px; background: var(--c123-glass-strong, rgba(255, 255, 255, 0.92)); box-shadow: 0 18px 48px rgba(15, 23, 42, 0.16); }
+  .c123-public-search:has(.c123-public-search-results[hidden]) { display: none !important; }
+  .c123-public-search-panelbar { display: flex; align-items: center; gap: 6px; padding: 8px 10px 0; }
+  .c123-public-search-panelbar:has(.c123-public-search-scope[hidden]):has(.c123-public-search-action:disabled) { display: none; }
+  .c123-public-search-scope { margin: 0; }
+  .c123-public-search-scope .c123-public-search-pill-icon, .c123-public-search-scope .c123-public-search-pill-close { display: inline-flex; flex: 0 0 auto; }
+  /* 结果行加了勾选框：老 CSS 是 3 列 grid（图标/内容/复制），这里扩成 4 列 */
+  .c123-public-search-result { grid-template-columns: 20px 32px minmax(0, 1fr) 26px; }
+  /* 名称/路径自适应换行（维护者 2026-09-18：与脚本其他预览处一致，不省略号截断） */
+  .c123-public-search-result-name, .c123-public-search-result-path { white-space: normal; word-break: break-all; }
+  /* 官方搜索结果页的秒传/CSV 按钮条（挂在面包屑左侧容器里） */
+  .c123-results-actions { display: inline-flex; gap: 6px; margin-left: 12px; }
+  .c123-results-action { padding: 4px 12px; border: 1px solid var(--c123-border); border-radius: 8px; background: var(--c123-accent-soft, rgba(0, 0, 0, 0.04)); color: var(--c123-text, #1f2329); font-size: 13px; cursor: pointer; }
+  .c123-results-action:hover:not(:disabled) { border-color: var(--c123-accent); }
+  .c123-results-action:disabled { opacity: 0.5; cursor: default; }
+  .c123-public-search-results { position: static !important; inset: auto !important; width: auto !important; max-width: none !important; max-height: none !important; display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; border: 0 !important; background: transparent !important; box-shadow: none !important; backdrop-filter: none !important; padding: 0 10px 8px !important; overflow: visible !important; }
+  .c123-public-search-list { overflow-y: auto; min-height: 0; }
+  @media (max-width: 700px) {
+    .c123-public-search { min-width: calc(100vw - 32px); max-width: calc(100vw - 32px); right: -8px; }
+  }`;
+  function normalizedText(value) {
+    return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+  }
+  function abortError2() {
+    return new DOMException("操作已取消", "AbortError");
+  }
+  function fileExtensionOf(name) {
+    const match = /\.([a-z0-9]{1,10})$/i.exec(String(name || "").trim());
+    return match ? match[1].toLowerCase() : "";
+  }
+  function pathOfEntry(entry) {
+    return [String(entry?.parentName || "").trim(), String(entry?.name || "").trim()].filter(Boolean).join("/");
+  }
+  function searchEntryKey(entry) {
+    return `${String(entry?.id || "")}|${pathOfEntry(entry)}`;
+  }
+  function sortSearchMatches(items, mode) {
+    if (mode === "name") return [...items].sort((left, right) => String(left.name).localeCompare(String(right.name), "zh-CN") || pathOfEntry(left).localeCompare(pathOfEntry(right), "zh-CN"));
+    if (mode === "size") return [...items].sort((left, right) => Number(right.size || 0) - Number(left.size || 0) || pathOfEntry(left).localeCompare(pathOfEntry(right), "zh-CN"));
+    return items;
+  }
+  // 官方 HighLight 用 <123pan_strong> 标记命中片段；一律走 textNode/<mark> 构建，不 innerHTML，防注入。
+  // 没有官方高亮时退回本地关键词 <mark>（v1.2.0 的 appendHighlightedText）。
+  function appendHighlightedText(target, element, text2, terms) {
+    const clean = String(text2 || "");
+    const needles = [...new Set((terms || []).filter(Boolean).map((term) => term.toLowerCase()))].sort((left, right) => right.length - left.length);
+    if (!clean || !needles.length) {
+      element.textContent = clean;
+      return;
+    }
+    const haystack = clean.toLowerCase();
+    const ranges = [];
+    for (const needle of needles) {
+      let from = 0;
+      for (;;) {
+        const at = haystack.indexOf(needle, from);
+        if (at < 0) break;
+        ranges.push([at, at + needle.length]);
+        from = at + needle.length;
+      }
+    }
+    if (!ranges.length) {
+      element.textContent = clean;
+      return;
+    }
+    ranges.sort((left, right) => left[0] - right[0]);
+    const merged = [];
+    for (const range of ranges) {
+      const last = merged[merged.length - 1];
+      if (last && range[0] <= last[1]) last[1] = Math.max(last[1], range[1]);
+      else merged.push([range[0], range[1]]);
+    }
+    const fragment = target.createDocumentFragment();
+    let cursor = 0;
+    for (const [start, end] of merged) {
+      if (start > cursor) fragment.append(target.createTextNode(clean.slice(cursor, start)));
+      const mark = target.createElement("mark");
+      mark.textContent = clean.slice(start, end);
+      fragment.append(mark);
+      cursor = end;
+    }
+    if (cursor < clean.length) fragment.append(target.createTextNode(clean.slice(cursor)));
+    element.replaceChildren(fragment);
+  }
+  function appendHighlightMarkup(target, element, entry, terms) {
+    const source = String(entry?.highlight || "");
+    if (!source || source.indexOf("<123pan_strong>") < 0) {
+      appendHighlightedText(target, element, entry?.name, terms);
+      return;
+    }
+    const pattern = /<123pan_strong>([\s\S]*?)<\/123pan_strong>/g;
+    const fragment = target.createDocumentFragment();
+    let cursor = 0;
+    let match;
+    while ((match = pattern.exec(source))) {
+      if (match.index > cursor) fragment.append(target.createTextNode(source.slice(cursor, match.index)));
+      const mark = target.createElement("mark");
+      mark.textContent = match[1];
+      fragment.append(mark);
+      cursor = match.index + match[0].length;
+    }
+    if (cursor < source.length) fragment.append(target.createTextNode(source.slice(cursor)));
+    element.replaceChildren(fragment);
+  }
+  function ensureSearchCss(target) {
+    if (target.getElementById("c123-public-search-css")) return;
+    const style = target.createElement("style");
+    style.id = "c123-public-search-css";
+    style.textContent = PUBLIC_SHARE_SEARCH_CSS;
+    (target.head || target.documentElement)?.append(style);
+  }
+  function createSearchState(target, source) {
+    const previous = target.__CLOUD123_PUBLIC_SHARE_SEARCH_STATE__;
+    if (previous?.source === source) return previous;
+    previous?.controller?.abort();
+    const state = {
+      source,
+      share: null,
+      items: [],
+      total: 0,
+      next: "0",
+      status: "idle",
+      error: null,
+      controller: null,
+      fetching: false,
+      requestKey: "",
+      preserveRender: false,
+      scope: null,
+      filter: "all",
+      sort: "relevance",
+      selected: new Map(),
+      root: null,
+      renderTimer: null,
+      debounceTimer: null,
+      resultsDismissed: false,
+      renderMatches: [],
+      renderedCount: 0,
+      activeIndex: -1
+    };
+    target.__CLOUD123_PUBLIC_SHARE_SEARCH_STATE__ = state;
+    return state;
+  }
+  function setQueryState(root, query) {
+    root.dataset.hasQuery = String(Boolean(String(query || "").trim()));
+  }
+  function resultButton(target, entry2, index, state, handlers) {
+    const button = target.createElement("button");
+    button.type = "button";
+    button.className = "c123-public-search-result";
+    const isFolder = Number(entry2.type) === 1;
+    button.dataset.type = isFolder ? "folder" : "file";
+    button.dataset.index = String(index);
+    button.id = `c123-public-search-option-${index}`;
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", "false");
+    button.title = pathOfEntry(entry2);
+    const check = target.createElement("input");
+    check.type = "checkbox";
+    check.className = "c123-public-search-check";
+    check.checked = state.selected.has(searchEntryKey(entry2));
+    check.setAttribute("aria-label", "勾选后生成秒传");
+    check.title = "勾选后可批量生成秒传 JSON";
+    check.addEventListener("click", (event) => event.stopPropagation());
+    check.addEventListener("change", () => handlers?.onToggle?.(entry2, check.checked));
+    const resultIcon = target.createElement("span");
+    resultIcon.className = "c123-public-search-result-icon";
+    resultIcon.innerHTML = icon(isFolder ? "folder" : "fileCog", 17);
+    const copy = target.createElement("span");
+    copy.className = "c123-public-search-result-copy";
+    const name = target.createElement("span");
+    name.className = "c123-public-search-result-name";
+    appendHighlightMarkup(target, name, entry2, state.terms);
+    const meta = target.createElement("span");
+    meta.className = "c123-public-search-result-meta";
+    const badge = target.createElement("span");
+    badge.className = "c123-public-search-result-ext";
+    badge.textContent = isFolder ? "文件夹" : fileExtensionOf(entry2.name).toUpperCase() || "文件";
+    meta.append(badge);
+    if (!isFolder && Number(entry2.size) > 0) {
+      const size = target.createElement("span");
+      size.className = "c123-public-search-result-size";
+      size.textContent = formatBytes(Number(entry2.size));
+      meta.append(size);
+    }
+    const path = target.createElement("span");
+    path.className = "c123-public-search-result-path";
+    path.textContent = String(entry2.parentName || "").trim() || "分享根目录";
+    meta.append(path);
+    copy.append(name, meta);
+    const copyPath = target.createElement("span");
+    copyPath.className = "c123-public-search-copy";
+    copyPath.setAttribute("role", "button");
+    copyPath.setAttribute("aria-label", "复制路径");
+    copyPath.title = "复制路径";
+    copyPath.innerHTML = icon("copy", 14);
+    copyPath.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      handlers?.onCopyPath?.(entry2);
+    });
+    button.append(check, resultIcon, copy, copyPath);
+    button.addEventListener("click", () => handlers?.onOpen?.(entry2, button));
+    button.addEventListener("mouseenter", () => handlers?.onHover?.(index));
+    return button;
+  }
+  // 复用官方搜索框（维护者 2026-09-18 定稿）：不再注入自己的输入框，脚本面板挂在
+  // 官方搜索输入框（input.share-search-input）的 relative 容器正下方，输入/回车/清空
+  // 全部跟随官方框；官方搜索照常执行，脚本侧只是同步多搜一份用于秒传勾选与 CSV。
+  function findOfficialShareSearchInput(target) {
+    const direct = target.querySelector("input.share-search-input");
+    if (direct) return direct;
+    return [...target.querySelectorAll("input")].find((candidate) => /搜索/.test(String(candidate.placeholder || "")) && !candidate.closest("[data-cloud123-helper]")) || null;
+  }
+  function findShareSearchAnchor(target) {
+    const input = findOfficialShareSearchInput(target);
+    if (!input) return null;
+    const anchor = input.closest(".share-search-input") || input.closest('[class*="input-module"]')?.parentElement || input.parentElement?.parentElement || input.parentElement;
+    if (!anchor) return null;
+    return { input, anchor };
+  }
+  // 从搜索结果条目生成秒传文件清单：文件直出（自带 Etag 零扫描），文件夹只扫该子树。
+  // 面板勾选与官方结果页按钮共用（维护者 2026-09-18：官方结果页勾选也要能生成秒传/CSV）。
+  async function collectSearchFastlinkFiles(api, share, entries, onProgress) {
+    const folders = (entries || []).filter((entry2) => Number(entry2.type) === 1);
+    const files = [];
+    let skipped = 0;
+    for (const entry2 of entries || []) {
+      if (Number(entry2.type) === 1) continue;
+      const etag = String(entry2.etag || "").trim().toLowerCase();
+      if (!/^[0-9a-f]{32}$/.test(etag)) {
+        skipped += 1;
+        continue;
+      }
+      files.push({ fileName: entry2.name, path: pathOfEntry(entry2), etag, size: Number(entry2.size || 0) });
+    }
+    for (const folder of folders) {
+      onProgress?.(`正在扫描「${folder.name}」以生成秒传…`);
+      const scanned = await collectPublicShareFiles(api, share, {
+        parentId: folder.id,
+        onProgress: (count) => onProgress?.(`正在扫描「${folder.name}」：已读取 ${count} 个文件…`)
+      });
+      for (const file of scanned) {
+        const relative = String(file.path || file.fileName || "").replace(/^\/+|\/+$/g, "");
+        files.push({
+          fileName: file.fileName || relative.split("/").at(-1),
+          path: `${String(folder.name || "文件夹")}/${relative}`,
+          etag: String(file.etag || ""),
+          size: Number(file.size || 0)
+        });
+      }
+    }
+    // 返回键名与调用方解构一致（面板与官方结果页按钮都取 { filtered, skipped }）
+    return { filtered: filterFastlinkFiles(files, {}), skipped };
+  }
+  function buildSearchCsvText(rows) {
+    const lines = ["路径,类型,大小,修改时间,Etag"];
+    for (const entry2 of rows || []) {
+      const cells = [
+        pathOfEntry(entry2),
+        Number(entry2.type) === 1 ? "文件夹" : "文件",
+        Number(entry2.type) === 1 ? "" : String(entry2.size || ""),
+        String(entry2.updateAt || ""),
+        Number(entry2.type) === 1 ? "" : String(entry2.etag || "")
+      ];
+      lines.push(cells.map((cell) => `"${String(cell ?? "").replace(/"/g, '""')}"`).join(","));
+    }
+    return `\uFEFF${lines.join("\r\n")}`;
+  }
+  // 官方结果页勾选的行 ↔ 脚本搜索条目匹配：优先「父目录/文件名」配对，退回文件名首个命中
+  function resolveCheckedEntries(checkedRows, entries) {
+    const byKey = new Map();
+    const byName = new Map();
+    for (const entry2 of entries || []) {
+      byKey.set(`${String(entry2.parentName || "")}/${entry2.name}`, entry2);
+      if (!byName.has(entry2.name)) byName.set(entry2.name, entry2);
+    }
+    const matched = [];
+    const missing = [];
+    for (const row of checkedRows || []) {
+      const hit = byKey.get(`${String(row.parentName || "")}/${row.name}`) || byName.get(row.name);
+      if (hit) matched.push(hit);
+      else missing.push(row);
+    }
+    return { matched, missing };
+  }
+  function detectOfficialSearchResults(target) {
+    const left = target.querySelector(".content-operate-container-left");
+    return Boolean(left && /的搜索结果/.test(String(left.textContent || "")));
+  }
+  function readOfficialCheckedRows(target) {
+    // 勾选识别双保险：checkbox.checked 为主，官方行上的 rowSelected 类名兜底
+    const rows = [...target.querySelectorAll("tr[class*=row]")].filter((row) => !row.querySelector("th"));
+    return rows
+      .filter((row) => row.querySelector('input[type="checkbox"]')?.checked || /rowSelected/.test(String(row.className || "")))
+      .map((row) => {
+        const cells = [...row.querySelectorAll("td")].map((cell) => String(cell.textContent || "").trim());
+        return { name: cells[1] || "", parentName: cells[4] || "" };
+      })
+      .filter((row) => row.name);
+  }
+  // 官方搜索结果页的增强按钮条：勾选官方结果行 → 生成秒传 JSON / 导出 CSV
+  // （面板在结果模式自动隐藏，这里的按钮是结果模式唯一的导出入口）
+  function ensureOfficialResultsActions(target, options) {
+    const left = target.querySelector(".content-operate-container-left");
+    if (!left || !options?.api || typeof options.api.searchPublicShare !== "function") return null;
+    const existing = left.querySelector(".c123-results-actions");
+    if (!detectOfficialSearchResults(target)) {
+      existing?.remove();
+      return null;
+    }
+    if (existing) return existing;
+    const state = target.__CLOUD123_PUBLIC_SHARE_SEARCH_STATE__;
+    const bar = target.createElement("div");
+    bar.className = "c123-results-actions";
+    const fastlinkButton = target.createElement("button");
+    fastlinkButton.type = "button";
+    fastlinkButton.className = "c123-results-action";
+    fastlinkButton.textContent = "生成秒传";
+    fastlinkButton.title = "先在官方结果里勾选文件/文件夹，点此生成秒传 JSON（文件自带特征值无需扫描，文件夹只扫描该文件夹）";
+    const csvButton = target.createElement("button");
+    csvButton.type = "button";
+    csvButton.className = "c123-results-action";
+    csvButton.textContent = "导出 CSV";
+    csvButton.title = "把官方结果里勾选的行导出成 CSV";
+    const officialQuery = () => String(findOfficialShareSearchInput(target)?.value || "").trim();
+    const resolveShare = () => state?.share || parsePublicShareInput(String(options.locationRef?.href || target.defaultView?.location?.href || ""));
+    // 按当前官方勾选行去搜索接口取条目（按官方当前关键词分页拉取，凑齐或到上限为止）
+    const resolveSelection = async (button, label) => {
+      const checked = readOfficialCheckedRows(target);
+      if (!checked.length) {
+        showStatus(target, "请先在官方搜索结果里勾选要处理的文件", "error");
+        return null;
+      }
+      const query = officialQuery();
+      if (!query) {
+        showStatus(target, "未找到搜索关键词", "error");
+        return null;
+      }
+      let share;
+      try {
+        share = resolveShare();
+      } catch {
+        share = null;
+      }
+      if (!share?.shareKey) {
+        showStatus(target, "未能识别当前分享链接", "error");
+        return null;
+      }
+      const entries = [];
+      const seen = new Set();
+      const pushEntries = (list) => {
+        for (const item of list || []) {
+          const key = `${item.id}|${pathOfEntry(item)}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            entries.push(item);
+          }
+        }
+      };
+      // 先复用面板已加载的搜索结果做匹配（零请求），不够再去接口分页补
+      pushEntries(state?.items);
+      let next = "0";
+      for (;;) {
+        const { matched: prematched } = resolveCheckedEntries(checked, entries);
+        if (prematched.length >= checked.length) break;
+        button.textContent = `${label}（已匹配 ${prematched.length}/${checked.length}…）`;
+        const result2 = await options.api.searchPublicShare(query, {
+          shareKey: share.shareKey,
+          sharePwd: share.sharePwd || "",
+          limit: 100,
+          next
+        });
+        pushEntries(result2.files);
+        const { matched } = resolveCheckedEntries(checked, entries);
+        next = String(result2.next ?? "-1");
+        if (matched.length >= checked.length || next === "-1" || next === "" || entries.length >= SEARCH_RESULT_HARD_LIMIT) break;
+      }
+      return { share, ...resolveCheckedEntries(checked, entries) };
+    };
+    const runWithButton = async (button, label, worker) => {
+      const original = button.textContent;
+      button.disabled = true;
+      try {
+        await worker((text) => {
+          button.textContent = text;
+        });
+      } catch (error) {
+        if (error?.name !== "AbortError") showStatus(target, `${label}失败：${String(error?.message || error || "未知错误")}`, "error");
+      } finally {
+        button.disabled = false;
+        button.textContent = original;
+      }
+    };
+    fastlinkButton.addEventListener("click", () => runWithButton(fastlinkButton, "生成秒传", async (setLabel) => {
+      const resolved = await resolveSelection(fastlinkButton, "生成秒传");
+      if (!resolved) return;
+      if (!resolved.matched.length) {
+        showStatus(target, "官方结果与搜索接口对不上号，未能生成秒传", "error");
+        return;
+      }
+      const { filtered, skipped } = await collectSearchFastlinkFiles(options.api, resolved.share, resolved.matched, (message) => {
+        setLabel("生成秒传…");
+        showStatus(target, message);
+      });
+      if (!filtered.length) {
+        showStatus(target, "勾选的结果里没有可生成秒传的文件", "error");
+        return;
+      }
+      const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      downloadJson(target, `官方搜索秒传-${stamp}.123fastlink.json`, buildFastlinkJson(filtered));
+      showStatus(target, `秒传 JSON 已下载：${filtered.length} 个文件${skipped ? `（跳过 ${skipped} 个无特征值结果）` : ""}`);
+    }));
+    csvButton.addEventListener("click", () => runWithButton(csvButton, "导出 CSV", async (setLabel) => {
+      const resolved = await resolveSelection(csvButton, "导出 CSV");
+      if (!resolved) return;
+      if (!resolved.matched.length) {
+        showStatus(target, "官方结果与搜索接口对不上号，未能导出", "error");
+        return;
+      }
+      setLabel("导出 CSV…");
+      const query = (officialQuery() || "结果").replace(/[\\/:*?"<>|]/g, "_");
+      const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      downloadText(`官方搜索-${query}-${stamp}.csv`, buildSearchCsvText(resolved.matched), "text/csv;charset=utf-8");
+      showStatus(target, `已导出 ${resolved.matched.length} 条搜索结果`);
+    }));
+    bar.append(fastlinkButton, csvButton);
+    left.append(bar);
+    return bar;
+  }
+  function ensurePublicShareSearch(target = document, options = {}) {
+    if (!target?.body || !options.api || typeof options.api.searchPublicShare !== "function") return null;
+    const found = findShareSearchAnchor(target);
+    if (!found) return null;
+    const input = found.input;
+    const anchor = found.anchor;
+    const existing = anchor.querySelector(".c123-public-search");
+    if (existing) {
+      // 面板已挂着的场合不做重建，但显隐要跟着官方页面模式走：
+      // 回车出官方结果页 → 收起；点面包屑回浏览模式 → 恢复（observer 每次 mutation 都会经过这里）
+      const prevState = target.__CLOUD123_PUBLIC_SHARE_SEARCH_STATE__;
+      if (prevState?.root === existing) prevState.syncVisibility?.();
+      return existing;
+    }
+    const source = String(options.locationRef?.href || target.defaultView?.location?.href || "");
+    const state = createSearchState(target, source);
+    try {
+      state.share = parsePublicShareInput(source);
+    } catch {
+      state.share = null;
+    }
+    ensureSearchCss(target);
+    const view = target.defaultView || globalThis;
+    const root = target.createElement("div");
+    root.className = "c123-public-search";
+    root.dataset.cloud123Helper = "public-search";
+    root.dataset.hasQuery = "false";
+    // 面板绝对定位在官方搜索框容器正下方（容器若非 relative 则补上）
+    anchor.style.position = "relative";
+    const panelbar = target.createElement("div");
+    panelbar.className = "c123-public-search-panelbar";
+    const scopePill = target.createElement("button");
+    scopePill.type = "button";
+    scopePill.className = "c123-public-search-scope";
+    scopePill.hidden = true;
+    scopePill.title = "点击返回整个分享内搜索";
+    const scopeText = target.createElement("span");
+    // icon() 返回的是 HTML 字符串，必须经 innerHTML 插入；直接 append 会当成纯文本
+    const scopeIcon = target.createElement("span");
+    scopeIcon.className = "c123-public-search-pill-icon";
+    scopeIcon.innerHTML = icon("folder", 13);
+    const scopeClose = target.createElement("span");
+    scopeClose.className = "c123-public-search-pill-close";
+    scopeClose.innerHTML = icon("close", 12);
+    scopePill.append(scopeIcon, scopeText, scopeClose);
+    scopePill.addEventListener("click", () => {
+      if (!state.scope) return;
+      state.scope = null;
+      state.resultsDismissed = false;
+      fetchPage({ reset: true });
+    });
+    panelbar.append(scopePill);
+    const results = target.createElement("div");
+    results.className = "c123-public-search-results";
+    results.id = "c123-public-search-results";
+    results.hidden = true;
+    const summary = target.createElement("div");
+    summary.className = "c123-public-search-summary";
+    summary.setAttribute("role", "status");
+    const summaryText = target.createElement("span");
+    summary.append(summaryText);
+    const refreshButton = target.createElement("button");
+    refreshButton.type = "button";
+    refreshButton.className = "c123-public-search-refresh";
+    refreshButton.title = "重新搜索";
+    refreshButton.setAttribute("aria-label", "重新搜索");
+    refreshButton.hidden = true;
+    refreshButton.innerHTML = icon("refresh", 14);
+    refreshButton.addEventListener("click", () => fetchPage({ reset: true }));
+    summary.append(refreshButton);
+    const filters = target.createElement("div");
+    filters.className = "c123-public-search-filters";
+    filters.hidden = true;
+    const filterChips = SEARCH_TYPE_FILTERS.map(({ key, label }) => {
+      const chip = target.createElement("button");
+      chip.type = "button";
+      chip.className = "c123-public-search-chip";
+      chip.dataset.filter = key;
+      chip.textContent = label;
+      chip.addEventListener("click", () => {
+        if (state.filter === key && state.status === "ready") return;
+        state.filter = key;
+        state.resultsDismissed = false;
+        fetchPage({ reset: true });
+      });
+      return chip;
+    });
+    const sortButton = target.createElement("button");
+    sortButton.type = "button";
+    sortButton.className = "c123-public-search-sort";
+    sortButton.addEventListener("click", () => {
+      const modes = Object.keys(SEARCH_SORT_LABELS);
+      state.sort = modes[(modes.indexOf(state.sort) + 1) % modes.length] || "relevance";
+      render();
+    });
+    const actions = target.createElement("div");
+    actions.className = "c123-public-search-actions";
+    const fastlinkButton = target.createElement("button");
+    fastlinkButton.type = "button";
+    fastlinkButton.className = "c123-public-search-action";
+    fastlinkButton.textContent = "生成秒传";
+    fastlinkButton.disabled = true;
+    fastlinkButton.title = "勾选结果后生成秒传 JSON：文件自带特征值无需扫描，文件夹只扫描该文件夹";
+    fastlinkButton.addEventListener("click", () => {
+      void generateFastlink();
+    });
+    const csvButton = target.createElement("button");
+    csvButton.type = "button";
+    csvButton.className = "c123-public-search-action";
+    csvButton.textContent = "导出 CSV";
+    csvButton.disabled = true;
+    csvButton.title = "把已加载的搜索结果导出成 CSV";
+    // 注意必须包一层箭头函数：exportCsv 是下方才声明的 const，注册时直接传引用会踩 TDZ，
+    // ensurePublicShareSearch 会在挂上搜索框之前同步抛错（1.3.14 首版实测踩过）
+    csvButton.addEventListener("click", () => exportCsv());
+    const clearSelectionButton = target.createElement("button");
+    clearSelectionButton.type = "button";
+    clearSelectionButton.className = "c123-public-search-action";
+    clearSelectionButton.textContent = "清空已选";
+    clearSelectionButton.disabled = true;
+    clearSelectionButton.addEventListener("click", () => {
+      state.selected.clear();
+      updateActionButtons();
+      render();
+    });
+    actions.append(fastlinkButton, csvButton, clearSelectionButton);
+    filters.append(...filterChips, sortButton);
+    panelbar.append(actions);
+    const list = target.createElement("div");
+    list.className = "c123-public-search-list";
+    list.setAttribute("role", "listbox");
+    list.setAttribute("aria-label", "搜索结果");
+    results.append(panelbar, summary, filters, list);
+    results.addEventListener("wheel", (event) => {
+      if (list.scrollHeight <= list.clientHeight) return;
+      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? Math.max(1, list.clientHeight) : 1);
+      const atTop = list.scrollTop <= 0 && delta < 0;
+      const atBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 1 && delta > 0;
+      if (atTop || atBottom) return;
+      event.preventDefault();
+      event.stopPropagation();
+      list.scrollTop += delta;
+    }, { passive: false, capture: true });
+    results.addEventListener("touchmove", (event) => event.stopPropagation(), { passive: true, capture: true });
+    list.addEventListener("scroll", () => {
+      if (list.scrollTop + list.clientHeight >= list.scrollHeight - 96) appendNextPage();
+    }, { passive: true });
+    root.append(results);
+    anchor.append(root);
+    state.root = root;
+    const setSummaryText = (text2) => {
+      summaryText.textContent = text2;
+    };
+    const renderScope = () => {
+      scopePill.hidden = !state.scope;
+      if (state.scope) scopeText.textContent = `范围：${state.scope.name}`;
+    };
+    const updateActionButtons = () => {
+      fastlinkButton.textContent = state.selected.size ? `生成秒传（${state.selected.size}）` : "生成秒传";
+      fastlinkButton.disabled = !state.selected.size || state.status === "exporting";
+      csvButton.disabled = !(state.items || []).length;
+      clearSelectionButton.disabled = !state.selected.size;
+    };
+    const copyEntryPath = async (entry2) => {
+      const text2 = pathOfEntry(entry2);
+      if (!text2) return;
+      try {
+        await copyText(text2);
+        showStatus(target, `已复制路径：${text2}`);
+      } catch {
+        showStatus(target, "复制失败，请手动复制", "error");
+      }
+    };
+    const toggleEntry = (entry2, checked) => {
+      const key = searchEntryKey(entry2);
+      if (checked) state.selected.set(key, entry2);
+      else state.selected.delete(key);
+      updateActionButtons();
+    };
+    const openEntry = (entry2) => {
+      if (Number(entry2?.type) !== 1) {
+        // 点文件结果 = 切换勾选（与行首复选框一致）
+        const key = searchEntryKey(entry2);
+        const nextChecked = !state.selected.has(key);
+        if (nextChecked) state.selected.set(key, entry2);
+        else state.selected.delete(key);
+        updateActionButtons();
+        render();
+        return;
+      }
+      // 点文件夹结果 = 把搜索范围收进该文件夹
+      state.scope = { id: String(entry2.id || ""), name: String(entry2.name || "") };
+      state.resultsDismissed = false;
+      fetchPage({ reset: true });
+    };
+    const updateSummaryCount = () => {
+      const total = Number(state.total || 0);
+      const loaded = (state.items || []).length;
+      let text2 = `共 ${total} 项`;
+      if (total > loaded) text2 += `，已加载 ${loaded} 项`;
+      if (state.scope) text2 += `（范围：${state.scope.name}）`;
+      text2 += ` · 已显示 ${state.renderedCount} 项`;
+      if (loaded >= SEARCH_RESULT_HARD_LIMIT) text2 += "，已达显示上限，请用类型筛选缩小范围";
+      setSummaryText(text2);
+    };
+    const optionNodes = () => [...list.querySelectorAll(".c123-public-search-result")];
+    const setActiveOption = (index) => {
+      const nodes = optionNodes();
+      if (!nodes.length || index < 0 || index >= nodes.length) return;
+      state.activeIndex = index;
+      nodes.forEach((node, position) => {
+        const active = position === index;
+        node.dataset.active = String(active);
+        node.setAttribute("aria-selected", String(active));
+      });
+      list.setAttribute("aria-activedescendant", nodes[index].id);
+      nodes[index].scrollIntoView?.({ block: "nearest" });
+    };
+    const exportCsv = () => {
+      const rows = state.items || [];
+      if (!rows.length) return;
+      const query = normalizedText(input.value).replace(/[\\/:*?"<>|]/g, "_") || "结果";
+      const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      downloadText(`分享搜索-${query}-${stamp}.csv`, buildSearchCsvText(rows), "text/csv;charset=utf-8");
+      showStatus(target, `已导出 ${rows.length} 条搜索结果`);
+    };
+    const generateFastlink = async () => {
+      const picked = [...state.selected.values()];
+      if (!picked.length || state.status === "exporting") return;
+      if (!state.share?.shareKey) {
+        showStatus(target, "未能识别当前分享链接，无法生成秒传", "error");
+        return;
+      }
+      const previousStatus = state.status;
+      state.status = "exporting";
+      updateActionButtons();
+      summary.dataset.tone = "";
+      const finish = (message, tone = "") => {
+        state.status = previousStatus === "exporting" ? "ready" : previousStatus;
+        updateActionButtons();
+        summary.dataset.tone = tone;
+        setSummaryText(message);
+        if (tone) showStatus(target, message, tone);
+      };
+      try {
+        const { filtered, skipped } = await collectSearchFastlinkFiles(options.api, state.share, picked, (message) => setSummaryText(message));
+        if (!filtered.length) {
+          finish("勾选的结果里没有可生成秒传的文件", "error");
+          return;
+        }
+        const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+        const filename = `分享搜索秒传-${stamp}.123fastlink.json`;
+        downloadJson(target, filename, buildFastlinkJson(filtered));
+        finish(`秒传 JSON 已下载：${filtered.length} 个文件${skipped ? `（跳过 ${skipped} 个无特征值结果）` : ""}`);
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          finish("已取消生成秒传");
+          return;
+        }
+        finish(`生成秒传失败：${String(error?.message || error || "未知错误")}`, "error");
+      }
+    };
+    const fetchPage = async ({ reset }) => {
+      const query = input.value.trim();
+      if (!query) return;
+      if (!state.share?.shareKey) {
+        state.status = "error";
+        state.error = new Error("未能识别当前分享链接");
+        render();
+        return;
+      }
+      const controller = new AbortController();
+      state.controller?.abort();
+      state.controller = controller;
+      const filterDef = SEARCH_TYPE_FILTERS.find((chip) => chip.key === state.filter);
+      const requestKey = `${query}|${state.filter}|${state.scope?.id || "0"}`;
+      state.requestKey = requestKey;
+      state.fetching = true;
+      state.status = "searching";
+      state.error = null;
+      if (reset) {
+        state.items = [];
+        state.total = 0;
+        state.next = "0";
+        state.renderMatches = [];
+        state.renderedCount = 0;
+        state.activeIndex = -1;
+      }
+      updateActionButtons();
+      render();
+      try {
+        const result2 = await options.api.searchPublicShare(query, {
+          shareKey: state.share.shareKey,
+          sharePwd: state.share.sharePwd || "",
+          parentFileId: state.scope?.id || "0",
+          category: filterDef?.category || "",
+          limit: SEARCH_PAGE_LIMIT,
+          next: reset ? "0" : state.next,
+          signal: controller.signal,
+          onPace: (info) => {
+            if (info?.seconds) setSummaryText(`分享接口风控冷却中：${info.seconds}s 后自动继续（第 ${info.strikes} 次触发）`);
+          }
+        });
+        if (state.requestKey !== requestKey || controller.signal.aborted) return;
+        state.items = reset ? result2.files : (state.items || []).concat(result2.files);
+        state.total = Number(result2.total || 0);
+        state.next = String(result2.next ?? "-1");
+        state.status = "ready";
+        // 加载更多时不重建列表（保留滚动位置），只把新结果补进去；仅相关度排序下增量安全
+        state.preserveRender = !reset && state.sort === "relevance";
+      } catch (error) {
+        if (error?.name === "AbortError") return;
+        state.error = error;
+        state.status = "error";
+      } finally {
+        if (state.requestKey === requestKey) state.fetching = false;
+        render();
+      }
+    };
+    const loadMore = () => {
+      if (state.fetching || state.status !== "ready") return false;
+      if (state.next === "-1" || state.next === "" || (state.items || []).length >= SEARCH_RESULT_HARD_LIMIT) return false;
+      void fetchPage({ reset: false });
+      return true;
+    };
+    const appendNextPage = () => {
+      const matches = state.renderMatches || [];
+      const next = Math.min(matches.length, state.renderedCount + SEARCH_RESULT_PAGE_SIZE);
+      if (next <= state.renderedCount) {
+        if (state.renderedCount >= matches.length) loadMore();
+        return false;
+      }
+      state.terms = normalizedText(input.value).split(" ").filter(Boolean);
+      for (let position = state.renderedCount; position < next; position += 1) {
+        list.append(resultButton(target, matches[position], position, state, {
+          onToggle: toggleEntry,
+          onCopyPath: copyEntryPath,
+          onOpen: openEntry,
+          onHover: setActiveOption
+        }));
+      }
+      state.renderedCount = next;
+      updateSummaryCount();
+      return true;
+    };
+    const moveActive = (delta) => {
+      if (!state.renderedCount && !appendNextPage()) return;
+      let index = state.activeIndex < 0 ? (delta > 0 ? 0 : state.renderedCount - 1) : state.activeIndex + delta;
+      if (index >= state.renderedCount) appendNextPage();
+      index = Math.max(0, Math.min(index, state.renderedCount - 1));
+      setActiveOption(index);
+    };
+    const render = () => {
+      if (!root.isConnected || state.root !== root) return;
+      const query = input.value.trim();
+      setQueryState(root, query);
+      renderScope();
+      updateActionButtons();
+      if (!query) {
+        results.hidden = true;
+        filters.hidden = true;
+        list.replaceChildren();
+        state.renderMatches = [];
+        state.renderedCount = 0;
+        state.activeIndex = -1;
+        return;
+      }
+      if (state.resultsDismissed) {
+        results.hidden = true;
+        return;
+      }
+      // 官方搜索结果页展示时不重复出脚本面板；勾选/导出走官方页上的按钮条
+      if (detectOfficialSearchResults(target)) {
+        results.hidden = true;
+        return;
+      }
+      // 加载更多路径：已渲染的行保持不动，只增量补新结果（preserveRender 在消费后复位）
+      if (state.preserveRender && state.renderedCount && state.status === "ready") {
+        state.preserveRender = false;
+        updateSummaryCount();
+        appendNextPage();
+        let guard = 0;
+        while (state.renderedCount < state.renderMatches.length && list.scrollHeight <= list.clientHeight + 4 && guard < 40) {
+          if (!appendNextPage()) break;
+          guard += 1;
+        }
+        return;
+      }
+      state.preserveRender = false;
+      results.hidden = false;
+      summary.dataset.tone = state.status === "error" ? "error" : "";
+      refreshButton.hidden = state.status !== "ready";
+      summary.querySelectorAll(".c123-public-search-retry").forEach((node) => node.remove());
+      list.replaceChildren();
+      list.removeAttribute("aria-activedescendant");
+      state.activeIndex = -1;
+      state.renderedCount = 0;
+      state.renderMatches = sortSearchMatches(state.items || [], state.sort);
+      filters.hidden = false;
+      for (const chip of filterChips) chip.dataset.active = String(chip.dataset.filter === state.filter);
+      sortButton.textContent = `排序：${SEARCH_SORT_LABELS[state.sort] || SEARCH_SORT_LABELS.relevance}`;
+      if (state.status === "error") {
+        filters.hidden = true;
+        setSummaryText(`搜索失败：${String(state.error?.message || state.error || "未知错误")}`);
+        const retry = target.createElement("button");
+        retry.type = "button";
+        retry.className = "c123-public-search-retry";
+        retry.textContent = "重试";
+        retry.addEventListener("click", () => fetchPage({ reset: true }));
+        summary.append(retry);
+        return;
+      }
+      if (state.status === "searching") {
+        setSummaryText((state.items || []).length ? `已加载 ${(state.items || []).length} 项，正在加载更多…` : `正在搜索“${query}”…`);
+        return;
+      }
+      const matches = state.renderMatches;
+      if (!matches.length) {
+        setSummaryText(`未找到“${query}”`);
+        return;
+      }
+      updateSummaryCount();
+      appendNextPage();
+      let guard = 0;
+      while (state.renderedCount < state.renderMatches.length && list.scrollHeight <= list.clientHeight + 4 && guard < 40) {
+        if (!appendNextPage()) break;
+        guard += 1;
+      }
+    };
+    // 官方搜索框驱动：官方输入框的输入/回车/清空同步驱动脚本侧搜索，官方搜索照常执行
+    const syncFromOfficial = () => {
+      const query = String(input.value || "").trim();
+      view.clearTimeout(state.debounceTimer);
+      if (!query) {
+        state.controller?.abort();
+        state.status = "idle";
+        state.resultsDismissed = false;
+        render();
+        return;
+      }
+      state.resultsDismissed = false;
+      render();
+      state.debounceTimer = view.setTimeout(() => fetchPage({ reset: true }), SEARCH_DEBOUNCE_MS);
+    };
+    if (!input.dataset.c123SearchWired) {
+      input.dataset.c123SearchWired = "true";
+      input.addEventListener("input", syncFromOfficial);
+      input.addEventListener("focus", () => {
+        if (input.value.trim()) {
+          state.resultsDismissed = false;
+          render();
+        }
+      });
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          state.resultsDismissed = true;
+          results.hidden = true;
+          return;
+        }
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          if (results.hidden || !state.renderMatches.length) return;
+          event.preventDefault();
+          moveActive(event.key === "ArrowDown" ? 1 : -1);
+          return;
+        }
+        if (event.key !== "Enter") return;
+        // 不 preventDefault：官方搜索照常执行；结果页出现后面板自动隐藏，脚本侧不再重复拉结果
+      });
+    }
+    // 显隐同步（轻量，不重建列表）：官方结果页模式收起，浏览模式且有已加载结果时恢复
+    const syncVisibility = () => {
+      const query = String(input.value || "").trim();
+      if (!query || state.resultsDismissed || detectOfficialSearchResults(target)) {
+        results.hidden = true;
+        return;
+      }
+      if (results.hidden && ((state.items || []).length || state.status === "searching")) results.hidden = false;
+    };
+    state.syncVisibility = syncVisibility;
+    // 官方页面重渲染可能重建搜索框并冲掉面板；重注入后面板按官方框当前值自动恢复
+    if (String(input.value || "").trim() && (state.items || []).length) {
+      state.resultsDismissed = false;
+      render();
+    }
+    if (!target.__CLOUD123_PUBLIC_SHARE_SEARCH_OUTSIDE__) {
+      target.__CLOUD123_PUBLIC_SHARE_SEARCH_OUTSIDE__ = (event) => {
+        const current = target.__CLOUD123_PUBLIC_SHARE_SEARCH_STATE__?.root;
+        if (current && !current.contains(event.target)) {
+          target.__CLOUD123_PUBLIC_SHARE_SEARCH_STATE__.resultsDismissed = true;
+          const panel = current.querySelector(".c123-public-search-results");
+          if (panel) panel.hidden = true;
+        }
+      };
+      target.addEventListener("pointerdown", target.__CLOUD123_PUBLIC_SHARE_SEARCH_OUTSIDE__);
+    }
+    return root;
+  }
   // src/core/release-group.js
   var EXTENSION = /(\.(?:mkv|mp4|avi|mov|wmv|flv|webm|m4v|mpeg|mpg|3gp|ts|m2ts|mts|ass|srt|ssa|zip|rar|7z))$/i;
   var GENERIC_GROUP = /^[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9._@-]{1,49}$/;
