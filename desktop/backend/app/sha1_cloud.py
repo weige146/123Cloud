@@ -11,7 +11,8 @@
 - 连接强制 TLS 且校验服务器身份（VERIFY_CA+IDENTITY：随包分发的 CA + 证书 IP SAN），
   没有 CA 直接拒绝连接，绝不降级明文；
 - 所有网络操作"尽力而为"：连接失败/超时一律记 WARNING 并按"没有命中"处理，
-  绝不抛异常打断搬运；连续失败 3 次自动熔断 10 分钟，避免不可达时拖慢任务；
+  绝不抛异常打断搬运；连续失败自动熔断几分钟（数据库客户端 3 次熔断 10 分钟，
+  API 客户端 5 次熔断 5 分钟），避免不可达时拖慢任务；
 - 只按内容指纹反查 (sha1, size) / (etag, size)；绝不以 (name, size) 反查共享库，
   新增记录携带文件名，但文件名不用于判断内容相同；
 - 回写只发生在内容经过验证的搬运成功之后；INSERT IGNORE 首写优先，只需要 INSERT 权限；
@@ -148,6 +149,10 @@ def _build_ssl_context(ssl_ca: str) -> "_ssl.SSLContext":
 class Sha1CloudClient:
     """中心库的最小客户端：短连接 + 严格入参校验 + 全部异常吞掉 + 失败熔断。"""
 
+    # 熔断参数做成类属性，API 客户端按"慢而不死"的服务器特点放宽
+    breaker_threshold = _BREAKER_THRESHOLD
+    breaker_open_seconds = _BREAKER_OPEN_SECONDS
+
     def __init__(self) -> None:
         self._config: Optional[Dict[str, Any]] = None
         self._config_loaded = False
@@ -197,27 +202,30 @@ class Sha1CloudClient:
 
     def _record_success(self) -> None:
         with self._state_lock:
+            recovered = bool(self._open_until or self._half_open or self._failure_count)
             self._failure_count = 0
             self._open_until = 0.0
             self._half_open = False
+        if recovered:
+            logger.info("共享SHA1库已恢复使用")
 
     def _record_failure(self) -> None:
         with self._state_lock:
             if self._half_open:
                 # 半开探针失败：立即重新熔断一个完整周期
-                self._open_until = time.monotonic() + _BREAKER_OPEN_SECONDS
+                self._open_until = time.monotonic() + self.breaker_open_seconds
                 logger.warning(
-                    "共享SHA1库半开探针失败，继续熔断 %d 分钟", _BREAKER_OPEN_SECONDS // 60,
+                    "共享SHA1库半开探针失败，继续暂停 %d 分钟", self.breaker_open_seconds // 60,
                 )
                 return
             self._failure_count += 1
-            if self._failure_count >= _BREAKER_THRESHOLD:
-                self._open_until = time.monotonic() + _BREAKER_OPEN_SECONDS
+            if self._failure_count >= self.breaker_threshold:
+                self._open_until = time.monotonic() + self.breaker_open_seconds
                 self._failure_count = 0
                 self._half_open = False
                 logger.warning(
-                    "共享SHA1库连续失败 %d 次，熔断 %d 分钟",
-                    _BREAKER_THRESHOLD, _BREAKER_OPEN_SECONDS // 60,
+                    "共享SHA1库连续失败 %d 次，暂停使用 %d 分钟再试（搬运不受影响，只影响秒传加速）",
+                    self.breaker_threshold, self.breaker_open_seconds // 60,
                 )
 
     def _run(self, sql: str, params: tuple) -> Optional[list]:
@@ -314,7 +322,26 @@ class Sha1CloudClient:
 
 
 class Sha1ApiClient(Sha1CloudClient):
-    """普通客户端仅连接 HTTPS API，不读取数据库凭据。"""
+    """普通客户端仅连接 HTTPS API，不读取数据库凭据。
+
+    服务器在海外，多数用户经隧道访问：实测 TLS 握手就要 1~4 秒，若每个查询都
+    新建连接，搬运期多路并发会把请求拖到超时（2026-09-19 实测：单发 2~3 秒能过
+    5 秒预算，5 路并发就超时熔断）。因此：
+    - 连接复用：按"直连/各代理地址"各缓存一个 httpx.Client（keepalive），
+      查询只需付一次握手；
+    - 超时拆分：连接 5 秒、读响应 10 秒（握手慢不算响应慢）；
+    - 并发闸：最多同时压服务器 3 个请求，搬运 5 并发也不会放大流量；
+    - 熔断放宽：连败 5 次暂停 5 分钟，少误伤"慢而不死"的服务器。
+    """
+
+    breaker_threshold = 5
+    breaker_open_seconds = 300
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._http_lock = threading.Lock()
+        self._http_clients: Dict[Optional[str], Any] = {}
+        self._gate = threading.BoundedSemaphore(3)
 
     @staticmethod
     def _error_brief_with_detail(error: BaseException) -> str:
@@ -346,24 +373,38 @@ class Sha1ApiClient(Sha1CloudClient):
             pass
         return None
 
+    def _http_client(self, proxy: Optional[str]):
+        """按代理地址缓存的长连接客户端（None=直连）；TLS 上下文跟着各自客户端走。"""
+        with self._http_lock:
+            client = self._http_clients.get(proxy)
+            if client is None:
+                import httpx
+                verify = _ssl.create_default_context(cafile=os.environ.get("SHA1_POOL_API_CA") or None)
+                client = httpx.Client(
+                    verify=verify,
+                    timeout=httpx.Timeout(10.0, connect=5.0),
+                    follow_redirects=False,
+                    trust_env=False,
+                    proxy=proxy,
+                )
+                self._http_clients[proxy] = client
+            return client
+
     def _send(self, method: str, url: str, payload: dict, proxy: Optional[str]) -> dict:
-        import httpx
-        verify = _ssl.create_default_context(cafile=os.environ.get("SHA1_POOL_API_CA") or None)
-        with httpx.Client(verify=verify, timeout=5, follow_redirects=False,
-                          trust_env=False, proxy=proxy) as client:
-            kwargs = {"params": payload} if method == "GET" else {"json": payload}
-            endpoint = "/lookup" if method == "GET" else "/submit"
-            with client.stream(method, url + endpoint,
-                               headers={"Authorization": "Bearer " + (_token_override or os.environ.get("SHA1_POOL_API_TOKEN", ""))},
-                               **kwargs) as response:
-                response.raise_for_status()
-                body = bytearray()
-                for chunk in response.iter_bytes():
-                    body.extend(chunk)
-                    if len(body) > 16384:
-                        raise ValueError("API response too large")
-            import json
-            result = json.loads(body)
+        client = self._http_client(proxy)
+        kwargs = {"params": payload} if method == "GET" else {"json": payload}
+        endpoint = "/lookup" if method == "GET" else "/submit"
+        with client.stream(method, url + endpoint,
+                           headers={"Authorization": "Bearer " + (_token_override or os.environ.get("SHA1_POOL_API_TOKEN", ""))},
+                           **kwargs) as response:
+            response.raise_for_status()
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                body.extend(chunk)
+                if len(body) > 16384:
+                    raise ValueError("API response too large")
+        import json
+        result = json.loads(body)
         if not isinstance(result, dict):
             raise ValueError("invalid API response")
         return result
@@ -383,18 +424,20 @@ class Sha1ApiClient(Sha1CloudClient):
             token = _token_override or os.environ.get("SHA1_POOL_API_TOKEN", "")
             if not token or token == "CHANGE_ME":
                 raise ValueError("API token missing")
-            try:
-                result = self._send(method, url, payload, proxy=None)
-            except Exception as error:
-                # 直连失败且本机配了系统代理时（典型场景：服务器 IP 直连被墙），
-                # 改走系统代理再试一次；HTTP 层的拒绝（401/403/429）不重试
-                if type(error).__name__ not in {"ConnectTimeout", "ConnectError"}:
-                    raise
-                proxy = self._system_https_proxy()
-                if not proxy:
-                    raise
-                logger.warning("共享SHA1库直连不上，改走系统代理再试一次")
-                result = self._send(method, url, payload, proxy=proxy)
+            # 并发闸：一次逻辑请求（含代理重试）占一个名额，最多 3 路同时打服务器
+            with self._gate:
+                try:
+                    result = self._send(method, url, payload, proxy=None)
+                except Exception as error:
+                    # 直连失败且本机配了系统代理时（典型场景：服务器 IP 直连被墙），
+                    # 改走系统代理再试一次；HTTP 层的拒绝（401/403/429）不重试
+                    if type(error).__name__ not in {"ConnectTimeout", "ConnectError"}:
+                        raise
+                    proxy = self._system_https_proxy()
+                    if not proxy:
+                        raise
+                    logger.warning("共享SHA1库直连不上，改走系统代理再试一次")
+                    result = self._send(method, url, payload, proxy=proxy)
             self._record_success()
             return result
         except Exception as error:
