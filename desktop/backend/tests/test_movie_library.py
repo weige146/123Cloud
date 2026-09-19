@@ -151,12 +151,12 @@ class MovieLibraryEngineTests(unittest.TestCase):
             self.assertEqual(r["added"], 1)
             self.assertEqual(r["skipped"], 0)
 
-            # 来源 B：另一作品 + 与 A 完全相同的 dir（应跳过）
+            # 来源 B：另一作品 + 与 A 完全相同的 dir（skip 模式下应整作品跳过）
             payload_b = _fastlink_payload("", [
                 {"path": f"{WORK_B}/b.mkv", "fileName": "b.mkv", "etag": _etag(2), "size": 200},
                 {"path": f"{WORK_A}/dup.mkv", "fileName": "dup.mkv", "etag": _etag(9), "size": 999},
             ])
-            r = db.import_payload("库B.json", payload_b)
+            r = db.import_payload("库B.json", payload_b, mode="skip")
             self.assertEqual(r["added"], 1)
             self.assertEqual(r["skipped"], 1)
 
@@ -198,11 +198,11 @@ class MovieLibraryEngineTests(unittest.TestCase):
             self.assertEqual(exported["totalFilesCount"], 2)
             self.assertTrue(exported["files"][0]["etag"])
 
-            # 同来源重导 → 更新（先删后插）
+            # 同来源重导 → 更新（skip 模式：先删后插，整包替换）
             payload_a2 = _fastlink_payload(WORK_A + "/", [
                 {"path": "new.mkv", "fileName": "new.mkv", "etag": _etag(8), "size": 5},
             ])
-            db.import_payload("库A.json", payload_a2)
+            db.import_payload("库A.json", payload_a2, mode="skip")
             listing = db.list_files(WORK_A)
             self.assertEqual(listing["files"][0]["fileName"], "new.mkv")
 
@@ -533,12 +533,13 @@ class LibraryRouteTests(unittest.TestCase):
             self.assertEqual(result["failed"], 1)
             names = {s["name"] for s in movie_library_db.list_sources()}
             self.assertEqual(names, {"A.json", "B.json"})
-            # 同一来源再次导入 → 先清后插（可更新），作品数不叠加
+            # 同一来源再次导入（默认合并模式）：文件完全相同 → 无新增、作品数不叠加
             again = asyncio.run(main.import_library_paths(
                 main.LibraryImportPathsRequest(paths=[str(tmp / "A.json")]), _StubRequest(),
             ))
-            self.assertEqual(again["added"], 1)
-            self.assertEqual(again["skipped"], 0)
+            self.assertEqual(again["added"], 0)
+            self.assertEqual(again["mergedWorks"], 0)
+            self.assertEqual(again["skipped"], 1)
             self.assertEqual(asyncio.run(main.read_library_status())["status"]["workCount"], 2)
 
     def test_import_dir_route_skips_checkpoints(self):
@@ -760,7 +761,7 @@ class MovieLibraryStreamImportTests(unittest.TestCase):
             self.assertEqual(rows_of(Path(d) / "a.db"), rows_of(Path(d) / "b.db"))
 
     def test_stream_db_skip_existing_and_reimport_updates(self):
-        """dir 已存在跳过（保留先入库的）；同名来源重导先清后插（可更新）。"""
+        """skip 模式：dir 已存在整作品跳过（保留先入库的）；同名来源重导先清后插（可更新）。"""
         from app.movie_library_db import LibraryDb
         with tempfile.TemporaryDirectory() as d:
             db = LibraryDb(Path(d) / "cloud123.db")
@@ -775,7 +776,7 @@ class MovieLibraryStreamImportTests(unittest.TestCase):
                 {"path": f"{WORK_B}/b.mkv", "fileName": "b.mkv", "etag": _etag(2), "size": 200},
             ]), ensure_ascii=False), encoding="utf-8")
             meta, entries = movie_library.open_library_stream(f)
-            r = db.import_stream("库.json", meta["commonPath"], entries)
+            r = db.import_stream("库.json", meta["commonPath"], entries, mode="skip")
             self.assertEqual(r["added"], 1)
             self.assertEqual(r["skipped"], 1)
             listing = db.list_files(WORK_A)
@@ -788,7 +789,7 @@ class MovieLibraryStreamImportTests(unittest.TestCase):
                 {"path": f"{work_c}/b2.mkv", "fileName": "b2.mkv", "etag": _etag(3), "size": 1},
             ]), ensure_ascii=False), encoding="utf-8")
             meta2, entries2 = movie_library.open_library_stream(f2)
-            r2 = db.import_stream("库2.json", meta2["commonPath"], entries2)
+            r2 = db.import_stream("库2.json", meta2["commonPath"], entries2, mode="skip")
             self.assertEqual(r2["added"], 1)
             total, _ = db.search("", 1, 20, libs=["库2.json"])
             self.assertEqual(total, 1)
@@ -798,7 +799,7 @@ class MovieLibraryStreamImportTests(unittest.TestCase):
                 {"path": f"{work_c}/b2.mkv", "fileName": "b2.mkv", "etag": _etag(4), "size": 2},
             ]), ensure_ascii=False), encoding="utf-8")
             meta3, entries3 = movie_library.open_library_stream(f3)
-            r3 = db.import_stream("库2.json", meta3["commonPath"], entries3)
+            r3 = db.import_stream("库2.json", meta3["commonPath"], entries3, mode="skip")
             self.assertEqual(r3["added"], 1, "同名来源重导应先清后插、再次新增")
             listing = db.list_files(f"电影/{work_c}")
             self.assertEqual(listing["files"][0]["etag"], _etag(4), "重导后文件应为新版本")
@@ -1090,6 +1091,86 @@ class LibraryEnrichTests(unittest.TestCase):
             result = asyncio.run(main.start_library_enrich(main.LibraryTokenRequest(), _StubRequest()))
         self.assertEqual(result["processed"], 1)
         self.assertEqual(result["stats"]["ok"], 1)
+
+    def _switch_store(self):
+        original_store = main.store
+        self.addCleanup(setattr, main, "store", original_store)
+        from app.session_store import SessionStore
+        main.store = SessionStore(Path(self._directory.name))
+        return main.store
+
+    def test_lookup_prefers_type_and_early_stops(self):
+        """先查偏好类型；首查命中且标题匹配（评分≥2）就不再查另一个类型；结果进 KV 缓存。"""
+        store = self._switch_store()
+        calls = []
+
+        async def fake_fetch(type_, tmdb_id):
+            calls.append(type_)
+            if type_ == "tv":
+                return {"name": "海王", "first_air_date": "2018-01-01",
+                        "genres": [{"id": 18, "name": "剧情"}], "popularity": 10}
+            return None
+
+        with unittest.mock.patch.object(main, "_tmdb_fetch_info", fake_fetch):
+            fields = asyncio.run(main._tmdb_enrich_lookup(297802, "海王", 2018, prefer_type="tv"))
+        self.assertEqual(calls, ["tv"], "首查命中且标题匹配就不再查第二个类型")
+        self.assertEqual(fields["media_type"], "电视剧")
+        # 第二次：同样参数走 KV 缓存，不再发请求
+        fields2 = asyncio.run(main._tmdb_enrich_lookup(297802, "海王", 2018, prefer_type="movie"))
+        self.assertEqual(calls, ["tv"])
+        self.assertIsNotNone(fields2)
+        self.assertTrue(store.read_value(main._enrich_cache_key("zh-CN", 297802)))
+
+    def test_lookup_falls_back_when_first_type_mismatches(self):
+        """首查标题对不上（评分<2）继续查另一类型择优，不会错配。"""
+        self._switch_store()  # 隔离 KV 缓存，不能读真实库
+        calls = []
+
+        async def fake_fetch(type_, tmdb_id):
+            calls.append(type_)
+            if type_ == "tv":
+                return {"name": "完全不同的剧", "first_air_date": "2020-01-01", "genres": []}
+            return {"title": "海王", "release_date": "2018-12-07", "genres": [{"id": 28, "name": "动作"}]}
+
+        with unittest.mock.patch.object(main, "_tmdb_fetch_info", fake_fetch):
+            fields = asyncio.run(main._tmdb_enrich_lookup(297802, "海王", 2018, prefer_type="tv"))
+        self.assertEqual(calls, ["tv", "movie"], "首查不匹配应继续查 movie")
+        self.assertEqual(fields["media_type"], "电影")
+
+    def test_search_lookup_requires_title_match(self):
+        """无标记选配：搜索结果必须标题匹配（评分≥2）才采纳；完全不相干不返回 id。"""
+
+        class _FakeResponse:
+            def __init__(self, payload):
+                self.status_code = 200
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class _FakeClient:
+            def __init__(self, payload):
+                self._payload = payload
+
+            async def get(self, url, headers=None):
+                return _FakeResponse(self._payload)
+
+        with unittest.mock.patch.object(main, "_tmdb_http", lambda: _FakeClient(
+            {"results": [{"id": 42, "name": "海王", "first_air_date": "2018-01-01"}]}
+        )):
+            matched = asyncio.run(main._tmdb_search_lookup("海王", 2018))
+        self.assertEqual(matched, 42)
+
+        with unittest.mock.patch.object(main, "_tmdb_http", lambda: _FakeClient(
+            {"results": [{"id": 43, "name": "完全无关的剧", "first_air_date": "2018-01-01"}]}
+        )):
+            matched = asyncio.run(main._tmdb_search_lookup("海王", 2018))
+        self.assertIsNone(matched, "标题对不上的搜索结果不采纳")
+
+    def test_prefer_type_heuristic(self):
+        self.assertEqual(main._prefer_tmdb_type({"video_count": 5, "dir": "电影/海王"}), "tv")
+        self.assertEqual(main._prefer_tmdb_type({"video_count": 1, "dir": "剧集/Show/Season 1"}), "tv")
+        self.assertEqual(main._prefer_tmdb_type({"video_count": 1, "dir": "电影/海王 (2018)"}), "movie")
 
 
 W_MOVIE_1 = "合集/甲 (2018) {tmdb-11}"

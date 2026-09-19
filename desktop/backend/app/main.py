@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote as url_quote, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -175,11 +175,36 @@ pan115_recycle_cleanup_task: Optional[asyncio.Task[None]] = None
 telegram_callback_polling_task: Optional[asyncio.Task[None]] = None
 library_enrich_task: Optional[asyncio.Task[None]] = None
 # 影库分类充实（后台懒回填）：每批条数 / 相邻请求间隔 / 无活时空闲 / 单作品失败重试阈值
-LIBRARY_ENRICH_BATCH = 20
+LIBRARY_ENRICH_BATCH = 40
 LIBRARY_ENRICH_REQ_GAP = 0.25
 LIBRARY_ENRICH_IDLE_SEC = 30
 LIBRARY_ENRICH_ACTIVE_SEC = 2
 LIBRARY_ENRICH_MAX_ATTEMPTS = 3
+LIBRARY_ENRICH_CONCURRENCY = 5
+LIBRARY_ENRICH_UNTAGGED_BATCH = 10
+
+# 导入完成后踢一下整理循环，立刻开始处理新入库的作品（不用等空闲轮询）
+library_enrich_kick = asyncio.Event()
+
+# TV 目录特征：Season 01 / S01E02 之类，用于决定先查 tv 还是 movie（TMDB 的 movie/tv id 会撞号）
+_TV_DIR_PATTERN = re.compile(r"season[ ._-]*\d|s\d{1,2}[-.e]\d{1,2}", re.I)
+
+
+def _enrich_cache_key(lang: str, tmdb_id: int) -> str:
+    return f"libraryEnrich:{lang or 'zh-CN'}:{int(tmdb_id)}"
+
+
+def _prefer_tmdb_type(row: Dict[str, Any]) -> str:
+    """先查哪个类型：剧集特征（视频数≥2 或目录带 Season/S01E02）先查 tv，否则先查 movie。
+    命中且标题对得上（评分≥2）就不再查另一类型，省一半请求；对不上仍会双查择优。"""
+    try:
+        if int(row.get("video_count") or 0) >= 2:
+            return "tv"
+    except Exception:
+        pass
+    if _TV_DIR_PATTERN.search(str(row.get("dir") or "")):
+        return "tv"
+    return "movie"
 PAN123_COPY_PASSWORD_PENDING_PREFIX = "telegram_pan123_copy_password:"
 PAN123_COPY_PASSWORD_TTL_SECONDS = 600
 TELEGRAM_BOT_COMMANDS = [
@@ -2007,6 +2032,8 @@ class LibraryConfigRequest(BaseModel):
     playerPath: Optional[str] = None
     autoTrash: Optional[bool] = None
     playCachePath: Optional[str] = None
+    importMode: Optional[str] = None
+    enrichUntagged: Optional[bool] = None
     token: str = ""
     clearToken: bool = False
 
@@ -2037,6 +2064,10 @@ def normalize_movie_library_config(raw: Dict[str, Any]) -> Dict[str, Any]:
             if str(cfg.get("playCachePath") or "").strip() == library_playback.LEGACY_PLAY_CACHE_PATH
             else str(cfg.get("playCachePath") or "").strip() or library_playback.DEFAULT_PLAY_CACHE_PATH
         ),
+        # 重复作品导入策略：merge=只增不减（新文件并入已有作品，保留整理成果）；skip=旧行为（整作品跳过）
+        "importMode": "skip" if str(cfg.get("importMode") or "").strip().lower() == "skip" else "merge",
+        # 无 {tmdb-N} 标记的作品是否用标题+年份搜 TMDB 自动匹配（有匹配错风险，默认关）
+        "enrichUntagged": bool(cfg.get("enrichUntagged", False)),
     }
 
 
@@ -2166,6 +2197,8 @@ async def read_library_config(request: Request) -> Dict[str, Any]:
             "playerPath": cfg.get("playerPath", ""),
             "autoTrash": bool(cfg.get("autoTrash", True)),
             "playCachePath": cfg.get("playCachePath", library_playback.DEFAULT_PLAY_CACHE_PATH),
+            "importMode": cfg.get("importMode", "merge"),
+            "enrichUntagged": bool(cfg.get("enrichUntagged", False)),
             "tokenSet": bool(token),
             # 令牌明文只回给本机管理页；远程浏览器/脚本只能拿到打码预览
             "token": token if loopback else "",
@@ -2195,6 +2228,8 @@ async def write_library_config(request: LibraryConfigRequest, request_obj: Reque
             "playerPath": current.get("playerPath", "") if request.playerPath is None else str(request.playerPath).strip(),
             "autoTrash": bool(current.get("autoTrash", True)) if request.autoTrash is None else bool(request.autoTrash),
             "playCachePath": current.get("playCachePath", library_playback.DEFAULT_PLAY_CACHE_PATH) if request.playCachePath is None else (str(request.playCachePath).strip() or library_playback.DEFAULT_PLAY_CACHE_PATH),
+            "importMode": current.get("importMode", "merge") if request.importMode is None else ("skip" if str(request.importMode).strip().lower() == "skip" else "merge"),
+            "enrichUntagged": bool(current.get("enrichUntagged", False)) if request.enrichUntagged is None else bool(request.enrichUntagged),
             "token": new_token,
         }
     })
@@ -2213,6 +2248,8 @@ async def write_library_config(request: LibraryConfigRequest, request_obj: Reque
         "playerPath": saved_cfg.get("playerPath", ""),
         "autoTrash": bool(saved_cfg.get("autoTrash", True)),
         "playCachePath": saved_cfg.get("playCachePath", library_playback.DEFAULT_PLAY_CACHE_PATH),
+        "importMode": saved_cfg.get("importMode", "merge"),
+        "enrichUntagged": bool(saved_cfg.get("enrichUntagged", False)),
         "tokenSet": bool(saved_cfg["token"]),
         "token": saved_cfg["token"] if loopback else "",
         "tokenPreview": None if loopback else _mask_token(saved_cfg["token"]),
@@ -2255,7 +2292,10 @@ async def import_library_file(request: Request, name: str = Query(""), token: st
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
     safe_name = os.path.basename(str(name or "").strip()) or "导入"
-    return await asyncio.to_thread(movie_library_db.import_payload, safe_name, payload, _library_video_ext())
+    result = await asyncio.to_thread(
+        movie_library_db.import_payload, safe_name, payload, _library_video_ext(), _library_config().get("importMode", "merge"))
+    library_enrich_kick.set()
+    return result
 
 
 class LibraryImportPathsRequest(BaseModel):
@@ -2268,7 +2308,7 @@ def _library_video_ext() -> Any:
     return movie_library.video_ext_set(_library_config().get("videoExtensions") or None)
 
 
-def _import_library_from_path(path: str, name: str, video_ext: Any = None) -> Dict[str, Any]:
+def _import_library_from_path(path: str, name: str, video_ext: Any = None, mode: str = "merge") -> Dict[str, Any]:
     """按路径导入单个影库文件（同步、阻塞，调用方须放线程池）。
     JSON（含 GB 级巨型秒传文件）走流式解析 + 流式入库，不再整读进内存；
     秒传文本 / .123share 沿用整读解析。非影库文件抛 ValueError，由路由记为跳过。"""
@@ -2280,11 +2320,11 @@ def _import_library_from_path(path: str, name: str, video_ext: Any = None) -> Di
         except movie_library.LibraryFullParseFallback:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 payload = movie_library.parse_library_content(f.read())
-            return movie_library_db.import_payload(name, payload, video_ext)
-        return movie_library_db.import_stream(name, meta["commonPath"], files_iter, video_ext=video_ext)
+            return movie_library_db.import_payload(name, payload, video_ext, mode)
+        return movie_library_db.import_stream(name, meta["commonPath"], files_iter, video_ext=video_ext, mode=mode)
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         payload = movie_library.parse_library_content(f.read())
-    return movie_library_db.import_payload(name, payload, video_ext)
+    return movie_library_db.import_payload(name, payload, video_ext, mode)
 
 
 @app.post("/api/library/import/paths")
@@ -2294,12 +2334,13 @@ async def import_library_paths(request: LibraryImportPathsRequest, request_obj: 
     if not request.paths:
         raise HTTPException(status_code=400, detail="请选择要导入的文件")
     video_ext = _library_video_ext()
+    import_mode = str(_library_config().get("importMode") or "merge")
     results = []
     for raw_path in request.paths[:50]:
         path = os.path.abspath(os.path.expanduser(str(raw_path or "").strip()))
         base = os.path.basename(path)
         try:
-            result = await asyncio.to_thread(_import_library_from_path, path, base, video_ext)
+            result = await asyncio.to_thread(_import_library_from_path, path, base, video_ext, import_mode)
             results.append({"file": base, **result})
         except OSError as error:
             results.append({"file": base, "ok": False, "error": f"读取失败：{error}"})
@@ -2311,9 +2352,16 @@ async def import_library_paths(request: LibraryImportPathsRequest, request_obj: 
             continue
     added = sum(r.get("added", 0) for r in results)
     skipped = sum(r.get("skipped", 0) for r in results)
+    merged_works = sum(r.get("mergedWorks", 0) for r in results)
+    merged_files = sum(r.get("mergedFiles", 0) for r in results)
     failed = sum(1 for r in results if not r.get("ok"))
-    logger.info(f"影库导入：批量导入 {len(results)} 个文件 — 新增 {added} 个作品、重复跳过 {skipped} 个、失败 {failed} 个")
-    return {"ok": True, "results": results, "added": added, "skipped": skipped, "failed": failed}
+    logger.info(
+        f"影库导入：批量导入 {len(results)} 个文件 — 新增 {added} 个作品、并入已有作品 {merged_works} 个"
+        f"（新文件 {merged_files} 个）、重复跳过 {skipped} 个、失败 {failed} 个",
+    )
+    library_enrich_kick.set()
+    return {"ok": True, "results": results, "added": added, "skipped": skipped,
+            "mergedWorks": merged_works, "mergedFiles": merged_files, "failed": failed}
 
 
 class LibraryImportDirRequest(BaseModel):
@@ -2342,11 +2390,13 @@ async def import_library_dir(request: LibraryImportDirRequest, request_obj: Requ
         raise HTTPException(status_code=404, detail="目录里没有找到影库文件（支持 json/txt/123share）")
     results = []
     added = skipped = failed = 0
+    merged_works = merged_files = 0
     video_ext = _library_video_ext()
+    import_mode = str(_library_config().get("importMode") or "merge")
     for path in sorted(walked):
         base = os.path.basename(path)
         try:
-            r = await asyncio.to_thread(_import_library_from_path, path, base, video_ext)
+            r = await asyncio.to_thread(_import_library_from_path, path, base, video_ext, import_mode)
         except OSError as error:
             failed += 1
             results.append({"file": base, "status": "失败", "info": f"读取失败：{error}"})
@@ -2357,9 +2407,13 @@ async def import_library_dir(request: LibraryImportDirRequest, request_obj: Requ
             continue
         added += r["added"]
         skipped += r["skipped"]
-        results.append({"file": base, "status": "完成", "info": f"新增 {r['added']} · 重复 {r['skipped']} · {r['fileCount']} 个文件"})
+        merged_works += r.get("mergedWorks", 0)
+        merged_files += r.get("mergedFiles", 0)
+        results.append({"file": base, "status": "完成", "info": f"新增 {r['added']} · 并入 {r.get('mergedWorks', 0)} · 重复 {r['skipped']} · {r['fileCount']} 个文件"})
     logger.info(f"影库导入：文件夹批量导入 {len(walked)} 个文件 — 新增 {added} 个作品、重复跳过 {skipped} 个、失败 {failed} 个")
-    return {"ok": True, "total": len(walked), "added": added, "skipped": skipped, "failed": failed, "results": results}
+    library_enrich_kick.set()
+    return {"ok": True, "total": len(walked), "added": added, "skipped": skipped,
+            "mergedWorks": merged_works, "mergedFiles": merged_files, "failed": failed, "results": results}
 
 
 TMDB_BUILTIN_KEY = "8265bd1679663a7ea12ac168da84d2e8"
@@ -2370,6 +2424,17 @@ def _tmdb_credentials() -> Tuple[str, str]:
     token = str(submission.get("tmdbToken") or "").strip()
     lang = str(submission.get("tmdbLanguage") or "").strip() or "zh-CN"
     return token, lang
+
+
+_tmdb_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _tmdb_http() -> httpx.AsyncClient:
+    """整理循环专用的共享连接池：每个作品 1-2 次 TMDB 请求，复用省掉反复建连的开销。"""
+    global _tmdb_http_client
+    if _tmdb_http_client is None or _tmdb_http_client.is_closed:
+        _tmdb_http_client = httpx.AsyncClient(timeout=15.0)
+    return _tmdb_http_client
 
 
 async def _tmdb_fetch_info(type_: str, tmdb_id: int) -> Optional[Dict[str, Any]]:
@@ -2385,15 +2450,15 @@ async def _tmdb_fetch_info(type_: str, tmdb_id: int) -> Optional[Dict[str, Any]]
         f"https://api.tmdb.org/3/{type_}/{tmdb_id}?api_key={TMDB_BUILTIN_KEY}&language=zh-CN",
         {},
     ))
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for url, headers in attempts:
-            try:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code != 200:
-                    continue
-                return resp.json()
-            except Exception:
+    client = _tmdb_http()
+    for url, headers in attempts:
+        try:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
                 continue
+            return resp.json()
+        except Exception:
+            continue
     return None
 
 
@@ -2560,52 +2625,125 @@ def _tmdb_enrich_fields(info: Dict[str, Any], matched_type: str) -> Dict[str, An
     }
 
 
-async def _tmdb_enrich_lookup(tmdb_id: int, title: str, year: int) -> Optional[Dict[str, Any]]:
-    """movie/tv 双查择优，返回可直接入库的分类字段；查不到返回 None。"""
+async def _tmdb_enrich_lookup(tmdb_id: int, title: str, year: int, prefer_type: str = "") -> Optional[Dict[str, Any]]:
+    """movie/tv 双查择优，返回可直接入库的分类字段；查不到返回 None。
+    prefer_type 指定的类型先查，首查命中且标题匹配（评分≥2）就跳过另一类型。"""
+    cached = store.read_value(_enrich_cache_key(_tmdb_credentials()[1], tmdb_id))
+    if isinstance(cached, dict) and isinstance(cached.get("fields"), dict):
+        return cached["fields"]
+    types = ("tv", "movie") if prefer_type == "tv" else ("movie", "tv")
     best: Optional[Dict[str, Any]] = None
     best_type = ""
     best_score = -1
-    for type_ in ("movie", "tv"):
+    for index, type_ in enumerate(types):
         info = await _tmdb_fetch_info(type_, tmdb_id)
-        if not info:
-            continue
-        score = _tmdb_match_score(info, title, year)
-        if score <= best_score:
-            continue
-        best, best_type, best_score = info, type_, score
+        if info:
+            score = _tmdb_match_score(info, title, year)
+            if score > best_score:
+                best, best_type, best_score = info, type_, score
+            if index == 0 and best_score >= 2:
+                break
     if best is None:
         return None
-    return _tmdb_enrich_fields(best, best_type)
+    fields = _tmdb_enrich_fields(best, best_type)
+    store.write_value(_enrich_cache_key(_tmdb_credentials()[1], tmdb_id), {"type": best_type, "fields": fields})
+    return fields
+
+
+async def _tmdb_search_lookup(title: str, year: int) -> Optional[int]:
+    """无标记作品选配：按标题+年份搜 TMDB，标题匹配（评分≥2）才认，返回 tmdb_id。"""
+    token, lang = _tmdb_credentials()
+    query = url_quote(str(title or "").strip())
+    client = _tmdb_http()
+    best_id: Optional[int] = None
+    best_score = 1  # 搜索结果必须至少标题匹配（+2）才采纳
+    for type_, year_param in (("tv", "first_air_date_year"), ("movie", "primary_release_year")):
+        attempts = []
+        if token:
+            attempts.append((
+                f"https://api.themoviedb.org/3/search/{type_}?query={query}&language={lang}"
+                + (f"&{year_param}={int(year)}" if year else ""),
+                {"Authorization": f"Bearer {token}"},
+            ))
+        attempts.append((
+            f"https://api.tmdb.org/3/search/{type_}?query={query}&api_key={TMDB_BUILTIN_KEY}&language=zh-CN"
+            + (f"&{year_param}={int(year)}" if year else ""),
+            {},
+        ))
+        for url, headers in attempts:
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    continue
+                results = resp.json().get("results") or []
+                for item in results[:5]:
+                    score = _tmdb_match_score(item, title, year)
+                    if score > best_score:
+                        best_id, best_score = int(item.get("id") or 0), score
+            except Exception:
+                continue
+            if best_id:
+                break
+        if best_id:
+            break
+    return best_id
 
 
 async def _library_enrich_pass(limit: int = LIBRARY_ENRICH_BATCH) -> int:
-    """处理一批 pending：逐条查 TMDB 写回成功或计失败重试。返回本批处理条数。"""
+    """处理一批 pending：并发查 TMDB 写回成功或计失败重试。返回本批处理条数。"""
     rows = await asyncio.to_thread(movie_library_db.pending_works, limit)
-    processed = 0
-    for row in rows:
-        dirname = row["dir"]
-        tmdb_id = row.get("tmdb_id")
-        fields = None
-        if tmdb_id:
-            try:
-                fields = await _tmdb_enrich_lookup(tmdb_id, str(row.get("title") or ""), int(row.get("year") or 0))
-            except Exception:
+    if rows:
+        semaphore = asyncio.Semaphore(LIBRARY_ENRICH_CONCURRENCY)
+
+        async def _one(row: Dict[str, Any]) -> None:
+            async with semaphore:
+                dirname = row["dir"]
+                tmdb_id = row.get("tmdb_id")
                 fields = None
-        if fields:
-            await asyncio.to_thread(movie_library_db.apply_enrichment, dirname, fields)
-        else:
-            await asyncio.to_thread(movie_library_db.mark_enrich_failure, dirname, LIBRARY_ENRICH_MAX_ATTEMPTS)
-        processed += 1
+                if tmdb_id:
+                    try:
+                        prefer = _prefer_tmdb_type(row)
+                        fields = await _tmdb_enrich_lookup(
+                            int(tmdb_id), str(row.get("title") or ""), int(row.get("year") or 0), prefer_type=prefer)
+                    except Exception:
+                        fields = None
+                if fields:
+                    await asyncio.to_thread(movie_library_db.apply_enrichment, dirname, fields)
+                else:
+                    await asyncio.to_thread(movie_library_db.mark_enrich_failure, dirname, LIBRARY_ENRICH_MAX_ATTEMPTS)
+
+        await asyncio.gather(*(_one(row) for row in rows))
         await asyncio.sleep(LIBRARY_ENRICH_REQ_GAP)
+    processed = len(rows)
+    # 无标记作品选配（设置开启才跑）：标题+年份搜 TMDB，匹配上就排进正常整理队列
+    if _library_config().get("enrichUntagged"):
+        untagged = await asyncio.to_thread(movie_library_db.untagged_works, LIBRARY_ENRICH_UNTAGGED_BATCH)
+        for row in untagged:
+            try:
+                matched = await _tmdb_search_lookup(str(row.get("title") or ""), int(row.get("year") or 0))
+            except Exception:
+                matched = None
+            if matched:
+                await asyncio.to_thread(movie_library_db.assign_tmdb_id, row["dir"], matched)
+            else:
+                await asyncio.to_thread(movie_library_db.mark_untagged_failure, row["dir"])
+            await asyncio.sleep(LIBRARY_ENRICH_REQ_GAP)
     return processed
 
 
 async def library_enrich_loop() -> None:
-    """常驻后台：有 pending 就分批回填，队列空时长时间空闲等待新导入。"""
+    """常驻后台：有 pending 就分批回填，队列空时空闲等待；导入完成后 kick 立刻开工。"""
     while True:
         try:
             n = await _library_enrich_pass()
-            await asyncio.sleep(LIBRARY_ENRICH_ACTIVE_SEC if n else LIBRARY_ENRICH_IDLE_SEC)
+            if n:
+                await asyncio.sleep(LIBRARY_ENRICH_ACTIVE_SEC)
+                continue
+            try:
+                await asyncio.wait_for(library_enrich_kick.wait(), timeout=LIBRARY_ENRICH_IDLE_SEC)
+            except asyncio.TimeoutError:
+                pass
+            library_enrich_kick.clear()
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -2643,7 +2781,39 @@ async def reset_library_enrich(request: LibraryEnrichResetRequest, request_obj: 
     """重新入队回填：默认只把 failed 打回 pending；refreshAll=true 连 ok 一起重排刷新分类。"""
     _guard_library_token(request_obj, request.token)
     requeued = await asyncio.to_thread(movie_library_db.reset_enrichment, not request.refreshAll)
+    library_enrich_kick.set()
     return {"ok": True, "requeued": requeued, "stats": await asyncio.to_thread(movie_library_db.enrich_stats)}
+
+
+class LibraryDuplicatesMergeRequest(BaseModel):
+    keepDir: str = ""
+    mergeDirs: List[str] = Field(default_factory=list)
+    token: str = ""
+
+
+@app.get("/api/library/duplicates")
+async def list_library_duplicates(request: Request, token: str = "") -> Dict[str, Any]:
+    """同一部剧/电影入库了多个目录的分组（按 tmdb_id 判重），供合并去重。"""
+    _guard_library_token(request, token)
+    groups = await asyncio.to_thread(movie_library_db.duplicate_groups)
+    return {"ok": True, "groups": groups}
+
+
+@app.post("/api/library/duplicates/merge")
+async def merge_library_duplicates(request: LibraryDuplicatesMergeRequest, request_obj: Request) -> Dict[str, Any]:
+    """把重复目录并入保留目录：文件去重合并（path 相同保留先入库的）、副本的播放记录清除、统计重算。"""
+    _guard_library_token(request_obj, request.token)
+    keep_dir = str(request.keepDir or "").strip()
+    merge_dirs = [str(d or "").strip() for d in request.mergeDirs if str(d or "").strip()]
+    if not keep_dir or not merge_dirs:
+        raise HTTPException(status_code=400, detail="请选择要保留的作品和至少一个要并入的副本")
+    if keep_dir in merge_dirs:
+        raise HTTPException(status_code=400, detail="要保留的作品不能同时出现在合并列表里")
+    try:
+        result = await asyncio.to_thread(movie_library_db.merge_duplicate_works, keep_dir, merge_dirs)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"ok": True, **result}
 
 
 @app.post("/api/library/export/save")

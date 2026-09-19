@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 TRANSFER_OFFLINE_RESUBMIT_MAX = 3
 # 撞 123 "同时下载任务超出最大限制" 时的重试间隔（毫秒），有界指数退避
 OFFLINE_SUBMIT_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000]
+# 等待超时但 123 说"任务还在下载"时，按剩余进度顺延等待的最大次数
+#（每个文件终身计一次总数，重提后不重置，防止慢任务把队列无限拖住）
+OFFLINE_WAIT_EXTEND_MAX = 2
 
 PAN123_OFFLINE_SUBMIT_NAME_MAX = int(__import__("os").environ.get("PAN123_OFFLINE_SUBMIT_NAME_MAX", "180"))
 PAN123_OFFLINE_DISPLAY_PATH_MAX = int(__import__("os").environ.get("PAN123_OFFLINE_DISPLAY_PATH_MAX", "240"))
@@ -471,12 +474,21 @@ class OfflineDownloadManager:
         task = self.pipeline.task
         file = item.file
         display = _display_path(file)
+        target_dir_id = str(file.get("targetDirId") or "")
+        if not target_dir_id.isdigit():
+            # 单文件目录 ID 坏了只跳过这个文件：没拿到 115 直链、没建离线任务、不烧退避重试
+            reason = f"123 目标目录 ID 不合法（{target_dir_id or '空'}），请到设置页检查「123 目标目录 ID」"
+            file["status"] = "failed"
+            file["error"] = reason
+            file["finishedAt"] = _utc_now_iso()
+            item.failed = True
+            _add_task_log(task, "error", f"离线提交失败：{display}（{reason}）")
+            return
 
         file["status"] = "running"
         file["startedAt"] = _utc_now_iso()
         file["error"] = None
         try:
-            target_dir_id = str(file.get("targetDirId") or "")
             before_ids = await self.pipeline.snapshot_candidate_file_ids(self.pipeline.target_root_id, target_dir_id)
             item.before_ids = before_ids
             pan115 = Pan115TransferClient(item.account["cookie"] if item.account else "")
@@ -506,6 +518,9 @@ class OfflineDownloadManager:
             if not await service._save_transfer_task(task):
                 raise TaskCancelled()
             item.submitted = True
+            # 等待计时从"真正提交"起算：排队等了几小时才轮到的文件，
+            # 不能一进在飞就按入队时刻算超时
+            item.started_ms = time.monotonic() * 1000
         except TaskCancelled:
             raise
         except Exception as error:
@@ -602,26 +617,56 @@ class OfflineDownloadManager:
                         file, item.target_dir_id, item.target_root_id, item.before_ids
                     )
                 if created:
-                    await self._mark_done(item, created, share_to_cloud=matched_by_name)
+                    # 单文件收尾（改名/学习表/删源）失败只重试认领这一个，不拖死整批等待
+                    try:
+                        await self._mark_done(item, created, share_to_cloud=matched_by_name)
+                    except TaskCancelled:
+                        raise
+                    except Exception as error:
+                        _add_task_log(
+                            task, "error",
+                            f"下载完成但收尾失败，下一轮重试认领：{_display_path(file)}（{error}）",
+                        )
                     progressed = True
                     continue
 
                 deadline_ms = _offline_wait_deadline_ms(file.get("size", 0), max_polls * poll_ms)
                 if time.monotonic() * 1000 - item.started_ms < deadline_ms:
                     continue
-                # 超时：先自动重新提交（最多 3 次），把等待计时重新起算
+                # 超时先问一次 123 离线任务本身的状态（只在超时这一刻问，不做轮询）：
+                # 还在下载就顺延等待，别把慢任务盲目重提造成重复下载
+                offline_status = await self._offline_status_once(pan123, file)
+                if offline_status == "running" and int(file.get("offlineWaitExtends") or 0) < OFFLINE_WAIT_EXTEND_MAX:
+                    file["offlineWaitExtends"] = int(file.get("offlineWaitExtends") or 0) + 1
+                    item.started_ms = time.monotonic() * 1000
+                    _add_task_log(
+                        task, "info",
+                        f"离线任务还在下载，继续等待（已顺延 {file['offlineWaitExtends']}/{OFFLINE_WAIT_EXTEND_MAX} 次）：{_display_path(file)}",
+                    )
+                    progressed = True
+                    continue
+                if offline_status == "done":
+                    self._mark_failed(
+                        item,
+                        "123 离线任务显示下载完成，但目标目录里一直没有出现对应文件（可能落在了别的目录）。"
+                        "请到 123 网页版找到该文件移动到目标目录，重新运行任务即可自动认领",
+                    )
+                    progressed = True
+                    continue
+                # 任务失败或状态问不到：重新提交（直链重新取，旧直链大概率已过期）
                 resubmits = int(file.get("offlineResubmits") or 0)
-                if file.get("sourceUrl") and resubmits < TRANSFER_OFFLINE_RESUBMIT_MAX:
+                if resubmits < TRANSFER_OFFLINE_RESUBMIT_MAX:
                     file["offlineResubmits"] = resubmits + 1
                     _add_task_log(
                         task, "warn",
-                        f"等了很久还没落盘，自动重新提交离线任务"
+                        f"等了很久还没落盘，重新获取直链后再自动提交一次离线任务"
                         f"（第 {resubmits + 1}/{TRANSFER_OFFLINE_RESUBMIT_MAX} 次）：{_display_path(file)}",
                     )
                     try:
+                        download_url = await self._renew_source_url(item)
                         async with service._get_offline_submit_semaphore():
                             new_task_id = await pan123.create_offline_download(
-                                file["sourceUrl"], item.target_dir_id,
+                                download_url, item.target_dir_id,
                                 file.get("offlineSubmitName") or file["name"],
                             )
                     except TaskCancelled:
@@ -657,6 +702,51 @@ class OfflineDownloadManager:
                 if not await service._save_transfer_task(task):
                     raise TaskCancelled()
             await _delay(poll_ms)
+
+    async def _offline_status_once(self, pan123: Pan123OpenAPIClient, file: Dict[str, Any]) -> Optional[str]:
+        """超时那一刻问一次离线任务状态："running"=还在下载 / "done"=已完成 / "failed"=失败 / None=问不到。
+
+        OpenAPI 的进度接口不稳定（可能报错、可能报不准），所以不做轮询、不作为
+        完成依据，只在"等了很久还没落盘"时用它区分"慢"和"卡死"。
+        """
+        task_id = file.get("offlineTaskId")
+        if not task_id:
+            return None
+        try:
+            info = await pan123.get_offline_process(int(task_id))
+            status = int(info.get("status") or 0)
+        except Exception:
+            return None
+        if status == 1:
+            return "running"
+        if status == 2:
+            return "done"
+        if status == -1:
+            return "failed"
+        return None
+
+    async def _renew_source_url(self, item: OfflineItem) -> str:
+        """超时重提前重新取一次 115 直链：旧直链可能已过期，直接复用大概率白下。"""
+        service = self.pipeline.service
+        task = self.pipeline.task
+        file = item.file
+        try:
+            pan115 = Pan115TransferClient(item.account["cookie"] if item.account else "")
+            fresh = await service._get_pan115_download_url(task, file, pan115, item.account)
+            if fresh:
+                file["sourceUrl"] = fresh
+                return fresh
+        except TaskCancelled:
+            raise
+        except Exception as error:
+            _add_task_log(
+                task, "warn",
+                f"重新获取 115 直链失败，改用上次地址重试：{_display_path(file)}（{error}）",
+            )
+        stale = str(file.get("sourceUrl") or "")
+        if not stale:
+            raise RuntimeError("没有可用的 115 直链")
+        return stale
 
     async def _mark_done(self, item: OfflineItem, created: Dict[str, Any], share_to_cloud: bool = False) -> None:
         service = self.pipeline.service
@@ -766,6 +856,17 @@ class TransferPipeline:
             _add_task_log(task, "info", "开始搬运 115 本地盘目录")
         else:
             _add_task_log(task, "info", "开始搬运 115 分享")
+        if not self.target_root_id.isdigit():
+            # 设置页的"123 目标目录 ID"填了非数字（比如粘贴了文件夹名）：
+            # 直接判停并说明，不进管线折腾出一堆难懂的报错
+            _add_task_log(
+                task, "error",
+                f"123 目标目录 ID 配置不合法（当前值：{self.target_root_id}），应为纯数字 ID。"
+                f"请到设置页「123 目标目录 ID」改成数字后重新运行",
+            )
+            task["status"] = "failed"
+            task["finishedAt"] = _utc_now_iso()
+            return
 
         files = await self.phase_inspect()
         if not files or _is_final_pipeline_status(task):
@@ -975,7 +1076,7 @@ class TransferPipeline:
 
             file["offlineTaskId"] = existing_offline_task["id"]
             _add_task_log(task, "info", f"继续等待上次未完成的 123 离线任务 #{existing_offline_task['id']}：{display}")
-            resumed_item = OfflineItem(file, target_dir_id, self.target_root_id)
+            resumed_item = OfflineItem(file, target_dir_id, self.target_root_id, None, self.deletion_account())
             resumed_item.submitted = True  # 断点恢复视为已提交，占用一个离线并发位
             self.offline.items.append(resumed_item)
             return "resumed"
@@ -1175,6 +1276,10 @@ class TransferPipeline:
         except Exception as error:
             # 列表暂时查不到时宁可按"任务还在"继续等（有超时兜底），不误判任务丢失
             _add_unique_task_log(self.task, "warn", f"123 离线列表暂时查不到，先按任务仍在处理（{error}）")
+            return {"id": task_id or 0, "name": filenames[0] if filenames else ""}
+        if not tasks:
+            # OpenAPI 客户端没有离线列表接口（恒为空列表）：查不到不等于任务没了。
+            # 宁可按"任务仍在"继续等（超时兜底会有限重提），不在这里把文件判死
             return {"id": task_id or 0, "name": filenames[0] if filenames else ""}
         for item in tasks:
             if item.get("id") == task_id:

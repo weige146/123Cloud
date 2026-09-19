@@ -511,7 +511,12 @@ class TransferServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_pipeline_restart_with_submission_intent_never_creates_a_duplicate_offline_task(self):
+    def test_pipeline_restart_with_submission_intent_keeps_waiting_for_previous_task(self):
+        """重启续跑：上次提交过离线任务的文件不再被判死。
+
+        OpenAPI 查不到离线列表（恒为空）≠ 任务不存在：宁可按"任务仍在"继续等，
+        也不立即重提制造重复任务；真死了有超时兜底有限重提。
+        """
         async def run() -> None:
             files = [{
                 "id": "1",
@@ -531,18 +536,28 @@ class TransferServiceTests(unittest.TestCase):
             pan123.list_offline_tasks.return_value = []
 
             pipeline, _stub, task = self._make_pipeline(files, pan123)
-            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
-                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
-                await pipeline.run()
 
+            class _StopLoop(Exception):
+                pass
+
+            async def stop_on_first_wait(ms):
+                raise _StopLoop()
+
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=stop_on_first_wait):
+                with self.assertRaises(_StopLoop):
+                    await pipeline.run()
+
+            # 没有立即重提（防重复），文件也没有被判死，而是继续占用一个并发位等待
             pan123.create_offline_download.assert_not_awaited()
-            self.assertEqual(task["files"][0]["status"], "failed")
-            self.assertIn("停止自动重复添加", task["files"][0]["error"])
+            self.assertEqual(task["files"][0]["status"], "pending")
+            self.assertFalse(task["files"][0].get("error"))
+            self.assertTrue(any("继续等待上次未完成的 123 离线任务" in log["message"] for log in task["logs"]))
 
         asyncio.run(run())
 
     def test_offline_wait_never_queries_status_api_and_completes_via_listing(self):
-        """等待阶段不查询 123 离线进度接口（OpenAPI 侧不稳定，只刷警告），完成判定只看目录落盘。"""
+        """完成判定只看目录落盘，不做进度轮询；状态接口只在超时那一刻问一次。"""
         async def run() -> None:
             files = [{"id": "1", "name": "episode.mkv", "size": 1024, "path": [], "status": "pending", "sourceType": "115_share"}]
             pan123 = AsyncMock()
@@ -575,6 +590,48 @@ class TransferServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_invalid_target_dir_config_fails_task_before_any_submission(self):
+        """「123 目标目录 ID」填了非数字：任务直接判停并说明，不进管线制造难懂的报错。"""
+        async def run() -> None:
+            files = [{"id": "1", "name": "episode.mkv", "size": 1024, "path": [], "status": "pending", "sourceType": "115_share"}]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pipeline, _stub, task = self._make_pipeline(files, pan123)
+            pipeline.target_root_id = "来自: 离线下载"
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
+                await pipeline.run()
+
+            pan123.create_offline_download.assert_not_awaited()
+            self.assertEqual(task["status"], "failed")
+            self.assertTrue(any("目标目录 ID 配置不合法" in log["message"] for log in task["logs"]))
+
+        asyncio.run(run())
+
+    def test_file_with_non_numeric_target_dir_skipped_without_submission(self):
+        """单文件目录 ID 变成垃圾值：只跳过该文件并说明原因，不建离线任务也不烧退避重试。"""
+        async def run() -> None:
+            files = [{"id": "1", "name": "episode.mkv", "size": 1024, "path": [], "status": "pending", "sourceType": "115_share", "sha1": None}]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "来自: 离线下载"  # 目录解析异常返回了非数字
+            pan123.sha1_reuse.return_value = None
+            pan123.md5_reuse.return_value = None
+            pan123.list_files.return_value = []
+            pan123.find_file_by_size.return_value = None
+
+            pipeline, _stub, task = self._make_pipeline(files, pan123)
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
+                await pipeline.run()
+
+            pan123.create_offline_download.assert_not_awaited()
+            self.assertEqual(task["files"][0]["status"], "failed")
+            self.assertIn("目标目录 ID 不合法", task["files"][0]["error"])
+            self.assertEqual(task["status"], "failed")
+
+        asyncio.run(run())
+
     def test_offline_timeout_resubmits_up_to_limit_then_fails(self):
         async def run() -> None:
             files = [{
@@ -586,8 +643,16 @@ class TransferServiceTests(unittest.TestCase):
             pan123.ensure_path.return_value = "9"
             pan123.list_files.return_value = []  # 永远等不到落盘
             pan123.find_file_by_size.return_value = None
+            # 状态接口问不到（返回未知状态）：按原样走超时重提
+            pan123.get_offline_process.return_value = {"process": 0.0, "status": 0, "raw": {}}
 
-            pipeline, _stub, task = self._make_pipeline(files, pan123)
+            pipeline, stub, task = self._make_pipeline(files, pan123)
+            urls = iter([])
+
+            async def fresh_url(task_, file_, client, account=None):
+                return f"https://115.invalid/fresh-{next(urls, len(task['logs']))}"
+
+            stub._get_pan115_download_url = fresh_url
             with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
                     patch("app.transfer_pipeline._delay", new=AsyncMock()), \
                     patch("app.transfer_pipeline._offline_wait_deadline_ms", return_value=30):
@@ -597,7 +662,107 @@ class TransferServiceTests(unittest.TestCase):
             self.assertEqual(pan123.create_offline_download.await_count, 4)
             self.assertEqual(task["files"][0]["status"], "failed")
             self.assertIn("超时", task["files"][0]["error"])
-            self.assertTrue(any("自动重新提交离线任务" in log["message"] for log in task["logs"]))
+            self.assertTrue(any("自动提交一次离线任务" in log["message"] for log in task["logs"]))
+            # 重提用的直链是重新获取的，不是上次那个旧地址
+            resubmit_urls = [call.args[0] for call in pan123.create_offline_download.await_args_list[1:]]
+            self.assertTrue(resubmit_urls)
+            self.assertTrue(all(url.startswith("https://115.invalid/fresh-") for url in resubmit_urls))
+
+        asyncio.run(run())
+
+    def test_offline_timeout_extends_wait_while_task_still_downloading(self):
+        """超时但 123 说任务还在下载：顺延等待（有上限），不盲目重提制造重复任务。"""
+        async def run() -> None:
+            files = [{
+                "id": "1", "name": "episode.mkv", "size": 1024, "path": [],
+                "status": "pending", "sourceType": "115_share", "sha1": None,
+            }]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "9"
+            pan123.list_files.return_value = []
+            pan123.find_file_by_size.return_value = None
+            pan123.get_offline_process.return_value = {"process": 55.0, "status": 1, "raw": {}}
+
+            pipeline, _stub, task = self._make_pipeline(files, pan123)
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()), \
+                    patch("app.transfer_pipeline._offline_wait_deadline_ms", return_value=30):
+                await pipeline.run()
+
+            # 顺延 2 次后不再顺延：重提 3 次后判失败（1 次首提 + 3 次重提）
+            self.assertEqual(pan123.create_offline_download.await_count, 4)
+            self.assertEqual(task["files"][0].get("offlineWaitExtends"), 2)
+            self.assertEqual(task["files"][0]["status"], "failed")
+            self.assertTrue(any("继续等待" in log["message"] for log in task["logs"]))
+
+        asyncio.run(run())
+
+    def test_offline_done_but_never_lands_fails_fast_with_guidance(self):
+        """123 说离线已完成、目录里却一直等不到文件：立即判失败并告诉用户去哪里找，不重复下载。"""
+        async def run() -> None:
+            files = [{
+                "id": "1", "name": "episode.mkv", "size": 1024, "path": [],
+                "status": "pending", "sourceType": "115_share", "sha1": None,
+            }]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "9"
+            pan123.list_files.return_value = []
+            pan123.find_file_by_size.return_value = None
+            pan123.get_offline_process.return_value = {"process": 100.0, "status": 2, "raw": {}}
+
+            pipeline, _stub, task = self._make_pipeline(files, pan123)
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()), \
+                    patch("app.transfer_pipeline._offline_wait_deadline_ms", return_value=30):
+                await pipeline.run()
+
+            # 不再重提下载同一份内容：只有首次提交这 1 次
+            self.assertEqual(pan123.create_offline_download.await_count, 1)
+            self.assertEqual(task["files"][0]["status"], "failed")
+            self.assertIn("移动到目标目录", task["files"][0]["error"])
+
+        asyncio.run(run())
+
+    def test_offline_claim_survives_finalize_error_and_retries_next_round(self):
+        """落盘认领的收尾（学习表/改名等）失败只影响单个文件，下一轮重试后照常完成，不拖死整批。"""
+        async def run() -> None:
+            files = [{"id": "1", "name": "episode.mkv", "size": 1024, "path": [], "status": "pending", "sourceType": "115_share"}]
+            pan123 = AsyncMock()
+            pan123.clientKind = "openapi"
+            pan123.ensure_path.return_value = "9"
+            state = {"downloaded": False}
+
+            async def list_files(dir_id):
+                if state["downloaded"]:
+                    return [{"fileId": 99, "filename": "episode.mkv", "size": 1024, "type": 0}]
+                return []
+
+            async def create_offline(_url, _dir_id, _filename):
+                state["downloaded"] = True
+                return 123
+
+            pan123.list_files.side_effect = list_files
+            pan123.create_offline_download.side_effect = create_offline
+            pan123.find_file_by_size.return_value = None
+
+            pipeline, stub, task = self._make_pipeline(files, pan123)
+            hash_calls = {"n": 0}
+
+            async def flaky_remember(file_, created_, share_to_cloud=False):
+                hash_calls["n"] += 1
+                if hash_calls["n"] == 1:
+                    raise RuntimeError("学习表写库打了个嗝")
+
+            stub._remember_transfer_hash = flaky_remember
+            with patch("app.transfer_pipeline.Pan115TransferClient", MagicMock()), \
+                    patch("app.transfer_pipeline._delay", new=AsyncMock()):
+                await pipeline.run()
+
+            self.assertTrue(any("收尾失败" in log["message"] for log in task["logs"]))
+            self.assertEqual(task["files"][0]["status"], "success")
+            self.assertEqual(task["status"], "success")
 
         asyncio.run(run())
 

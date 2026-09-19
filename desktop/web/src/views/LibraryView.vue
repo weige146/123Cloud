@@ -12,6 +12,7 @@ import {
   type LibraryCategory,
   type LibraryConfig,
   type LibraryContinueItem,
+  type LibraryDuplicateGroup,
   type LibraryEnrichStats,
   type LibraryFacets,
   type LibraryFile,
@@ -62,6 +63,8 @@ const uploading = ref(false);
 const libraryFileInput = ref<HTMLInputElement | null>(null);
 const exportDirInput = ref("");
 const videoExtensionsInput = ref("");
+const importModeInput = ref("merge");
+const enrichUntaggedInput = ref(false);
 const playerPathInput = ref("");
 const autoTrashInput = ref(true);
 const playCachePathInput = ref("秒传");
@@ -98,6 +101,8 @@ async function loadConfig() {
   configTransferConcurrency.value = data.config.transferConcurrency || 5;
   exportDirInput.value = data.config.exportDir || "";
   videoExtensionsInput.value = data.config.videoExtensions || "";
+  importModeInput.value = data.config.importMode === "skip" ? "skip" : "merge";
+  enrichUntaggedInput.value = data.config.enrichUntagged === true;
   playerPathInput.value = data.config.playerPath || "";
   autoTrashInput.value = data.config.autoTrash !== false;
   playCachePathInput.value = data.config.playCachePath || "秒传";
@@ -115,6 +120,8 @@ async function saveConfig() {
       transferConcurrency: Number(configTransferConcurrency.value) || 5,
       exportDir: exportDirInput.value.trim(),
       videoExtensions: videoExtensionsInput.value.trim(),
+      importMode: importModeInput.value === "skip" ? "skip" : "merge",
+      enrichUntagged: enrichUntaggedInput.value === true,
       playerPath: playerPathInput.value.trim(),
       autoTrash: autoTrashInput.value,
       playCachePath: playCachePathInput.value.trim(),
@@ -1369,6 +1376,62 @@ async function deleteSelectedWorks() {
   }
 }
 
+// ===== 重复作品：同 tmdb_id 多目录，合并去重 =====
+const duplicatesOpen = ref(false);
+const duplicatesLoading = ref(false);
+const duplicateGroups = ref<LibraryDuplicateGroup[]>([]);
+const duplicateKeep = ref<Record<number, string>>({});
+const mergingDuplicates = ref(false);
+
+async function loadDuplicates() {
+  duplicatesLoading.value = true;
+  try {
+    const data = await libraryApi.duplicates(apiToken.value);
+    duplicateGroups.value = data.groups || [];
+    duplicateKeep.value = Object.fromEntries(
+      duplicateGroups.value.map((group) => [group.tmdbId, group.works[0]?.dir || ""]),
+    );
+  } catch (error) {
+    notifyError(`重复作品加载失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    duplicatesLoading.value = false;
+  }
+}
+
+function openDuplicates() {
+  duplicatesOpen.value = true;
+  loadDuplicates();
+}
+
+async function mergeDuplicateGroup(group: LibraryDuplicateGroup) {
+  const keepDir = duplicateKeep.value[group.tmdbId];
+  if (!keepDir) {
+    notifyError("先选择要保留的版本");
+    return;
+  }
+  const mergeDirs = group.works.map((w) => w.dir).filter((dir) => dir !== keepDir);
+  if (!mergeDirs.length) {
+    notifyError("该分组只有一个版本，无需合并");
+    return;
+  }
+  const ok = await confirm(
+    `保留「${keepDir}」，把其余 ${mergeDirs.length} 个副本的文件并进去？重复文件以保留版本为准，副本的播放记录会被清除（不影响网盘里的文件）。`,
+    "合并重复作品",
+  );
+  if (!ok) return;
+  mergingDuplicates.value = true;
+  try {
+    const data = await libraryApi.mergeDuplicates(keepDir, mergeDirs, apiToken.value);
+    notifySuccess(`已合并：移入 ${data.movedFiles.toLocaleString()} 个文件，删除 ${data.mergedWorks} 个副本`);
+    await loadDuplicates();
+    await refreshAfterDeletion();
+  } catch (error) {
+    notifyError(`合并失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    mergingDuplicates.value = false;
+  }
+}
+
 async function deleteChosenCategory() {
   const value = categoryDeleteTarget.value;
   if (!value) {
@@ -1789,6 +1852,7 @@ onUnmounted(() => {
             :loading="deletingWorks" :disabled="!selectedWorkDirs.size"
             @click="deleteSelectedWorks"
           >删除所选</v-btn>
+          <v-btn size="small" variant="outlined" prepend-icon="mdi-merge" @click="openDuplicates">重复作品</v-btn>
           <v-spacer />
           <v-select
             v-model="categoryDeleteTarget"
@@ -1807,6 +1871,59 @@ onUnmounted(() => {
             @click="deleteChosenCategory"
           >删除该分类</v-btn>
         </div>
+
+        <v-dialog v-model="duplicatesOpen" max-width="720">
+          <v-card>
+            <v-card-title class="hub-dialog-title">
+              <span>重复作品合并</span>
+              <div class="hub-dialog-actions">
+                <v-btn size="small" variant="text" :loading="duplicatesLoading" @click="loadDuplicates">刷新</v-btn>
+                <v-btn size="small" variant="text" @click="duplicatesOpen = false">关闭</v-btn>
+              </div>
+            </v-card-title>
+            <v-card-text>
+              <div class="muted-hint" style="margin-bottom: 12px">
+                同一部剧/电影入库了多个目录（按 TMDB 标记判重）。选一个要保留的版本，其余副本的文件会去重并入，
+                副本的作品与播放记录从数据库清除（不影响网盘里的文件）。
+              </div>
+              <div v-if="!duplicateGroups.length && !duplicatesLoading" class="empty-state">
+                <v-icon size="40">mdi-check-circle-outline</v-icon>
+                <p>没有发现重复作品</p>
+              </div>
+              <v-list v-else density="compact">
+                <v-list-item v-for="group in duplicateGroups" :key="group.tmdbId" class="dup-group">
+                  <div class="dup-group-head">
+                    <strong>TMDB {{ group.tmdbId }}</strong>
+                    <span class="muted-hint">{{ group.works.length }} 个版本</span>
+                    <v-spacer />
+                    <v-select
+                      v-model="duplicateKeep[group.tmdbId]"
+                      :items="group.works.map((w) => ({ title: `${w.title || w.dir}（${w.video_count} 视频 / ${formatBytes(w.total_size)}${w.tmdb_status === 'ok' ? ' · 已整理' : ''}）`, value: w.dir }))"
+                      item-title="title"
+                      item-value="value"
+                      label="保留哪个版本"
+                      variant="outlined"
+                      density="compact"
+                      hide-details
+                      class="dup-keep-select"
+                    />
+                    <v-btn
+                      size="small" color="primary" variant="tonal" prepend-icon="mdi-merge"
+                      :loading="mergingDuplicates" :disabled="group.works.length < 2"
+                      @click="mergeDuplicateGroup(group)"
+                    >合并其余</v-btn>
+                  </div>
+                  <div class="dup-dir-list">
+                    <div v-for="w in group.works" :key="w.dir" class="dup-dir" :class="{ kept: duplicateKeep[group.tmdbId] === w.dir }">
+                      <span class="mono-value mono-value-sm">{{ w.dir }}</span>
+                      <span class="muted-hint">{{ w.source }}</span>
+                    </div>
+                  </div>
+                </v-list-item>
+              </v-list>
+            </v-card-text>
+          </v-card>
+        </v-dialog>
 
         <div v-if="resultInfo" class="result-info">{{ resultInfo }}</div>
         <div v-if="searchNotice" class="hub-status-line">{{ searchNotice }}</div>
@@ -1897,7 +2014,37 @@ onUnmounted(() => {
           <v-btn variant="outlined" prepend-icon="mdi-folder-multiple-outline" :loading="importingDir" @click="importFromFolder">从文件夹批量导入…</v-btn>
           <input ref="libraryFileInput" type="file" accept=".json,.txt,.123share,.123fastlink" multiple hidden @change="importLibraryFiles" />
         </div>
-        <div class="muted-hint">同一作品重复导入会自动跳过（保留先入库的）；同名来源重新导入会更新其内容。</div>
+        <div class="muted-hint">
+          默认「合并新文件」：已有作品只补库里没有的新文件（新剧集、新版本自动进来），整理成果保留、只增不减。
+          切到「跳过」则恢复旧行为（整作品跳过、同名来源重导整包替换）。
+        </div>
+        <FormField hint="重复作品导入策略：合并新文件（推荐，新更新的集自动进来）或跳过（保留先入库的，同名来源整包替换）。">
+          <div class="port-row">
+            <v-select
+              v-model="importModeInput"
+              :items="[
+                { title: '合并新文件（推荐）', value: 'merge' },
+                { title: '跳过已有作品', value: 'skip' },
+              ]"
+              item-title="title"
+              item-value="value"
+              label="重复作品导入策略"
+              variant="outlined"
+              density="compact"
+              hide-details
+              class="grow"
+            />
+          </div>
+        </FormField>
+        <FormField hint="目录名没有 {tmdb-数字} 标记的作品，用标题+年份自动搜 TMDB 匹配并补齐海报/分类。自动匹配有认错剧的风险，默认关闭。">
+          <v-switch
+            v-model="enrichUntaggedInput"
+            label="无 TMDB 标记的作品自动搜索整理"
+            color="primary"
+            density="compact"
+            hide-details
+          />
+        </FormField>
         <FormField label="转存并发（1-10，保存后生效）">
           <div class="port-row">
             <v-text-field
@@ -3268,6 +3415,48 @@ onUnmounted(() => {
 
 .category-delete-select {
   max-width: 280px;
+}
+
+/* ===== 重复作品合并弹窗 ===== */
+.dup-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  margin-bottom: 10px;
+}
+
+.dup-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.dup-keep-select {
+  min-width: 260px;
+  max-width: 380px;
+  flex: 1;
+}
+
+.dup-dir-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.dup-dir {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.06);
+  overflow: hidden;
+}
+
+.dup-dir.kept {
+  background: rgba(65, 198, 169, 0.14);
 }
 
 .poster-card.selecting {

@@ -316,13 +316,64 @@ class Sha1CloudClient:
 class Sha1ApiClient(Sha1CloudClient):
     """普通客户端仅连接 HTTPS API，不读取数据库凭据。"""
 
+    @staticmethod
+    def _error_brief_with_detail(error: BaseException) -> str:
+        """错误大白话摘要：区分"连不上"和"服务端拒绝"，带上 HTTP 状态码含义。"""
+        name = type(error).__name__
+        if name == "HTTPStatusError":
+            code = getattr(getattr(error, "response", None), "status_code", None)
+            meaning = {401: "令牌无效", 403: "令牌无此权限", 429: "请求太频繁被限流"}.get(code, "服务端返回错误")
+            return f"HTTP {code}（{meaning}）"
+        if name in {"ConnectTimeout", "ConnectError"}:
+            return "连接不上服务器（网络不通或该地址需要代理）"
+        if name in {"ReadTimeout", "WriteTimeout", "PoolTimeout"}:
+            return "服务器响应超时"
+        if "certificate" in str(error).lower():
+            return "证书校验失败"
+        return name
+
+    @staticmethod
+    def _system_https_proxy() -> Optional[str]:
+        """读系统代理设置（macOS/Windows 的系统级代理，不是环境变量）。"""
+        try:
+            import urllib.request
+            proxies = urllib.request.getproxies()
+            for key in ("https", "all"):
+                proxy = proxies.get(key)
+                if proxy:
+                    return proxy
+        except Exception:
+            pass
+        return None
+
+    def _send(self, method: str, url: str, payload: dict, proxy: Optional[str]) -> dict:
+        import httpx
+        verify = _ssl.create_default_context(cafile=os.environ.get("SHA1_POOL_API_CA") or None)
+        with httpx.Client(verify=verify, timeout=5, follow_redirects=False,
+                          trust_env=False, proxy=proxy) as client:
+            kwargs = {"params": payload} if method == "GET" else {"json": payload}
+            endpoint = "/lookup" if method == "GET" else "/submit"
+            with client.stream(method, url + endpoint,
+                               headers={"Authorization": "Bearer " + (_token_override or os.environ.get("SHA1_POOL_API_TOKEN", ""))},
+                               **kwargs) as response:
+                response.raise_for_status()
+                body = bytearray()
+                for chunk in response.iter_bytes():
+                    body.extend(chunk)
+                    if len(body) > 16384:
+                        raise ValueError("API response too large")
+            import json
+            result = json.loads(body)
+        if not isinstance(result, dict):
+            raise ValueError("invalid API response")
+        return result
+
     def _request(self, method: str, payload: dict) -> Optional[dict]:
         if self._breaker_open():
             return None
         if self._open_until:
             self._enter_half_open_if_expired()
         try:
-            import httpx
             from urllib.parse import urlsplit
             url = os.environ.get("SHA1_POOL_API_URL", "").rstrip("/")
             parsed = urlsplit(url)
@@ -332,27 +383,23 @@ class Sha1ApiClient(Sha1CloudClient):
             token = _token_override or os.environ.get("SHA1_POOL_API_TOKEN", "")
             if not token or token == "CHANGE_ME":
                 raise ValueError("API token missing")
-            verify = _ssl.create_default_context(cafile=os.environ.get("SHA1_POOL_API_CA") or None)
-            with httpx.Client(verify=verify, timeout=5, follow_redirects=False, trust_env=False) as client:
-                kwargs = {"params": payload} if method == "GET" else {"json": payload}
-                endpoint = "/lookup" if method == "GET" else "/submit"
-                with client.stream(method, url + endpoint,
-                                   headers={"Authorization": "Bearer " + token}, **kwargs) as response:
-                    response.raise_for_status()
-                    body = bytearray()
-                    for chunk in response.iter_bytes():
-                        body.extend(chunk)
-                        if len(body) > 16384:
-                            raise ValueError("API response too large")
-                    import json
-                    result = json.loads(body)
-            if not isinstance(result, dict):
-                raise ValueError("invalid API response")
+            try:
+                result = self._send(method, url, payload, proxy=None)
+            except Exception as error:
+                # 直连失败且本机配了系统代理时（典型场景：服务器 IP 直连被墙），
+                # 改走系统代理再试一次；HTTP 层的拒绝（401/403/429）不重试
+                if type(error).__name__ not in {"ConnectTimeout", "ConnectError"}:
+                    raise
+                proxy = self._system_https_proxy()
+                if not proxy:
+                    raise
+                logger.warning("共享SHA1库直连不上，改走系统代理再试一次")
+                result = self._send(method, url, payload, proxy=proxy)
             self._record_success()
             return result
         except Exception as error:
             self._record_failure()
-            logger.warning("共享SHA1 API失败，本次按未命中处理：%s", _error_brief(error))
+            logger.warning("共享SHA1 API失败，本次按未命中处理：%s", self._error_brief_with_detail(error))
             return None
 
     def lookup_etag_by_sha1(self, sha1: Any, size: Any) -> Optional[str]:

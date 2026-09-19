@@ -126,7 +126,7 @@ function collectTransferConfig(): TransferConfig {
     pan115Cookie: cookies.join("\n"),
     pan115Cookies: cookies,
     targetDirId: transferForm.targetDirId.trim() || "0",
-    localPath115: transferForm.localPath115.trim(),
+    localPath115: normalizeLocalPath115(transferForm.localPath115.trim()),
     pan115TargetCid: transferForm.pan115TargetCid.trim() || "0",
     pan123OauthApi: transferForm.pan123OauthApi.trim(),
     excludeSuffix: transferForm.excludeSuffix.trim(),
@@ -157,6 +157,34 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
   return Math.max(min, Math.min(max, Math.round(number)));
 }
 
+// 目录 ID 类输入框的守卫：这类值填错会一路流到后端接口，报出难懂的错
+function digitsOrEmpty(value: unknown): true | string {
+  const text = String(value ?? "").trim();
+  if (!text) return true;
+  return /^\d+$/.test(text) ? true : "只能填数字 ID（留空 = 0）";
+}
+
+function cidListOrEmpty(value: unknown): true | string {
+  const text = String(value ?? "").trim();
+  if (!text) return true;
+  return /^(?:\d+[\s,，、]*)+$/.test(text) ? true : "只能填数字 CID，多个用逗号分隔";
+}
+
+function httpUrlOrEmpty(value: unknown): true | string {
+  const text = String(value ?? "").trim();
+  if (!text) return true;
+  return /^https?:\/\//i.test(text) ? true : "需要以 http:// 或 https:// 开头";
+}
+
+// 115 本地盘路径归一化：只填「文件夹名」自动补 /，纯数字自动转 CID
+function normalizeLocalPath115(value: unknown): string {
+  const text = String(value ?? "").trim();
+  if (!text || text === "/") return text;
+  if (/^(?:cid|id):/i.test(text)) return text;
+  if (/^\d+$/.test(text)) return `cid:${text}`;
+  return `/${text.replace(/^\/+/, "").replace(/\/+$/, "")}`;
+}
+
 async function loadTransfer() {
   transferLoading.value = true;
   try {
@@ -177,6 +205,19 @@ async function loadTransfer() {
 }
 
 async function saveTransfer() {
+  const checks: Array<[unknown, (value: unknown) => true | string]> = [
+    [transferForm.targetDirId, digitsOrEmpty],
+    [transferForm.pan115TargetCid, digitsOrEmpty],
+    [transferForm.excludeCid, cidListOrEmpty],
+    [transferForm.pan123OauthApi, httpUrlOrEmpty],
+  ];
+  for (const [value, check] of checks) {
+    const result = check(value);
+    if (result !== true) {
+      notifyError(`保存失败：${result}`);
+      return;
+    }
+  }
   transferSaving.value = true;
   try {
     const data = await transferApi.putConfig(collectTransferConfig());
@@ -221,7 +262,9 @@ async function submitTransfer() {
 }
 
 async function submitLocalTransfer() {
-  const path115 = transferForm.localPath115.trim();
+  // 只填「文件夹名」时自动补 /、纯数字自动转 CID，并把修正后的值写回输入框
+  const path115 = normalizeLocalPath115(transferForm.localPath115);
+  transferForm.localPath115 = path115;
   if (!path115) {
     notifyError("请输入 115 本地盘目录路径或 CID");
     return;
@@ -500,6 +543,17 @@ function syncHelperFromConfig() {
 }
 
 async function saveHelper() {
+  const checks: Array<[unknown, (value: unknown) => true | string]> = [
+    [helperForm.offlineTargetDirId, digitsOrEmpty],
+    [helperForm.pan123SourceDirId, digitsOrEmpty],
+  ];
+  for (const [value, check] of checks) {
+    const result = check(value);
+    if (result !== true) {
+      notifyError(`保存失败：${result}`);
+      return;
+    }
+  }
   helperSaving.value = true;
   try {
     const next = ensureSubmissionConfig();
@@ -1298,7 +1352,9 @@ onUnmounted(() => {
               <v-text-field
                 v-model="transferForm.localPath115"
                 label="115 本地盘目录路径 / CID"
-                placeholder="cid:123456 或 /云下载/待搬运"
+                placeholder="/云下载/待搬运 或 cid:123456"
+                hint="从 115 网盘哪个文件夹搬出：填 / 开头的路径（如 /电影），只填文件夹名会自动补 /，填数字自动当作 CID"
+                persistent-hint
                 variant="outlined"
                 density="compact"
               />
@@ -1316,6 +1372,9 @@ onUnmounted(() => {
                 v-model="sourceDirId123"
                 label="123 源目录 ID"
                 :placeholder="`留空默认用 115→123 落地目录（${transferForm.targetDirId || '0'}），可填其他目录 ID`"
+                :rules="[digitsOrEmpty]"
+                hint="从 123 网盘哪个文件夹搬去 115：填该文件夹的数字 ID，留空用默认落地目录"
+                persistent-hint
                 variant="outlined"
                 density="compact"
               />
@@ -1352,18 +1411,70 @@ onUnmounted(() => {
               </div>
               <FormGrid>
                 <v-switch v-model="transferForm.enabled" label="启用 115 搬运" color="primary" hide-details />
-                <v-text-field v-model="transferForm.targetDirId" label="123 目标目录 ID" variant="outlined" density="compact" />
-                <v-text-field v-model="transferForm.localPath115" label="115 本地盘目录路径 / CID" variant="outlined" density="compact" />
-                <v-text-field v-model="transferForm.pan115TargetCid" label="115 目标目录 CID（123→115）" variant="outlined" density="compact" />
-                <v-text-field v-model="transferForm.pan123OauthApi" label="123 授权服务地址（可选，默认社区官方）" variant="outlined" density="compact" />
-                <v-text-field v-model.number="transferForm.concurrency" label="并发任务数 1-5" type="number" variant="outlined" density="compact" />
-                <v-text-field v-model="transferForm.excludeSuffix" label="排除后缀" variant="outlined" density="compact" />
-                <v-text-field v-model="transferForm.excludeCid" label="排除 115 目录 CID" variant="outlined" density="compact" />
+                <v-text-field
+                  v-model="transferForm.targetDirId"
+                  label="123 目标目录 ID"
+                  placeholder="0"
+                  :rules="[digitsOrEmpty]"
+                  hint="115→123 搬运落到 123 网盘哪个文件夹：打开 123 网盘网页版进入该文件夹，地址栏里的数字就是 ID。0 = 网盘根目录"
+                  persistent-hint
+                  variant="outlined"
+                  density="compact"
+                />
+                <v-text-field
+                  v-model="transferForm.localPath115"
+                  label="115 本地盘目录路径 / CID"
+                  placeholder="/云下载/待搬运 或 cid:123456"
+                  hint="从 115 网盘哪个文件夹搬出：填 / 开头的路径（如 /电影），只填文件夹名会自动补 /，填数字自动当作 CID"
+                  persistent-hint
+                  variant="outlined"
+                  density="compact"
+                />
+                <v-text-field
+                  v-model="transferForm.pan115TargetCid"
+                  label="115 目标目录 CID（123→115）"
+                  placeholder="0"
+                  :rules="[digitsOrEmpty]"
+                  hint="123→115 搬运落到 115 网盘哪个文件夹：填 115 目标文件夹的 CID 数字，0 = 根目录"
+                  persistent-hint
+                  variant="outlined"
+                  density="compact"
+                />
+                <v-text-field
+                  v-model="transferForm.pan123OauthApi"
+                  label="123 授权服务地址（可选，默认社区官方）"
+                  placeholder="留空即可"
+                  :rules="[httpUrlOrEmpty]"
+                  hint="不懂就留空，用社区官方授权服务；自建才填 https:// 开头的地址"
+                  persistent-hint
+                  variant="outlined"
+                  density="compact"
+                />
+                <v-text-field v-model.number="transferForm.concurrency" label="并发任务数 1-5" type="number" hint="同时在 123 排队的离线任务数，也是同时搬运的任务数" persistent-hint variant="outlined" density="compact" />
+                <v-text-field
+                  v-model="transferForm.excludeSuffix"
+                  label="排除后缀"
+                  placeholder=".txt,.jpg"
+                  hint="这些后缀的文件不搬运，多个用逗号分隔"
+                  persistent-hint
+                  variant="outlined"
+                  density="compact"
+                />
+                <v-text-field
+                  v-model="transferForm.excludeCid"
+                  label="排除 115 目录 CID"
+                  placeholder="123456,789"
+                  :rules="[cidListOrEmpty]"
+                  hint="这些 115 文件夹里的内容不搬运，填数字 CID，多个用逗号分隔"
+                  persistent-hint
+                  variant="outlined"
+                  density="compact"
+                />
                 <v-switch v-model="transferForm.delete115AfterSuccess" label="成功后删除 115 源文件" color="warning" hide-details />
                 <v-switch v-model="transferForm.pauseEnabled" label="启用晚高峰暂停" color="primary" hide-details />
                 <v-select v-model="transferForm.pauseTimeZone" :items="timeZones" label="暂停时区" variant="outlined" density="compact" />
-                <v-text-field v-model.number="transferForm.pauseStartHour" label="暂停开始小时" type="number" variant="outlined" density="compact" />
-                <v-text-field v-model.number="transferForm.pauseEndHour" label="暂停结束小时" type="number" variant="outlined" density="compact" />
+                <v-text-field v-model.number="transferForm.pauseStartHour" label="暂停开始小时" type="number" hint="0-23，晚高峰暂停从这个点开始" persistent-hint variant="outlined" density="compact" />
+                <v-text-field v-model.number="transferForm.pauseEndHour" label="暂停结束小时" type="number" hint="0-23，到这个点恢复搬运" persistent-hint variant="outlined" density="compact" />
               </FormGrid>
               <v-textarea
                 v-model="transferForm.pan115Cookie"
@@ -1513,10 +1624,10 @@ onUnmounted(() => {
 
         <FormGrid>
           <v-switch v-model="helperForm.enabled" label="启用 115 助手" hide-details />
-          <v-text-field v-model="helperForm.offlineTargetDirId" label="离线保存目录 ID" variant="outlined" density="compact" />
+          <v-text-field v-model="helperForm.offlineTargetDirId" label="离线保存目录 ID" placeholder="0" :rules="[digitsOrEmpty]" hint="115 助手离线下载的文件存到 123 网盘哪个文件夹：填数字 ID，0 = 根目录" persistent-hint variant="outlined" density="compact" />
           <v-text-field v-model="helperForm.directLinkRoot" label="直链根目录" placeholder="留空用默认 <数据目录>/directlink" variant="outlined" density="compact" />
           <v-text-field v-model="helperForm.publicBaseUrl" label="公网基址" placeholder="https://域名（留空自动用请求地址）" variant="outlined" density="compact" />
-          <v-text-field v-model="helperForm.pan123SourceDirId" label="123 网盘源目录 ID" placeholder="网盘直链虚拟目录根目录 fileId（留空不启用）" variant="outlined" density="compact" />
+          <v-text-field v-model="helperForm.pan123SourceDirId" label="123 网盘源目录 ID" placeholder="网盘直链虚拟目录根目录 fileId（留空不启用）" :rules="[digitsOrEmpty]" hint="填 123 网盘文件夹的数字 ID，可通过下方「选择 123 网盘源目录」挑选" persistent-hint variant="outlined" density="compact" />
           <v-text-field v-model.number="helperForm.requestIntervalMs" label="请求间隔毫秒" type="number" variant="outlined" density="compact" />
           <v-text-field v-model="helperForm.trashPassword" label="回收站密码" type="password" variant="outlined" density="compact" />
           <v-switch v-model="helperForm.dailyRecycleCleanupEnabled" label="每日自动清理回收站" hide-details />
@@ -1676,6 +1787,10 @@ onUnmounted(() => {
           <v-text-field
             v-model="poolDirId"
             label="123 目标目录 ID（根目录填 0）"
+            placeholder="0"
+            :rules="[digitsOrEmpty]"
+            hint="秒传结果落到 123 网盘哪个文件夹：填数字 ID，0 = 根目录"
+            persistent-hint
             variant="outlined"
             density="compact"
           />

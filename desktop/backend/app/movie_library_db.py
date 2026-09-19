@@ -219,9 +219,60 @@ class LibraryDb:
         return connection
 
     # ---------- 导入 ----------
-    def import_payload(self, name: str, payload: Dict[str, Any], video_ext: Any = None) -> Dict[str, Any]:
-        """把解析后的影库 payload 入库。dir 已存在 → 跳过（保留先入库的）；
-        同名来源重新导入 → 先清该来源旧数据再插（可更新）。
+    def _snapshot_enrichment(self, connection: sqlite3.Connection, source: str) -> Dict[str, Dict[str, Any]]:
+        """快照某来源下已整理成功（tmdb_status='ok'）的分类字段，供重导后按 dir 恢复。"""
+        import json as _json
+        rows = connection.execute(
+            "SELECT dir, media_type, genres, region, poster_path, vote_average, overview,"
+            " language, air_status, popularity, year FROM library_works WHERE source = ? AND tmdb_status = 'ok'",
+            (source,)).fetchall()
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            try:
+                genres = _json.loads(r["genres"] or "[]")
+            except Exception:
+                genres = []
+            snapshot[str(r["dir"])] = {
+                "media_type": str(r["media_type"] or ""),
+                "genres": genres,
+                "region": str(r["region"] or ""),
+                "poster_path": str(r["poster_path"] or ""),
+                "vote_average": float(r["vote_average"] or 0),
+                "overview": str(r["overview"] or ""),
+                "language": str(r["language"] or ""),
+                "air_status": str(r["air_status"] or ""),
+                "popularity": float(r["popularity"] or 0),
+                "year": r["year"],
+            }
+        return snapshot
+
+    def _recompute_work_stats(self, connection: sqlite3.Connection, dirname: str) -> None:
+        """按库内文件明细重算作品的统计与技术属性（合并新文件后调用）。不动整理字段。"""
+        agg = connection.execute(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(is_video),0) AS v, COALESCE(SUM(size),0) AS s"
+            " FROM library_work_files WHERE dir = ?", (dirname,)).fetchone()
+        names = [str(r["file_name"]) for r in connection.execute(
+            "SELECT file_name FROM library_work_files WHERE dir = ? AND is_video = 1", (dirname,))]
+        state = new_tech_state()
+        for name in names:
+            update_tech_state(state, name)
+        resolution, edition = tech_result(state)
+        connection.execute(
+            "UPDATE library_works SET file_count = ?, video_count = ?, total_size = ?,"
+            " resolution = ?, edition = ?, tech = ? WHERE dir = ?",
+            (int(agg["c"]), int(agg["v"]), int(agg["s"]), resolution, edition,
+             _tech_json(infer_technical_detailed(names)), dirname),
+        )
+
+    # 单个作品合并时懒加载的已存在文件路径集合上限：超过则该作品退回"跳过"，
+    # 防止病态大目录（百万级文件）把内存吃爆
+    MERGE_PATH_SET_LIMIT = 200_000
+
+    def import_payload(self, name: str, payload: Dict[str, Any], video_ext: Any = None, mode: str = "merge") -> Dict[str, Any]:
+        """把解析后的影库 payload 入库。
+        mode="merge"（默认）：只增不减——已存在的作品并入新文件（保留先入库的文件与整理成果）；
+        mode="skip"：旧行为——dir 已存在 → 整作品跳过（保留先入库的）；同名来源重新导入 → 先清该来源旧数据再插，
+        且已整理成功的作品字段先快照、重插后按 dir 恢复（不重新拉 TMDB）。
         video_ext：视频扩展名集合（None=默认 VIDEO_EXT，可传 video_ext_set(用户自定义)）。"""
         ext_set = video_ext_set(video_ext) if video_ext else VIDEO_EXT
         common_path = str(payload.get("commonPath") or "").strip("/")
@@ -239,16 +290,41 @@ class LibraryDb:
         imported_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
 
         added = skipped = 0
+        merged_works = merged_files = merged_size = 0
         added_files = added_size = 0
         connection = self._connect()
         try:
             with connection:
-                connection.execute("DELETE FROM library_work_files WHERE dir IN (SELECT dir FROM library_works WHERE source = ?)", (name,))
-                connection.execute("DELETE FROM library_works WHERE source = ?", (name,))
+                if mode == "skip":
+                    snapshot = self._snapshot_enrichment(connection, name)
+                    connection.execute("DELETE FROM library_work_files WHERE dir IN (SELECT dir FROM library_works WHERE source = ?)", (name,))
+                    connection.execute("DELETE FROM library_works WHERE source = ?", (name,))
+                else:
+                    snapshot = {}
                 for work_dir, info in works.items():
                     exists = connection.execute("SELECT 1 FROM library_works WHERE dir = ?", (work_dir,)).fetchone()
-                    if exists:
+                    if exists and mode != "merge":
                         skipped += 1
+                        continue
+                    if exists:
+                        # 合并：只把库里没有的文件插进去，统计与技术属性按合并结果重算
+                        existing_paths = {str(r["path"]) for r in connection.execute(
+                            "SELECT path FROM library_work_files WHERE dir = ?", (work_dir,))}
+                        new_files = [f for f in info["files"] if str(f.get("path") or "") not in existing_paths]
+                        for f in new_files:
+                            fpath = str(f.get("path") or "")
+                            fname = str(f.get("fileName") or fpath.rsplit("/", 1)[-1])
+                            connection.execute(
+                                "INSERT OR REPLACE INTO library_work_files (dir, path, file_name, etag, size, s3_key_flag, is_video)"
+                                " VALUES (?,?,?,?,?,?,?)",
+                                (work_dir, fpath or fname, fname, str(f.get("etag") or ""), int(f.get("size") or 0),
+                                 str(f.get("s3KeyFlag") or ""), 1 if fpath.lower().endswith(tuple(ext_set)) else 0),
+                            )
+                        if new_files:
+                            self._recompute_work_stats(connection, work_dir)
+                            merged_works += 1
+                            merged_files += len(new_files)
+                            merged_size += sum(int(f.get("size") or 0) for f in new_files)
                         continue
                     cat, sub = split_category(work_dir)
                     tech_json = _tech_json(infer_technical_detailed(
@@ -277,16 +353,22 @@ class LibraryDb:
                 connection.execute(
                     "INSERT OR REPLACE INTO library_sources (name, imported_at, common_path, work_count, file_count, total_size)"
                     " VALUES (?,?,?,?,?,?)",
-                    (name, imported_at, common_path, added, added_files, added_size),
+                    (name, imported_at, common_path, added, added_files + merged_files, added_size + merged_size),
                 )
         finally:
             connection.close()
+        # 跳过模式的同名来源重导：把快照的整理成果按 dir 恢复（只有本次重新入库的作品需要）
+        if snapshot:
+            for work_dir, fields in snapshot.items():
+                if work_dir in works:
+                    self.apply_enrichment(work_dir, fields)
         logger.info(
-            "影库导入：%s — 新增 %d 个作品、重复跳过 %d 个、%d 个文件",
-            name, added, skipped, added_files,
+            "影库导入：%s — 新增 %d 个作品、并入已有作品 %d 个（新文件 %d 个）、重复跳过 %d 个",
+            name, added, merged_works, merged_files, skipped,
         )
         return {"ok": True, "name": name, "added": added, "skipped": skipped,
-                "fileCount": added_files, "totalSize": added_size}
+                "mergedWorks": merged_works, "mergedFiles": merged_files,
+                "fileCount": added_files + merged_files, "totalSize": added_size + merged_size}
 
     def delete_source(self, name: str) -> bool:
         connection = self._connect()
@@ -311,25 +393,34 @@ class LibraryDb:
             connection.close()
 
     # ---------- 流式导入（巨型秒传 JSON） ----------
-    def import_stream(self, name: str, common_path: str, files_iter: Iterable[Dict[str, Any]], batch_size: int = 20000, video_ext: Any = None) -> Dict[str, Any]:
+    def import_stream(self, name: str, common_path: str, files_iter: Iterable[Dict[str, Any]], batch_size: int = 20000, video_ext: Any = None, mode: str = "merge") -> Dict[str, Any]:
         """流式导入：条目迭代器逐批 executemany 写 library_work_files，作品行按累计统计最后统一写。
-        语义与 import_payload 一致：dir 已存在 → 跳过（保留先入库的）；同名来源先清旧数据再插（可更新）。
+        语义与 import_payload 一致（mode="merge" 默认：只增不减，已有作品并入新文件、整理成果保留；
+        mode="skip"：dir 已存在整作品跳过，同名来源先清旧数据再插、已整理字段快照后恢复）。
         千万级条目内存占用只与批次大小和作品数相关，不随文件条数线性增长。
         video_ext：视频扩展名集合（None=默认 VIDEO_EXT，可传 video_ext_set(用户自定义)）。"""
         ext_set = video_ext_set(video_ext) if video_ext else VIDEO_EXT
+        merge_mode = mode != "skip"
         imported_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
         fallback_root = common_path.rsplit("/", 1)[-1] if common_path else ""
         stats: Dict[str, List[int]] = {}
         tech: Dict[str, Dict[str, Any]] = {}
         detail_tech: Dict[str, Dict[str, Any]] = {}
         verdicts: Dict[str, bool] = {}
+        existing_paths: Dict[str, set] = {}
+        merged: Dict[str, List[int]] = {}
+        large_roots: set = set()
         added_files = added_size = 0
         connection = self._connect()
         try:
             with connection:
-                connection.execute(
-                    "DELETE FROM library_work_files WHERE dir IN (SELECT dir FROM library_works WHERE source = ?)", (name,))
-                connection.execute("DELETE FROM library_works WHERE source = ?", (name,))
+                if merge_mode:
+                    snapshot: Dict[str, Dict[str, Any]] = {}
+                else:
+                    snapshot = self._snapshot_enrichment(connection, name)
+                    connection.execute(
+                        "DELETE FROM library_work_files WHERE dir IN (SELECT dir FROM library_works WHERE source = ?)", (name,))
+                    connection.execute("DELETE FROM library_works WHERE source = ?", (name,))
                 batch: List[Tuple] = []
                 for entry in files_iter:
                     path = str(entry.get("path") or "")
@@ -345,7 +436,35 @@ class LibraryDb:
                     if verdict is None:
                         verdict = connection.execute("SELECT 1 FROM library_works WHERE dir = ?", (root,)).fetchone() is not None
                         verdicts[root] = verdict
+                        if merge_mode and verdict:
+                            count = connection.execute(
+                                "SELECT COUNT(*) AS c FROM library_work_files WHERE dir = ?", (root,)).fetchone()["c"]
+                            if count <= self.MERGE_PATH_SET_LIMIT:
+                                existing_paths[root] = {str(r["path"]) for r in connection.execute(
+                                    "SELECT path FROM library_work_files WHERE dir = ?", (root,))}
+                            else:
+                                # 病态大作品不合并（路径集合会吃内存），按跳过处理并记一笔
+                                large_roots.add(root)
                     if verdict:
+                        if not merge_mode or root in large_roots:
+                            continue
+                        file_key = path or fname
+                        if file_key in existing_paths[root]:
+                            continue
+                        existing_paths[root].add(file_key)
+                        g = merged.get(root)
+                        if g is None:
+                            g = merged[root] = [0, 0]
+                        g[0] += 1
+                        g[1] += int(entry.get("size") or 0)
+                        batch.append((root, path or fname, fname,
+                                      str(entry.get("etag") or ""), int(entry.get("size") or 0),
+                                      str(entry.get("s3KeyFlag") or ""), 1 if fname.lower().endswith(tuple(ext_set)) else 0))
+                        if len(batch) >= batch_size:
+                            connection.executemany(
+                                "INSERT OR REPLACE INTO library_work_files (dir, path, file_name, etag, size, s3_key_flag, is_video)"
+                                " VALUES (?,?,?,?,?,?,?)", batch)
+                            batch.clear()
                         continue
                     size = int(entry.get("size") or 0)
                     is_video = 1 if fname.lower().endswith(tuple(ext_set)) else 0
@@ -390,19 +509,33 @@ class LibraryDb:
                         " file_count, video_count, total_size, resolution, edition, tmdb_status, tech, source)"
                         " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", work_rows)
                 added = len(work_rows)
-                skipped = sum(1 for v in verdicts.values() if v)
+                merged_works = len(merged)
+                merged_files = sum(g[0] for g in merged.values())
+                merged_size = sum(g[1] for g in merged.values())
+                # 跳过的 = 已存在且本次没并入任何新文件的作品（含超限退回跳过的大作品）
+                skipped = sum(1 for root, v in verdicts.items() if v and root not in merged)
+                # 合并过的作品：统计与技术属性按合并结果重算（新文件可能是更高规格版本）
+                for root in merged:
+                    self._recompute_work_stats(connection, root)
                 connection.execute(
                     "INSERT OR REPLACE INTO library_sources (name, imported_at, common_path, work_count, file_count, total_size)"
                     " VALUES (?,?,?,?,?,?)",
-                    (name, imported_at, common_path, added, added_files, added_size))
+                    (name, imported_at, common_path, added, added_files + merged_files, added_size + merged_size))
         finally:
             connection.close()
+        # 跳过模式的同名来源重导：把快照的整理成果按 dir 恢复（只有本次重建的作品行需要恢复）
+        if snapshot:
+            reinserted = {root for root, v in verdicts.items() if not v}
+            for work_dir, fields in snapshot.items():
+                if work_dir in reinserted:
+                    self.apply_enrichment(work_dir, fields)
         logger.info(
-            "影库流式导入：%s — 新增 %d 个作品、重复跳过 %d 个、%d 个文件",
-            name, added, skipped, added_files,
+            "影库流式导入：%s — 新增 %d 个作品、并入已有作品 %d 个（新文件 %d 个）、重复跳过 %d 个",
+            name, added, merged_works, merged_files, skipped,
         )
         return {"ok": True, "name": name, "added": added, "skipped": skipped,
-                "fileCount": added_files, "totalSize": added_size}
+                "mergedWorks": merged_works, "mergedFiles": merged_files,
+                "fileCount": added_files + merged_files, "totalSize": added_size + merged_size}
 
     # ---------- 查询 ----------
     def list_sources(self) -> List[Dict[str, Any]]:
@@ -783,11 +916,12 @@ class LibraryDb:
         connection = self._connect()
         try:
             rows = connection.execute(
-                "SELECT dir, tmdb_id, title, year FROM library_works"
+                "SELECT dir, tmdb_id, title, year, video_count FROM library_works"
                 " WHERE tmdb_status = 'pending' AND tmdb_id IS NOT NULL"
                 " ORDER BY enrich_attempts, year DESC, dir LIMIT ?",
                 (max(1, int(limit)),)).fetchall()
-            return [{"dir": r["dir"], "tmdb_id": r["tmdb_id"], "title": r["title"], "year": r["year"]} for r in rows]
+            return [{"dir": r["dir"], "tmdb_id": r["tmdb_id"], "title": r["title"],
+                     "year": r["year"], "video_count": int(r["video_count"] or 0)} for r in rows]
         finally:
             connection.close()
 
@@ -837,7 +971,8 @@ class LibraryDb:
             connection.close()
 
     def reset_enrichment(self, only_failed: bool = True) -> int:
-        """重新入队：默认把 failed 打回 pending；only_failed=False 则全部有 tmdb_id 的重排（含 ok，用于刷新分类）。"""
+        """重新入队：默认把 failed 打回 pending；only_failed=False 则全部有 tmdb_id 的重排（含 ok，用于刷新分类），
+        同时清零无标记作品的搜索尝试次数（给选配整理重新匹配的机会）。"""
         connection = self._connect()
         try:
             with connection:
@@ -846,7 +981,105 @@ class LibraryDb:
                 if only_failed:
                     sql += " AND tmdb_status = 'failed'"
                 cur = connection.execute(sql)
+                if not only_failed:
+                    connection.execute(
+                        "UPDATE library_works SET enrich_attempts = 0 WHERE tmdb_status = 'none'")
                 return cur.rowcount
+        finally:
+            connection.close()
+
+    # ---------- 无标记作品选配整理（设置开启才使用） ----------
+    def untagged_works(self, limit: int = 10, max_attempts: int = 3) -> List[Dict[str, Any]]:
+        """取一批没有 {tmdb-N} 标记的作品（tmdb_status='none'），按标题+年份去 TMDB 搜索匹配。"""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT dir, title, year FROM library_works"
+                " WHERE tmdb_status = 'none' AND tmdb_id IS NULL AND enrich_attempts < ?"
+                " ORDER BY enrich_attempts, year DESC, dir LIMIT ?",
+                (max(1, int(max_attempts)), max(1, int(limit)),)).fetchall()
+            return [{"dir": r["dir"], "title": r["title"], "year": r["year"]} for r in rows]
+        finally:
+            connection.close()
+
+    def assign_tmdb_id(self, dirname: str, tmdb_id: int) -> None:
+        """搜索匹配成功：写回 tmdb_id 并排进正常整理队列。"""
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE library_works SET tmdb_id = ?, tmdb_status = 'pending', enrich_attempts = 0 WHERE dir = ?",
+                    (int(tmdb_id), dirname))
+        finally:
+            connection.close()
+
+    def mark_untagged_failure(self, dirname: str) -> None:
+        """搜索没匹配上：尝试次数 +1（保持 none，达到阈值后不再自动重试，刷新全部时清零重来）。"""
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE library_works SET enrich_attempts = enrich_attempts + 1 WHERE dir = ?", (dirname,))
+        finally:
+            connection.close()
+
+    # ---------- 重复作品（同 tmdb_id 多个目录） ----------
+    def duplicate_groups(self) -> List[Dict[str, Any]]:
+        """同一部剧/电影（tmdb_id 相同）入库了多个目录的分组，供合并去重。"""
+        connection = self._connect()
+        try:
+            ids = [int(r["tmdb_id"]) for r in connection.execute(
+                "SELECT tmdb_id FROM library_works WHERE tmdb_id IS NOT NULL"
+                " GROUP BY tmdb_id HAVING COUNT(*) > 1")]
+            groups: List[Dict[str, Any]] = []
+            for tmdb_id in ids:
+                rows = connection.execute(
+                    "SELECT dir, title, year, file_count, video_count, total_size, source, poster_path, tmdb_status"
+                    " FROM library_works WHERE tmdb_id = ? ORDER BY total_size DESC, dir", (tmdb_id,)).fetchall()
+                groups.append({"tmdbId": tmdb_id, "works": [dict(r) for r in rows]})
+            return groups
+        finally:
+            connection.close()
+
+    def merge_duplicate_works(self, keep_dir: str, merge_dirs: List[str]) -> Dict[str, int]:
+        """把重复目录的文件并入保留目录（文件名相同视为同一集，保留先入库的），副本的作品行/文件/播放记录清除，
+        保留目录的整理成果与统计（重算）不受影响。"""
+        connection = self._connect()
+        try:
+            moved_files = 0
+            removed = 0
+            with connection:
+                if not connection.execute("SELECT 1 FROM library_works WHERE dir = ?", (keep_dir,)).fetchone():
+                    raise ValueError(f"要保留的作品不存在：{keep_dir}")
+                keep_names = {str(r["file_name"]).lower() for r in connection.execute(
+                    "SELECT file_name FROM library_work_files WHERE dir = ?", (keep_dir,))}
+                for merge_dir in merge_dirs:
+                    if merge_dir == keep_dir:
+                        continue
+                    if not connection.execute("SELECT 1 FROM library_works WHERE dir = ?", (merge_dir,)).fetchone():
+                        continue
+                    incoming = []
+                    for r in connection.execute(
+                            "SELECT path, file_name, etag, size, s3_key_flag, is_video"
+                            " FROM library_work_files WHERE dir = ?", (merge_dir,)):
+                        name = str(r["file_name"])
+                        if name.lower() in keep_names:
+                            continue  # 同名 = 同一集：保留 keep 版本，副本的不搬
+                        keep_names.add(name.lower())
+                        incoming.append((keep_dir, str(r["path"]), name, str(r["etag"] or ""),
+                                         int(r["size"] or 0), str(r["s3_key_flag"] or ""), int(r["is_video"] or 0)))
+                    if incoming:
+                        connection.executemany(
+                            "INSERT OR IGNORE INTO library_work_files (dir, path, file_name, etag, size, s3_key_flag, is_video)"
+                            " VALUES (?,?,?,?,?,?,?)", incoming)
+                        moved_files += len(incoming)
+                    # 副本的播放记录挂在旧 dir 上，文件并走后一并清除
+                    connection.execute("DELETE FROM library_playback WHERE dir = ?", (merge_dir,))
+                    connection.execute("DELETE FROM library_work_files WHERE dir = ?", (merge_dir,))
+                    connection.execute("DELETE FROM library_works WHERE dir = ?", (merge_dir,))
+                    removed += 1
+                self._recompute_work_stats(connection, keep_dir)
+            return {"mergedWorks": removed, "movedFiles": moved_files}
         finally:
             connection.close()
 
@@ -1318,12 +1551,12 @@ def _db() -> LibraryDb:
     return _default_db
 
 
-def import_payload(name: str, payload: Dict[str, Any], video_ext: Any = None) -> Dict[str, Any]:
-    return _db().import_payload(name, payload, video_ext)
+def import_payload(name: str, payload: Dict[str, Any], video_ext: Any = None, mode: str = "merge") -> Dict[str, Any]:
+    return _db().import_payload(name, payload, video_ext, mode)
 
 
-def import_stream(name: str, common_path: str, files_iter: Iterable[Dict[str, Any]], batch_size: int = 20000, video_ext: Any = None) -> Dict[str, Any]:
-    return _db().import_stream(name, common_path, files_iter, batch_size, video_ext)
+def import_stream(name: str, common_path: str, files_iter: Iterable[Dict[str, Any]], batch_size: int = 20000, video_ext: Any = None, mode: str = "merge") -> Dict[str, Any]:
+    return _db().import_stream(name, common_path, files_iter, batch_size, video_ext, mode)
 
 
 def delete_source(name: str) -> bool:

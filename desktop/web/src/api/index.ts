@@ -290,9 +290,28 @@ export interface LibraryConfig {
   playerPath: string;
   autoTrash: boolean;
   playCachePath: string;
+  importMode: "merge" | "skip";
+  enrichUntagged: boolean;
   tokenSet: boolean;
   token: string;
   tokenPreview: string | null;
+}
+
+export interface LibraryDuplicateWork {
+  dir: string;
+  title: string;
+  year: number | null;
+  file_count: number;
+  video_count: number;
+  total_size: number;
+  source: string;
+  poster_path: string;
+  tmdb_status: string;
+}
+
+export interface LibraryDuplicateGroup {
+  tmdbId: number;
+  works: LibraryDuplicateWork[];
 }
 
 export interface LibraryPlayEntry {
@@ -487,6 +506,14 @@ export const libraryApi = {
     api.post<{ ok: boolean; processed: number; stats: LibraryEnrichStats }>("/api/library/enrich/start", { token }),
   enrichReset: (token: string, refreshAll = false) =>
     api.post<{ ok: boolean; requeued: number; stats: LibraryEnrichStats }>("/api/library/enrich/reset", { token, refreshAll }),
+  duplicates: (token: string) =>
+    api.get<{ ok: boolean; groups: LibraryDuplicateGroup[] }>(`/api/library/duplicates${libraryTokenQuery(token)}`),
+  mergeDuplicates: (keepDir: string, mergeDirs: string[], token: string) =>
+    api.post<{ ok: boolean; mergedWorks: number; movedFiles: number }>("/api/library/duplicates/merge", {
+      keepDir,
+      mergeDirs,
+      token,
+    }),
   search: (params: { q?: string; cat?: string; sub?: string; page?: number; size?: number; lib?: string; mediaType?: string; genre?: string; region?: string; decade?: number; sort?: string; language?: string; status?: string; edition?: string; rating?: number; tech?: string; token?: string }) => {
     const query = new URLSearchParams();
     if (params.q) query.set("q", params.q);
