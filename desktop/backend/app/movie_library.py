@@ -779,6 +779,9 @@ _TECH_RESOURCE = (
     (r"BD[ ._-]?RIP", "BDRip"),
     (r"HD[ ._-]?RIP", "HDRip"),
     (r"DVD[ ._-]?RIP", "DVDRip"),
+    (r"(?<![A-Z])HD[ ._-]?TC(?![A-Z])", "HDTC"),
+    (r"(?<![A-Z])CAM(?![A-Z])", "CAM"),
+    (r"(?<![A-Z0-9])TS(?![A-Z0-9])", "TS"),
 )
 _TECH_DYNAMIC = (
     (r"HDR10\+|HDR[ ._-]?10\+", "HDR10+"),
@@ -791,6 +794,9 @@ _TECH_DYNAMIC = (
 )
 _TECH_VIDEO = (
     (r"AV1", "AV1"),
+    (r"(?<![A-Z0-9])AVS[ ._-]?3(?![A-Z0-9])", "AVS3"),
+    (r"(?<![A-Z0-9])AVS[ ._-]?2(?![A-Z0-9])", "AVS2"),
+    (r"(?<![A-Z0-9])AVS[ ._-]?\+(?![A-Z0-9])", "AVS+"),
     (r"HEVC", "HEVC"),
     (r"H[ ._-]?265|X[ ._-]?265", "H265"),
     (r"AVC", "AVC"),
@@ -804,7 +810,8 @@ _TECH_AUDIO = (
     (r"DTS[ ._-]?HD[ ._-]?MA", "DTS.HD.MA"),
     (r"DTS[ ._-]?HD[ ._-]?HRA", "DTS.HD.HRA"),
     (r"EAC3|DDP|DD\+", "DDP"),
-    (r"\bAC3\b|DD\b|DOLBY[ ._-]?DIGITAL", "DD"),
+    # DD 后面允许跟声道数（DD2.0/DD5.1）：\b 在「DD2」处不成立，会整个漏掉
+    (r"\bAC3\b|DD(?![A-Z+])|DOLBY[ ._-]?DIGITAL", "DD"),
     (r"\bDTS\b", "DTS"),
     (r"FLAC", "FLAC"),
     (r"\bAAC\b", "AAC"),
@@ -825,13 +832,57 @@ _TECH_EDITIONS = (
     (r"PROPER", "PROPER"),
     (r"REPACK", "REPACK"),
     (r"RERIP", "RERIP"),
+    (r"(?<![A-Z])ANNIVERSARY[ ._-]?EDITION(?![A-Z])", "Anniversary Edition"),
+    (r"(?<![A-Z])COLLECTOR'?S[ ._-]?EDITION(?![A-Z])", "Collector's Edition"),
+    (r"(?<![A-Z])ULTIMATE[ ._-]?EDITION(?![A-Z])", "Ultimate Edition"),
+    (r"(?<![A-Z0-9])MAXPLUS(?![A-Z0-9])", "MAXPLUS"),
+    (r"(?<![A-Z0-9])DC(?![A-Z0-9])", "Director's Cut"),
 )
-_TECH_VIDEO_FORMAT = (
-    (r"4320P|8K", "4320p"),
-    (r"2160P|\b4K\b|\bUHD\b", "2160p"),
-    (r"1080[PI]", "1080p"),
-    (r"720P", "720p"),
-    (r"480P|576P", "480p"),
+# 地区版标签（对齐油猴 originalEdition 默认表）：
+_TECH_EDITIONS += tuple(
+    (rf"(?<![A-Z0-9]){code}(?![A-Z0-9])", code)
+    for code in ("GER", "JPN", "USA", "FRA", "ITA", "ESP", "KOR", "HK", "TW", "UK",
+                 "EUR", "CAN", "AUS", "NLD", "SWE", "NOR", "FIN", "DNK", "POL", "RUS",
+                 "CHN", "THA", "IND", "MEX", "BRA")
+)
+# 来源平台（对齐油猴 mediaSource 默认映射，别名带整词边界防串：MAX 不得命中 CLIMAX）。
+# iT/iTunes 与 FriDay 是常用来源照常收录：与电影《IT》(2017)、《Black Friday》撞名属
+# 已知误报（维护者定调：碰到手动改），不为此做大小写特判。
+_TECH_SOURCES = (
+    (r"(?<![A-Z0-9])(?:AMZN|AMAZON|PRIME)(?![A-Z0-9])", "AMZN"),
+    (r"(?<![A-Z0-9])(?:NF|NETFLIX)(?![A-Z0-9])", "NF"),
+    (r"(?<![A-Z0-9])(?:ATVP|APPLE[ ._-]?TV\+?)(?![A-Z0-9])", "ATVP"),
+    (r"(?<![A-Z0-9])(?:IT|ITUNES)(?![A-Z0-9])", "iT"),
+    (r"(?<![A-Z0-9])(?:DSNP|DISNEY\+|DISNEY[ ._-]?PLUS)(?![A-Z0-9])", "DSNP"),
+    (r"(?<![A-Z0-9])HULU(?![A-Z0-9])", "Hulu"),
+    (r"(?<![A-Z0-9])(?:HMAX|MAX)(?![A-Z0-9])", "MAX"),
+    (r"(?<![A-Z0-9])(?:HBOGO|HBO)(?![A-Z0-9])", "HBO"),
+    (r"(?<![A-Z0-9])(?:CRUNCHYROLL|CR)(?![A-Z0-9])", "CR"),
+    (r"(?<![A-Z0-9])(?:IQIYI|IQ)(?![A-Z0-9])", "IQ"),
+    (r"(?<![A-Z0-9])(?:WETV|TENCENT|TXTV)(?![A-Z0-9])", "WeTV"),
+    (r"(?<![A-Z0-9])(?:BILIBILI|BILI)(?![A-Z0-9])", "Bilibili"),
+    (r"(?<![A-Z0-9])(?:B[ ._-]?GLOBAL|BG)(?![A-Z0-9])", "BG"),
+    (r"(?<![A-Z0-9])(?:YOUKU|YK)(?![A-Z0-9])", "YOUKU"),
+    (r"(?<![A-Z0-9])MGTV(?![A-Z0-9])", "MGTV"),
+    (r"(?<![A-Z0-9])(?:ABEMA|ABMA)(?![A-Z0-9])", "ABEMA"),
+    (r"(?<![A-Z0-9])ADN(?![A-Z0-9])", "ADN"),
+    (r"(?<![A-Z0-9])AT[ ._-]?X(?![A-Z0-9])", "AT-X"),
+    (r"(?<![A-Z0-9])BAHA(?![A-Z0-9])", "Baha"),
+    (r"(?<![A-Z0-9])FOD(?![A-Z0-9])", "FOD"),
+    (r"(?<![A-Z0-9])FRIDAY(?![A-Z0-9])", "FriDay"),
+    (r"FRIDAY[ ._-]?影音", "FriDay"),
+    (r"(?<![A-Z0-9])KKTV(?![A-Z0-9])", "KKTV"),
+    (r"(?<![A-Z0-9])(?:FUNIMATION|FUNI)(?![A-Z0-9])", "FUNi"),
+    (r"(?<![A-Z0-9])(?:HIDIVE|HIDI)(?![A-Z0-9])", "HIDI"),
+    (r"(?<![A-Z0-9])(?:U[ ._-]?NEXT|UNXT)(?![A-Z0-9])", "UNXT"),
+    (r"(?<![A-Z0-9])VIU(?![A-Z0-9])", "VIU"),
+    (r"(?<![A-Z0-9])LINETV(?![A-Z0-9])", "LINETV"),
+    (r"(?<![A-Z0-9])(?:HAMIVIDEO|HAMI)(?![A-Z0-9])", "Hami"),
+    (r"(?<![A-Z0-9])MW(?![A-Z0-9])", "MW"),
+    (r"(?<![A-Z0-9])(?:CATCHPLAY|CPP)(?![A-Z0-9])", "CPP"),
+    (r"(?<![A-Z0-9])TVING(?![A-Z0-9])", "TVING"),
+    (r"(?<![A-Z0-9])WAVVE(?![A-Z0-9])", "Wavve"),
+    (r"(?<![A-Z0-9])(?:YT|YOUTUBE)(?![A-Z0-9])", "YT"),
 )
 
 
@@ -848,6 +899,7 @@ def new_detail_state() -> Dict[str, Any]:
     return {
         "resource": ("", 1 << 30), "dynamic": ("", 1 << 30),
         "video": ("", 1 << 30), "audio": ("", 1 << 30),
+        "source": ("", 1 << 30), "bit": ("", 0),
         "dolby": "", "hq": "", "fps": "", "editions": [],
     }
 
@@ -858,7 +910,8 @@ def update_detail_state(state: Dict[str, Any], name: str) -> Dict[str, Any]:
     if not upper:
         return state
     for key, table in (("resource", _TECH_RESOURCE), ("dynamic", _TECH_DYNAMIC),
-                       ("video", _TECH_VIDEO), ("audio", _TECH_AUDIO)):
+                       ("video", _TECH_VIDEO), ("audio", _TECH_AUDIO),
+                       ("source", _TECH_SOURCES)):
         label = _tech_first_match(upper, table)
         if key == "resource" and label and label != "UHD BluRay Remux" and "REMUX" in upper:
             # REMUX 记号在而 Remux 别名跨不过中间的分辨率段（BluRay.1080p.Remux 落到
@@ -889,17 +942,25 @@ def update_detail_state(state: Dict[str, Any], name: str) -> Dict[str, Any]:
                 # 左最匹配把前面的版本号并进来了（如 265.25fps）：只留 fps 紧前一段
                 value = m.group(0).rpartition(".")[2]
             state["fps"] = value.lower().rstrip("fps") + "fps"
+    # 色深取全部文件里出现的最高档（10bit/12bit 是画质正向信号）
+    m = re.search(r"(?<![0-9])(8|10|12)[ ._-]?BIT(?![A-Z0-9])", upper)
+    if m:
+        rank = int(m.group(1))
+        if rank > state["bit"][1]:
+            state["bit"] = (f"{rank}bit", rank)
     return state
 
 
 def detail_state_result(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "resourceType": state["resource"][0],
+        "mediaSource": state["source"][0],
         "dolbyVision": state["dolby"],
         "dynamicRange": state["dynamic"][0],
         "videoCodec": state["video"][0],
         "audioCodec": state["audio"][0],
         "frameRate": state["fps"],
+        "colorDepth": state["bit"][0],
         "highQuality": state["hq"],
         "originalEdition": list(state["editions"]),
     }

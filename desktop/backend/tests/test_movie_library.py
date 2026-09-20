@@ -1057,6 +1057,55 @@ class LibraryEnrichTests(unittest.TestCase):
             "Remux",
         )
 
+    def test_infer_technical_detailed_broadcast_avs(self):
+        """国产 4K 广播录制（对齐油猴 1.3.16）：AVS2/AVS3 编码、UHDTV、DD2.0=DD、色深/帧率。"""
+        tech = movie_library.infer_technical_detailed([
+            "故乡几万里.S01E01.2024.2160p.50fps.UHDTV.AVS2.10bit.HLG.DD2.0-QHstudIo.mkv",
+        ])
+        self.assertEqual(tech["resourceType"], "UHDTV")
+        self.assertEqual(tech["videoCodec"], "AVS2")
+        self.assertEqual(tech["audioCodec"], "DD")
+        self.assertEqual(tech["dynamicRange"], "HLG")
+        self.assertEqual(tech["frameRate"], "50fps")
+        self.assertEqual(tech["colorDepth"], "10bit")
+        self.assertEqual(movie_library.infer_technical_detailed(["Show.2024.2160p.UHDTV.AVS3.HLG-GRP.mkv"])["videoCodec"], "AVS3")
+        self.assertEqual(movie_library.infer_technical_detailed(["Show.2024.2160p.UHDTV.AVS+.HLG-GRP.mkv"])["videoCodec"], "AVS+")
+        # DD2.0/DD5.1 是 Dolby Digital 不是 DDP（油猴端 DD+ 别名退化遮蔽同源问题）
+        self.assertEqual(movie_library.infer_technical_detailed(["M.2024.1080p.WEB-DL.DD2.0.H.264-GRP.mkv"])["audioCodec"], "DD")
+        self.assertEqual(movie_library.infer_technical_detailed(["M.2024.1080p.WEB-DL.DD5.1.x264-GRP.mkv"])["audioCodec"], "DD")
+        self.assertEqual(movie_library.infer_technical_detailed(["M.2024.1080p.WEB-DL.DD+5.1.H.264-GRP.mkv"])["audioCodec"], "DDP")
+        self.assertEqual(movie_library.infer_technical_detailed(["M.2024.1080p.WEB-DL.DDP5.1.H.265-GRP.mkv"])["audioCodec"], "DDP")
+
+    def test_infer_technical_detailed_source_editions_guards(self):
+        """mediaSource/colorDepth 新字段、整词边界防串、版本/地区版补齐。"""
+        tech = movie_library.infer_technical_detailed([
+            "Show.S01.2024.2160p.NF.WEB-DL.DDP5.1.HDR10.HEVC.10bit-GRP.mkv",
+        ])
+        self.assertEqual(tech["mediaSource"], "NF")
+        self.assertEqual(tech["colorDepth"], "10bit")
+        self.assertEqual(movie_library.infer_technical_detailed(["M.2024.2160p.AMZN.WEB-DL.DV.HEVC-GRP.mkv"])["mediaSource"], "AMZN")
+        # iT/iTunes 与 FriDay 常用来源照常收录（撞名《IT》《Black Friday》属已知误报，人工改）
+        self.assertEqual(movie_library.infer_technical_detailed(["Show.2024.1080p.WEB-DL.iT.AAC2.0.H.264-GRP.mkv"])["mediaSource"], "iT")
+        self.assertEqual(movie_library.infer_technical_detailed(["M.2024.1080p.WEB-DL.ITUNES.DD5.1-GRP.mkv"])["mediaSource"], "iT")
+        self.assertEqual(movie_library.infer_technical_detailed(["Show.S01.FriDay.1080p.WEB-DL.H.264-GRP.mkv"])["mediaSource"], "FriDay")
+        # 色深取最高档
+        self.assertEqual(movie_library.infer_technical_detailed(["A.1080p.8bit.H.264.mkv", "B.1080p.10bit.HEVC.mkv"])["colorDepth"], "10bit")
+        # 整词边界：CLIMAX 不给 MAX、M2TS 不给 TS、BECAME 不给 CAM、FINALE 不给地区 FIN
+        self.assertEqual(movie_library.infer_technical_detailed(["Climax.2024.1080p.WEB-DL.H.264-GRP.mkv"])["mediaSource"], "")
+        self.assertEqual(movie_library.infer_technical_detailed(["Show.2024.1080p.M2TS.H.264-GRP.mkv"])["resourceType"], "")
+        self.assertEqual(movie_library.infer_technical_detailed(["Became.2024.1080p.WEB-DL.H.264-GRP.mkv"])["resourceType"], "WEB-DL")
+        self.assertNotIn("FIN", movie_library.infer_technical_detailed(["The.Finale.2024.1080p.WEB-DL.H.264-GRP.mkv"])["originalEdition"])
+        # 资源类型补 HDTC/CAM/TS（TS 需整词）
+        self.assertEqual(movie_library.infer_technical_detailed(["M.HDTC.720p.mkv"])["resourceType"], "HDTC")
+        self.assertEqual(movie_library.infer_technical_detailed(["M.CAM.mkv"])["resourceType"], "CAM")
+        self.assertEqual(movie_library.infer_technical_detailed(["M.TS.1080p.mkv"])["resourceType"], "TS")
+        # 版本补 MAXPLUS/地区版/DC
+        tech2 = movie_library.infer_technical_detailed(["M.2024.2160p.UHD.BluRay.HDR.HEVC.MAXPLUS.USA-GRP.mkv"])
+        self.assertEqual(tech2["resourceType"], "UHD BluRay")
+        self.assertIn("MAXPLUS", tech2["originalEdition"])
+        self.assertIn("USA", tech2["originalEdition"])
+        self.assertEqual(movie_library.infer_technical_detailed(["M.2024.1080p.BluRay.DC.H.264-GRP.mkv"])["originalEdition"], ["Director's Cut"])
+
     def test_channel_from_stored_migration(self):
         """旧数据（media_type=movie/tv + genres 中文名）回填中文频道。"""
         from app.movie_library import channel_from_stored

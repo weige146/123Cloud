@@ -24,8 +24,8 @@ from .movie_library import (
 
 logger = logging.getLogger(__name__)
 
-_TECH_KEYS = ("resourceType", "dolbyVision", "dynamicRange", "videoCodec", "audioCodec",
-              "frameRate", "highQuality", "originalEdition")
+_TECH_KEYS = ("resourceType", "mediaSource", "dolbyVision", "dynamicRange", "videoCodec",
+              "audioCodec", "frameRate", "colorDepth", "highQuality", "originalEdition")
 
 
 def _tech_json(tech: Dict[str, Any]) -> str:
@@ -188,11 +188,13 @@ class LibraryDb:
                                 "UPDATE library_playback SET season = ?, episode = ? WHERE dir = ? AND file_path = ?",
                                 (p_season, p_episode, row["dir"], row["file_path"]),
                             )
-            # tech 列（杜比视界/HDR/编码/帧率等，筛选与详情用）：补列后对没算过的作品按文件名回填
+            # tech 列（杜比视界/HDR/编码/帧率等，筛选与详情用）：补列后对没算过的作品按文件名回填；
+            # 旧格式 tech JSON（缺 mediaSource/colorDepth 键的）也一并重算
             if "tech" not in existing:
                 conn.execute("ALTER TABLE library_works ADD COLUMN tech TEXT NOT NULL DEFAULT ''")
             need_tech = conn.execute(
-                "SELECT COUNT(*) AS c FROM library_works WHERE tech = ''").fetchone()["c"]
+                "SELECT COUNT(*) AS c FROM library_works WHERE tech = ''"
+                " OR tech NOT LIKE '%\"mediaSource\"%'").fetchone()["c"]
             if need_tech:
                 import json as _json
                 files = conn.execute(
@@ -204,9 +206,7 @@ class LibraryDb:
                 with conn:
                     for dir_name, names in names_by_dir.items():
                         tech = infer_technical_detailed(names)
-                        if any(tech.get(k) for k in ("resourceType", "dolbyVision", "dynamicRange",
-                                                     "videoCodec", "audioCodec", "frameRate",
-                                                     "highQuality", "originalEdition")):
+                        if any(tech.get(k) for k in _TECH_KEYS):
                             conn.execute(
                                 "UPDATE library_works SET tech = ? WHERE dir = ?",
                                 (_json.dumps(tech, ensure_ascii=False, separators=(",", ":")), dir_name),

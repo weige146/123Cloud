@@ -328,11 +328,13 @@ export interface LibraryPlayEntry {
 
 export interface LibraryTechInfo {
   resourceType: string;
+  mediaSource: string;
   dolbyVision: string;
   dynamicRange: string;
   videoCodec: string;
   audioCodec: string;
   frameRate: string;
+  colorDepth: string;
   highQuality: string;
   originalEdition: string[];
 }

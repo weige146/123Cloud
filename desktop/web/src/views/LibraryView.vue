@@ -1133,17 +1133,19 @@ function techChipLabel(tech: string): string {
   return tech.split(":")[1] || tech;
 }
 
-// 详情技术属性标签（文件名细识别）：[资源类型, DV, HDR, 视频/音频编码, 帧率, HQ, 地区版…]
+// 详情技术属性标签（文件名细识别）：[资源类型, 来源, DV, HDR, 视频/音频编码, 帧率, 色深, HQ, 地区版…]
 const techLabels = computed<string[]>(() => {
   const tech = playStructure.value?.tech;
   if (!tech) return [];
   return [
     tech.resourceType,
+    tech.mediaSource,
     tech.dolbyVision,
     tech.dynamicRange,
     tech.videoCodec,
     tech.audioCodec,
     tech.frameRate,
+    tech.colorDepth,
     tech.highQuality,
     ...(tech.originalEdition || []),
   ].filter(Boolean);
