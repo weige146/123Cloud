@@ -83,10 +83,47 @@ test("第一部留在标题里不丢剧名：【家有儿女第一部】", () =>
   assert.equal(inferTitle("【家有儿女第一部】"), "家有儿女第一部");
 });
 
+// —— 同括号「频道前缀+剧名」混排 ——
+test("频道前缀与剧名同括号：【四川卫视4K超高清频道 故乡几万里】取剧名", () => {
+  assert.equal(
+    inferTitle("[四川卫视4K超高清频道 故乡几万里].SCTV-4K.My.Hometown.Across.The.Ocean.2024.S01.2160p.50fps.UHDTV.AVS2.10bit.HLG.DD2.0-QHstudIo"),
+    "故乡几万里",
+  );
+});
+test("频道代码+剧名同括号：【CCTV-8 电视剧频道 狂飙】取剧名", () => {
+  assert.equal(inferTitle("【CCTV-8 电视剧频道 狂飙】"), "狂飙");
+  assert.equal(inferTitle("【SCTV-4K 故乡几万里】"), "故乡几万里");
+});
+test("技术注记打头的混排括号：【4K 超高清频道 故乡几万里】取剧名", () => {
+  assert.equal(inferTitle("【4K 超高清频道 故乡几万里】"), "故乡几万里");
+  assert.equal(inferTitle("【国语 狂飙】"), "狂飙");
+});
+test("混排括号剥光标记仍是标记：【4K 全36集】不当地名", () => {
+  assert.equal(inferTitle("【4K 全36集】黑猫警长"), "黑猫警长");
+});
+test("纯标题括号不误剥：【家有儿女第一部】不动", () => {
+  assert.equal(inferTitle("【家有儿女第一部】"), "家有儿女第一部");
+  assert.equal(inferTitle("【庆余年】【第一季】"), "庆余年");
+});
+
+// —— 括号外频道代码前缀（标记独占括号的变体）——
+test("标记独占括号时 SCTV-4K 频道代码不粘进英文标题", () => {
+  assert.equal(
+    inferTitle("[四川卫视4K超高清频道].SCTV-4K.My.Hometown.Across.The.Ocean.2024.S01.2160p.UHDTV.AVS2.10bit.HLG.DD2.0-QHstudIo"),
+    "My Hometown Across The Ocean",
+  );
+  assert.equal(inferTitle("CCTV-1 开讲啦 20240101"), "开讲啦");
+});
+test("TV 开头的剧名不被频道代码剥离误伤", () => {
+  assert.equal(inferTitle("TV Patrol 2024.1080p.HDTV-GROUP"), "TV Patrol");
+});
+
 // —— 手动查询解析联动 ——
 test("查询带频道前缀时搜索词是剧名", () => {
   const parsed = parseTmdbLookupQuery("【中国广电重温经典频道】黑猫警长");
   assert.equal(parsed.query, "黑猫警长");
+  const mixed = parseTmdbLookupQuery("[四川卫视4K超高清频道 故乡几万里].SCTV-4K.My.Hometown.Across.The.Ocean.2024.S01");
+  assert.equal(mixed.query, "故乡几万里");
 });
 test("inferMediaType：全N集/共N集识别为剧集（不再因年份+分辨率误判电影）", () => {
   assert.equal(inferMediaType("【重温经典频道】黑猫警长 1984 全5集 1080P"), "tv");

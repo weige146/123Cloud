@@ -57,7 +57,7 @@ test("内置表与高清剧集网对应表逐条对齐，纯组名写法且不�
 test("新装用户：内置表原样进入识别词", () => {
   const config = normalizeConfig({});
   assert.deepEqual([...config.library.recognition.customWords], [...BUILTIN_RELEASE_GROUP_WORDS]);
-  assert.equal(config.schemaVersion, 14);
+  assert.equal(config.schemaVersion, 16);
 });
 
 test("老用户升级：内置表追加在已有规则后面，已有同义规则不重复", () => {

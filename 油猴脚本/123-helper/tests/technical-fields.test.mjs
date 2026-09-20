@@ -87,4 +87,20 @@ assert.equal(inferTechnicalFields("The.Movie.2019.UHD.BluRay.2160p.Remux.HEVC-GR
 assert.equal(inferTechnicalFields("The.Movie.2019.1080p.Remux.H.264-GROUP").resourceType, "Remux");
 console.log("ok BluRay.1080p.Remux 分辨率隔段识别为 BluRay Remux，纯 Remux 不误升");
 
+// 7. 国产 4K 广播录制：AVS2 编码、UHDTV 资源类型、DD2.0 是 Dolby Digital 不是 DDP
+//    （此前 DD+ 别名归一化剥掉 + 退化成 DD、表序又在 DD 之前，DD2.0 被前缀误判成 DDP）
+fields = inferTechnicalFields("[四川卫视4K超高清频道 故乡几万里].SCTV-4K.My.Hometown.Across.The.Ocean.2024.S01.2160p.50fps.UHDTV.AVS2.10bit.HLG.DD2.0-QHstudIo");
+assert.equal(fields.resourceType, "UHDTV");
+assert.equal(fields.videoCodec, "AVS2");
+assert.equal(fields.audioCodec, "DD.2.0");
+assert.equal(fields.dynamicRange, "HLG");
+assert.equal(fields.frameRate, "50fps");
+assert.equal(fields.colorDepth, "10bit");
+assert.equal(inferTechnicalFields("Show.2024.2160p.UHDTV.AVS3.HLG.DD5.1-GROUP").videoCodec, "AVS3");
+assert.equal(inferTechnicalFields("Show.2024.2160p.UHDTV.AVS+.HLG.DD2.0-GROUP").videoCodec, "AVS+");
+assert.equal(inferTechnicalFields("Movie.2024.1080p.WEB-DL.DD+5.1.H.264-GROUP").audioCodec, "DDP.5.1");
+assert.equal(inferTechnicalFields("Movie.2024.1080p.WEB-DL.DDP5.1.Atmos.H.265-GROUP").audioCodec, "DDP.5.1.Atmos");
+assert.equal(inferTechnicalFields("Show.S01.2160p.IPTV.H.265.DD.2.0-GROUP").audioCodec, "DD.2.0");
+console.log("ok AVS2/AVS3/AVS+ 编码、UHDTV 资源类型、DD2.0 不再误判成 DDP");
+
 console.log("technical-fields.test.mjs 全部通过");

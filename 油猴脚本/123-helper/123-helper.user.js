@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.16
+// @version      1.3.17
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -2700,6 +2700,7 @@
     entry("source-nf", "mediaSource", ["NF", "Netflix"], "NF"),
     entry("source-atvp", "mediaSource", ["ATVP", "Apple TV+", "Apple TV"], "ATVP"),
     entry("source-it", "mediaSource", ["iT", "iTunes"], "iT"),
+    entry("source-friday", "mediaSource", ["FriDay", "Friday\u5F71\u97F3"], "FriDay"),
     entry("source-dsnp", "mediaSource", ["DSNP", "Disney+", "Disney Plus"], "DSNP"),
     entry("source-hulu", "mediaSource", ["Hulu"], "Hulu"),
     entry("source-max", "mediaSource", ["HMAX", "MAX"], "MAX"),
@@ -2716,7 +2717,6 @@
     entry("source-atx", "mediaSource", ["AT-X"], "AT-X"),
     entry("source-baha", "mediaSource", ["Baha"], "Baha"),
     entry("source-fod", "mediaSource", ["FOD"], "FOD"),
-    entry("source-friday", "mediaSource", ["FriDay", "Friday\u5F71\u97F3"], "FriDay"),
     entry("source-kktv", "mediaSource", ["KKTV"], "KKTV"),
     entry("source-funi", "mediaSource", ["FUNi", "Funimation"], "FUNi"),
     entry("source-hidi", "mediaSource", ["HIDI", "HIDIVE"], "HIDI"),
@@ -2754,6 +2754,9 @@
     entry("dynamic-sdr", "dynamicRange", ["SDR"], "SDR"),
     entry("dynamic-edr", "dynamicRange", ["EDR"], "EDR"),
     entry("video-av1", "videoCodec", ["AV1"], "AV1"),
+    entry("video-avs3", "videoCodec", ["AVS3"], "AVS3"),
+    entry("video-avs2", "videoCodec", ["AVS2"], "AVS2"),
+    entry("video-avs-plus", "videoCodec", ["AVS+"], "AVS+"),
     entry("video-hevc", "videoCodec", ["HEVC"], "HEVC"),
     entry("video-h265", "videoCodec", ["H265", "H.265", "X265", "X.265"], "H265"),
     entry("video-avc", "videoCodec", ["AVC"], "AVC"),
@@ -3111,10 +3114,38 @@
       edition.aliases = edition.aliases.filter((alias) => ["UK", "GBR"].includes(String(alias).toUpperCase()));
     }
   }
+  // v15：默认映射表新增的「视频编码」AVS2/AVS3/AVS+ 对存量用户是空缺——fixedMappings 是
+  // 首装时的快照，只改 DEFAULT_FIXED_MAPPINGS 老配置永远拿不到（AVS2 不识别就是这来的）。
+  // 一次性补种到用户列表尾部（已自建同名输出的跳过）。v15 中间版曾把 source-it/裸 FriDay
+  // 当误报清掉：维护者定调这两个来源常用、照常收录（与电影《IT》《Black Friday》撞名属
+  // 已知误报，碰到手动改），跑过中间版的配置要恢复默认条目。
+  function seedAvsVideoCodecMappings(stored) {
+    const version = Number(stored.schemaVersion || 0);
+    if (version >= 16 || !Array.isArray(stored.library?.recognition?.fixedMappings)) return;
+    const mappings = stored.library.recognition.fixedMappings;
+    const hasOutput = (output) => mappings.some((item) => item?.field === "videoCodec" && String(item?.output || "") === output);
+    for (const seed of [
+      { id: "video-avs3", field: "videoCodec", aliases: ["AVS3"], output: "AVS3" },
+      { id: "video-avs2", field: "videoCodec", aliases: ["AVS2"], output: "AVS2" },
+      { id: "video-avs-plus", field: "videoCodec", aliases: ["AVS+"], output: "AVS+" }
+    ]) {
+      if (!hasOutput(seed.output)) mappings.push({ ...seed });
+    }
+    if (version >= 15) {
+      if (!mappings.some((item) => item?.id === "source-it" || (item?.field === "mediaSource" && String(item?.output || "") === "iT"))) {
+        mappings.push({ id: "source-it", field: "mediaSource", aliases: ["iT", "iTunes"], output: "iT" });
+      }
+      const friday = mappings.find((item) => item?.id === "source-friday");
+      if (friday && Array.isArray(friday.aliases) && !friday.aliases.includes("FriDay")) {
+        friday.aliases = ["FriDay", ...friday.aliases.filter((alias) => String(alias || "").trim())];
+      }
+    }
+  }
   function normalizeConfig(value) {
     const stored = value && typeof value === "object" ? clone(value) : {};
     migrateTitleBlocks(stored);
     migrateBackendAlignedFixedMappings(stored);
+    seedAvsVideoCodecMappings(stored);
     if (stored.share && typeof stored.share === "object") delete stored.share.submissionGatewayUrl;
     if (typeof stored.organize?.setupCompleted !== "boolean") {
       stored.organize = { ...stored.organize || {}, setupCompleted: false };
@@ -3166,7 +3197,7 @@
       config.tmdb.apiBase = (/^https?:\/\//i.test(tmdbApiBaseRaw) ? tmdbApiBaseRaw : `https://${tmdbApiBaseRaw}`).replace(/\/+$/, "");
     } else config.tmdb.apiBase = "";
     applySpecialKeywordMappings(config.library.recognition.fixedMappings);
-    config.schemaVersion = 14;
+    config.schemaVersion = 16;
     delete config.metadata;
     return config;
   }
@@ -6543,6 +6574,14 @@
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.3.17",
+      notes: [
+        "电视台录制的剧也能认了：【四川卫视4K超高清频道 故乡几万里】这种频道名和剧名挤在同一个括号里的，直接认出剧名「故乡几万里」；【重温经典频道】黑猫警长、[字幕组]番名 这类标记括号照旧只当标记",
+        "SCTV-4K、CCTV-8 这类频道代码不会再粘在片名前面（片名是英文、频道标记写在括号里的录制命名也认得）",
+        "认得国产 4K 录播的技术字段了：AVS2 / AVS3 编码、UHDTV（超高清电视录制）整理时不再空着；音频 DD2.0 / DD5.1 也不再被误认成杜比全景声 Plus；升级后这些新识别词自动补进老配置，不用手动改设置"
+      ]
+    },
     {
       version: "1.3.16",
       notes: [
@@ -17678,12 +17717,14 @@ ${end.comment}` : end.comment;
     ].map((key) => [key, collect(key)]).filter(([, value]) => value));
   }
   function findAudioMapping(value, mappings) {
-    const key = String(value || "").replace(/[^A-Za-z0-9]+/g, "").toLocaleUpperCase();
+    // 归一化只剥分隔符、保留 + 等有效记号：「DD+」若把 + 剥掉就退化成「DD」，表序
+    // 又排在 DD 条目之前，DD2.0 会被前缀误判成 DDP（Dolby Digital Plus）。
+    const key = String(value || "").replace(/[\s._-]+/g, "").toLocaleUpperCase();
     if (!key) return null;
     for (const item of normalizeFixedMappings(mappings)) {
       if (item.field !== "audioCodec") continue;
       if (item.aliases.some((alias) => {
-        const aliasKey = String(alias).replace(/[^A-Za-z0-9]+/g, "").toLocaleUpperCase();
+        const aliasKey = String(alias).replace(/[\s._-]+/g, "").toLocaleUpperCase();
         return aliasKey && (key === aliasKey || key.startsWith(aliasKey));
       })) return item;
     }
@@ -17752,7 +17793,7 @@ ${end.comment}` : end.comment;
     const key = aliasSource || "";
     let pattern = INFER_TITLE_TOKEN_RE_CACHE.get(key);
     if (!pattern) {
-      pattern = new RegExp(`\\b(?:S\\d{1,3}(?:E\\d{1,5})?|Season\\s*\\d+|EP?\\d{1,5}|Complete|4320p|2160p|1440p|1080p|720p|WEB[- ]?DL|WEBRip|Blu[- ]?Ray|REMUX|HDTV|H[ .]?26[45]|HEVC|AVC|DDP?|AAC|FLAC|AV3A|HDR10\\+?|DoVi|DV${key ? `|${key}` : ""})\\b|${CHINESE_SEASON_PATTERN}`, "i");
+      pattern = new RegExp(`\\b(?:S\\d{1,3}(?:E\\d{1,5})?|Season\\s*\\d+|EP?\\d{1,5}|Complete|4320p|2160p|1440p|1080p|720p|WEB[- ]?DL|WEBRip|Blu[- ]?Ray|REMUX|HDTV|UHDTV|AVS3|AVS2|H[ .]?26[45]|HEVC|AVC|DDP?|AAC|FLAC|AV3A|HDR10\\+?|DoVi|DV${key ? `|${key}` : ""})\\b|${CHINESE_SEASON_PATTERN}`, "i");
       if (INFER_TITLE_TOKEN_RE_CACHE.size > 64) INFER_TITLE_TOKEN_RE_CACHE.clear();
       INFER_TITLE_TOKEN_RE_CACHE.set(key, pattern);
     }
@@ -17785,7 +17826,7 @@ ${end.comment}` : end.comment;
   // 硬解等技术注记。此前 titleFromBrackets 无条件取第一个含中文的括号内容当标题，
   // 【中国广电重温经典频道】黑猫警长 会把频道名当标题、[字幕组]剧名 会把组名当标题。
   var BRACKET_TAG_SUFFIX_RE = /(?:频道|电视台|電視台|卫视|衛視|广播电台|廣播電台|电台|電台|字幕组|字幕組|字幕|工作组|工作組|制作组|製作組|发布组|發佈組|發布組|资源组|資源組|压制组|壓制組|翻译组|翻譯組|剪辑组|剪輯組|工作室|影业|影業|传媒|傳媒|小组|小組|联盟|聯盟|出品|压制|壓制|搬运|搬運|录播|錄播|连载中|連載中|陆续更新|陸續更新|持续更新|持續更新)$/;
-  var BRACKET_TAG_WORDS_RE = new RegExp(`^(?:4K|8K|2K|2160|1080|720|480|360|FHD|UHD|HDTV|HQ|SDR|HDR|HDR10|HDR10\\+|Dolby|杜比|杜比視界|杜比视界|全景声|全景聲|Atmos|国语|國語|粤语|粵語|闽南语|閩南語|中字|简繁|簡繁|简中|繁中|简体|簡體|繁体|繁體|中英|双语|雙語|内封|內封|内嵌|內嵌|外挂|外掛|生肉|熟肉|官中|无字|無字|中文字幕|完整版|未删减|未刪減|无删减|無刪減|无水印|高清|蓝光|藍光|原盘|原盤|修复|修復|珍藏|典藏|重制|重製|合集|完结|完結|加长|加長|导演剪辑|導演剪輯|精校|精修|DECSS|REMUX|WEB[- .]?DL|WEBRip|BluRay|Blu[- ]?Ray|HDTV|BDRip|HDRip|DVDRip|DoVi|3D|IMAX|60fps|小体积|小體積|高码|高碼|高压|高壓|官方|独家|獨家|首发|首發|资源|資源|补档|補檔|存档|存檔|DVD|ISO)(?=$|[^A-Za-z0-9])`, "i");
+  var BRACKET_TAG_WORDS_RE = new RegExp(`^(?:4K|8K|2K|2160|1080|720|480|360|FHD|UHDTV|UHD|HDTV|HQ|SDR|HDR|HDR10|HDR10\\+|Dolby|杜比|杜比視界|杜比视界|全景声|全景聲|Atmos|国语|國語|粤语|粵語|闽南语|閩南語|中字|简繁|簡繁|简中|繁中|简体|簡體|繁体|繁體|中英|双语|雙語|内封|內封|内嵌|內嵌|外挂|外掛|生肉|熟肉|官中|无字|無字|中文字幕|完整版|未删减|未刪減|无删减|無刪減|无水印|高清|蓝光|藍光|原盘|原盤|修复|修復|珍藏|典藏|重制|重製|合集|完结|完結|加长|加長|导演剪辑|導演剪輯|精校|精修|DECSS|REMUX|WEB[- .]?DL|WEBRip|BluRay|Blu[- ]?Ray|HDTV|BDRip|HDRip|DVDRip|DoVi|3D|IMAX|60fps|小体积|小體積|高码|高碼|高压|高壓|官方|独家|獨家|首发|首發|资源|資源|补档|補檔|存档|存檔|DVD|ISO)(?=$|[^A-Za-z0-9])`, "i");
   var BRACKET_TAG_EPISODE_MARKERS_RE = new RegExp(`(?:第\\s*[\\d零〇一二两兩三四五六七八九十百]+\\s*[集期话話季部場场]|EP?\\s*\\d{1,5}(?=$|[^A-Za-z0-9])|S\\d{1,3}(?:E\\d{1,5})?(?=$|[^A-Za-z0-9])|全\\s*\\d{1,5}\\s*[集话話期]|更新至|更至|\\d{1,5}\\s*[集话話期](?=$|[^一-龥]))`, "i");
   var BRACKET_TAG_EPISODE_MARKERS_GLOBAL_RE = new RegExp(BRACKET_TAG_EPISODE_MARKERS_RE.source, "gi");
   // 括号内容去掉季集/集数标记后剩不到 2 个汉字 → 整个括号就是集数注记（如「全36集」），
@@ -17794,12 +17835,34 @@ ${end.comment}` : end.comment;
     const residue = String(value || "").replace(BRACKET_TAG_EPISODE_MARKERS_GLOBAL_RE, " ");
     return ((residue.match(/[\u3400-\u9fff]/g) || []).length < 2);
   }
+  // 「频道前缀+剧名」写在同一个括号里（【四川卫视4K超高清频道 故乡几万里】）：
+  // 按空白分段，前导标记段（频道/电视台/字幕组后缀词、4K/国语等技术注记词、
+  // CCTV-8/SCTV-4K 式频道代码）剥掉，余下部分才是剧名；只剥到还剩最后一段为止。
+  function bracketSegmentLooksLikeTag(segment) {
+    const value = String(segment || "").trim();
+    if (!value) return true;
+    if (BRACKET_TAG_SUFFIX_RE.test(value)) return true;
+    if (BRACKET_TAG_WORDS_RE.test(value)) return true;
+    if (/^[A-Za-z]{1,5}TV(?:[ ._-]?\d[\dA-Za-z]*)?$/i.test(value)) return true;
+    return false;
+  }
+  function stripBracketTagPrefixes(text2) {
+    const segments = String(text2 || "").trim().split(/\s+/).filter(Boolean);
+    let index = 0;
+    while (index < segments.length - 1 && bracketSegmentLooksLikeTag(segments[index])) index += 1;
+    return segments.slice(index).join(" ");
+  }
   function bracketContentLooksLikeTag(text2) {
     const value = String(text2 || "").trim();
     if (!value) return true;
     if (/^(?:19|20)\d{2}(?:年|版)?$/.test(value)) return true;
     if (BRACKET_TAG_SUFFIX_RE.test(value)) return true;
-    if (BRACKET_TAG_WORDS_RE.test(value)) return true;
+    if (BRACKET_TAG_WORDS_RE.test(value)) {
+      // 「4K 超高清频道 故乡几万里」：标记词只是前缀，剥掉后剩的是剧名就不是纯标记括号
+      const residual = stripBracketTagPrefixes(value);
+      if (residual === value || bracketContentLooksLikeTag(residual)) return true;
+      return false;
+    }
     if (BRACKET_TAG_EPISODE_MARKERS_RE.test(value) && bracketEpisodeTailStrips(value)) return true;
     return false;
   }
@@ -17814,13 +17877,16 @@ ${end.comment}` : end.comment;
     if (value.split(/[\s._·-]+/).some((token) => token && BRACKET_TAG_WORDS_RE.test(token))) return true;
     // 副标题式后缀（星海飞驰篇/某某章）：主标题在括号里，括号外只是分季名
     if (/(?:第\s*\d+\s*|[\u3400-\u9fff]{1,8})(?:篇|章)\s*$/.test(value)) return true;
-    if (/\b(?:WEB[- .]?DL|WEBRip|BluRay|Blu[- ]?Ray|REMUX|HDTV|4320p|2160p|1440p|1080[pi]|720p|576p|480p|4K|8K|UHD|HDR\+?|SDR|DoVi|HEVC|AVC|H[. ]?26[45]|x26[45]|AAC|FLAC|DDP?|AC3|TrueHD|DTS|Atmos|DVD|ISO)\b/i.test(value)) return true;
+    if (/\b(?:WEB[- .]?DL|WEBRip|BluRay|Blu[- ]?Ray|REMUX|HDTV|UHDTV|AVS3|AVS2|4320p|2160p|1440p|1080[pi]|720p|576p|480p|4K|8K|UHD|HDR\+?|SDR|DoVi|HEVC|AVC|H[. ]?26[45]|x26[45]|AAC|FLAC|DDP?|AC3|TrueHD|DTS|Atmos|DVD|ISO)\b/i.test(value)) return true;
     return false;
   }
   function inferTitlePipeline(stem, mappings) {
     let working = String(stem || "");
     working = working.replace(/(?:tmdbid|tmdb)[=\-_: ]?\d{2,10}/gi, " ");
     working = working.replace(/[_.]+/g, " ");
+    // 频道代码前缀（SCTV-4K / CCTV-8 / BRT1）：电视台录制命名常与英文标题连写，
+    // 不剥会粘进标题；要求代码后带数字，避免误伤以 TV 开头的剧名（TV Patrol）。
+    working = working.replace(/^\s*[A-Za-z]{1,5}TV(?:[ ._-]?\d[\dA-Za-z]*)?(?=\s|$)/i, " ");
     const year = working.match(YEAR);
     if (year?.index >= 2) working = working.slice(0, year.index);
     const aliasSource = audioAliasWordSource(mappings);
@@ -17840,7 +17906,7 @@ ${end.comment}` : end.comment;
     const chineseBrackets = brackets.filter((candidate) => /[\u3400-\u9fff]/.test(candidate));
     const titleBrackets = chineseBrackets.filter((candidate) => !bracketContentLooksLikeTag(candidate));
     const stemOutside = rawStem.replace(/[\[【][^\]】]*[\]】]/g, " ");
-    const fromBrackets = titleBrackets.length ? inferTitlePipeline(normalizeBracketTitle(titleBrackets[0]), mappings) : "";
+    const fromBrackets = titleBrackets.length ? inferTitlePipeline(normalizeBracketTitle(stripBracketTagPrefixes(titleBrackets[0])), mappings) : "";
     const fromOutside = inferTitlePipeline(stemOutside, mappings);
     // 「【组名/频道名】剧名」结构：括号内是短词、括号外是干净标题（无任何技术/集数
     // 标记）时取括号外；括号外带着注记时真正的标题仍可能在括号里，保留括号内候选。
@@ -19223,7 +19289,7 @@ ${end.comment}` : end.comment;
   var GENERIC_WEAK_FOLDERS = /^(?:Transfer|Downloads?|下载|待整理|未分类|Movies?|电影|影片|Shows?|Series|剧集|电视剧|TV|综艺|动漫|动画|Documentaries|纪录片|Media|媒体|媒体库|Videos?|Resources?|资源|Folder|Dir|Directory|新建文件夹|文件夹)$/i;
   var PURE_SEASON_FOLDER = /^(?:Season\s*\d{1,3}|S\d{1,3}|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季)$/i;
   var SEASON_FOLDER_PREFIX = /^(?:Season\s*\d{1,3}|S\d{1,3}|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季)(?:\s+|$)/i;
-  var SEASON_TECHNICAL_SUFFIX_SOURCE = "4320p|8K|2160p|4K|UHD|1440p|1080p|1080i|720p|576p|540p|480p|360p|HQ|DV|DoVi|Dolby|HDR|HDR10\\+?|HLG|SDR|EDR|WEB|WEB-DL|WEBRip|BluRay|Blu-Ray|BD|REMUX|HDTV|UHDTV|NF|Netflix|AMZN|Amazon|ATVP|DSNP|Disney|HMAX|MAX|HBO|IQ|WeTV|Bilibili|MGTV|YOUKU|ABMA|ADN|AT-X|Baha|FOD|FriDay|KKTV|FUNi|HIDI|UNXT|VIU|LINETV|Hami|MW|CPP|TVING|Wavve|YT|YouTube|HEVC|H265|H264|AVC|AV1|DDP?|DD\\+|AAC|AV3A|FLAC|TrueHD|DTS|LPCM|PCM|AC3|EAC3|Opus|10bit|12bit|8bit|MAXPLUS|IMAX|REPACK|PROPER|RERIP|CC";
+  var SEASON_TECHNICAL_SUFFIX_SOURCE = "4320p|8K|2160p|4K|UHD|UHDTV|1440p|1080p|1080i|720p|576p|540p|480p|360p|HQ|DV|DoVi|Dolby|HDR|HDR10\\+?|HLG|SDR|EDR|WEB|WEB-DL|WEBRip|BluRay|Blu-Ray|BD|REMUX|HDTV|NF|Netflix|AMZN|Amazon|ATVP|DSNP|Disney|HMAX|MAX|HBO|IQ|WeTV|Bilibili|MGTV|YOUKU|ABMA|ADN|AT-X|Baha|FOD|FriDay|KKTV|FUNi|HIDI|UNXT|VIU|LINETV|Hami|MW|CPP|TVING|Wavve|YT|YouTube|HEVC|H265|H264|AVC|AV1|AVS3|AVS2|AVS\\+|DDP?|DD\\+|AAC|AV3A|FLAC|TrueHD|DTS|LPCM|PCM|AC3|EAC3|Opus|10bit|12bit|8bit|MAXPLUS|IMAX|REPACK|PROPER|RERIP|CC";
   var SEASON_TECHNICAL_SUFFIX_START = new RegExp(`^(?:${SEASON_TECHNICAL_SUFFIX_SOURCE})$`, "i");
   var WEAK_FILE_TITLE = /^(?:unknown|未识别媒体|season\s*\d{1,3}|s\d{1,3}(?:e\d{1,5})?|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季|e(?:p(?:isode)?)?\s*\d{0,5}|第?\s*\d{1,5}\s*[集期话話]?)$/i;
   function normalizedTitle(value) {
