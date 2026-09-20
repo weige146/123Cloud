@@ -78,4 +78,13 @@ assert.equal(fields.audioCodec, "TrueHD.7.1");
 assert.equal(inferTechnicalFields("Movie.2018.1080p.UHD.BluRay.REMUX.HEVC-GROUP").resourceType, "UHD BluRay Remux");
 console.log("ok REMUX 与 UHD BluRay 隔段出现时识别为 UHD BluRay Remux");
 
+// 6b. REMUX：BluRay.1080p.Remux（分辨率插在 BluRay 和 Remux 中间）此前落到单独 Remux 档；
+//     BD.Remux 隔段同理；纯 Remux（无 BluRay 记号）保持 Remux 不误升
+assert.equal(inferTechnicalFields("The.Movie.2019.BluRay.1080p.Remux.AVC.FLAC.2.0-GROUP").resourceType, "BluRay Remux");
+assert.equal(inferTechnicalFields("The.Movie.2019.1080p.BluRay.Remux.AVC.FLAC.2.0-GROUP").resourceType, "BluRay Remux");
+assert.equal(inferTechnicalFields("The.Movie.2019.BD.1080p.Remux.AVC-GROUP").resourceType, "BluRay Remux");
+assert.equal(inferTechnicalFields("The.Movie.2019.UHD.BluRay.2160p.Remux.HEVC-GROUP").resourceType, "UHD BluRay Remux");
+assert.equal(inferTechnicalFields("The.Movie.2019.1080p.Remux.H.264-GROUP").resourceType, "Remux");
+console.log("ok BluRay.1080p.Remux 分辨率隔段识别为 BluRay Remux，纯 Remux 不误升");
+
 console.log("technical-fields.test.mjs 全部通过");

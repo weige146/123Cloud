@@ -1034,6 +1034,29 @@ class LibraryEnrichTests(unittest.TestCase):
         tech3 = movie_library.infer_technical_detailed(["Show.1080p.mkv"])
         self.assertEqual(tech3["frameRate"], "")
 
+    def test_infer_technical_remux_resolution_gap(self):
+        """REMUX 记号隔分辨率段：BluRay.1080p.Remux 补升 BluRay Remux；纯 Remux 不误升。"""
+        self.assertEqual(
+            movie_library.infer_technical_detailed(["Movie.2019.BluRay.1080p.Remux.AVC.FLAC.2.0-GRP.mkv"])["resourceType"],
+            "BluRay Remux",
+        )
+        self.assertEqual(
+            movie_library.infer_technical_detailed(["Movie.2019.1080p.BluRay.Remux.AVC.FLAC.2.0-GRP.mkv"])["resourceType"],
+            "BluRay Remux",
+        )
+        self.assertEqual(
+            movie_library.infer_technical_detailed(["Movie.2019.UHD.BluRay.2160p.Remux.HEVC-GRP.mkv"])["resourceType"],
+            "UHD BluRay Remux",
+        )
+        self.assertEqual(
+            movie_library.infer_technical_detailed(["Movie.2019.BD.1080p.Remux.AVC-GRP.mkv"])["resourceType"],
+            "BluRay Remux",
+        )
+        self.assertEqual(
+            movie_library.infer_technical_detailed(["Movie.2019.1080p.Remux.H.264-GRP.mkv"])["resourceType"],
+            "Remux",
+        )
+
     def test_channel_from_stored_migration(self):
         """旧数据（media_type=movie/tv + genres 中文名）回填中文频道。"""
         from app.movie_library import channel_from_stored

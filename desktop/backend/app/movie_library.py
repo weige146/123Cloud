@@ -860,6 +860,15 @@ def update_detail_state(state: Dict[str, Any], name: str) -> Dict[str, Any]:
     for key, table in (("resource", _TECH_RESOURCE), ("dynamic", _TECH_DYNAMIC),
                        ("video", _TECH_VIDEO), ("audio", _TECH_AUDIO)):
         label = _tech_first_match(upper, table)
+        if key == "resource" and label and label != "UHD BluRay Remux" and "REMUX" in upper:
+            # REMUX 记号在而 Remux 别名跨不过中间的分辨率段（BluRay.1080p.Remux 落到
+            # 单独 Remux 档）：按名字里 BluRay/UHD 有无补升为对应 Remux 档。
+            has_bluray = bool(re.search(r"BLU[ ._-]?RAY|(?<![A-Z0-9])BD(?![A-Z0-9])", upper))
+            has_uhd = bool(re.search(r"(?<![A-Z0-9])UHD(?![A-Z0-9])|ULTRA[ ._-]?HD", upper))
+            if has_bluray and has_uhd:
+                label = "UHD BluRay Remux"
+            elif has_bluray:
+                label = "BluRay Remux"
         if label:
             rank = next(i for i, (_, l) in enumerate(table) if l == label)
             if rank < state[key][1]:
