@@ -1302,14 +1302,23 @@ async def health() -> Dict[str, Any]:
     return {"ok": True, "name": "123 Cloud Gateway", "version": "1.0.0"}
 
 
+def _require_local_admin(request: Request) -> None:
+    """管理端点仅允许本机（loopback）访问，拒绝来自外部网络的请求。"""
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
 @app.get("/api/logs")
-async def read_backend_logs(limit: int = Query(1000, ge=1, le=10000)) -> Dict[str, Any]:
+async def read_backend_logs(request: Request, limit: int = Query(1000, ge=1, le=10000)) -> Dict[str, Any]:
     """最近的后端日志（内存环形缓冲），管理后台"运行日志"页面轮询读取。"""
+    _require_local_admin(request)
     return {"ok": True, "logs": recent_logs(limit)}
 
 
 @app.get("/api/admin/status")
-async def admin_status() -> Dict[str, Any]:
+async def admin_status(request: Request) -> Dict[str, Any]:
+    _require_local_admin(request)
     session = store.read_session()
     raw_config = store.read_config()
     submission = store.read_submission_config()
