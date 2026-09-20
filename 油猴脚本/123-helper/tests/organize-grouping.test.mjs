@@ -264,3 +264,37 @@ test("parseSeasonEpisode 集名形态边界", () => {
   assert.equal(parseSeasonEpisode("2001 太空漫游.mp4").episode, 0, "年份形前导数字不是集数");
   assert.equal(parseSeasonEpisode("武林外传.S01E01.mkv").episode, 1, "常规 SxxEyy 不受影响");
 });
+
+// —— 带年份的续作目录：按目录分组，不再塌缩成第一部的分组（怪物史瑞克 1-4） ——
+test("带年份的续作子目录各成一组，续作不再并进第一作", () => {
+  const mk = (index, folder, name) => ({ id: `s${index}`, name, relativePath: `${folder}/${name}`, sourceFolderId: `d${index}`, sourceFolderName: folder, parentId: "900" });
+  const frds = "BluRay.1080p.x265.10bit.3Audio.MNHD-FRDS";
+  const groups = buildLooseGroups([
+    mk(0, `怪物史瑞克.Shrek.2001.${frds}`, `Shrek.2001.${frds}.mkv`),
+    mk(0, `怪物史瑞克.Shrek.2001.${frds}`, "cover.jpg"),
+    mk(1, `怪物史瑞克2.Shrek.2.2004.${frds}`, `Shrek.2.2004.${frds}.mkv`),
+    mk(1, `怪物史瑞克2.Shrek.2.2004.${frds}`, "cover.jpg"),
+    mk(2, `怪物史瑞克3.Shrek.the.Third.2007.${frds}`, `Shrek.the.Third.2007.${frds}.mkv`),
+    mk(3, `怪物史瑞克4.Shrek.Forever.After.2010.${frds}`, `Shrek.Forever.After.2010.${frds}.mkv`)
+  ], config);
+  assert.equal(groups.length, 4, `四部续作应各成一组，实际 ${groups.length} 组`);
+  const titles = groups.map((group) => group.title).join("|");
+  assert.ok(titles.includes("怪物史瑞克2"), `第二部应有自己的分组：${titles}`);
+  assert.ok(titles.includes("怪物史瑞克3"), `第三部应有自己的分组：${titles}`);
+});
+
+test("无目录上下文时，带年份的续作文件名也不并入第一部", () => {
+  const groups = buildLooseGroups([
+    formFile("怪物史瑞克.Shrek.2001.BluRay.1080p.mkv", "m1"),
+    formFile("怪物史瑞克2.Shrek.2.2004.BluRay.1080p.mkv", "m2")
+  ], config);
+  assert.equal(groups.length, 2, `年份不相交的续作不应并组，实际 ${groups.length} 组`);
+});
+
+test("文件名带年份时结尾紧贴中文的数字按续作保留（叶问2 ≠ 叶问）", () => {
+  const groups = buildLooseGroups([
+    formFile("叶问.2008.BluRay.mkv", "y1"),
+    formFile("叶问2.2010.BluRay.mkv", "y2")
+  ], config);
+  assert.equal(groups.length, 2);
+});

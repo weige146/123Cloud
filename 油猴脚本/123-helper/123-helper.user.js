@@ -6552,7 +6552,8 @@
         "18+ 影视按名字也能搜到了（之前 TMDB 默认不给结果，只能填 ID）",
         "全40集/共12集这类写法的剧不再被误认成电影",
         "秒传工具箱点「生成二级链接（短链）」后，会自动把短链推送给客户端生成投稿草稿（和分享链接直投一样），不用再手动复制粘贴；投稿走短链，频道帖带「秒传链接」复制按钮，不再附带秒传 JSON 文件",
-        "整理认得「01 郭女侠怒砸同福店 佟掌柜秒点迷路人」这种「集号+集名」命名了：文件名里没有剧名时自动拿所在文件夹的名字当剧名、开头的数字当集数，81 集不再被拆成 81 个分组；文件夹名带「第2季 / Season 02」也会认成对应的季"
+        "整理认得「01 郭女侠怒砸同福店 佟掌柜秒点迷路人」这种「集号+集名」命名了：文件名里没有剧名时自动拿所在文件夹的名字当剧名、开头的数字当集数，81 集不再被拆成 81 个分组；文件夹名带「第2季 / Season 02」也会认成对应的季",
+        "电影合集整理不再串组：怪物史瑞克/怪物史瑞克2/3/4 这种「一片一目录」的续作合集，现在每个目录各认各的电影（看目录名里的年份区分），不会再全部合并成第一部的分组、把续作改名成第一部的名字；标题像不像之外还会看年份对不上就不合并"
       ]
     },
     {
@@ -19294,6 +19295,27 @@ ${end.comment}` : end.comment;
     const stripped = stripLooseEpisodeTail(title);
     return stripped && !isWeakLooseTitle(stripped) ? stripped : String(title || "").trim();
   }
+  // 文件名带年份时，标题结尾紧贴中文的数字是续作序号（怪物史瑞克2/叶问2），不是
+  // 集数，不剥——剥了会让四部续作塌缩成第一部的同一个分组键。「标题02」这类没有
+  // 年份佐证的仍按集数剥（原行为不变）。
+  function looseGroupBaseTitleForFile(title, text) {
+    const hasYear = /(?:^|[^0-9])(?:19|20)\d{2}(?:[^0-9]|$)/.test(String(text || ""));
+    if (hasYear && /[\u3400-\u9fff]\d{1,4}$/.test(String(title || "").trim())) {
+      const value = String(title || "").trim();
+      return value;
+    }
+    return looseGroupBaseTitle(title);
+  }
+  // 文件名/目录名里出现的年份集合：年份不相交的两组是不同作品（史瑞克 2001 vs
+  // 史瑞克2 2004），标题再像也不做前缀归并
+  function looseTextYears(names) {
+    const years = new Set();
+    for (const name of names || []) {
+      const matches = String(name || "").match(/(?:19|20)\d{2}/g);
+      if (matches) for (const value of matches) years.add(value);
+    }
+    return years;
+  }
   function looseGroupKeyTitle(baseTitle, text) {
     const normalized = String(baseTitle || "").replace(/[\s._-]+/g, "").toLocaleLowerCase() || "unknown";
     const season = seasonNumberFromText(text);
@@ -19364,8 +19386,18 @@ ${end.comment}` : end.comment;
     for (const file of loose) {
       const text2 = looseRecognitionText(file, customWords);
       const title = inferTitle(text2, fixedMappings);
+      // 目录扫描的散文件：直接父目录是「一目录一部影片」的强片名目录（非弱标题且带
+      // 年份、不含季词）时按目录并组，不按文件名标题归并——「怪物史瑞克/怪物史瑞克2/
+      // 怪物史瑞克3/怪物史瑞克4」四个续作目录若按标题归并会塌缩成第一部的分组，
+      // 续作全被改名成第一部的名字。季目录/无年份目录不适用（剧集仍按标题归组）。
+      const subfolderName = String(file.sourceFolderName || "");
+      const subfolderTitle = subfolderName && !isWeakOrganizeFolderTitle(subfolderName, fixedMappings)
+        && /(?:^|[^0-9])(?:19|20)\d{2}(?:[^0-9]|$)/.test(subfolderName)
+        && seasonNumberFromText(subfolderName) === null
+        ? cleanName(normalizedTitle(subfolderName)) || normalizedTitle(subfolderName)
+        : "";
       // 「01 集名」形态且能找到非弱父目录名：全部并进「父目录剧名」一组，不再逐集成组
-      const episodeForm = parseEpisodeTitleForm(file.name);
+      const episodeForm = !subfolderTitle ? parseEpisodeTitleForm(file.name) : null;
       const folderCtx = episodeForm ? episodeFormFolderContext(file, options, fixedMappings) : null;
       if (folderCtx && !file.targetSeason && folderCtx.season) file.targetSeason = folderCtx.season;
       const unidentified = isWeakLooseTitle(title);
@@ -19374,13 +19406,17 @@ ${end.comment}` : end.comment;
       let baseTitle;
       let key;
       let folderTitle = "";
-      if (folderCtx) {
+      if (subfolderTitle) {
+        folderTitle = subfolderTitle;
+        baseTitle = subfolderTitle;
+        key = `subfolder:${file.sourceFolderId || looseGroupAnchor(file)}:${String(subfolderTitle).replace(/[\s._-]+/g, "").toLocaleLowerCase()}`;
+      } else if (folderCtx) {
         folderTitle = folderCtx.title;
         baseTitle = folderTitle;
         const normalizedFolder = String(folderTitle).replace(/[\s._-]+/g, "").toLocaleLowerCase() || "unknown";
         key = `epform:${normalizedFolder}${folderCtx.season ? `:s${String(folderCtx.season).padStart(3, "0")}` : ""}:${looseGroupAnchor(file)}`;
       } else {
-        baseTitle = unidentified ? title : looseGroupBaseTitle(title);
+        baseTitle = unidentified ? title : looseGroupBaseTitleForFile(title, text2);
         key = unidentified ? `unknown:${looseGroupAnchor(file)}:${targetSeason || ""}` : looseGroupKeyTitle(baseTitle, text2);
       }
       if (!grouped.has(key)) grouped.set(key, { key, baseTitle, files: [], names: [], titles: [], unidentified: true, targetSeason: targetSeason || null, folderTitle });
@@ -19403,10 +19439,15 @@ ${end.comment}` : end.comment;
       }
       let base = null;
       let baseRemainder = "";
+      const entryYears = looseTextYears(entry.names);
       for (const candidate of mergedEntries) {
         if (candidate.unidentified || !candidate.baseTitle) continue;
         const remainder = looseVariantRemainder(entry.baseTitle, candidate.baseTitle);
-        if (remainder && (!base || candidate.baseTitle.length > base.baseTitle.length)) {
+        if (!remainder) continue;
+        // 双方都带年份且年份不相交 = 不同作品（史瑞克 2001 vs 史瑞克2 2004），不并
+        const candidateYears = looseTextYears(candidate.names);
+        if (entryYears.size && candidateYears.size && ![...entryYears].some((year) => candidateYears.has(year))) continue;
+        if (!base || candidate.baseTitle.length > base.baseTitle.length) {
           base = candidate;
           baseRemainder = remainder;
         }
