@@ -111,6 +111,38 @@ class SubmissionRoutingTests(unittest.TestCase):
         self.assertEqual(submitted_links[0]["password"], "FQW3")
         self.assertIn("pwd=FQW3", str(submit.await_args.kwargs["source_text"]))
 
+    def test_direct_fastlink_links_pushed_as_fastlink_drafts(self):
+        """油猴秒传直投：123FLCPV2$ 二级短链按 fastlink 通道建草稿，cleanUrl 原样保留、不挂 JSON 文档，
+        脚本抽出的真实文件名/大小上下文（sourceText）原样透传给识别。"""
+        submit = AsyncMock(return_value={"draftCount": 1})
+        link_url = (
+            "123FLCPV2$%GivR7wk9FQT4UwfLoCF0#972#"
+            "乐园侵触死亡之岛 (2023) {tmdb-222928}.123fastlink.json"
+        )
+        source_text = (
+            "🎬：乐园侵触死亡之岛 (2023) {tmdb-222928}\n💾：6.1GB\n"
+            "📄：Season 1/Rakuen.S01E01.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv\n"
+            "📄：Season 1/Rakuen.S01E02.2160p.WEB-DL.10bit.HEVC.AAC.2.0-Lsp115.mkv"
+        )
+        request = main.SubmissionSubmitRequest(links=[main.SubmissionLinkItem(
+            name="乐园侵触死亡之岛 (2023) {tmdb-222928}",
+            url=link_url,
+            sourceText=source_text,
+        )])
+        with patch.object(main, "submit_submission_links", submit):
+            result = asyncio.run(main.submit_submission(request))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["draftCount"], 1)
+        submitted_links = submit.await_args.args[1]
+        self.assertEqual(submitted_links[0]["provider"], "123fastlink")
+        # 秒传链接原样入草稿：$ # 等分隔符与种子名不许被 normalize 动过
+        self.assertEqual(submitted_links[0]["cleanUrl"], link_url)
+        self.assertNotIn("documents", submitted_links[0])
+        self.assertEqual(submitted_links[0]["sourceText"], source_text)
+        self.assertEqual(submit.await_args.args[2], "油猴秒传直投")
+        self.assertIn(f"🔗：{link_url}", str(submit.await_args.kwargs["source_text"]))
+
     def test_gsb_share_uses_canonical_official_origin_for_copy(self):
         enqueue = AsyncMock(return_value={"id": "copy-1"})
         with patch.object(main.pan123, "get_share_info", AsyncMock(return_value={
@@ -322,11 +354,8 @@ class TelegramFastlinkRoutingTests(unittest.TestCase):
         links = submit.await_args.args[1]
         self.assertEqual(links[0]["provider"], "123fastlink")
         self.assertTrue(links[0]["cleanUrl"].startswith("123FLCPV2$乐园侵触死亡之岛（2023）{tmdb-222928}/Season 1/%GivR7wk9FQT4UwfLoCF0#"))
-        # 原始 JSON 挂在草稿链接上：预览不发文件，发布到频道时随消息附上
-        documents = links[0]["documents"]
-        self.assertEqual(documents[0]["type"], "fastlink_json")
-        self.assertIn("123fastlink", documents[0]["fileName"])
-        self.assertIn("GivR7wk9FQT4UwfLoCF0", documents[0]["content"])
+        # 频道不再附带秒传 JSON 文件：草稿链接不再挂 documents
+        self.assertFalse(links[0].get("documents"))
         source_text = submit.await_args.kwargs["source_text"]
         self.assertIn("🎬：乐园侵触死亡之岛 (2023) {tmdb-222928}", source_text)
         self.assertIn("🔗：123FLCPV2$", source_text)

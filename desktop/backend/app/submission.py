@@ -484,6 +484,23 @@ async def build_submission_draft(
     return draft
 
 
+def _tmdb_candidates_match_title(candidates: List[Dict[str, Any]], query: str) -> bool:
+    """ID 直查结果里有没有与识别标题对得上的（精确或互为包含）；没有就值得补一轮标题搜索。"""
+    from .tmdb import tmdb_title_key
+
+    query_key = tmdb_title_key(query)
+    if not query_key:
+        return True
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        for value in [item.get("title"), item.get("originalTitle"), *(item.get("aliases") or [])]:
+            key = tmdb_title_key(str(value or ""))
+            if key and (key == query_key or key in query_key or query_key in key):
+                return True
+    return False
+
+
 async def find_submission_media(config: Dict[str, Any], metadata: Dict[str, Any], inspection: Dict[str, Any]) -> Dict[str, Any]:
     media_type = str(metadata.get("mediaType") or "unknown")
     normalized_type = media_type if media_type in {"movie", "tv"} else None
@@ -496,9 +513,21 @@ async def find_submission_media(config: Dict[str, Any], metadata: Dict[str, Any]
     media: Dict[str, Any] = {}
     if token:
         try:
-            from .tmdb import pick_best_tmdb_candidate, tmdb_find_by_id, tmdb_search_candidates
+            from .tmdb import pick_best_tmdb_candidate, tmdb_find_by_id, tmdb_search_candidates, tmdb_title_key
 
             candidates = await tmdb_find_by_id(token, language, tmdb_id, normalized_type) if tmdb_id else []
+            # ID 撞库/标记打错兜底：ID 查到的片子标题与识别标题完全对不上时，
+            # 补一轮标题搜索合并候选，让评分裁决（标题命中权重高于类型权重）
+            if candidates and title and not _tmdb_candidates_match_title(candidates, title):
+                try:
+                    searched = await tmdb_search_candidates(token, language, title, year, normalized_type)
+                except Exception:
+                    searched = []
+                seen_keys = {(str(item.get("mediaType") or ""), int(item.get("tmdbId") or 0)) for item in candidates}
+                candidates = candidates + [
+                    item for item in searched
+                    if (str(item.get("mediaType") or ""), int(item.get("tmdbId") or 0)) not in seen_keys
+                ]
             if not candidates and title:
                 candidates = await tmdb_search_candidates(token, language, title, year, normalized_type)
             if candidates:
@@ -1063,7 +1092,13 @@ def should_use_cached_media(cached_media: Optional[Dict[str, Any]], metadata: Di
         return None
     wanted = int(metadata.get("tmdbId") or 0)
     cached_id = int(cached_media.get("tmdbId") or 0)
-    if wanted and cached_id != wanted:
+    if wanted and cached_id and cached_id != wanted:
+        return None
+    # TMDB 电影/剧集是两套 ID 空间，同数字会撞出另一部片；类型判错过一次后，
+    # 缓存只比 tmdbId 会一直复用错误结果。缓存标题与本次识别标题对不上就弃用重识别
+    #（类型默认值不算证据——文件名没有剧集信号时会默认 movie，不能拿它否定缓存）。
+    title = str(metadata.get("title") or "").strip()
+    if title and str(cached_media.get("title") or "").strip() and not _tmdb_candidates_match_title([cached_media], title):
         return None
     return cached_media
 
@@ -2590,8 +2625,8 @@ def build_submission_preview_markup(draft: Dict[str, Any], config: Dict[str, Any
     provider = str(share.get("provider") or "")
     rows: List[List[Dict[str, Any]]] = []
     if provider == "123fastlink" and clean_url.startswith("123FLCPV2$"):
-        # copy_text 按钮文本上限 256 字符；超长的多文件秒传链接改由发布时
-        # 附带的秒传 JSON 文件承载，避免 BUTTON_COPY_TEXT_INVALID。
+        # copy_text 按钮文本上限 256 字符。脚本直投推来的是二级链接种子（单条记录，
+        # 必不超限）；超长的普通秒传链接发不了复制按钮，频道也不再附带秒传 JSON 文件。
         if len(clean_url) <= 256:
             rows.append([{"text": "秒传链接", "copy_text": {"text": clean_url}}])
     elif re.match(r"^https?://", clean_url, re.I):
@@ -2620,8 +2655,8 @@ def build_share_markup_row(draft: Dict[str, Any], config: Dict[str, Any]) -> Opt
     clean_url = str(share.get("cleanUrl") or share.get("url") or "").strip()
     provider = str(share.get("provider") or "")
     if provider == "123fastlink" and clean_url.startswith("123FLCPV2$"):
-        # 同预览键盘：超过 copy_text 256 字符上限的链接不发按钮，
-        # 秒传内容改由随频道消息附带的 JSON 文件承载。
+        # 同预览键盘：超过 copy_text 256 字符上限的链接不发按钮；
+        # 频道不再附带秒传 JSON 文件，秒传内容靠这条复制按钮（二级短链必不超限）。
         if len(clean_url) <= 256:
             return [{"text": "秒传链接", "copy_text": {"text": clean_url}}]
         return None
@@ -3198,6 +3233,10 @@ async def send_submission_seed_documents(bot_token: str, chat_id: Any, draft: Di
     message_ids: List[int] = []
     try:
         for document in normalize_submission_documents(draft.get("documents") or []):
+            # 频道帖不再附带秒传 JSON 文件：秒传内容改由「秒传链接」复制按钮承载。
+            # 这里兜底过滤旧存量草稿，避免重发时又把 JSON 文件挂到频道。
+            if str(document.get("type") or "") == "fastlink_json":
+                continue
             sent = await send_telegram_document(
                 bot_token,
                 chat_id,

@@ -607,7 +607,8 @@ async def handle_admin_fastlink_document(
     text = "\n".join(context_lines)
     if caption.strip():
         text = f"{caption.strip()}\n{text}"
-    # 原始 JSON 挂到草稿：预览不带文件，发布到频道时随消息附上秒传 JSON。
+    # 频道帖不再附带秒传 JSON 文件：秒传内容由草稿/频道帖的「秒传链接」复制按钮承载
+    #（脚本直投推来的二级短链必不超 256 字符按钮上限），草稿不再挂 documents。
     link_dicts = [
         {
             "url": link,
@@ -615,14 +616,6 @@ async def handle_admin_fastlink_document(
             "provider": "123fastlink",
             "title": title if index == 0 else "",
             "sourceText": text,
-            "documents": [
-                {
-                    "type": "fastlink_json",
-                    "fileName": file_name or "123FastLink_Export.123fastlink.json",
-                    "mimeType": "application/json",
-                    "content": content,
-                }
-            ],
         }
         for index, link in enumerate(links)
     ]
@@ -1181,6 +1174,9 @@ class SubmissionLinkItem(BaseModel):
     name: str = ""
     url: str = ""
     password: str = ""
+    # 秒传直投附带的真实文件名/大小上下文（💾 总体积 + 📄 文件名若干），
+    # 识别剧集类型、画质、大小全靠它；分享直投不传此字段
+    sourceText: str = ""
 
 
 class SubmissionSubmitRequest(BaseModel):
@@ -1620,6 +1616,18 @@ async def submit_submission(request: SubmissionSubmitRequest) -> Dict[str, Any]:
             url = str(item.url or "").strip()
             if not url:
                 continue
+            # 秒传直投：123 助手「生成二级链接」推来的是 123FLCPV2$ 秒传链接（短链种子），
+            # 原样入草稿；不能走 normalize_web_share_url（那是给 http 分享链接保留 ?pwd= 的）。
+            if FASTLINK_RE.match(url):
+                link_dicts.append({
+                    "provider": "123fastlink",
+                    "title": str(item.name or "").strip(),
+                    "url": url,
+                    "cleanUrl": url,
+                    "password": "",
+                    "sourceText": str(item.sourceText or "").strip(),
+                })
+                continue
             password = str(item.password or "").strip()
             if not password:
                 try:
@@ -1638,6 +1646,7 @@ async def submit_submission(request: SubmissionSubmitRequest) -> Dict[str, Any]:
             })
         if not link_dicts:
             raise HTTPException(status_code=400, detail="links 里没有有效链接")
+        source_label = "油猴秒传直投" if all(d["provider"] == "123fastlink" for d in link_dicts) else "油猴分享直投"
         source_text = "\n".join(
             "🎬：" + d["title"] + "\n🔗：" + d["url"] for d in link_dicts
         )
@@ -1645,7 +1654,7 @@ async def submit_submission(request: SubmissionSubmitRequest) -> Dict[str, Any]:
             draft_result = await submit_submission_links(
                 store,
                 link_dicts,
-                "油猴分享直投",
+                source_label,
                 source_text=source_text,
                 max_links=10,
                 target_user_id=request.targetUserId,

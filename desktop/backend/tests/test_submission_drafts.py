@@ -28,7 +28,10 @@ from app.submission import (
     send_submission_preview_result,
     share_media_cache_key,
     publish_submission_draft,
+    find_submission_media,
+    inspect_fastlink,
     inspect_web_share,
+    should_use_cached_media,
     submission_publication_identity,
     submission_publication_message_ids,
     build_submission_resource_name,
@@ -277,6 +280,73 @@ class SubmissionDraftTests(unittest.TestCase):
             rows = send_text.await_args.kwargs["reply_markup"]["inline_keyboard"]
             self.assertFalse(any(row[0].get("text") == "秒传链接" for row in rows))
             self.assertTrue(any(row[0].get("text") == "📣 发布到频道" for row in rows))
+
+    def test_media_cache_rejected_when_title_mismatches(self):
+        """TMDB 电影/剧集两套 ID 空间同数字撞库：缓存标题与本次识别标题对不上时必须弃用重新识别。"""
+        cached = {"tmdbId": 272272, "mediaType": "movie", "title": "The Jilting of Granny Weatherall", "year": "1980"}
+        metadata = {"tmdbId": 272272, "mediaType": "tv", "title": "J Music", "year": "2023"}
+        self.assertIsNone(should_use_cached_media(cached, metadata))
+        # 标题对得上照常命中
+        good = {"tmdbId": 272272, "mediaType": "tv", "title": "J Music", "year": "2023"}
+        self.assertEqual(should_use_cached_media(good, metadata), good)
+        # 识别标题缺失时不误伤（维持旧行为）
+        self.assertEqual(should_use_cached_media(cached, {"tmdbId": 272272}), cached)
+
+    def test_find_media_searches_title_when_id_result_mismatches(self):
+        """ID 直查到的片子标题与识别标题对不上（ID 撞库/标记打错）时，补标题搜索让评分裁决。"""
+        async def fake_find(token, language, tmdb_id, media_type):
+            if media_type == "tv":
+                return [{
+                    "tmdbId": 272272, "mediaType": "tv", "title": "The Jilting of Granny Weatherall",
+                    "originalTitle": "", "aliases": [], "year": "1980", "voteAverage": 4.0, "genres": [],
+                }]
+            return []
+
+        async def fake_search(token, language, query, year, media_type, limit=12):
+            assert query == "J Music" and year == "2023"
+            return [{
+                "tmdbId": 345678, "mediaType": "tv", "title": "J Music",
+                "originalTitle": "", "aliases": [], "year": "2023", "voteAverage": 0, "genres": [],
+            }]
+
+        metadata = {"tmdbId": 272272, "mediaType": "tv", "title": "J Music", "year": "2023"}
+        inspection = {"fileNames": ["Season 1/J Music.2023.S01E01.1080p.MyTVSuper.WEB-DL.H265.AAC-ADWeb.mkv"]}
+        with patch("app.tmdb.tmdb_find_by_id", side_effect=fake_find), \
+                patch("app.tmdb.tmdb_search_candidates", side_effect=fake_search):
+            media = asyncio.run(find_submission_media({"tmdbToken": "token"}, metadata, inspection))
+
+        self.assertEqual(media["tmdbId"], 345678)
+        self.assertEqual(media["title"], "J Music")
+        self.assertEqual(media["mediaType"], "tv")
+
+    def test_fastlink_source_context_feeds_inspection(self):
+        """秒传直投上下文：脚本推来的 💾 总体积 + 📄 真实文件名要喂给识别，
+        种子名本身没有画质/大小/集数信息（否则会把种子文件自己当成作品识别）。"""
+        link = {
+            "url": "123FLCPV2$%2AVLL53Urfzyr9I4Cyx2rX#36835#J Music (2023) {tmdb-272272}.123fastlink.json",
+            "cleanUrl": "123FLCPV2$%2AVLL53Urfzyr9I4Cyx2rX#36835#J Music (2023) {tmdb-272272}.123fastlink.json",
+            "provider": "123fastlink",
+            "title": "J Music (2023) {tmdb-272272}",
+            "sourceText": (
+                "🎬：J Music (2023) {tmdb-272272}\n💾：6.1GB\n"
+                "📄：Season 1/J Music.2023.S01E01.1080p.MyTVSuper.WEB-DL.H265.AAC-ADWeb.mkv\n"
+                "📄：Season 1/J Music.2023.S01E02.1080p.MyTVSuper.WEB-DL.H265.AAC-ADWeb.mkv"
+            ),
+        }
+        inspection = inspect_fastlink(link)
+
+        self.assertEqual(inspection["size"], "6.1GB")
+        self.assertEqual(
+            inspection["fileNames"],
+            [
+                "Season 1/J Music.2023.S01E01.1080p.MyTVSuper.WEB-DL.H265.AAC-ADWeb.mkv",
+                "Season 1/J Music.2023.S01E02.1080p.MyTVSuper.WEB-DL.H265.AAC-ADWeb.mkv",
+            ],
+        )
+        # 没有上下文时回退种子名，不至于空手
+        fallback = inspect_fastlink({**link, "sourceText": ""})
+        self.assertIn("J Music (2023)", fallback["title"])
+        self.assertEqual(fallback["size"], "35.97 KB")
 
     def test_submission_resubmitting_same_link_cleans_stale_draft_message(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -958,12 +1028,14 @@ class SubmissionDraftTests(unittest.TestCase):
                 result = asyncio.run(publish_submission_draft(store, "telegram-token", config, draft))
 
             self.assertTrue(result["ok"])
-            self.assertEqual(result["seedMessageIds"], [100])
-            self.assertEqual(send_document.await_args.kwargs["reply_to_message_id"], 99)
+            # 频道帖不再附带秒传 JSON 文件：fastlink 草稿的 documents 被跳过，
+            # 秒传内容由「秒传链接」复制按钮承载；旧帖清理与发布记录照常
+            self.assertEqual(result["seedMessageIds"], [])
+            send_document.assert_not_called()
             self.assertEqual(deleted, [{"chat_id": "-1002", "message_id": 51}, {"chat_id": "-1002", "message_id": 50}])
             publications = store.find_submission_publications("-1002", identity["identityKey"], 0)
             self.assertEqual([item["messageId"] for item in publications], [99])
-            self.assertEqual(publications[0]["seedMessageIds"], [100])
+            self.assertEqual(publications[0]["seedMessageIds"], [])
 
 
 class TelethonPublishButtonsTests(unittest.TestCase):
