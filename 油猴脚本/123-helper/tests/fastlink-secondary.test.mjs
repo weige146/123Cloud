@@ -27,6 +27,7 @@ globalThis.__fastlink = {
   buildFastlinkText, buildFastlinkJson, parseFastlink,
   generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile,
   resolveAndImportFastlink, isSeedLikeName,
+  buildFastlinkSubmissionContext,
   normalizeSeedFolderId, readTableSelectionRecords
 };
 `;
@@ -40,7 +41,7 @@ sandbox.window = {};
 sandbox.document = { querySelectorAll: () => [], getElementById: () => null };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag, buildFastlinkText, buildFastlinkJson, parseFastlink, generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile, resolveAndImportFastlink, isSeedLikeName, normalizeSeedFolderId, readTableSelectionRecords } = sandbox.__fastlink;
+const { md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag, buildFastlinkText, buildFastlinkJson, parseFastlink, generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile, resolveAndImportFastlink, isSeedLikeName, buildFastlinkSubmissionContext, normalizeSeedFolderId, readTableSelectionRecords } = sandbox.__fastlink;
 
 const cases = [];
 const test = (name, fn) => cases.push([name, fn]);
@@ -275,6 +276,52 @@ test("自动识别：单文件种子名走二级还原，普通内容直接转�
   const plainLink = `123FLCPV2$%${hexToBase62(md5("电影本体"))}#123#Movie.2026.1080p.mkv`;
   await resolveAndImportFastlink(api, plainLink, "7", { concurrency: 2 });
   assert.deepEqual(calls.transferred, ["Movie.2026.1080p.mkv"]);
+});
+
+// ---------- 秒传直投识别上下文（buildFastlinkSubmissionContext） ----------
+test("直投上下文：标准 JSON 抽真实文件名与 totalSize", () => {
+  const json = JSON.stringify({
+    commonPath: "J Music (2023) {tmdb-272272}/",
+    totalFilesCount: 2,
+    totalSize: 6547244819,
+    usesBase62EtagsInExport: true,
+    files: [
+      { path: "Season 1/J Music.2023.S01E01.1080p.MyTVSuper.WEB-DL.H26.AAC-ADWeb.mkv", fileName: "J Music.2023.S01E01.1080p.MyTVSuper.WEB-DL.H26.AAC-ADWeb.mkv", etag: md5("e1"), size: 3666910245 },
+      { path: "Season 1/J Music.2023.S01E02.1080p.MyTVSuper.WEB-DL.H26.AAC-ADWeb.mkv", fileName: "J Music.2023.S01E02.1080p.MyTVSuper.WEB-DL.H26.AAC-ADWeb.mkv", etag: md5("e2"), size: 2880334574 }
+    ]
+  });
+  const context = buildFastlinkSubmissionContext("J Music (2023) {tmdb-272272}", json);
+  const lines = context.split("\n");
+  assert.equal(lines[0], "🎬：J Music (2023) {tmdb-272272}");
+  assert.match(lines[1], /^💾：6\.\d+ GB$/);
+  assert.ok(lines.includes("📄：Season 1/J Music.2023.S01E01.1080p.MyTVSuper.WEB-DL.H26.AAC-ADWeb.mkv"));
+  assert.ok(lines.includes("📄：Season 1/J Music.2023.S01E02.1080p.MyTVSuper.WEB-DL.H26.AAC-ADWeb.mkv"));
+  assert.equal(lines.length, 4, "path 与 fileName 不应重复出现");
+});
+
+test("直投上下文：V2 链接文本按 $/# 抽路径与体积", () => {
+  const text = buildFastlinkText([
+    { name: "剧名", etag: md5("e1"), size: 100, path: "Season 1/第01集.mkv" },
+    { name: "剧名", etag: md5("e2"), size: 250, path: "Season 1/第02集.mkv" }
+  ]);
+  const context = buildFastlinkSubmissionContext("剧名 (2026)", text);
+  const lines = context.split("\n");
+  assert.equal(lines[0], "🎬：剧名 (2026)");
+  assert.match(lines[1], /^💾：350 B$/);
+  // buildFastlinkText 会把公共前缀提为 commonPath，条目里只剩文件名
+  assert.ok(lines.includes("📄：第01集.mkv"));
+  assert.ok(lines.includes("📄：第02集.mkv"));
+});
+
+test("直投上下文：文件名封顶 100 条，空内容返回空串", () => {
+  const files = Array.from({ length: 130 }, (_, index) => ({ name: `f${index}`, etag: md5(`e${index}`), size: 1, path: `第${index}集.mkv` }));
+  const context = buildFastlinkSubmissionContext("剧名", buildFastlinkText(files));
+  const nameLines = context.split("\n").filter((line) => line.startsWith("📄："));
+  assert.equal(nameLines.length, 100);
+
+  assert.equal(buildFastlinkSubmissionContext("剧名", ""), "");
+  // 只有种子记录、没有路径字段时也返回空串（回退旧文案，不带误导上下文）
+  assert.equal(buildFastlinkSubmissionContext("剧名", "123FLCPV2$%abc#1#"), "");
 });
 
 let failed = 0;

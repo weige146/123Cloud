@@ -6550,7 +6550,8 @@
         "BluRay.1080p.Remux 这种写法现在能认出是蓝光原盘（Remux）；NF@ADWeb 这类「片源@发布组」会拆开记：片源 NF、发布组 ADWeb",
         "按名字搜不到候选时自动换综合搜索（电影+剧集一起搜），你手动查询输错类型、或脚本认错类型都不再空手而归；搜不到也会提示换词或填 TMDB ID",
         "18+ 影视按名字也能搜到了（之前 TMDB 默认不给结果，只能填 ID）",
-        "全40集/共12集这类写法的剧不再被误认成电影"
+        "全40集/共12集这类写法的剧不再被误认成电影",
+        "秒传工具箱点「生成二级链接（短链）」后，会自动把短链推送给客户端生成投稿草稿（和分享链接直投一样），不用再手动复制粘贴；投稿走短链，频道帖带「秒传链接」复制按钮，不再附带秒传 JSON 文件"
       ]
     },
     {
@@ -9128,6 +9129,43 @@
     const fileName = `${base}.123fastlink.${artifact.link ? "txt" : "json"}`;
     const seed = await api.uploadTextFile(fileName, content, parentId, options.signal);
     return { ...seed, fileName };
+  }
+  // 二级链接直投投稿时随链接带给客户端的识别上下文：从种子内容里抽真实文件名（前 100 条）
+  // 与总体积，客户端识别剧集/电影、画质、大小才有据可依（对齐旧「JSON 文件发机器人」流程
+  // 的素材；种子名本身没有这些信息，会被当成种子文件自己识别）。轻量正则抽取，不整包 JSON.parse。
+  function buildFastlinkSubmissionContext(name, text) {
+    const content = String(text || "");
+    if (!content) return "";
+    const title = String(name || "").trim();
+    const lines = title ? [`\u{1F3AC}\uFF1A${title}`] : [];
+    const names = [];
+    let totalSize = 0;
+    if (/^\s*\{/.test(content)) {
+      const headerTotal = Number((content.match(/"totalSize"\s*:\s*(\d+)/) || [])[1]);
+      if (Number.isSafeInteger(headerTotal) && headerTotal > 0) totalSize = headerTotal;
+      const pathRe = /"path"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+      let match = null;
+      while ((match = pathRe.exec(content)) && names.length < 100) {
+        if (match[1]) names.push(match[1]);
+      }
+      if (totalSize <= 0) {
+        const sizeRe = /"size"\s*:\s*(\d+)/g;
+        while ((match = sizeRe.exec(content))) totalSize += Number(match[1]) || 0;
+      }
+    } else {
+      for (const chunk of content.replace(/^123FLCPV2\$%?/i, "").split("$")) {
+        const parts = chunk.split("#");
+        if (parts.length < 3) continue;
+        const size = Number(parts[1]);
+        if (Number.isSafeInteger(size) && size > 0) totalSize += size;
+        const path = parts.slice(2).join("#");
+        if (path && names.length < 100) names.push(path);
+      }
+    }
+    if (!names.length) return "";
+    if (totalSize > 0) lines.push(`\u{1F4BE}\uFF1A${formatBytes(totalSize)}`);
+    for (const item of names) lines.push(`\u{1F4C4}\uFF1A${item}`);
+    return lines.join("\n");
   }
 
   // src/public-share-cleanup.js
@@ -22110,7 +22148,8 @@ ${end.comment}` : end.comment;
             method: "POST",
             // 结构化直投：链接数组直接给客户端后端扫成草稿（跳过归属判断，快一倍）；
             // 老后端不认识 links 字段时会返回 400，此时回退拼接文本形式。
-            body: { links: batch.map((item) => ({ name: item.name || "", url: item.url || "" })) },
+            // sourceText：秒传直投附带的真实文件名/大小上下文（分享直投没有此字段）
+            body: { links: batch.map((item) => ({ name: item.name || "", url: item.url || "", ...(item.sourceText ? { sourceText: String(item.sourceText) } : {}) })) },
             signal: options.signal,
             timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS
           }).catch(async (error) => {
@@ -22317,7 +22356,7 @@ ${end.comment}` : end.comment;
     const exportRows = state.items.map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${Number(item.type) === 1 ? "\u6587\u4EF6\u5939\uFF08\u9012\u5F52\uFF09" : "\u6587\u4EF6"}</td></tr>`).join("");
     const artifactCards = state.artifacts.slice(0, 30);
     const generatedLinks = state.artifacts.length ? `<div class="fastlink-results">${artifactCards.map((artifact, index) => `<section class="fastlink-result-card"><div><strong>${escapeHtml(artifact.item?.name || artifact.filename || `第 ${index + 1} 份`)}</strong><span>${artifact.fileCount} 个文件</span></div><textarea readonly aria-label="${escapeHtml(artifact.item?.name || artifact.filename || `第 ${index + 1} 份`)} 秒传链接">${escapeHtml(artifact.link || "")}</textarea><button class="button" data-action="fastlink-copy-link" data-index="${index}">${icon("copy", 15)}复制链接</button></section>`).join("")}</div>${state.artifacts.length > artifactCards.length ? `<span class="footer-note">链接仅回显前 ${artifactCards.length} 份（共 ${state.artifacts.length} 份），其余文件已下载到本地，不逐条塞进页面。</span>` : ""}` : "";
-    const exportPane = state.items.length ? `${notice("\u6BCF\u4E2A\u9876\u5C42\u9879\u76EE\u4F1A\u5206\u522B\u751F\u6210\u9879\u76EE\u683C\u5F0F\u7684 JSON \u4E0E 123FLCPV2 \u94FE\u63A5\uFF0C\u5BFC\u51FA\u4E0D\u4F1A\u4FEE\u6539\u6E90\u6587\u4EF6\u3002", "", "download")}<div class="table-wrap"><table><thead><tr><th>\u9876\u5C42\u9879\u76EE</th><th>\u8303\u56F4</th></tr></thead><tbody>${exportRows}</tbody></table></div><div class="button-row"><button class="button" data-action="fastlink-secondary-generate">${icon("link", 15)}\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\uFF08\u77ED\u94FE\uFF09</button><button class="button" data-action="fastlink-secondary-save-link">${icon("download", 15)}\u628A\u5DF2\u751F\u6210\u94FE\u63A5\u4FDD\u5B58\u5230\u4E91\u76D8</button></div>${state.artifacts.length ? `${notice(`\u5DF2\u5BFC\u51FA ${state.artifacts.length} \u4E2A\u79D2\u4F20\u6587\u4EF6\uFF0C\u5171\u5305\u542B ${state.fileCount} \u4E2A\u4E91\u76D8\u6587\u4EF6\u3002`, "success", "check")}${generatedLinks}` : ""}` : notice("\u5BFC\u51FA\u9700\u8981\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u4E00\u4E2A\u6216\u591A\u4E2A\u6587\u4EF6\u3001\u6587\u4EF6\u5939\u3002", "warning", "alert");
+    const exportPane = state.items.length ? `${notice("\u6BCF\u4E2A\u9876\u5C42\u9879\u76EE\u4F1A\u5206\u522B\u751F\u6210\u9879\u76EE\u683C\u5F0F\u7684 JSON \u4E0E 123FLCPV2 \u94FE\u63A5\uFF0C\u5BFC\u51FA\u4E0D\u4F1A\u4FEE\u6539\u6E90\u6587\u4EF6\u3002\u70B9\u300C\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\uFF08\u77ED\u94FE\uFF09\u300D\u6210\u529F\u540E\u4F1A\u81EA\u52A8\u628A\u77ED\u94FE\u63A8\u9001\u5230\u5BA2\u6237\u7AEF\u751F\u6210\u6295\u7A3F\u8349\u7A3F\u3002", "", "download")}<div class="table-wrap"><table><thead><tr><th>\u9876\u5C42\u9879\u76EE</th><th>\u8303\u56F4</th></tr></thead><tbody>${exportRows}</tbody></table></div><div class="button-row"><button class="button" data-action="fastlink-secondary-generate">${icon("link", 15)}\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\uFF08\u77ED\u94FE\uFF09</button><button class="button" data-action="fastlink-secondary-save-link">${icon("download", 15)}\u628A\u5DF2\u751F\u6210\u94FE\u63A5\u4FDD\u5B58\u5230\u4E91\u76D8</button></div>${state.artifacts.length ? `${notice(`\u5DF2\u5BFC\u51FA ${state.artifacts.length} \u4E2A\u79D2\u4F20\u6587\u4EF6\uFF0C\u5171\u5305\u542B ${state.fileCount} \u4E2A\u4E91\u76D8\u6587\u4EF6\u3002`, "success", "check")}${generatedLinks}` : ""}` : notice("\u5BFC\u51FA\u9700\u8981\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u4E00\u4E2A\u6216\u591A\u4E2A\u6587\u4EF6\u3001\u6587\u4EF6\u5939\u3002", "warning", "alert");
     const importPane = `${notice("\u652F\u6301 123FastLink JSON\u3001V1/V2 \u79D2\u4F20\u6587\u672C\u3001.123share \u4E0E\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE\uFF08\u81EA\u52A8\u8BC6\u522B\uFF09\uFF1B\u6587\u4EF6\u4F1A\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55\u5E76\u4FDD\u7559\u539F\u76EE\u5F55\u7ED3\u6784\u3002", "", "import")}<div class="button-row"><button class="button" data-action="fastlink-secondary-from-file">${icon("folderOpen", 15)}\u4ECE\u52FE\u9009\u7684\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58</button><button class="button" data-action="fastlink-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u672C\u5730\u79D2\u4F20\u6587\u4EF6</button></div><span class="footer-note">${state.importFile ? `\u5DF2\u9009\u62E9\uFF1A${escapeHtml(state.importFileName || "")}\uFF08${formatBytes(state.importFileSize)}\uFF09\u00B7 \u70B9\u300C\u5F00\u59CB\u8F6C\u5B58\u300D\u65F6\u6D41\u5F0F\u8BFB\u53D6\uFF0C\u4E0D\u6574\u8BFB\u8FDB\u5185\u5B58` : escapeHtml(state.importFileName || "\u672A\u9009\u62E9\u672C\u5730\u6587\u4EF6")}</span>${state.importFile ? `<button class="button compact" data-action="fastlink-import-file-clear">\u6E05\u9664\u6587\u4EF6</button>` : ""}<input id="fastlink-file" type="file" accept=".json,.txt,.123fastlink,.123share,application/json,text/plain" hidden>${state.input && state.input.length > 2000000 ? `<span class="footer-note">\u7C98\u8D34\u5185\u5BB9\u8F83\u5927\uFF08${formatBytes(stringByteSize(state.input))}\uFF09\uFF0C\u5DF2\u4FDD\u7559\u4F46\u4E0D\u56DE\u663E\uFF0C\u53EF\u76F4\u63A5\u5F00\u59CB\u8F6C\u5B58</span>` : ""}<div class="editor-surface"><textarea id="fastlink-input" placeholder="\u7C98\u8D34\u79D2\u4F20 JSON\u3001\u94FE\u63A5\u3001.123share \u6216\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE">${state.input && state.input.length > 2000000 ? "" : escapeHtml(state.input || "")}</textarea></div>`;
     const publicPane = `${notice("\u8F93\u5165 123 \u4E91\u76D8\u5206\u4EAB\u94FE\u63A5\uFF0C\u9012\u5F52\u8BFB\u53D6\u5176\u4E2D\u7684\u6587\u4EF6\u5E76\u4E0B\u8F7D\u53EF\u76F4\u63A5\u8F6C\u5B58\u7684\u6807\u51C6 JSON\uFF1B\u540C\u65F6\u4FDD\u7559 123FLCPV2 \u94FE\u63A5\u4F9B\u590D\u5236\u3002", "", "share")}<label class="field"><span>\u5206\u4EAB\u94FE\u63A5 / Key</span><input id="fastlink-public-input" value="${escapeHtml(state.publicInput || "")}" placeholder="\u652F\u6301 www.123865.com/s/... \u4E0E share.123pan.cn/123pan/..."></label><label class="field"><span>\u63D0\u53D6\u7801\uFF08\u53EF\u9009\uFF0C\u94FE\u63A5\u5DF2\u5305\u542B\u65F6\u65E0\u9700\u586B\u5199\uFF09</span><input id="fastlink-public-password" value="${escapeHtml(state.publicPassword || "")}"></label>`;
     const batchPane = `${notice("\u6BCF\u884C\u4E00\u4E2A\u5206\u4EAB\u94FE\u63A5\u3001Key \u6216\u5E26\u63D0\u53D6\u7801\u7684\u6587\u672C\uFF1B\u6BCF\u4E2A\u5206\u4EAB\u4F1A\u72EC\u7ACB\u4E0B\u8F7D\u4E00\u4E2A\u6807\u51C6 JSON\u3002", "", "share")}<div class="editor-surface"><textarea id="fastlink-public-batch" placeholder="https://www.123865.com/s/xxxx?pwd=ABCD&#10;xxxx \u63D0\u53D6\u7801:ABCD">${escapeHtml(state.publicBatch || "")}</textarea></div>`;
@@ -25361,13 +25400,40 @@ ${end.comment}` : end.comment;
         const artifact = outcome.result;
         this.fastlink.artifacts = [artifact];
         this.fastlink.fileCount = artifact.fileCount;
-        if (this.completeFastlinkTask(outcome.task, artifact)) return;
-        this.toast("\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210\uFF0C\u53EF\u590D\u5236\u6216\u76F4\u63A5\u5206\u4EAB", "success");
+        // 生成成功即自动直投：二级短链推给客户端生成投稿草稿（与分享直投同一接口）。
+        // 只推短链种子（单条记录，必不超 TG「秒传链接」复制按钮 256 字符上限），
+        // 频道帖靠复制按钮取内容，不再附带秒传 JSON 文件。
+        const pushNote = await this.pushFastlinkSubmissionDraft(artifact);
+        if (this.completeFastlinkTask(outcome.task, artifact)) {
+          if (pushNote) this.toast(pushNote, "warning");
+          return;
+        }
+        this.toast(pushNote || "二级秒传链接已生成，投稿草稿已推送", pushNote ? "warning" : "success");
         this.syncFastlinkCheckpointSummary();
         this.render();
       } catch (error) {
         if (this.offerFastlinkSalvage("secondaryExport", error)) return;
         throw error;
+      }
+    }
+    // 二级链接生成后自动直投客户端生成投稿草稿：和分享链接直投走同一接口、同一响应校验。
+    // 推送失败只提示、不影响已生成的链接；返回空字符串表示推送成功。
+    async pushFastlinkSubmissionDraft(artifact) {
+      const link = String(artifact?.link || "").trim();
+      if (!link) return "";
+      const submissionUrl = String(this.config.share?.submissionUrl || "").trim();
+      if (!submissionUrl) return "还没配置投稿地址，本次只生成了链接（设置 → 分享与秒传 → 投稿地址）";
+      const name = String(artifact.item?.name || artifact.filename || "秒传分享").replace(/\.123fastlink\.(?:json|txt)$/i, "").trim() || "秒传分享";
+      try {
+        // 带上种子内容里抽出的真实文件名/总体积（前 100 条）：
+        // 客户端识别剧集类型、画质、真实大小全靠这些，种子名里没有
+        const sourceText = buildFastlinkSubmissionContext(name, artifact?.text);
+        const results = await this.submissionClient.submitShares(submissionUrl, [{ name, url: link, sourceText }]);
+        const failed = results.find((item) => item.status === "failed");
+        return failed ? `投稿草稿推送失败：${failed.message || "客户端没有返回结果"}` : "";
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        return `投稿草稿推送失败：${error instanceof Error ? error.message : String(error)}`;
       }
     }
     async restoreFastlinkFromCloudFile() {
