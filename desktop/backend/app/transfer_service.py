@@ -13,6 +13,7 @@ import math
 import os
 import re
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 from uuid import uuid4
@@ -103,6 +104,9 @@ PAN115_ACCOUNT_COOLDOWN_MS = _normalize_non_negative_ms(
 )
 # 全局 123 离线提交并发闸门，避免多任务同时提交撞"同时下载超出最大限制"
 TRANSFER_OFFLINE_SUBMIT_CONCURRENCY = max(1, int(os.environ.get("TRANSFER_OFFLINE_SUBMIT_CONCURRENCY", "3")))
+# 全局 123 离线提交最小间隔：提交太快会撞"操作频繁，请慢一点"风控，
+# 跨任务串行排队，两次提交之间至少隔这么久
+TRANSFER_OFFLINE_SUBMIT_SPACING_MS = max(0, int(os.environ.get("TRANSFER_OFFLINE_SUBMIT_SPACING_MS", "2000")))
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +148,62 @@ class TransferService:
         self._account_health: Dict[str, Dict[str, Any]] = {}
         # Python 3.9 下在无事件循环时创建 Semaphore 会踩 get_event_loop 的坑，推迟到协程里创建
         self._offline_submit_semaphore: Optional[asyncio.Semaphore] = None
+        # 123 离线提交全局节拍：两次提交之间至少隔 TRANSFER_OFFLINE_SUBMIT_SPACING_MS
+        self._offline_submit_pace_lock: Optional[asyncio.Lock] = None
+        self._offline_submit_next_ok_ms = 0.0
+        # 「同时在 123 排队的离线任务」全局名额池：跨搬运任务共享（上限=后台"并发"配置）
+        self._offline_slots_condition: Optional[asyncio.Condition] = None
+        self._offline_slots_used = 0
 
     def _get_offline_submit_semaphore(self) -> asyncio.Semaphore:
         if self._offline_submit_semaphore is None:
             self._offline_submit_semaphore = asyncio.Semaphore(TRANSFER_OFFLINE_SUBMIT_CONCURRENCY)
         return self._offline_submit_semaphore
+
+    def _get_offline_slots_condition(self) -> asyncio.Condition:
+        if self._offline_slots_condition is None:
+            self._offline_slots_condition = asyncio.Condition()
+        return self._offline_slots_condition
+
+    @asynccontextmanager
+    async def offline_submit_pacing(self):
+        """123 离线提交全局节拍：两次提交之间至少隔 TRANSFER_OFFLINE_SUBMIT_SPACING_MS。
+
+        并发闸只限制同时在飞的请求数，不管间隔；间隔太短会撞 123 的
+        "操作频繁，请慢一点"风控。这里跨任务串行排队，把提交节奏拉开。
+        """
+        if self._offline_submit_pace_lock is None:
+            self._offline_submit_pace_lock = asyncio.Lock()
+        async with self._offline_submit_pace_lock:
+            wait_ms = self._offline_submit_next_ok_ms - time.monotonic() * 1000
+            if wait_ms > 0:
+                await asyncio.sleep(wait_ms / 1000)
+            self._offline_submit_next_ok_ms = time.monotonic() * 1000 + TRANSFER_OFFLINE_SUBMIT_SPACING_MS
+            yield
+
+    async def acquire_offline_slot(self) -> None:
+        """占一个「同时在 123 排队的离线任务」全局名额。
+
+        上限 = 后台"并发"配置（_max_offline_slots），跨搬运任务共享：123 的
+        离线数量限制按账号算，两个任务各提交 5 个就超了用户配置的并发上限。
+        等待时除名额释放外还按 1 秒兜底轮询，改大"并发"配置后最多 1 秒生效。
+        """
+        while True:
+            limit = self._max_offline_slots(await self._get_transfer_config())
+            async with self._get_offline_slots_condition():
+                if self._offline_slots_used < limit:
+                    self._offline_slots_used += 1
+                    return
+                try:
+                    await asyncio.wait_for(self._get_offline_slots_condition().wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+
+    async def release_offline_slot(self) -> None:
+        async with self._get_offline_slots_condition():
+            if self._offline_slots_used > 0:
+                self._offline_slots_used -= 1
+                self._get_offline_slots_condition().notify_all()
 
     def set_notifier(self, notifier: Optional[TransferNotifier]) -> None:
         """搬运终态（成功/失败/部分失败）通知。"""

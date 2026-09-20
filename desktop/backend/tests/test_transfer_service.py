@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -397,6 +399,17 @@ class TransferServiceTests(unittest.TestCase):
 
             def _get_offline_submit_semaphore(self):
                 return asyncio.Semaphore(3)
+
+            async def acquire_offline_slot(self):
+                self.offline_slots_in_use = getattr(self, "offline_slots_in_use", 0) + 1
+                self.offline_slots_peak = max(getattr(self, "offline_slots_peak", 0), self.offline_slots_in_use)
+
+            async def release_offline_slot(self):
+                self.offline_slots_in_use = getattr(self, "offline_slots_in_use", 1) - 1
+
+            @asynccontextmanager
+            async def offline_submit_pacing(self):
+                yield
 
             async def _inspect_pan115_share(self, task, link, accounts, fallback_cookie):
                 return {"accountIndex": 0, "inspection": {"title": "Demo", "files": files}}
@@ -1050,6 +1063,73 @@ class TransferServiceTests(unittest.TestCase):
         async def run() -> None:
             await run_case("episode.mkv", True)
             await run_case("renamed-by-123.mkv", False)
+
+        asyncio.run(run())
+
+
+class OfflineGlobalGateTests(unittest.TestCase):
+    """离线全局名额池与提交节拍：123 的离线数量限制按账号算，"并发"上限必须跨任务共享；
+    提交间隔太短会撞"操作频繁，请慢一点"风控，全局节拍把提交拉开。"""
+
+    def _make_service(self, concurrency):
+        directory = tempfile.mkdtemp()
+        store = SessionStore(Path(directory))
+        store.write_config({"transfer": {"concurrency": concurrency}})
+        return TransferService(store)
+
+    def test_global_slot_pool_blocks_until_release(self):
+        async def run():
+            service = self._make_service(concurrency=1)
+            await service.acquire_offline_slot()
+            self.assertEqual(service._offline_slots_used, 1)
+
+            second = asyncio.create_task(service.acquire_offline_slot())
+            try:
+                await asyncio.wait_for(asyncio.shield(second), timeout=0.05)
+                self.fail("并发上限 1 时第二个名额不应立刻拿到")
+            except asyncio.TimeoutError:
+                pass
+
+            await service.release_offline_slot()
+            await asyncio.wait_for(second, timeout=1)
+            self.assertEqual(service._offline_slots_used, 1, "释放后等待者应拿到名额")
+            await service.release_offline_slot()
+            self.assertEqual(service._offline_slots_used, 0)
+
+        asyncio.run(run())
+
+    def test_global_slot_pool_re_reads_config_after_wait(self):
+        """等名额期间把"并发"调大：唤醒后按新上限放行，无需重启。"""
+        async def run():
+            with tempfile.TemporaryDirectory() as directory:
+                store = SessionStore(Path(directory))
+                store.write_config({"transfer": {"concurrency": 1}})
+                service = TransferService(store)
+
+                await service.acquire_offline_slot()
+                second = asyncio.create_task(service.acquire_offline_slot())
+                await asyncio.sleep(0.05)
+                self.assertFalse(second.done())
+
+                store.write_config({"transfer": {"concurrency": 2}})
+                await asyncio.wait_for(second, timeout=3)
+                self.assertEqual(service._offline_slots_used, 2)
+
+        asyncio.run(run())
+
+    def test_offline_submit_pacing_spaces_submissions(self):
+        from app import transfer_service as transfer_service_module
+
+        async def run():
+            service = self._make_service(concurrency=1)
+            with patch.object(transfer_service_module, "TRANSFER_OFFLINE_SUBMIT_SPACING_MS", 150):
+                start = time.monotonic()
+                async with service.offline_submit_pacing():
+                    pass
+                async with service.offline_submit_pacing():
+                    pass
+                elapsed = time.monotonic() - start
+            self.assertGreaterEqual(elapsed, 0.13, "两次提交之间应至少隔一个节拍间隔")
 
         asyncio.run(run())
 

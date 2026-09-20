@@ -83,5 +83,61 @@ class OfflineWaitLoggingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pipeline.service.saved, 1)
 
 
+class _SlotCountingService(_FakeService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.released = 0
+
+    async def release_offline_slot(self):
+        self.released += 1
+
+
+class OfflineSlotBookkeepingTest(unittest.IsolatedAsyncioTestCase):
+    """全局离线名额的簿记：到终态（完成/失败）或任务退出时要归还，没占名额不能多还。"""
+
+    async def test_mark_failed_releases_held_slot(self):
+        pipeline = _FakePipeline()
+        service = _SlotCountingService()
+        pipeline.service = service
+        manager = _QuietManager(pipeline)
+        item = tp.OfflineItem({"name": "a.mkv", "size": 10, "method": "offline"}, "123", "0")
+        item.slot_held = True
+        manager.items.append(item)
+
+        await manager._mark_failed(item, "测试失败")
+
+        self.assertTrue(item.failed)
+        self.assertFalse(item.slot_held)
+        self.assertEqual(service.released, 1)
+
+    async def test_mark_failed_without_slot_does_not_release(self):
+        pipeline = _FakePipeline()
+        service = _SlotCountingService()
+        pipeline.service = service
+        manager = _QuietManager(pipeline)
+        item = tp.OfflineItem({"name": "a.mkv", "size": 10, "method": "offline"}, "123", "0")
+        manager.items.append(item)
+
+        await manager._mark_failed(item, "测试失败")
+
+        self.assertEqual(service.released, 0, "没占名额不应多还")
+
+    async def test_release_all_slots_only_releases_held(self):
+        pipeline = _FakePipeline()
+        service = _SlotCountingService()
+        pipeline.service = service
+        manager = _QuietManager(pipeline)
+        held = tp.OfflineItem({"name": "held.mkv", "size": 10}, "123", "0")
+        held.slot_held = True
+        pending = tp.OfflineItem({"name": "pending.mkv", "size": 10}, "123", "0")
+        manager.items.extend([held, pending])
+
+        await manager.release_all_slots()
+
+        self.assertEqual(service.released, 1)
+        self.assertFalse(held.slot_held)
+        self.assertFalse(pending.slot_held)
+
+
 if __name__ == "__main__":
     unittest.main()

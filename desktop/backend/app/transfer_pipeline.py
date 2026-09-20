@@ -425,6 +425,8 @@ class OfflineItem:
         self.failed = False
         # submitted=False 表示还在排队等空位，未真正提交到 123
         self.submitted = False
+        # 是否占着一个「同时在 123 排队」的全局名额（提交前占位，终态归还）
+        self.slot_held = False
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +468,21 @@ class OfflineDownloadManager:
             item = self.pending.pop(0)
             await self.submit(item)
 
+    async def _release_slot(self, item: OfflineItem) -> None:
+        """归还全局离线名额（文件到终态或任务退出时；重复调用安全）。"""
+        if not item.slot_held:
+            return
+        item.slot_held = False
+        try:
+            await self.pipeline.service.release_offline_slot()
+        except Exception:
+            pass
+
+    async def release_all_slots(self) -> None:
+        """任务退出（含取消/异常）时归还所有全局离线名额，防止泄漏。"""
+        for item in self.items:
+            await self._release_slot(item)
+
     # ------------------------------------------------------------------
     # 阶段 4：提交
     # ------------------------------------------------------------------
@@ -504,6 +521,10 @@ class OfflineDownloadManager:
             if not await service._save_transfer_task(task):
                 raise TaskCancelled()
 
+            # 占全局「同时在 123 排队」名额（跨任务共享）：123 的离线数量限制按账号算，
+            # 两个任务各交 5 个就超了用户配置的并发上限。提交失败在下方 except 里归还。
+            await service.acquire_offline_slot()
+            item.slot_held = True
             offline_task_id = await self._create_with_backoff(file, download_url)
             file["offlineTaskId"] = offline_task_id
             file["offlineStatus"] = "running"
@@ -531,6 +552,7 @@ class OfflineDownloadManager:
             file["error"] = str(error)
             file["finishedAt"] = _utc_now_iso()
             item.failed = True
+            await self._release_slot(item)
             _add_task_log(task, "error", f"离线提交失败：{display}（{error}）")
 
     async def _create_with_backoff(self, file: Dict[str, Any], download_url: str) -> int:
@@ -541,7 +563,8 @@ class OfflineDownloadManager:
             target_dir_id = str(file.get("targetDirId") or "")
             try:
                 async with self.pipeline.service._get_offline_submit_semaphore():
-                    return await pan123.create_offline_download(download_url, target_dir_id, submit_name)
+                    async with self.pipeline.service.offline_submit_pacing():
+                        return await pan123.create_offline_download(download_url, target_dir_id, submit_name)
             except TaskCancelled:
                 raise
             except Exception as error:
@@ -550,7 +573,8 @@ class OfflineDownloadManager:
                     await self.pipeline.refresh_target_dir(file)
                     refreshed_dir = str(file.get("targetDirId") or "")
                     async with self.pipeline.service._get_offline_submit_semaphore():
-                        return await pan123.create_offline_download(download_url, refreshed_dir, submit_name)
+                        async with self.pipeline.service.offline_submit_pacing():
+                            return await pan123.create_offline_download(download_url, refreshed_dir, submit_name)
                 last_error = error
                 if attempt >= len(OFFLINE_SUBMIT_BACKOFF_MS):
                     break
@@ -610,7 +634,7 @@ class OfflineDownloadManager:
                 if not created:
                     suspicious = await self._find_suspicious_artifact(item)
                     if suspicious:
-                        self._mark_failed(item, f"123 离线落盘了疑似错误页文件，已移入回收站：{suspicious}")
+                        await self._mark_failed(item, f"123 离线落盘了疑似错误页文件，已移入回收站：{suspicious}")
                         progressed = True
                         continue
                     created = await self.pipeline.recover_offline_file(
@@ -646,7 +670,7 @@ class OfflineDownloadManager:
                     progressed = True
                     continue
                 if offline_status == "done":
-                    self._mark_failed(
+                    await self._mark_failed(
                         item,
                         "123 离线任务显示下载完成，但目标目录里一直没有出现对应文件（可能落在了别的目录）。"
                         "请到 123 网页版找到该文件移动到目标目录，重新运行任务即可自动认领",
@@ -665,14 +689,15 @@ class OfflineDownloadManager:
                     try:
                         download_url = await self._renew_source_url(item)
                         async with service._get_offline_submit_semaphore():
-                            new_task_id = await pan123.create_offline_download(
-                                download_url, item.target_dir_id,
-                                file.get("offlineSubmitName") or file["name"],
-                            )
+                            async with service.offline_submit_pacing():
+                                new_task_id = await pan123.create_offline_download(
+                                    download_url, item.target_dir_id,
+                                    file.get("offlineSubmitName") or file["name"],
+                                )
                     except TaskCancelled:
                         raise
                     except Exception as submit_error:
-                        self._mark_failed(item, f"超时后重新提交失败：{submit_error}")
+                        await self._mark_failed(item, f"超时后重新提交失败：{submit_error}")
                         progressed = True
                         continue
                     file["offlineTaskId"] = new_task_id
@@ -683,7 +708,7 @@ class OfflineDownloadManager:
                     await service._save_transfer_task(task)
                     progressed = True
                 else:
-                    self._mark_failed(
+                    await self._mark_failed(
                         item,
                         f"等待 123 离线完成超时（已自动重新提交 {resubmits} 次）",
                     )
@@ -772,8 +797,9 @@ class OfflineDownloadManager:
         if deletion_task:
             task.setdefault("_pendingPan115Deletions", []).append(deletion_task)
         item.done = True
+        await self._release_slot(item)
 
-    def _mark_failed(self, item: OfflineItem, reason: str) -> None:
+    async def _mark_failed(self, item: OfflineItem, reason: str) -> None:
         file = item.file
         file["status"] = "failed"
         if file.get("method") == "offline":
@@ -783,6 +809,7 @@ class OfflineDownloadManager:
         file["finishedAt"] = _utc_now_iso()
         _add_task_log(self.pipeline.task, "error", f"下载失败：{_display_path(file)}（{reason}）")
         item.failed = True
+        await self._release_slot(item)
 
     async def _rename_if_needed(self, item: OfflineItem, found: Dict[str, Any]) -> Dict[str, Any]:
         file = item.file
@@ -873,8 +900,12 @@ class TransferPipeline:
             return
         todo = await self.phase_plan(files)
         offline_files = await self.phase_reuse(todo)
-        await self.phase_submit(offline_files)
-        await self.offline.wait_all()
+        try:
+            await self.phase_submit(offline_files)
+            await self.offline.wait_all()
+        finally:
+            # 任务结束（含取消/异常）归还所有全局离线名额，防止泄漏卡死后续任务
+            await self.offline.release_all_slots()
         await self.phase_finalize()
 
     # ------------------------------------------------------------------
