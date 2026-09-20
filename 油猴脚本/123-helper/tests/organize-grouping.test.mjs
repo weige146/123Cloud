@@ -23,13 +23,13 @@ const driver = `;
 globalThis.__organize = {
   inferTitle, mediaKey, buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle,
   looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames,
-  applyVariantTagsForCollisions, parseSeasonEpisode, specialContext, isVideoFile
+  applyVariantTagsForCollisions, parseSeasonEpisode, specialContext, isVideoFile, collectOrganizeGroups
 };
 `;
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle, parseSeasonEpisode } = sandbox.__organize;
+const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle, parseSeasonEpisode, collectOrganizeGroups } = sandbox.__organize;
 
 const config = { library: { recognition: { customWords: [] } } };
 const file = (name, id = name) => ({ id, name });
@@ -297,4 +297,55 @@ test("文件名带年份时结尾紧贴中文的数字按续作保留（叶问2 
     formFile("叶问2.2010.BluRay.mkv", "y2")
   ], config);
   assert.equal(groups.length, 2);
+});
+
+// —— 合集容器：顶层目录含多个强片名子目录时按子目录各成一组（怪物史莱克案例） ——
+const mkFile = (id, name, size) => ({ id, name, type: 0, size });
+test("合集容器：顶层目录含多个强片名子目录时按子目录各成一组", async () => {
+  const frds = "BluRay.1080p.x265.10bit.3Audio.MNHD-FRDS";
+  const tree = {
+    top: [
+      { id: "d1", name: `怪物史瑞克.Shrek.2001.${frds}`, type: 1 },
+      { id: "d2", name: `怪物史瑞克2.Shrek.2.2004.${frds}`, type: 1 },
+      { id: "d3", name: `怪物史瑞克3.Shrek.the.Third.2007.${frds}`, type: 1 }
+    ],
+    d1: [mkFile("f1", `Shrek.2001.${frds}.mkv`, 100), mkFile("f2", "cover.jpg", 5)],
+    d2: [mkFile("f3", `Shrek.2.2004.${frds}.mkv`, 110), mkFile("f4", "cover.jpg", 5)],
+    d3: [mkFile("f5", `Shrek.the.Third.2007.${frds}.mkv`, 120), mkFile("f6", "cover.jpg", 5)]
+  };
+  const api = { listAll: async (id) => tree[id] || [] };
+  const tmdb = { search: async () => [] };
+  const groups = await collectOrganizeGroups(api, [{ id: "top", name: "怪物史莱克", type: 1 }], config, { tmdb });
+  assert.equal(groups.length, 3, `三个续作子目录应各成一组，实际 ${groups.length}`);
+  assert.ok(groups.every((group) => group.id.startsWith("loose:subfolder:")), "校验失败时落回散文件目录分组兜底");
+  const titles = groups.map((group) => group.title).join("|");
+  assert.ok(titles.includes("怪物史瑞克2"), `第二部应有自己的分组：${titles}`);
+  assert.ok(titles.includes("怪物史瑞克3"), `第三部应有自己的分组：${titles}`);
+});
+
+test("带 TMDB 标记的子目录也算强片名子目录，触发容器拆分", async () => {
+  const tree = {
+    top: [
+      { id: "d1", name: "三体 (2023) {tmdb-808}", type: 1 },
+      { id: "d2", name: "三体 第二季 (2024) {tmdb-809}", type: 1 }
+    ],
+    d1: [mkFile("f1", "三体.S01E01.2023.1080p.mkv", 100)],
+    d2: [mkFile("f2", "三体.S02E01.2024.1080p.mkv", 110)]
+  };
+  const api = { listAll: async (id) => tree[id] || [] };
+  const tmdb = { search: async () => [] };
+  const groups = await collectOrganizeGroups(api, [{ id: "top", name: "三体系列", type: 1 }], config, { tmdb });
+  assert.equal(groups.length, 2, `带标记的两个子目录应各成一组，实际 ${groups.length}`);
+});
+
+test("单电影/剧集目录（子目录都是季目录）仍按整目录一组", async () => {
+  const tree = {
+    top: [{ id: "d1", name: "Season 1", type: 1 }],
+    d1: [mkFile("f1", "三体.S01E01.2023.1080p.mkv", 100), mkFile("f2", "三体.S01E02.2023.1080p.mkv", 101)]
+  };
+  const api = { listAll: async (id) => tree[id] || [] };
+  const tmdb = { details: async (type, id) => ({ id: Number(id), mediaType: type, title: "三体", year: "2023", aliases: [], genres: [], overview: "", posterUrl: "", backdropUrl: "", voteAverage: 0 }) };
+  const groups = await collectOrganizeGroups(api, [{ id: "top", name: "三体 (2023) {tmdb-808}", type: 1 }], config, { tmdb });
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].id, "folder:top", "季目录不算强片名子目录，维持整目录一组");
 });

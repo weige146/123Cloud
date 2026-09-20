@@ -6546,14 +6546,14 @@
     {
       version: "1.3.16",
       notes: [
+        "整理认得「01 郭女侠怒砸同福店 佟掌柜秒点迷路人」这种「集号+集名」命名了：文件名里没有剧名时自动拿所在文件夹的名字当剧名、开头的数字当集数，81 集不再被拆成 81 个分组；文件夹名带「第2季 / Season 02」也会认成对应的季",
+        "电影合集整理不再串组：怪物史瑞克/怪物史瑞克2/3/4 这种「一片一目录」的续作合集，勾选最上层目录整理时会把容器认出来，每个电影目录各认各的电影（看目录名里的年份或 TMDB 标记区分），不会再全部合并成第一部的分组、把续作改名成第一部的名字；标题像但年份对不上的也不会硬合并",
         "整理识别认得【频道】【字幕组】前缀了：【重温经典频道】黑猫警长、[字幕组]番剧 这类名字不再把频道名/组名当成片名，搜 TMDB 也能直接搜到",
         "BluRay.1080p.Remux 这种写法现在能认出是蓝光原盘（Remux）；NF@ADWeb 这类「片源@发布组」会拆开记：片源 NF、发布组 ADWeb",
-        "按名字搜不到候选时自动换综合搜索（电影+剧集一起搜），你手动查询输错类型、或脚本认错类型都不再空手而归；搜不到也会提示换词或填 TMDB ID",
+        "按名字搜不到候选时自动换综合搜索（电影+剧集一起搜），手动查询输错类型、或脚本认错类型都不再空手而归；搜不到也会提示换词或填 TMDB ID",
         "18+ 影视按名字也能搜到了（之前 TMDB 默认不给结果，只能填 ID）",
         "全40集/共12集这类写法的剧不再被误认成电影",
-        "秒传工具箱点「生成二级链接（短链）」后，会自动把短链推送给客户端生成投稿草稿（和分享链接直投一样），不用再手动复制粘贴；投稿走短链，频道帖带「秒传链接」复制按钮，不再附带秒传 JSON 文件",
-        "整理认得「01 郭女侠怒砸同福店 佟掌柜秒点迷路人」这种「集号+集名」命名了：文件名里没有剧名时自动拿所在文件夹的名字当剧名、开头的数字当集数，81 集不再被拆成 81 个分组；文件夹名带「第2季 / Season 02」也会认成对应的季",
-        "电影合集整理不再串组：怪物史瑞克/怪物史瑞克2/3/4 这种「一片一目录」的续作合集，现在每个目录各认各的电影（看目录名里的年份区分），不会再全部合并成第一部的分组、把续作改名成第一部的名字；标题像不像之外还会看年份对不上就不合并"
+        "秒传投稿一键直投：秒传工具箱点「生成二级链接（短链）」生成成功后，自动把短链推送给客户端生成投稿草稿，不用再手动复制粘贴；投稿走短链，频道帖带「秒传链接」复制按钮（点一下复制整条），不再附带秒传 JSON 文件"
       ]
     },
     {
@@ -19570,6 +19570,44 @@ ${end.comment}` : end.comment;
       if (Number(item.type) === 1) {
         const scanned = await scanFolder(api, item, options);
         if (!scanned.files.some((file) => isVideoFile(file.name))) continue;
+        const mappings = config?.library?.recognition?.fixedMappings;
+        // 「一目录一部的续作/系列合集」容器：直接子目录里有 ≥2 个「非弱标题 + 带年份或
+        // 带 {tmdb-N} 标记、不含季词」的强片名目录时，顶层只是容器（怪物史莱克/怪物
+        // 史瑞克+2+3+4）。若仍按顶层目录识别，TMDB 会模糊命中第一部（怪物史莱克→
+        // Shrek 2001），整棵树含全部续作都被改名成第一部——按强片名子目录各成一组、
+        // 各认各的；校验不过的子目录文件落回散文件分组（还有目录名兜底分组托底）。
+        const childFolders = scanned.sourceFolders.filter((folder) => Number(folder.depth) === 1 && folder.id && folder.name);
+        const isStrongChildFolder = (name) => !isWeakOrganizeFolderTitle(name, mappings)
+          && (/(?:^|[^0-9])(?:19|20)\d{2}(?:[^0-9]|$)/.test(name) || /\{\s*tmdb-?\d+\s*\}/i.test(name))
+          && seasonNumberFromText(name) === null;
+        const strongChildren = childFolders.filter((folder) => isStrongChildFolder(folder.name));
+        if (strongChildren.length >= 2) {
+          const claimed = /* @__PURE__ */ new Set();
+          for (const child of strongChildren) {
+            const childFiles = scanned.files.filter((file) => String(file.relativePath || "").startsWith(`${child.name}/`));
+            if (!childFiles.length) continue;
+            childFiles.forEach((file) => claimed.add(String(file.id)));
+            if (!childFiles.some((file) => isVideoFile(file.name))) continue;
+            const validation = await validateStrongFolderTitle(options.tmdb, child.name, config, options);
+            if (!validation.available || validation.media) {
+              groups.push({
+                id: `folder:${child.id}`,
+                title: child.name,
+                files: childFiles,
+                sourceFolders: scanned.sourceFolders,
+                sourceFolderId: child.id,
+                sourceFolderName: child.name,
+                media: validation.media || void 0
+              });
+            } else {
+              for (const file of childFiles) loose.push({ ...file, sourceFolders: scanned.sourceFolders });
+            }
+          }
+          for (const file of scanned.files) {
+            if (!claimed.has(String(file.id))) loose.push({ ...file, sourceFolders: scanned.sourceFolders });
+          }
+          continue;
+        }
         const targetSeason = targetSeasonFromFolder(item.name);
         if (!isWeakOrganizeFolderTitle(item.name, config?.library?.recognition?.fixedMappings)) {
           const validation = await validateStrongFolderTitle(options.tmdb, item.name, config, options);
