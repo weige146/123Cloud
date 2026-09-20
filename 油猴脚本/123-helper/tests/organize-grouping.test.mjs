@@ -29,7 +29,7 @@ globalThis.__organize = {
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle } = sandbox.__organize;
+const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle, parseSeasonEpisode } = sandbox.__organize;
 
 const config = { library: { recognition: { customWords: [] } } };
 const file = (name, id = name) => ({ id, name });
@@ -196,3 +196,71 @@ test("同剧各 part 文件归入同一分组，分组标题不带分段标记",
 
 await chain;
 console.log(`\n${passed} 个用例全部通过`);
+
+// —— 「集号+集名」形态：父目录名兜底分组（01 郭女侠怒砸同福店 佟掌柜秒点迷路人） ——
+const formFile = (name, id, extra = {}) => ({ id, name, ...extra });
+
+test("集名形态按父目录名并成一组，季集按前导数字解析", () => {
+  const groups = buildLooseGroups([
+    formFile("01 郭女侠怒砸同福店 佟掌柜秒点迷路人.mkv", "w1", { sourceFolderId: "f1", sourceFolderName: "武林外传", parentId: "900" }),
+    formFile("02 五岳盟主之争.mp4", "w2", { sourceFolderId: "f1", sourceFolderName: "武林外传", parentId: "900" }),
+    formFile("03 群雄争霸夺魁首.rmvb", "w3", { sourceFolderId: "f1", sourceFolderName: "武林外传", parentId: "900" })
+  ], config);
+  assert.equal(groups.length, 1, `应并成一组，实际 ${groups.length}`);
+  assert.equal(groups[0].title, "武林外传");
+  assert.equal(parseSeasonEpisode("01 郭女侠怒砸同福店 佟掌柜秒点迷路人.mkv").seasonEpisode, "S01E01");
+  assert.equal(parseSeasonEpisode("03 群雄争霸夺魁首.rmvb").episode, 3);
+});
+
+test("直接勾选文件时用当前目录名兜底（options.currentDirName）", () => {
+  const grouped = buildLooseGroups([
+    formFile("01 郭女侠怒砸同福店.mkv", "b1", { parentId: "900" }),
+    formFile("02 五岳盟主之争.mp4", "b2", { parentId: "900" })
+  ], config, { currentDirName: "武林外传" });
+  assert.equal(grouped.length, 1);
+  assert.equal(grouped[0].title, "武林外传");
+  // 没有目录名上下文时维持旧行为：逐文件一组
+  const loose = buildLooseGroups([
+    formFile("01 郭女侠怒砸同福店.mkv", "c1"),
+    formFile("02 五岳盟主之争.mp4", "c2")
+  ], config);
+  assert.equal(loose.length, 2);
+});
+
+test("目录名带季号时剥出剧名并记目标季；纯季目录向上找剧名", () => {
+  const seasonFolder = buildLooseGroups([
+    formFile("01 归来.mp4", "d1", { sourceFolderId: "f2", sourceFolderName: "武林外传 第二季", parentId: "901" }),
+    formFile("02 相逢.mp4", "d2", { sourceFolderId: "f2", sourceFolderName: "武林外传 第二季", parentId: "901" })
+  ], config);
+  assert.equal(seasonFolder.length, 1);
+  assert.equal(seasonFolder[0].title, "武林外传");
+  assert.equal(seasonFolder[0].targetSeason, 2);
+
+  const nested = buildLooseGroups([
+    { id: "n1", name: "07 风波.mp4", sourceFolderId: "s2", sourceFolderName: "Season 2", sourceFolders: [{ id: "f1", name: "武林外传", depth: 0 }, { id: "s2", name: "Season 2", depth: 1 }], parentId: "s2" },
+    { id: "n2", name: "08 转机.mp4", sourceFolderId: "s2", sourceFolderName: "Season 2", sourceFolders: [{ id: "f1", name: "武林外传", depth: 0 }, { id: "s2", name: "Season 2", depth: 1 }], parentId: "s2" }
+  ], config);
+  assert.equal(nested.length, 1);
+  assert.equal(nested[0].title, "武林外传");
+  assert.equal(nested[0].targetSeason, 2);
+});
+
+test("带年份/画质标记或年份形前导数字的不算集名形态", () => {
+  const groups = buildLooseGroups([
+    formFile("01 武林外传 2006 1080p.mkv", "g1"),
+    formFile("02 武林外传 2006 1080p.mkv", "g2"),
+    formFile("2001 太空漫游.mkv", "g3")
+  ], config, { currentDirName: "电影合集" });
+  // 前两个是普通命名（含年份/画质）按各自标题识别；2001 开头是年份不是集数，都不并入「电影合集」
+  for (const group of groups) {
+    assert.notEqual(group.title, "电影合集");
+  }
+});
+
+test("parseSeasonEpisode 集名形态边界", () => {
+  assert.equal(parseSeasonEpisode("07 风波.mp4").seasonEpisode, "S01E07");
+  assert.equal(parseSeasonEpisode("07-09 风波.mp4").endEpisode, 9);
+  assert.equal(parseSeasonEpisode("21 Jump Street.mp4").episode, 0, "拉丁集名不启用前导集数");
+  assert.equal(parseSeasonEpisode("2001 太空漫游.mp4").episode, 0, "年份形前导数字不是集数");
+  assert.equal(parseSeasonEpisode("武林外传.S01E01.mkv").episode, 1, "常规 SxxEyy 不受影响");
+});

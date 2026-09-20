@@ -6551,7 +6551,8 @@
         "按名字搜不到候选时自动换综合搜索（电影+剧集一起搜），你手动查询输错类型、或脚本认错类型都不再空手而归；搜不到也会提示换词或填 TMDB ID",
         "18+ 影视按名字也能搜到了（之前 TMDB 默认不给结果，只能填 ID）",
         "全40集/共12集这类写法的剧不再被误认成电影",
-        "秒传工具箱点「生成二级链接（短链）」后，会自动把短链推送给客户端生成投稿草稿（和分享链接直投一样），不用再手动复制粘贴；投稿走短链，频道帖带「秒传链接」复制按钮，不再附带秒传 JSON 文件"
+        "秒传工具箱点「生成二级链接（短链）」后，会自动把短链推送给客户端生成投稿草稿（和分享链接直投一样），不用再手动复制粘贴；投稿走短链，频道帖带「秒传链接」复制按钮，不再附带秒传 JSON 文件",
+        "整理认得「01 郭女侠怒砸同福店 佟掌柜秒点迷路人」这种「集号+集名」命名了：文件名里没有剧名时自动拿所在文件夹的名字当剧名、开头的数字当集数，81 集不再被拆成 81 个分组；文件夹名带「第2季 / Season 02」也会认成对应的季"
       ]
     },
     {
@@ -17990,6 +17991,19 @@ ${end.comment}` : end.comment;
       const episode = Number(match[2]);
       return { season: season2, episode, endEpisode: 0, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}` };
     }
+    // 「01 郭女侠怒砸同福店」集名形态：前导裸数字当集数（可带范围）。4 位数字按年份
+    // 处理（2001 太空漫游不是第 2001 集）；剩余文本要带 CJK（21 Jump Street 不误伤）
+    match = text2.match(/^\s*E?(\d{1,4})(?:\s*[-~到至]\s*E?(\d{1,4}))?(?=$|[ ._\-\u00B7\u3400-\u9fff])/i);
+    if (match) {
+      const season2 = Number(fallbackSeason || 1);
+      const episode = Number(match[1]);
+      const endEpisode = Number(match[2] || 0);
+      const rest2 = text2.slice(match[0].length).replace(/^[ ._\-\u00B7]+/, "").trim();
+      const yearLike = !endEpisode && episode >= 1900 && episode <= 2100;
+      if (episode > 0 && !yearLike && (!rest2 || /[\u3400-\u9fff]/.test(rest2))) {
+        return { season: season2, episode, endEpisode, ...span(match), seasonEpisode: `S${String(season2).padStart(2, "0")}E${String(episode).padStart(2, "0")}${endEpisode ? `-E${String(endEpisode).padStart(2, "0")}` : ""}` };
+      }
+    }
     const seasonOnly = text2.match(/(?:Season\s*|\bS)(\d{1,3})(?:\s*季)?\b/i);
     const namedSeason = seasonOnly ? null : text2.match(NAMED_SEASON_RE);
     const season = seasonOnly ? Number(seasonOnly[1]) : namedSeason ? chineseInteger2(namedSeason[1]) : Number(fallbackSeason || 1);
@@ -19295,7 +19309,54 @@ ${end.comment}` : end.comment;
     if (seasonNumberFromText(rest) !== null) return "";
     return rest;
   }
-  function buildLooseGroups(loose, config) {
+  // 「01 郭女侠怒砸同福店 佟掌柜秒点迷路人」这类「集号+集名」文件名：前导 1-4 位集号
+  // （可带范围）+ 集名文本，文件名里没有剧名。集名带年份/分辨率/来源/SxxEyy 等真剧名
+  // 特征、或前导数字本身像年份（2001 太空漫游）时不算，走普通识别。
+  var EPISODE_TITLE_FORM_MARKER_RE = new RegExp(`(?:19|20)\\d{2}|S\\d{1,3}(?:E\\d{1,5})?|\\u7B2C\\s*\\d{1,3}\\s*\\u5B63|\\b(?:EP?\\s*\\d{1,5}|${SEASON_TECHNICAL_SUFFIX_SOURCE})\\b`, "i");
+  function parseEpisodeTitleForm(name) {
+    const stem = String(name || "").replace(/\.[a-z0-9]{1,5}$/i, "").trim();
+    const match = stem.match(/^E?(\d{1,4})(?:\s*[-~\u5230\u81F3]\s*E?(\d{1,4}))?[ ._\-\u00B7]+(\S.*)$/i);
+    if (!match) return null;
+    const episode = Number(match[1]);
+    const endEpisode = Number(match[2] || 0);
+    const episodeTitle = match[3].trim();
+    if (episode <= 0 || (episode >= 1900 && episode <= 2100 && !endEpisode)) return null;
+    if (!/[\u3400-\u9fff]/.test(episodeTitle)) return null;
+    if (EPISODE_TITLE_FORM_MARKER_RE.test(episodeTitle)) return null;
+    return { episode, endEpisode, episodeTitle };
+  }
+  // 集名形态文件目录名里剥季号：纯季目录不算剧名；「武林外传 第2季 / Season 02」
+  // 剥出剧名并把季号带出来当目标季。
+  function organizeEpisodeFormFolderContext(name, mappings) {
+    const text2 = normalizedTitle(name);
+    if (!text2 || isWeakOrganizeFolderTitle(text2, mappings)) return null;
+    const season = seasonNumberFromText(text2);
+    if (!Number.isInteger(season)) return { title: cleanName(text2) || text2, season: null };
+    const stripped = text2.replace(new RegExp(`\\s*[\\(（\\[【~～\\-]*\\s*(?:Season\\s*|S)0*${season}\\s*[)）\\]】]*$`, "i"), "").replace(new RegExp(`\\s*[\\(（\\[【~～\\-]*\\s*\\u7B2C\\s*[${CHINESE_NUMBER_PATTERN}]+\\s*\\u5B63\\s*[)）\\]】]*$`), "").replace(/[\s._\-·（(【【]+$/, "").trim();
+    if (!stripped || isWeakLooseTitle(stripped)) return null;
+    return { title: cleanName(stripped) || stripped, season: season > 0 ? season : null };
+  }
+  // 集名形态的剧名回退（GuessIt/Sonarr 的父目录兜底）：按「直接父目录 → 更上层目录
+  // → 当前目录」找第一个非弱标题的目录名当剧名；纯季目录（Season 2/第2季）不算剧名，
+  // 但其中的季号会在找到剧名时一并带上。
+  function episodeFormFolderContext(file, options, mappings) {
+    const candidates = [];
+    if (file.sourceFolderName) candidates.push(file.sourceFolderName);
+    const folders = [...(file.sourceFolders || [])].sort((left, right) => (Number(right.depth) || 0) - (Number(left.depth) || 0));
+    for (const folder of folders) {
+      if (folder && folder.name) candidates.push(folder.name);
+    }
+    if (options && options.currentDirName) candidates.push(options.currentDirName);
+    let season = null;
+    for (const name of candidates) {
+      const folderSeason = targetSeasonFromFolder(name);
+      if (season === null && Number.isInteger(folderSeason) && folderSeason > 0) season = folderSeason;
+      const context = organizeEpisodeFormFolderContext(name, mappings);
+      if (context) return { title: context.title, season: context.season === null ? season : context.season };
+    }
+    return null;
+  }
+  function buildLooseGroups(loose, config, options = {}) {
     const groups = [];
     const grouped = /* @__PURE__ */ new Map();
     const customWords = config.library?.recognition?.customWords || [];
@@ -19303,16 +19364,31 @@ ${end.comment}` : end.comment;
     for (const file of loose) {
       const text2 = looseRecognitionText(file, customWords);
       const title = inferTitle(text2, fixedMappings);
+      // 「01 集名」形态且能找到非弱父目录名：全部并进「父目录剧名」一组，不再逐集成组
+      const episodeForm = parseEpisodeTitleForm(file.name);
+      const folderCtx = episodeForm ? episodeFormFolderContext(file, options, fixedMappings) : null;
+      if (folderCtx && !file.targetSeason && folderCtx.season) file.targetSeason = folderCtx.season;
       const unidentified = isWeakLooseTitle(title);
       const targetSeason = Number(file.targetSeason || 0);
       // 结尾集号（01 / 第01集 / E02…）不参与分组键，同一标题的各集归为一组。
-      const baseTitle = unidentified ? title : looseGroupBaseTitle(title);
-      const key = unidentified ? `unknown:${looseGroupAnchor(file)}:${targetSeason || ""}` : looseGroupKeyTitle(baseTitle, text2);
-      if (!grouped.has(key)) grouped.set(key, { key, baseTitle, files: [], names: [], titles: [], unidentified, targetSeason: targetSeason || null });
+      let baseTitle;
+      let key;
+      let folderTitle = "";
+      if (folderCtx) {
+        folderTitle = folderCtx.title;
+        baseTitle = folderTitle;
+        const normalizedFolder = String(folderTitle).replace(/[\s._-]+/g, "").toLocaleLowerCase() || "unknown";
+        key = `epform:${normalizedFolder}${folderCtx.season ? `:s${String(folderCtx.season).padStart(3, "0")}` : ""}:${looseGroupAnchor(file)}`;
+      } else {
+        baseTitle = unidentified ? title : looseGroupBaseTitle(title);
+        key = unidentified ? `unknown:${looseGroupAnchor(file)}:${targetSeason || ""}` : looseGroupKeyTitle(baseTitle, text2);
+      }
+      if (!grouped.has(key)) grouped.set(key, { key, baseTitle, files: [], names: [], titles: [], unidentified: true, targetSeason: targetSeason || null, folderTitle });
       const group = grouped.get(key);
       group.files.push(file);
       group.names.push(text2);
       group.titles.push(title);
+      if (folderTitle && !group.folderTitle) group.folderTitle = folderTitle;
       if (targetSeason && !group.targetSeason) group.targetSeason = targetSeason;
       group.unidentified &&= unidentified;
     }
@@ -19483,7 +19559,7 @@ ${end.comment}` : end.comment;
         loose.push({ ...item, relativePath: item.name, sourceFolders: [] });
       }
     }
-    return [...groups, ...buildLooseGroups(loose, config)];
+    return [...groups, ...buildLooseGroups(loose, config, options)];
   }
   function inferTitleLength(value) {
     return mediaKey(value).length || String(value || "").length;
@@ -25636,6 +25712,7 @@ ${end.comment}` : end.comment;
       const location2 = mode === "inPlace" ? "inPlace" : mode ? "library" : this.organize.location;
       return {
         currentDir: this.organize.currentDir,
+        currentDirName: this.organize.currentDirName || "",
         inPlace: location2 === "inPlace",
         naming: "normalized",
         mediaByGroup: this.organize.mediaByGroup,
@@ -25667,6 +25744,7 @@ ${end.comment}` : end.comment;
       this.organize = {
         items: items.map((item) => ({ ...item })),
         currentDir: String(currentDir || "0"),
+        currentDirName: "",
         location: this.config.library.rootId ? "library" : "inPlace",
         naming: "normalized",
         preview: null,
@@ -25705,6 +25783,9 @@ ${end.comment}` : end.comment;
       const requestId = ++organizeState.previewRequestId;
       const previousSelection = this.organize.selectedGroupId;
       const previousPreview = this.organize.preview;
+      // 「01 集名」形态的兜底分组需要当前目录名当剧名；拿不到就退回逐文件分组的旧行为
+      organizeState.currentDirName = await this.loadOrganizeCurrentDirName();
+      if (this.organize !== organizeState) return;
       const preview = await this.runTask(async (signal) => {
         this.setProgress(0, 1, "\u626B\u63CF\u5E76\u8BC6\u522B\u5A92\u4F53");
         return buildOrganizePreview(this.api, this.tmdb, this.organize.items, this.config, {
@@ -25734,6 +25815,17 @@ ${end.comment}` : end.comment;
       this.organize.selectedGroupId = selectedStillExists ? previousSelection : matchingGroup?.id || preview.groups[0]?.id || "";
       this.organize.tool = null;
       if (this.state.view === "organize") this.render();
+    }
+    // 整理「集名形态」兜底用：取当前目录名当候选剧名（根目录/接口失败给空串，退回旧行为）
+    async loadOrganizeCurrentDirName() {
+      const dirId = String(this.organize?.currentDir || "0");
+      if (dirId === "0" || typeof this.api.fileInfos !== "function") return "";
+      try {
+        const folders = await this.api.fileInfos([dirId]);
+        return String(folders.find((item) => String(item.id) === dirId)?.name || folders[0]?.name || "").trim();
+      } catch {
+        return "";
+      }
     }
     setOrganizeProgress(done, total, name, stage) {
       const labels = {
