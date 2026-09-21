@@ -98,7 +98,7 @@ function makeState(selected = [], unselected = [], selectAll = false) {
   assert.deepEqual([...state.selectedIds].sort(), ["old0", "old1"]);
 }
 
-console.log("selection-crosspage: all", 10, "cases passed");
+console.log("selection-crosspage: all", 15, "cases passed");
 
 // 10. 删除文件后「重命名/整理」按钮残留修复（shouldClearStaleSelection，1.3.7）：
 // 计数文本消失（hostCount=null）且可见行无任何勾选 = 官方已清空选中，应清空本地残留。
@@ -112,3 +112,18 @@ assert.equal(shouldClear(makeState(["a", "ghost"]), new Map([["a", true]]), null
 assert.equal(shouldClear(makeState([], [], true), new Map([["c", false]]), null), false);
 // 10d. 计数存在（哪怕是滞后旧值）→ 交给 reconcile 的收缩信号，不清空。
 assert.equal(shouldClear(makeState(["a", "b"]), new Map([["c", false]]), 2), false);
+
+// 11. 移动/复制把目录搬空后的「重命名/整理」按钮残留修复（isEmptySelectionStale，1.3.18）：
+// 可见行 0 个 + 计数文本消失（hostCount=null）+ 本地还有残留 id → 应进入延迟确认清理。
+const emptyStale = context.isEmptySelectionStale;
+assert.equal(typeof emptyStale, "function");
+// 11a. 空目录（0 行）+ 计数消失 + 有残留 → 命中。
+assert.equal(emptyStale(makeState(["a", "b"]), 0, null), true);
+// 11b. 行还在（翻页/刷新中）→ 不清，跨页选中不受影响。
+assert.equal(emptyStale(makeState(["a", "b"]), 3, null), false);
+// 11c. 计数还在（哪怕滞后旧值）→ 交给 reconcile 的收缩信号。
+assert.equal(emptyStale(makeState(["a", "b"]), 0, 2), false);
+// 11d. 全选模式 → 不清（unselectedIds 语义由 reconcile 维护）。
+assert.equal(emptyStale(makeState([], [], true), 0, null), false);
+// 11e. 没有残留 id → 无需清理。
+assert.equal(emptyStale(makeState([], [], false), 0, null), false);

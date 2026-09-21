@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.17
+// @version      1.3.18
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -4093,6 +4093,15 @@
     if (state.selectAll || hostCount !== null) return false;
     return ![...visibleRows.values()].some(Boolean);
   }
+  // 移动/复制把目录搬空后的残留：可见行 0 个、计数文本也被官方一并移走（hostCount=null），
+  // 本地 selectedIds 却还在——hasSelection 被它顶成 true，「重命名/整理」按钮就会在空目录
+  // 里常驻显示（1.3.7 的清理分支带 visibleRows>0 守卫，恰好管不到这种场景）。
+  // 只有「确实 0 行 + 读不到计数 + 还有残留」才允许进入延迟确认清理；行还在（翻页中/
+  // 刷新中/计数滞后）绝不清，避免误伤跨页选中的累积。
+  function isEmptySelectionStale(state, visibleRowCount, hostCount) {
+    if (state.selectAll || hostCount !== null) return false;
+    return visibleRowCount === 0 && state.selectedIds.size > 0;
+  }
   var PageBridge = class {
     constructor(api, config = {}) {
       this.api = api;
@@ -4101,6 +4110,7 @@
       this.selectedIds = /* @__PURE__ */ new Set();
       this.unselectedIds = /* @__PURE__ */ new Set();
       this.selectAll = false;
+      this.emptySelectionSince = 0;
       this.listeners = /* @__PURE__ */ new Set();
       this.commands = {};
       this.observer = null;
@@ -4334,6 +4344,20 @@
         this.selectedIds.clear();
         this.unselectedIds.clear();
       } else if (visibleRows.size > 0 && shouldClearStaleSelection(this, visibleRows, hostCount)) {
+        this.selectedIds.clear();
+        this.unselectedIds.clear();
+      }
+      if (!isEmptySelectionStale(this, visibleRows.size, hostCount)) {
+        this.emptySelectionSince = 0;
+      } else if (!this.emptySelectionSince) {
+        // 首次观察到空目录残留：不立即清，等 500ms 后重查一次、状态仍在才清——
+        // 复制/翻页瞬间列表卸载也会短暂呈现「0 行 + 无计数」，立即清会误伤跨页选中。
+        this.emptySelectionSince = Date.now();
+        setTimeout(() => {
+          this.readSelection();
+          this.emit();
+        }, 500);
+      } else if (Date.now() - this.emptySelectionSince >= 450) {
         this.selectedIds.clear();
         this.unselectedIds.clear();
       }
@@ -6574,6 +6598,14 @@
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.3.18",
+      notes: [
+        "修复移动、复制文件后「重命名」「整理」按钮不消失的问题",
+        "取消勾选或清空目录后，按钮约一秒内自动隐藏",
+        "多分段电影的 Part 标记挪到片名年份后面，媒体库能把两段认成一部电影"
+      ]
+    },
     {
       version: "1.3.17",
       notes: [
@@ -19906,16 +19938,25 @@ ${end.comment}` : end.comment;
     }
     return "";
   }
-  function injectNameVariant(normalizedName, tag) {
+  function injectNameVariant(normalizedName, tag, year = "") {
     const value = String(normalizedName || "");
     const tagValue = String(tag || "").trim();
     if (!value || !tagValue) return value;
     if (value.toLocaleLowerCase().includes(tagValue.toLocaleLowerCase())) return value;
     const [stem, extension] = splitExtension(value);
     // 变体（Part01/药食同源/加更版…）插在季集记号之后、分辨率等技术参数之前，
-    // 与发布组命名习惯一致；无季集记号时退回扩展名前的老位置。
+    // 与发布组命名习惯一致。电影没有季集记号 → 参照 Emby/Plex 的多部分堆叠
+    // 规范（Movie Name (Year) - part1.mkv），插在「标题.年份」之后、技术字段
+    // 之前；拿不到年份或年份不在文件名里时退回扩展名前的老位置。
     const anchor = stem.match(/^.*?\bS\d{1,3}(?:[ ._-]*E\d{1,5}(?:\s*-\s*(?:S\d{1,3}\s*)?E?\d{1,5})?)?(?=$|[^A-Za-z0-9])/i);
-    const merged = anchor ? `${stem.slice(0, anchor[0].length)}.${tagValue}${stem.slice(anchor[0].length)}` : `${stem}.${tagValue}`;
+    let merged = "";
+    if (anchor) {
+      merged = `${stem.slice(0, anchor[0].length)}.${tagValue}${stem.slice(anchor[0].length)}`;
+    } else {
+      const yearText = String(year || "").trim();
+      const yearMatch = yearText ? stem.match(new RegExp(`^(.*(?<![0-9])${yearText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![0-9]))`)) : null;
+      merged = yearMatch ? `${yearMatch[1]}.${tagValue}${stem.slice(yearMatch[1].length)}` : `${stem}.${tagValue}`;
+    }
     return cleanRenderedName(merged, extension);
   }
   function synthesizeEpisodeCandidatesFromNames(files) {
@@ -20109,7 +20150,7 @@ ${end.comment}` : end.comment;
       if (!tag) continue;
       const key = String(task.normalizedName || "").toLocaleLowerCase();
       if ((counts.get(key) || 0) <= 1) continue;
-      const injected = injectNameVariant(task.normalizedName, tag) || task.normalizedName;
+      const injected = injectNameVariant(task.normalizedName, tag, task.fields?.year) || task.normalizedName;
       if (injected === task.normalizedName) continue;
       task.normalizedName = injected;
       if (!task.hasManualName) {
@@ -24321,15 +24362,6 @@ ${end.comment}` : end.comment;
       queueTask(() => {
         void this.openSelectionCommand(command);
       });
-    }
-    updateToolbarOverflow() {
-      const container = this.toolbar;
-      if (!container?.isConnected && !container?.parentElement) return;
-      for (const control of container.querySelectorAll('[data-toolbar-direct="true"]')) {
-        // 「转存秒传」只在选中秒传种子文件时显示，展开/溢出逻辑不得把它强行显示出来
-        if (control.dataset.command === "fastlinkImport" && control.dataset.seedReady !== "true") continue;
-        control.hidden = false;
-      }
     }
     mountShareToolbar(container, context = {}) {
       this.toolbarObserver?.disconnect();

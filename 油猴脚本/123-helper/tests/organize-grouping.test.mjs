@@ -128,6 +128,23 @@ test("injectNameVariant 在季集记号后插入变体且幂等", () => {
   assert.equal(injectNameVariant(base, ""), base);
 });
 
+test("injectNameVariant 电影变体按 Emby/Plex 堆叠规范插在「标题.年份」之后", () => {
+  // 多分段电影：Part 标记紧跟年份、放在技术字段之前（旧行为是缀在发布组后面）
+  assert.equal(
+    injectNameVariant("Kill Bill The Whole Bloody Affair.2011.2160p.BluRay.Remux.HEVC.DTS.HD.MA.5.1-HDH.mkv", "Part01", "2011"),
+    "Kill Bill The Whole Bloody Affair.2011.Part01.2160p.BluRay.Remux.HEVC.DTS.HD.MA.5.1-HDH.mkv"
+  );
+  // 片名自带年份（Blade Runner 2049）按 media 年份锚定，不锚进标题里
+  assert.equal(
+    injectNameVariant("Blade Runner 2049.2017.2160p.WEB-DL.H265.mkv", "Part02", "2017"),
+    "Blade Runner 2049.2017.Part02.2160p.WEB-DL.H265.mkv"
+  );
+  // 年份不在文件名里 → 退回扩展名前的老位置
+  assert.equal(injectNameVariant("某电影.2160p.WEB-DL.mkv", "Part01", "2011"), "某电影.2160p.WEB-DL.Part01.mkv");
+  // 没传年份 → 保持旧行为（幂等/空标记也照旧）
+  assert.equal(injectNameVariant("初入职场·中医季.2025.2160p.WEB-DL.mp4", "Part02"), "初入职场·中医季.2025.2160p.WEB-DL.Part02.mp4");
+});
+
 // —— 变体标记仅在重名冲突时插入 ——
 test("applyVariantTagsForCollisions：集号唯一时不加变体，冲突时才插入", () => {
   const task = (name, tag) => ({ normalizedName: name, newName: name, targetPath: `综艺/Season 5/${name}`, folderParts: ["综艺", "Season 5"], variantTag: tag, hasManualName: false });
