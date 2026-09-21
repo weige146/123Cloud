@@ -1,0 +1,5 @@
+.venv/
+chrome-profile/
+__pycache__/
+.pytest_cache/
+*.log.jsonl

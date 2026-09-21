@@ -161,9 +161,9 @@
 测试位于 [`tests/`](./tests/)，纯 Node 运行、无浏览器、无网络依赖。每个 `*.test.mjs` 自包含：从 `123-helper.user.js` 按标记切出纯逻辑片段，在 `node:vm` 沙箱里用假 API 驱动。
 
 ```bash
-node 油猴脚本/123-helper/tests/run-all.mjs
+node 123-helper/tests/run-all.mjs
 # 或单独跑某一个
-node 油猴脚本/123-helper/tests/fastlink-progress.test.mjs
+node 123-helper/tests/fastlink-progress.test.mjs
 ```
 
 任一用例失败即以非 0 退出码结束，便于接 CI。覆盖范围：
