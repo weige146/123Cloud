@@ -17,16 +17,20 @@ TMDB 公开 v3/v4 API 只能读与账户操作，**不能贡献资料**。资料
 ### 季
 
 - `GET /tv/{tv_id}/remote/seasons?translate=false` —— 季列表 + `bson_id`、`episode_count`
-- `POST /tv/{tv_id}/remote/seasons` —— 新建季（body: `data=<JSON>`）
-- `POST /tv/{tv_id}/season/{season_no}/remote/primary_facts?series_id={tv_id}&translate=false` —— 更新季资料
+- `POST /tv/{tv_id}/remote/seasons` —— 新建季。**必须是 urlencoded 表单**（浏览器 UI 同款，从「添加新一季」弹窗钩子实测）：`id=&season_number_form=2&season_number=1&name=Season+2&overview=&air_date=<JS Date 串或空>&locked=false&locked_fields=&new=true`；关键字段是 `season_number_form`。**用 `data=<JSON>` 形态发它不认字段名，会静默建出一个默认「特别篇」（season 0）空季**，只能举报删除。
+- `POST /tv/{tv_id}/season/{season_no}/remote/primary_facts?series_id={tv_id}&translate=false` —— 更新季资料（UI 保存为 urlencoded 表单 + `authenticity_token`；**`season_number_form` 改季号服务端无声拒绝**——季号不可改）
+- 建季 UI 弹窗只有「季数 / 名字 / 简介」三字段；**季 air_date 自动取该季第 1 集的 air_date**（官方说明），不用手动设。
+- **删除季无自助入口**：官方规则「If you would like to delete a season, report it with the Report button」——走举报渠道（见下文「举报删除」）。
 
 ### 单集
 
 - `GET /tv/{tv_id}/season/{season_no}/remote/episodes?translate=false` —— 剧集列表（含每集 `id`、`bson_id`、`air_date`）
 - `POST /tv/{tv_id}/season/{season_no}/remote/episodes?translate=false` —— **新增**单集
-- `POST /tv/episode/{episode_id}/remote/primary_facts?series_id={tv_id}&episode_number={n}&translate=false` —— **更新**已有单集
+- `POST /tv/episode/{episode_id}/remote/primary_facts?series_id={tv_id}&episode_number={n}&translate=false` —— **更新**已有单集（成功响应带 `changes`：字段的前后值，可直接核对）
 - `POST /tv/{tv_id}/season/{season_no}/remote/next_episode_air_date?translate=false` —— 推算下一集默认日期（body: `episode_number=<n>`）
-- `DELETE /tv/{tv_id}/season/{season_no}/episode/{episode_no}?episode_id={episode_id}&translate=false` —— 删除单集
+- `DELETE /tv/{tv_id}/season/{season_no}/episode/{episode_no}?episode_id={episode_id}&translate=false` —— 删除单集（**实测返回 401 Invalid Permissions**：browser.py 的裸 fetch DELETE 不带 CSRF token；官方编辑页明示删集走 Report 举报，勿依赖此端点）
+
+**集不可跨季挪动**（TMDB 平台限制）。挪季的替代法（261074 实战）：新建目标季 → 在目标季重建全集（数据保真复制）→ 回读核验一致 → 把旧季的每集用 primary_facts **就地改成新数据**（旧集 bson/id 保留，内容被覆盖，改动进编辑记录）。主条目 `first_air_date` 自动取 S1E1 的 air_date，改完集日期即自动修正，不要手动设。
 
 **新增 payload**（官方编辑器同款字段）：
 
@@ -52,11 +56,18 @@ TMDB 公开 v3/v4 API 只能读与账户操作，**不能贡献资料**。资料
 - 子组增改同形：`POST/PUT …/episode_group/{group_id}/groups`（payload: `{"name","order","episode_count"}`，改时带 `id`）
 - `GET/POST/PUT/DELETE /tv/{tv_id}/remote/episode_group/{group_id}/{sub_group_id}/episodes` —— 子组成员单集（读出成员→改→整体回写）
 
-### 人物 / 演职员（cn-media-to-tmdb 实测）
+### 人物 / 演职员（cn-media-to-tmdb 实测 + 261074 实战）
 
 - `GET /search/remote/person?flatten_known_for=true` —— 搜人物，返回 `name/bson_id/credit_id/profile_path/known_for`。**同名多，必须核对 known_for 作品，不能取第一条。**
-- `GET/POST/PUT/DELETE /tv/{tv_id}/remote/seasons/cast?translate=false` —— 主演
+- `GET/POST/PUT/DELETE /tv/{tv_id}/remote/seasons/cast?translate=false` —— 主演（**GET 实测 500**，cast 读取走编辑页 grid；POST 为 urlencoded 表单：`credit_id=&add_to_every_season=true&bson_id=<人物bson>&locked=false&profile_path=<人物头像>&season_bson_id=<季bson>&translation=&new=true&name=<人物名>&character=<角色>`；`add_to_every_season=true` 一条覆盖所有季）
 - `GET/POST/PUT/DELETE /tv/{tv_id}/remote/seasons/crew?translate=false` —— 职员
+- **UI 弹窗流程（最稳）**：编辑页 `?active_nav_item=regular_cast` →「添加本季主演」→ `#person_search`（kendoAutoComplete）搜人 → **必须真实点击下拉列表项 li**（dispatch mousedown/mouseup/click），用 `ac.select(hit)` 只填文本不绑人物 bson，保存会发出 bson 空的废请求（服务端忽略不落库）→ 填 `#character_name_field`、按需勾 `#add_to_every_season` → 保存。综艺主持角色惯用 `Self - Host`。
+
+### 类型 / 出品公司 / 网络（261074 实测）
+
+- **类型**：`GET/POST /tv/{tv_id}/remote/genres?translate=false`。POST 为 data=JSON：`{"models":[{"id":10764,"bson_id":"<genre bson>","name":"Reality","order":1000}]}`——**id + bson_id + 英文主名三样缺一不可**（genre 的 bson 从编辑页「类型」区块 combobox 的 dataSource 项里拿）；只发中文名或纯英文名都报 `The specified genre could not be found.`（服务端按英文主名+id 匹配，界面显示的中文是翻译名）。失败也返回 HTTP 200 + `failure`，以 GET 复查为准。
+- **出品公司**：`GET/POST /tv/{tv_id}/remote/production_companies?translate=false`。POST data=JSON：`{"id":79261,"logo_path":"","name":"TVB"}`——id 正确时服务端自动补全 logo_path 与 url。
+- **网络**：`GET/POST /tv/{tv_id}/season/{n}/remote/networks?translate=false`（**networks 按季分配**，主条目页显示各季合并列表；`/tv/{tv_id}/remote/networks` 端点也存在，官方说明是待迁移网络的暂存区）。POST data=JSON：`{"id":48,"name":"TVB Jade"}`。
 
 ### 图片上传（全部已实测）
 
@@ -109,7 +120,18 @@ const r = await fetch('/image', {method:'POST', credentials:'same-origin', body:
 - **人物头像**：图片页 URL 是 `/person/{id}/images/profiles`（复数 profiles，单数 404）。页面内嵌配置 `media_type: 'Person', type: 'profile'`，上传与 `/image` 同款 multipart（upload_files/media_id/media_type/type/translate）。已实测到配置层。
 - **建条向导**：`/tv/new`、`/movie/new` 存在；查重端点已实锤 `GET /tv/duplicate_check?name=…&original_name=…` → `{"success":true}`（200 JSON）；`/tv/content_check` 对 GET 是 404（POST 型，形态需现场）。向导本体是 JS 分步表单（第一步防重名搜索），最终提交请求需首次真实建条时现场记录一次再补进本文档。
 - **图片删除**：**网页版没有自助删图入口**（代码级确认：画廊组件 `tmdb-image-gallery-*.js` 是纯查看器，卡片/悬停/灯箱/主应用 JS 全链路无删除端点；官方 Talk 亦确认只有管理员能删）。官方清理渠道 = 条目页「反馈」举报：`GET /report/new?media_type=TvSeries&media_id={bson}&request_url={页面路径}` 取表单 → POST 表单 action（urlencoded，非 data=JSON）→ `{"success":true}`。字段：`authenticity_token/session_language/item/item_id/item_type/request_url/type_of_problem/extra_details/public_report`；type_of_problem 单选值：`duplicate | bad_image | design_issue | offensive_or_spam | incorrect_content`，删自己误传的图选 `bad_image` 并把图片直链与理由写进 `extra_details`，管理员人工处理（实测提交 success）。
-- **通用坑**：条目级端点带 `{id}-{slug}` 形态（从编辑页 JS 抄最稳）；带查询串 `?translate=false`；写请求 `data=URL编码JSON`；响应 `failure.errors` 数组是官方校验文案（如分辨率不足），按文案修数据。
+- **季/集删除同走举报**（官方编辑页明示）：误建的空季选 `incorrect_content`，extra_details 写明删哪一季；提交方式见下「UI 钩子侦察法」的表单 POST fallback。
+- **通用坑**：条目级端点带 `{id}-{slug}` 形态（从编辑页 JS 抄最稳）；带查询串 `?translate=false`；写请求 `data=URL编码JSON`；响应 `failure.errors` 数组是官方校验文案（如分辨率不足），按文案修数据。**注意例外**：主条目/季 primary_facts、seasons 建季、cast 的 UI 保存是 **urlencoded 表单 + authenticity_token**，不是 data=JSON；v3 公开 API 有缓存延迟（季/集数改动要几分钟才反映），核验以 `/remote/*` 端点为准。
+
+### UI 钩子侦察法（261074 实战沉淀：端点形态未知时的标准探测流程）
+
+1. 页面内装钩子（fetch + XMLHttpRequest.open/send 包一层，把 method/url/body 推进 `window.__reqs`）；
+2. 真实点击目标按钮（添加季/添加类型/保存……）；
+3. 读 `window.__reqs` 拿到真实端点、方法、body 形态（urlencoded 表单 vs `data=JSON`），照抄。
+   - 踩坑：kendo 下拉的选中不能只 `cb.select(index)`/`cb.value()`——`dataSource.data()` 是 ObservableArray（`[].slice.call` 转真数组），且 `select(index)` 的索引空间与视图不一致会选错项；优先用 `dataValueField` 匹配 `cb.value('名')`，绑 model 的场景（人物搜索）必须真实点击下拉 li（dispatch mousedown/mouseup/click）。
+   - 忙等 `while(Date.now())` 会阻塞 XHR 回调，等网络结果要用 async IIFE + `await new Promise(setTimeout)`（browser.py 的 eval 支持）。
+   - 页面 submit 按钮 `click()` 可能被站点 JS 阻断不发请求（举报表单实测踩过）；fallback = `new FormData(form)` 序列化 + `fetch(location.href, {method:'POST', body:new URLSearchParams(fd), credentials:'same-origin'})`。
+   - browser.py 的 op 键名：navigate 用 `url`（不是 pageUrl）；eval 结果在 `value` 键；js 里顶层 `return`/`await` 非法，用 IIFE / async IIFE 包裹。
 
 ## 登录与会话（实测坑）
 
