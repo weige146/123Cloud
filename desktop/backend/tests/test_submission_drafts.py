@@ -22,6 +22,7 @@ from app.submission import (
     extract_release_group,
     is_completed_media,
     save_share_media_cache,
+    get_share_media_cache,
     save_submission_draft,
     select_submission_channel,
     send_submission_preview,
@@ -77,6 +78,8 @@ class SubmissionDraftTests(unittest.TestCase):
             "mediaType": "movie",
             "title": "肖申克的救赎",
             "year": "1994",
+            "overview": "希望让人自由",
+            "posterUrl": "https://image.tmdb.org/t/p/w780/poster.jpg",
         }
         fetch = AsyncMock(
             return_value={
@@ -116,7 +119,7 @@ class SubmissionDraftTests(unittest.TestCase):
                 {"url": "https://www.123pan.com/s/demo", "cleanUrl": "https://www.123pan.com/s/demo", "title": "Demo"},
                 {"title": "Demo", "fileNames": []},
                 "Telegram 投稿",
-                {"title": "Demo", "mediaType": "movie", "year": "2026"},
+                {"title": "Demo", "mediaType": "movie", "year": "2026", "overview": "简介", "posterUrl": "https://image.tmdb.org/t/p/w780/p.jpg"},
                 owner_user_id=202,
                 submitter={"id": 202, "username": "friend_submitter", "first_name": "朋友"},
             )
@@ -283,18 +286,101 @@ class SubmissionDraftTests(unittest.TestCase):
 
     def test_media_cache_rejected_when_title_mismatches(self):
         """TMDB 电影/剧集两套 ID 空间同数字撞库：缓存标题与本次识别标题对不上时必须弃用重新识别。"""
-        cached = {"tmdbId": 272272, "mediaType": "movie", "title": "The Jilting of Granny Weatherall", "year": "1980"}
+        cached = {
+            "tmdbId": 272272, "mediaType": "movie", "title": "The Jilting of Granny Weatherall", "year": "1980",
+            "overview": "旧简介", "posterUrl": "https://image.tmdb.org/t/p/w780/old.jpg", "backdropUrl": "",
+        }
         metadata = {"tmdbId": 272272, "mediaType": "tv", "title": "J Music", "year": "2023"}
         self.assertIsNone(should_use_cached_media(cached, metadata))
         # 标题对得上照常命中
-        good = {"tmdbId": 272272, "mediaType": "tv", "title": "J Music", "year": "2023"}
+        good = {
+            "tmdbId": 272272, "mediaType": "tv", "title": "J Music", "year": "2023",
+            "overview": "", "posterUrl": "https://image.tmdb.org/t/p/w780/p.jpg", "backdropUrl": "",
+        }
         self.assertEqual(should_use_cached_media(good, metadata), good)
         # 识别标题缺失时不误伤（维持旧行为）
         self.assertEqual(should_use_cached_media(cached, {"tmdbId": 272272}), cached)
 
+    def test_media_cache_empty_display_data_reidentifies(self):
+        """识别时 TMDB 条目还是空壳（无海报无简介），空结果被缓存后永远不自愈；
+        自动识别的缓存三样全空必须弃用重查，手动指定的是用户明确选择保持复用。"""
+        empty = {"tmdbId": 200851, "mediaType": "tv", "title": "凌云壮志包青天", "year": "2005"}
+        metadata = {"tmdbId": 200851, "mediaType": "tv", "title": "凌云壮志包青天", "year": "2005"}
+        self.assertIsNone(should_use_cached_media(dict(empty), metadata, "auto"))
+        self.assertIsNone(should_use_cached_media(dict(empty), metadata))
+        self.assertEqual(should_use_cached_media(dict(empty), metadata, "manual"), empty)
+        # 有海报（或仅有背景图/简介）照常命中
+        rich = {**empty, "posterUrl": "https://image.tmdb.org/t/p/w780/p.jpg"}
+        self.assertEqual(should_use_cached_media(rich, metadata), rich)
+        overview_only = {**empty, "overview": "后来补的简介"}
+        self.assertEqual(should_use_cached_media(overview_only, metadata), overview_only)
+
+    def test_empty_auto_cache_reidentifies_and_selfheals(self):
+        """空海报缓存重推时弃用重查：拿到 TMDB 新数据进草稿，并写回缓存完成自愈。"""
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            link = "123FLCPV2$%f#1024#Empty.Cache.2026.2160p.WEB-DL-HiveWeb.mkv"
+            stale = {
+                "tmdbId": 301345, "mediaType": "tv", "title": "京城奇探", "year": "2026",
+                "originalTitle": "", "aliases": [], "overview": "", "posterUrl": "", "backdropUrl": "",
+                "voteAverage": None, "genres": [], "status": "", "tmdbUrl": "https://www.themoviedb.org/tv/301345",
+            }
+            store.write_submission_config(
+                {
+                    "tmdbToken": "token",
+                    "allowedUserIds": [123456],
+                    "channels": [
+                        {"id": "private", "title": "私有", "chatId": "-1001", "enabled": True, "isDefault": True, "role": "private"}
+                    ]
+                }
+            )
+            save_share_media_cache(store, link, stale, "auto")
+
+            refreshed = {**stale, "overview": "新简介", "posterUrl": "https://image.tmdb.org/t/p/w780/new.jpg", "voteAverage": 7.0}
+            find_calls = []
+
+            async def fake_find(token, language, tmdb_id, media_type, force_refresh=False):
+                find_calls.append(force_refresh)
+                return [dict(refreshed)]
+
+            async def fake_douban(imdb_id="", title="", year="", media_type=""):
+                return None
+
+            with patch("app.tmdb.tmdb_find_by_id", side_effect=fake_find), \
+                    patch("app.tmdb.fetch_douban_rating", side_effect=fake_douban):
+                result = asyncio.run(
+                    submit_submission_links(
+                        store,
+                        [
+                            {
+                                "url": link,
+                                "cleanUrl": link,
+                                "provider": "123fastlink",
+                                "title": "京城奇探 (2026) {tmdb-301345}",
+                                "sourceText": "🎬：京城奇探 (2026) {tmdb-301345}\n📄：Empty.Cache.2026.2160p.WEB-DL-HiveWeb.mkv\n🔗：" + link,
+                                "inspection": {
+                                    "title": "京城奇探 (2026) {tmdb-301345}",
+                                    "fileNames": ["Empty.Cache.2026.2160p.WEB-DL-HiveWeb.mkv"],
+                                    "size": "1GB",
+                                    "rawText": "Empty.Cache.2026.2160p.WEB-DL-HiveWeb.mkv",
+                                },
+                            }
+                        ],
+                        "秒传链接",
+                    )
+                )
+
+            draft = result["drafts"][0]
+            self.assertEqual(find_calls, [True])
+            self.assertEqual(draft["media"]["posterUrl"], "https://image.tmdb.org/t/p/w780/new.jpg")
+            self.assertIn("新简介", draft["caption"])
+            healed = get_share_media_cache(store, link)
+            self.assertEqual(healed.get("media", {}).get("posterUrl"), "https://image.tmdb.org/t/p/w780/new.jpg")
+            self.assertEqual(healed.get("source"), "auto")
+
     def test_find_media_searches_title_when_id_result_mismatches(self):
         """ID 直查到的片子标题与识别标题对不上（ID 撞库/标记打错）时，补标题搜索让评分裁决。"""
-        async def fake_find(token, language, tmdb_id, media_type):
+        async def fake_find(token, language, tmdb_id, media_type, force_refresh=False):
             if media_type == "tv":
                 return [{
                     "tmdbId": 272272, "mediaType": "tv", "title": "The Jilting of Granny Weatherall",
@@ -302,7 +388,7 @@ class SubmissionDraftTests(unittest.TestCase):
                 }]
             return []
 
-        async def fake_search(token, language, query, year, media_type, limit=12):
+        async def fake_search(token, language, query, year, media_type, limit=12, force_refresh=False):
             assert query == "J Music" and year == "2023"
             return [{
                 "tmdbId": 345678, "mediaType": "tv", "title": "J Music",
@@ -680,6 +766,8 @@ class SubmissionDraftTests(unittest.TestCase):
             "status": "Ended",
             "seasons": [{"seasonNumber": 1, "episodeCount": 12}],
             "genres": [],
+            "overview": "简介",
+            "posterUrl": "https://image.tmdb.org/t/p/w780/p.jpg",
         }
         files = [f"Season 1/Show.S01E{episode:02d}.2160p.WEB-DL.HDR.60FPS.HEVC.AAC.mkv" for episode in range(1, 13)]
         inspection = {"title": "大明暗影三百忠魂 (2026) {tmdb-312541}", "fileNames": files, "size": "51.4 GB", "rawText": "\n".join(files)}

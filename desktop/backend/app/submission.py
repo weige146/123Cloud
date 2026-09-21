@@ -358,6 +358,7 @@ async def submit_submission_links(
                 inspection,
                 source_label,
                 cached_media,
+                cached_media_source=str(cached.get("source") or "auto"),
                 owner_chat_id=owner_chat,
                 owner_user_id=owner_user,
                 source_message_id=source_message_id,
@@ -417,6 +418,7 @@ async def build_submission_draft(
     inspection: Dict[str, Any],
     source_label: str,
     cached_media: Optional[Dict[str, Any]] = None,
+    cached_media_source: str = "auto",
     owner_chat_id: Optional[int] = None,
     owner_user_id: Optional[int] = None,
     source_message_id: int = 0,
@@ -427,7 +429,11 @@ async def build_submission_draft(
     source_text = str(link.get("sourceText") or "").strip()
     recognition = build_media_recognition_input(source_text, inspection)
     metadata = recognize_submission_metadata(recognition["text"], recognition["inspection"], config)
-    media = should_use_cached_media(cached_media, metadata) or await find_submission_media(config, metadata, recognition["inspection"])
+    cached_hit = should_use_cached_media(cached_media, metadata, cached_media_source)
+    # 缓存存在但被弃用（标题对不上或数据全空）时，TMDB 24h 内存缓存里很可能还躺着
+    # 同一份旧数据，强制绕过读缓存重查，「TMDB 补了海报/简介」的自愈才能拿到新数据
+    force_refresh = cached_hit is None and bool(cached_media)
+    media = cached_hit or await find_submission_media(config, metadata, recognition["inspection"], force_refresh=force_refresh)
     media = await enrich_submission_douban(media, metadata, config)
     metadata = fill_submission_metadata(metadata, media, recognition["inspection"])
     link_note = str(link.get("note") or "").strip()
@@ -501,7 +507,12 @@ def _tmdb_candidates_match_title(candidates: List[Dict[str, Any]], query: str) -
     return False
 
 
-async def find_submission_media(config: Dict[str, Any], metadata: Dict[str, Any], inspection: Dict[str, Any]) -> Dict[str, Any]:
+async def find_submission_media(
+    config: Dict[str, Any],
+    metadata: Dict[str, Any],
+    inspection: Dict[str, Any],
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
     media_type = str(metadata.get("mediaType") or "unknown")
     normalized_type = media_type if media_type in {"movie", "tv"} else None
     title = str(metadata.get("title") or inspection.get("title") or first_media_filename(inspection.get("fileNames") or []) or "未识别媒体").strip()
@@ -515,12 +526,12 @@ async def find_submission_media(config: Dict[str, Any], metadata: Dict[str, Any]
         try:
             from .tmdb import pick_best_tmdb_candidate, tmdb_find_by_id, tmdb_search_candidates, tmdb_title_key
 
-            candidates = await tmdb_find_by_id(token, language, tmdb_id, normalized_type) if tmdb_id else []
+            candidates = await tmdb_find_by_id(token, language, tmdb_id, normalized_type, force_refresh=force_refresh) if tmdb_id else []
             # ID 撞库/标记打错兜底：ID 查到的片子标题与识别标题完全对不上时，
             # 补一轮标题搜索合并候选，让评分裁决（标题命中权重高于类型权重）
             if candidates and title and not _tmdb_candidates_match_title(candidates, title):
                 try:
-                    searched = await tmdb_search_candidates(token, language, title, year, normalized_type)
+                    searched = await tmdb_search_candidates(token, language, title, year, normalized_type, force_refresh=force_refresh)
                 except Exception:
                     searched = []
                 seen_keys = {(str(item.get("mediaType") or ""), int(item.get("tmdbId") or 0)) for item in candidates}
@@ -529,7 +540,7 @@ async def find_submission_media(config: Dict[str, Any], metadata: Dict[str, Any]
                     if (str(item.get("mediaType") or ""), int(item.get("tmdbId") or 0)) not in seen_keys
                 ]
             if not candidates and title:
-                candidates = await tmdb_search_candidates(token, language, title, year, normalized_type)
+                candidates = await tmdb_search_candidates(token, language, title, year, normalized_type, force_refresh=force_refresh)
             if candidates:
                 media = pick_best_tmdb_candidate(candidates, title, year, normalized_type)
         except Exception:
@@ -1087,7 +1098,11 @@ def save_share_media_cache(store: SessionStore, share_url: str, media: Dict[str,
     store.write_value(SUBMISSION_MEDIA_CACHE_KEY, cache)
 
 
-def should_use_cached_media(cached_media: Optional[Dict[str, Any]], metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def should_use_cached_media(
+    cached_media: Optional[Dict[str, Any]],
+    metadata: Dict[str, Any],
+    source: str = "auto",
+) -> Optional[Dict[str, Any]]:
     if not isinstance(cached_media, dict) or not cached_media:
         return None
     wanted = int(metadata.get("tmdbId") or 0)
@@ -1099,6 +1114,12 @@ def should_use_cached_media(cached_media: Optional[Dict[str, Any]], metadata: Di
     #（类型默认值不算证据——文件名没有剧集信号时会默认 movie，不能拿它否定缓存）。
     title = str(metadata.get("title") or "").strip()
     if title and str(cached_media.get("title") or "").strip() and not _tmdb_candidates_match_title([cached_media], title):
+        return None
+    # 识别时 TMDB 条目可能还没海报没简介，空结果被缓存后永远不自愈；自动识别的缓存
+    # 海报/背景图/简介三样全空就弃用重查（手动指定的是用户明确选择，保持复用）。
+    if source != "manual" and not any(
+        str(cached_media.get(key) or "").strip() for key in ("posterUrl", "backdropUrl", "overview")
+    ):
         return None
     return cached_media
 

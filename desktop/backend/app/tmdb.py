@@ -346,11 +346,18 @@ def clean_path_part(value: str) -> str:
     return clean_name_part(value)
 
 
-async def tmdb_find_by_id(token: str, language: str, tmdb_id: int, media_type: Optional[str] = None) -> List[Dict[str, Any]]:
+async def tmdb_find_by_id(
+    token: str,
+    language: str,
+    tmdb_id: int,
+    media_type: Optional[str] = None,
+    *,
+    force_refresh: bool = False,
+) -> List[Dict[str, Any]]:
     types = [media_type] if media_type in {"movie", "tv"} else ["movie", "tv"]
     candidates: List[Dict[str, Any]] = []
     for kind in types:
-        media = await tmdb_get_details(token, language, kind, tmdb_id)
+        media = await tmdb_get_details(token, language, kind, tmdb_id, force_refresh=force_refresh)
         if media:
             candidates.append(media)
     return candidates
@@ -363,6 +370,7 @@ async def tmdb_search_candidates(
     year: str = "",
     media_type: Optional[str] = None,
     limit: int = 12,
+    force_refresh: bool = False,
 ) -> List[Dict[str, Any]]:
     cache_key = ":".join([
         language,
@@ -371,7 +379,7 @@ async def tmdb_search_candidates(
         str(limit),
         query.strip().casefold(),
     ])
-    cached = _tmdb_list_cache_get(_tmdb_search_cache, cache_key)
+    cached = None if force_refresh else _tmdb_list_cache_get(_tmdb_search_cache, cache_key)
     if cached is not None:
         return cached
 
@@ -451,11 +459,19 @@ async def _load_tmdb_search_candidates(
     return candidates
 
 
-async def tmdb_get_details(token: str, language: str, media_type: str, tmdb_id: int, *, client: Optional[httpx.AsyncClient] = None) -> Optional[Dict[str, Any]]:
+async def tmdb_get_details(
+    token: str,
+    language: str,
+    media_type: str,
+    tmdb_id: int,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    force_refresh: bool = False,
+) -> Optional[Dict[str, Any]]:
     if media_type not in {"movie", "tv"} or tmdb_id <= 0:
         return None
     cache_key = _tmdb_cache_key(tmdb_id, media_type, language)
-    cached = _tmdb_cache_get(cache_key)
+    cached = None if force_refresh else _tmdb_cache_get(cache_key)
     if cached is not None:
         return cached
 
