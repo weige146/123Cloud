@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.19
+// @version      1.3.20
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -6625,6 +6625,17 @@
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.3.20",
+      notes: [
+        "音频编码写在 Atmos 前面的命名，现在也能认出杜比全景声",
+        "4K 超高清原盘名字中间带连字符的，资源类型不再被降成普通蓝光原盘",
+        "整理改名时，这类文件的资源类型也能正确写上 4K 超高清原盘",
+        "整理预览的命名字段会直接预填组内文件识别出的帧率、编码等值",
+        "分组里修改或清空技术字段会同步到组内全部文件，清空即从文件名里删掉该字段",
+        "单个文件仍可在文件行里单独改，纠正个别文件写错的标记"
+      ]
+    },
     {
       version: "1.3.19",
       notes: [
@@ -18282,10 +18293,11 @@ ${end.comment}` : end.comment;
     const videoFormat = mapped("videoFormat");
     const mediaSource = mapped("mediaSource");
     let resourceType = mapped("resourceType");
-    // Remux 别名跨不过中间的分辨率段：「UHD.BluRay.2160p.REMUX」先被 UHD BluRay/BluRay
-    // 条目命中，「BluRay.1080p.Remux」落到单独的 Remux 条目。名字带 REMUX 记号时按
-    // BluRay/UHD 记号有无补升为对应 Remux 资源类型。
-    if (/\bREMUX\b/i.test(text2) && ["", "Remux", "BluRay", "UHD BluRay"].includes(resourceType)) {
+    // Remux 别名跨不过中间的分辨率段或连字符：「UHD.BluRay.2160p.REMUX」先被 UHD
+    // BluRay/BluRay 条目命中，「BluRay.1080p.Remux」落到单独的 Remux 条目，
+    // 「UHD.Blu-ray.REMUX」里 BluRay 整词被连字符断开、落到 Blu Ray Remux 条目。
+    // 名字带 REMUX 记号时按 BluRay/UHD 记号有无补升为对应 Remux 资源类型。
+    if (/\bREMUX\b/i.test(text2) && ["", "Remux", "BluRay", "BluRay Remux", "UHD BluRay"].includes(resourceType)) {
       const hasUhd = /\bUHD\b|Ultra[\s._-]*HD/i.test(text2);
       const hasBluRay = /\bBlu[\s._-]*Ray\b|\bBD\b/i.test(text2);
       if (hasUhd && hasBluRay) resourceType = "UHD BluRay Remux";
@@ -18298,15 +18310,19 @@ ${end.comment}` : end.comment;
     const videoCodec = mapped("videoCodec");
     const audioMatch = text2.match(buildAudioMatchRegex(configuredMappings));
     let audioRaw = "";
+    let leadingAtmos = false;
     if (audioMatch) {
       audioRaw = audioMatch[1];
       const matchEnd = audioMatch.index + audioMatch[0].length;
       const trailingAtmos = text2.slice(matchEnd, matchEnd + 12).match(/^[.\s-]*(?:Dolby[.\s-]*)?Atmos\b/i)?.[0];
       if (trailingAtmos) audioRaw += trailingAtmos;
+      // Atmos 写在编码前面的（Atmos.TrueHD7.1）只补 Atmos 判定、不并进 audioRaw：
+      // 别名匹配按前缀比对，并进去开头变成 ATMOS 就整体匹配不上了。
+      leadingAtmos = /(?:^|[^A-Za-z0-9])(?:Dolby[.\s-]*)?Atmos[.\s-]*$/i.test(text2.slice(Math.max(0, audioMatch.index - 16), audioMatch.index));
     }
     audioRaw = audioRaw.replace(/[ _-]+/g, ".").replace(/\.{2,}/g, ".");
     const audioChannels = audioRaw.match(/(\d\.\d)/)?.[1] || "";
-    const hasAtmos = /\bAtmos\b/i.test(audioRaw);
+    const hasAtmos = leadingAtmos || /\bAtmos\b/i.test(audioRaw);
     const hasJOC = /\bJOC\b/i.test(audioRaw);
     let audioCodec = findAudioMapping(audioRaw, configuredMappings)?.output || findAudioMapping(text2, configuredMappings)?.output || "";
     if (audioCodec) {
@@ -20117,9 +20133,12 @@ ${end.comment}` : end.comment;
       if (options.excludedItemIds?.has?.(String(file.id)) || options.excludedItemIds?.includes?.(String(file.id))) continue;
       if (excluded(file.name, config.library)) continue;
       let fileFields = inferFileFields(file.name, fields, index, config.library);
-      // 探测的实测元数据优先于文件名自带标记（显式动作、实测为准）；单文件纠偏最高。
+      // 组级手动改过的键整组同步（清空=整组删除该字段）；探测的实测元数据优先于
+      // 文件名自带标记（显式动作、实测为准）；单文件纠偏最高（稍后应用）。没动
+      // 过的组级字段不在此写入，文件保持文件名/目录名自己的值。
       for (const key of LOCAL_TECHNICAL_KEYS) {
-        if (!hasOwn(groupOverride, key) && hasOwn(metadataFields, key)) fileFields[key] = metadataFields[key];
+        if (hasOwn(groupOverride, key)) fileFields[key] = groupOverride[key];
+        else if (hasOwn(metadataFields, key)) fileFields[key] = metadataFields[key];
       }
       const fileOverride = options.fileOverrides?.[String(file.id)];
       if (fileOverride) {
@@ -20290,15 +20309,19 @@ ${end.comment}` : end.comment;
     let videoIndex = 0;
     group.files = (group.files || []).map((file) => {
       const merged = { ...fields };
-      // 技术字段优先级：单文件手动覆盖 > 组级手动 > 探测实测 > 文件名自带 > 目录名。
-      // 探测是显式动作、实测为准，识别出的真实规格要直接更新文件名（文件名写法与
-      // 实测不一致的以实测为准，如 H265→HEVC）；组级手动只填裸文件的规则不变。
+      // 技术字段优先级：单文件手动覆盖 > 组级手动（改过该键就整组同步，清空=整组
+      // 删除该字段）> 探测实测（实测为准，H265→HEVC 这类写法差异按实测更新）>
+      // 文件名自带 > 目录名（目录名推断只填裸文件；没动过的组级字段绝不自动写入
+      // 文件，混排组打开预览不互相污染）。文件名自带的值每次现算：组级/探测的
+      // 旧值会 persist 进 file.fields，回退若信它，清空组级字段后旧覆盖值会残留。
       const perFileTechnical = Boolean(file.fields?.technicalFromName);
       const fileOverride = options.fileOverrides?.[String(file.id)];
+      const nameTechnical = perFileTechnical ? inferFileFields(file.name, fields, 0, config.library) : null;
       for (const key of LOCAL_TECHNICAL_KEYS) {
         if (fileOverride && hasOwn(fileOverride, key)) merged[key] = fileOverride[key];
-        else if (!hasOwn(groupOverride, key) && hasOwn(metadataFields, key)) merged[key] = metadataFields[key];
-        else if (perFileTechnical && hasOwn(file.fields || {}, key)) merged[key] = file.fields[key] || "";
+        else if (hasOwn(groupOverride, key)) merged[key] = groupOverride[key];
+        else if (hasOwn(metadataFields, key)) merged[key] = metadataFields[key];
+        else if (nameTechnical && hasOwn(nameTechnical, key)) merged[key] = nameTechnical[key] || "";
       }
       merged.technicalFromName = perFileTechnical;
       const baseEpisodeFields = file.baseEpisodeFields ? { ...file.baseEpisodeFields } : episodeFieldSnapshot(file.fields || {});
@@ -22959,6 +22982,26 @@ ${end.comment}` : end.comment;
     const technicalKeys = ["videoFormat", "mediaSource", "resourceType", "effect", "originalEdition", "highQuality", "dolbyVision", "dynamicRange", "frameRate", "colorDepth", "videoCodec", "audioCodec", "releaseGroup"];
     const overrides = ui.organize.overrides[group.id] || {};
     const fields = { ...group.fields, ...overrides };
+    // 没改过的技术字段直接预填组内文件识别出的值（取最多文件一致的写法），改过
+    // （含清空）就以组级值为准——清空会从整组文件名里删掉该字段
+    const recognized = {};
+    for (const key of technicalKeys) {
+      if (hasOwn(overrides, key)) continue;
+      const counts = new Map();
+      for (const file of group.files) {
+        const value = String(file.fields?.[key] ?? "").trim();
+        if (value) counts.set(value, (counts.get(value) || 0) + 1);
+      }
+      let best = "";
+      let bestCount = 0;
+      for (const [value, count] of counts) {
+        if (count > bestCount) {
+          best = value;
+          bestCount = count;
+        }
+      }
+      recognized[key] = best || String(fields[key] || "");
+    }
     // 命名字段全部常驻展开：识别不到的就留空（空值不写入文件名），不再按「有值才显示」
     // 隐藏，「加入字段」下拉随之取消（维护者 2026-09-22 定）。
     const keys = [...identityKeys, ...technicalKeys];
@@ -22978,9 +23021,10 @@ ${end.comment}` : end.comment;
         const listId = `organize-alias-${key}-${String(group.id).replace(/[^A-Za-z0-9_-]/g, "-")}`;
         return controlFrame(key, label, `<input ${attributes} value="${escapeHtml(fields[key] || "")}" ${options.length ? `list="${listId}"` : ""}>${options.length ? `<datalist id="${listId}">${options.map((option) => `<option value="${escapeHtml(option)}"></option>`).join("")}</datalist>` : ""}`);
       }
-      return controlFrame(key, label, `<input ${attributes} value="${escapeHtml(fields[key] || "")}">`);
+      const value = technicalKeys.includes(key) && !hasOwn(overrides, key) ? recognized[key] || "" : fields[key] || "";
+      return controlFrame(key, label, `<input ${attributes} value="${escapeHtml(value)}">`);
     }).join("");
-    return `<section class="detail-section"><div class="section-title"><div>${icon("sliders", 17)}<h4>\u547D\u540D\u5B57\u6BB5</h4></div><span class="section-hint">\u7559\u7A7A\u4E0D\u5199\u5165\u6587\u4EF6\u540D\uFF1B\u6280\u672F\u5B57\u6BB5\u53EA\u5BF9\u6587\u4EF6\u540D\u6CA1\u5199\u89C4\u683C\u7684\u6587\u4EF6\u751F\u6548\uFF0C\u5355\u4E2A\u6587\u4EF6\u5728\u6587\u4EF6\u884C\u91CC\u5355\u72EC\u6539</span></div><div class="organize-fields">${controls}</div></section>`;
+    return `<section class="detail-section"><div class="section-title"><div>${icon("sliders", 17)}<h4>\u547D\u540D\u5B57\u6BB5</h4></div><span class="section-hint">\u5206\u7EC4\u91CC\u4FEE\u6539\u6216\u6E05\u7A7A\u6280\u672F\u5B57\u6BB5\u4F1A\u540C\u6B65\u5230\u7EC4\u5185\u5168\u90E8\u6587\u4EF6\uFF0C\u6E05\u7A7A\u5373\u4ECE\u6587\u4EF6\u540D\u91CC\u5220\u6389\u8BE5\u5B57\u6BB5\uFF1B\u5355\u4E2A\u6587\u4EF6\u5728\u6587\u4EF6\u884C\u91CC\u5355\u72EC\u6539</span></div><div class="organize-fields">${controls}</div></section>`;
   }
   function episodeOptions(ui, file) {
     if (!file.candidates?.length) return "";

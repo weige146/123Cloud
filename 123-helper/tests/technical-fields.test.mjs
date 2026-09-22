@@ -74,7 +74,7 @@ fields = inferTechnicalFields("Flight.of.the.Butterflies.2012.UHD.BluRay.2160p.R
 assert.equal(fields.resourceType, "UHD BluRay Remux");
 assert.equal(fields.videoFormat, "2160p");
 assert.equal(fields.videoCodec, "HEVC");
-assert.equal(fields.audioCodec, "TrueHD.7.1");
+assert.equal(fields.audioCodec, "TrueHD.7.1.Atmos");
 assert.equal(inferTechnicalFields("Movie.2018.1080p.UHD.BluRay.REMUX.HEVC-GROUP").resourceType, "UHD BluRay Remux");
 console.log("ok REMUX 与 UHD BluRay 隔段出现时识别为 UHD BluRay Remux");
 
@@ -102,5 +102,24 @@ assert.equal(inferTechnicalFields("Movie.2024.1080p.WEB-DL.DD+5.1.H.264-GROUP").
 assert.equal(inferTechnicalFields("Movie.2024.1080p.WEB-DL.DDP5.1.Atmos.H.265-GROUP").audioCodec, "DDP.5.1.Atmos");
 assert.equal(inferTechnicalFields("Show.S01.2160p.IPTV.H.265.DD.2.0-GROUP").audioCodec, "DD.2.0");
 console.log("ok AVS2/AVS3/AVS+ 编码、UHDTV 资源类型、DD2.0 不再误判成 DDP");
+
+// 8. Atmos 写在编码前面（HDH 式命名）：只补 Atmos 判定，编码与声道照常识别；
+//    对照组：Atmos 在后/在编码中间的既有写法不受影响；单独 Atmos 不触发音频识别
+fields = inferTechnicalFields("Superman.1978.2160p.REISSUE.UHD.Blu-ray.REMUX.HEVC.Atmos.TrueHD7.1-HDH");
+assert.equal(fields.audioCodec, "TrueHD.7.1.Atmos");
+assert.equal(fields.videoCodec, "HEVC");
+assert.equal(fields.resourceType, "UHD BluRay Remux");
+assert.equal(inferTechnicalFields("Show.2023.1080p.Atmos.DDP5.1.H.264-GROUP").audioCodec, "DDP.5.1.Atmos");
+assert.equal(inferTechnicalFields("Show.2023.1080p.Dolby.Atmos.TrueHD.7.1-GROUP").audioCodec, "TrueHD.7.1.Atmos");
+assert.equal(inferTechnicalFields("Movie.2024.1080p.TrueHD7.1.Atmos-GROUP").audioCodec, "TrueHD.7.1.Atmos");
+assert.equal(inferTechnicalFields("Movie.2024.1080p.TrueHD.Atmos.7.1-GROUP").audioCodec, "TrueHD.7.1.Atmos");
+assert.equal(inferTechnicalFields("Movie.2024.1080p.Atmos.H.265-GROUP").audioCodec, "");
+console.log("ok Atmos 写在编码前面也识别，单独 Atmos 不触发音频编码");
+
+// 8b. REMUX：连字符写法 UHD.Blu-ray.REMUX 此前落到 Blu Ray Remux 条目后不再补升；
+//     无 UHD 记号的普通蓝光连字符 Remux 保持 BluRay Remux
+assert.equal(inferTechnicalFields("Movie.2010.UHD.Blu-ray.REMUX.2160p.HEVC-GROUP").resourceType, "UHD BluRay Remux");
+assert.equal(inferTechnicalFields("Movie.2010.Blu-ray.REMUX.1080p.AVC-GROUP").resourceType, "BluRay Remux");
+console.log("ok 连字符 UHD.Blu-ray.REMUX 补升为 UHD BluRay Remux");
 
 console.log("technical-fields.test.mjs 全部通过");

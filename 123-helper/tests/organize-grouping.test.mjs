@@ -501,7 +501,7 @@ test("探测的实测元数据覆盖文件名自带标记；单文件覆盖仍�
   assert.equal(group.files[1].fields.dolbyVision, "DV");
 });
 
-test("组级技术字段修改只填裸文件，不再整组联动；清空也不再压制文件名自带值", () => {
+test("组级技术字段修改同步全部文件（清空=整组删除该字段）；单文件覆盖仍最高", () => {
   const dvName = "剧名.S01E01.2160p.DV.HDR10.WEB-DL.mkv";
   const hdrName = "剧名.S01E02.2160p.HDR10.WEB-DL.mkv";
   const bareName = "S01E03.mkv";
@@ -509,12 +509,16 @@ test("组级技术字段修改只填裸文件，不再整组联动；清空也�
   const mk = (id, name, index) => ({ id, name, type: 0, size: 1, fields: inferFileFields(name, fields, index, config) });
   const group = { id: "g-ovr", title: "剧名", fields: { ...fields }, files: [mk("f1", dvName, 0), mk("f2", hdrName, 1), mk("f3", bareName, 2)] };
   refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true, overrides: { "g-ovr": { dolbyVision: "DV" } } });
-  assert.equal(group.files[1].fields.dolbyVision, "", "组级 DV 不覆盖文件名写了 HDR 的文件");
-  assert.ok(!group.files[1].newName.includes("DV"), `HDR 文件新名不应出现 DV：${group.files[1].newName}`);
+  assert.equal(group.files[0].fields.dolbyVision, "DV", "组级修改同步到文件名自带的文件");
+  assert.equal(group.files[1].fields.dolbyVision, "DV", "组级修改同步到全部文件");
   assert.equal(group.files[2].fields.dolbyVision, "DV", "裸文件吃到组级值");
+  refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true, overrides: { "g-ovr": { dolbyVision: "DV" } }, fileOverrides: { f2: { dolbyVision: "" } } });
+  assert.equal(group.files[1].fields.dolbyVision, "", "单文件覆盖压过组级同步");
   refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true, overrides: { "g-ovr": { dolbyVision: "" } } });
-  assert.equal(group.files[0].fields.dolbyVision, "DV", "清空组级字段不压制文件名自带的 DV");
+  assert.equal(group.files[0].fields.dolbyVision, "", "清空组级字段=整组删除，文件名自带的 DV 也删掉");
+  assert.ok(!group.files[0].newName.includes("DV"), `清空后新名不应再带 DV：${group.files[0].newName}`);
   assert.equal(group.files[1].fields.dolbyVision, "");
+  assert.equal(group.files[2].fields.dolbyVision, "");
 });
 
 test("文件级覆盖优先级最高：单文件纠正文件名写错的标记", () => {
