@@ -400,9 +400,10 @@ class TransferServiceTests(unittest.TestCase):
             def _get_offline_submit_semaphore(self):
                 return asyncio.Semaphore(3)
 
-            async def acquire_offline_slot(self):
+            async def try_acquire_offline_slot(self):
                 self.offline_slots_in_use = getattr(self, "offline_slots_in_use", 0) + 1
                 self.offline_slots_peak = max(getattr(self, "offline_slots_peak", 0), self.offline_slots_in_use)
+                return True
 
             async def release_offline_slot(self):
                 self.offline_slots_in_use = getattr(self, "offline_slots_in_use", 1) - 1
@@ -864,16 +865,15 @@ class TransferServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_offline_wait_deadline_adapts_to_file_size(self):
+    def test_offline_wait_deadline_is_uniform(self):
+        """等待上限对所有文件统一（轮询次数×轮询间隔），不再按文件大小放宽：
+        大文件单独给几小时会占着全局名额拖死整个排队队列。"""
         from app.transfer_service import _offline_wait_deadline_ms
 
         configured = 60 * 60_000
-        self.assertEqual(_offline_wait_deadline_ms(100 * 1024 * 1024, configured), configured)
-        self.assertEqual(_offline_wait_deadline_ms(600 * 1024 * 1024, configured), 90 * 60_000)
-        self.assertEqual(_offline_wait_deadline_ms(3 * 1024 * 1024 * 1024, configured), 2 * 60 * 60_000)
-        self.assertEqual(_offline_wait_deadline_ms(20 * 1024 * 1024 * 1024, configured), 4 * 60 * 60_000)
-        # 配置更长时以配置为准
-        self.assertEqual(_offline_wait_deadline_ms(20 * 1024 * 1024 * 1024, 5 * 60 * 60_000), 5 * 60 * 60_000)
+        self.assertEqual(_offline_wait_deadline_ms(configured), configured)
+        self.assertEqual(_offline_wait_deadline_ms(240 * 15_000), 60 * 60_000)
+        self.assertEqual(_offline_wait_deadline_ms(0), 1000)
 
     def test_account_cooldown_snapshot_and_clear(self):
         async def run() -> None:
@@ -1077,42 +1077,40 @@ class OfflineGlobalGateTests(unittest.TestCase):
         store.write_config({"transfer": {"concurrency": concurrency}})
         return TransferService(store)
 
-    def test_global_slot_pool_blocks_until_release(self):
+    def test_global_slot_pool_denied_until_release(self):
+        """名额满时 try_acquire 立即返回 False（绝不阻塞等待循环），释放后能再抢到。"""
         async def run():
             service = self._make_service(concurrency=1)
-            await service.acquire_offline_slot()
+            got = await service.try_acquire_offline_slot()
+            self.assertTrue(got)
             self.assertEqual(service._offline_slots_used, 1)
 
-            second = asyncio.create_task(service.acquire_offline_slot())
-            try:
-                await asyncio.wait_for(asyncio.shield(second), timeout=0.05)
-                self.fail("并发上限 1 时第二个名额不应立刻拿到")
-            except asyncio.TimeoutError:
-                pass
+            second = await service.try_acquire_offline_slot()
+            self.assertFalse(second, "并发上限 1 时第二个名额应立即被拒（不等待）")
+            self.assertEqual(service._offline_slots_used, 1)
 
             await service.release_offline_slot()
-            await asyncio.wait_for(second, timeout=1)
-            self.assertEqual(service._offline_slots_used, 1, "释放后等待者应拿到名额")
+            got_again = await service.try_acquire_offline_slot()
+            self.assertTrue(got_again, "释放后应能再抢到名额")
+            self.assertEqual(service._offline_slots_used, 1)
             await service.release_offline_slot()
             self.assertEqual(service._offline_slots_used, 0)
 
         asyncio.run(run())
 
-    def test_global_slot_pool_re_reads_config_after_wait(self):
-        """等名额期间把"并发"调大：唤醒后按新上限放行，无需重启。"""
+    def test_global_slot_pool_re_reads_config(self):
+        """"并发"配置调大后无需重启：下次 try_acquire 按新上限放行。"""
         async def run():
             with tempfile.TemporaryDirectory() as directory:
                 store = SessionStore(Path(directory))
                 store.write_config({"transfer": {"concurrency": 1}})
                 service = TransferService(store)
 
-                await service.acquire_offline_slot()
-                second = asyncio.create_task(service.acquire_offline_slot())
-                await asyncio.sleep(0.05)
-                self.assertFalse(second.done())
+                self.assertTrue(await service.try_acquire_offline_slot())
+                self.assertFalse(await service.try_acquire_offline_slot())
 
                 store.write_config({"transfer": {"concurrency": 2}})
-                await asyncio.wait_for(second, timeout=3)
+                self.assertTrue(await service.try_acquire_offline_slot(), "调大并发后应按新上限放行")
                 self.assertEqual(service._offline_slots_used, 2)
 
         asyncio.run(run())

@@ -181,23 +181,21 @@ class TransferService:
             self._offline_submit_next_ok_ms = time.monotonic() * 1000 + TRANSFER_OFFLINE_SUBMIT_SPACING_MS
             yield
 
-    async def acquire_offline_slot(self) -> None:
-        """占一个「同时在 123 排队的离线任务」全局名额。
+    async def try_acquire_offline_slot(self) -> bool:
+        """尝试占一个「同时在 123 排队的离线任务」全局名额，抢不到立即返回 False。
 
         上限 = 后台"并发"配置（_max_offline_slots），跨搬运任务共享：123 的
         离线数量限制按账号算，两个任务各提交 5 个就超了用户配置的并发上限。
-        等待时除名额释放外还按 1 秒兜底轮询，改大"并发"配置后最多 1 秒生效。
+        绝不阻塞等待：等待循环一旦停在等名额上就没人在轮询落盘，在飞文件
+        完成了也检测不到、名额永不释放，两个任务并发互抢会把彼此全部冻死。
+        名额被抢走的任务每轮轮询重试 fill，释放或调大"并发"后自然继续补交。
         """
-        while True:
-            limit = self._max_offline_slots(await self._get_transfer_config())
-            async with self._get_offline_slots_condition():
-                if self._offline_slots_used < limit:
-                    self._offline_slots_used += 1
-                    return
-                try:
-                    await asyncio.wait_for(self._get_offline_slots_condition().wait(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    pass
+        limit = self._max_offline_slots(await self._get_transfer_config())
+        async with self._get_offline_slots_condition():
+            if self._offline_slots_used < limit:
+                self._offline_slots_used += 1
+                return True
+            return False
 
     async def release_offline_slot(self) -> None:
         async with self._get_offline_slots_condition():

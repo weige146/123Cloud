@@ -218,18 +218,14 @@ def _is_missing_target_dir_error(error: Exception) -> bool:
     ))
 
 
-def _offline_wait_deadline_ms(file_size: int, configured_ms: int) -> int:
-    """按文件大小放宽离线等待上限：小文件用配置值，大文件给足排队+下载时间。"""
-    size = max(0, int(file_size or 0))
-    if size >= 10 * 1024 * 1024 * 1024:
-        adaptive = 4 * 60 * 60_000
-    elif size >= 2 * 1024 * 1024 * 1024:
-        adaptive = 2 * 60 * 60_000
-    elif size >= 500 * 1024 * 1024:
-        adaptive = 90 * 60_000
-    else:
-        adaptive = configured_ms
-    return max(configured_ms, adaptive)
+def _offline_wait_deadline_ms(configured_ms: int) -> int:
+    """离线等待上限 = 轮询次数 × 轮询间隔，所有文件统一时长。
+
+    不再按文件大小放宽：大文件单独给几小时会拖死整个排队队列（全局名额
+    被在飞任务占着，一个慢件卡住全队不前进）。慢任务由超时后的"问一次
+    123 状态"顺延机制兜底（OFFLINE_WAIT_EXTEND_MAX），卡住能及时暴露。
+    """
+    return max(1000, int(configured_ms or 0))
 
 
 async def _delay(ms: int) -> None:
@@ -463,9 +459,18 @@ class OfflineDownloadManager:
         return len([item for item in self.items if not item.done and not item.failed])
 
     async def fill(self) -> None:
-        """用排队中的文件把进行中的离线任务补到并发上限。"""
+        """用排队中的文件把进行中的离线任务补到并发上限。
+
+        先抢到全局名额才取下一个文件，名额满立即返回，绝不等待：
+        等待循环一旦停在补交上就没人在轮询落盘，在飞文件完成了也检测
+        不到、名额永不释放，两个任务并发互抢名额会把彼此全部冻死。
+        每轮轮询都会重试 fill，名额释放或调大"并发"后自然继续补交。
+        """
         while self.pending and len(self.inflight_items()) < self.max_inflight:
+            if not await self.pipeline.service.try_acquire_offline_slot():
+                break
             item = self.pending.pop(0)
+            item.slot_held = True
             await self.submit(item)
 
     async def _release_slot(self, item: OfflineItem) -> None:
@@ -499,6 +504,7 @@ class OfflineDownloadManager:
             file["error"] = reason
             file["finishedAt"] = _utc_now_iso()
             item.failed = True
+            await self._release_slot(item)
             _add_task_log(task, "error", f"离线提交失败：{display}（{reason}）")
             return
 
@@ -521,10 +527,8 @@ class OfflineDownloadManager:
             if not await service._save_transfer_task(task):
                 raise TaskCancelled()
 
-            # 占全局「同时在 123 排队」名额（跨任务共享）：123 的离线数量限制按账号算，
-            # 两个任务各交 5 个就超了用户配置的并发上限。提交失败在下方 except 里归还。
-            await service.acquire_offline_slot()
-            item.slot_held = True
+            # 全局「同时在 123 排队」名额已由 fill() 抢到后挂在 item.slot_held 上
+            #（提交失败在下方 except 里归还）；这里直接建 123 离线任务。
             offline_task_id = await self._create_with_backoff(file, download_url)
             file["offlineTaskId"] = offline_task_id
             file["offlineStatus"] = "running"
@@ -654,7 +658,7 @@ class OfflineDownloadManager:
                     progressed = True
                     continue
 
-                deadline_ms = _offline_wait_deadline_ms(file.get("size", 0), max_polls * poll_ms)
+                deadline_ms = _offline_wait_deadline_ms(max_polls * poll_ms)
                 if time.monotonic() * 1000 - item.started_ms < deadline_ms:
                     continue
                 # 超时先问一次 123 离线任务本身的状态（只在超时这一刻问，不做轮询）：

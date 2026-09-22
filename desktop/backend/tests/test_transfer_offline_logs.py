@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import unittest
 from unittest.mock import patch
@@ -73,7 +74,7 @@ class OfflineWaitLoggingTest(unittest.IsolatedAsyncioTestCase):
             logs.append(message)
 
         with patch.object(tp, "_delay", fake_delay), patch.object(
-            tp, "_offline_wait_deadline_ms", lambda size, total: 10**9
+            tp, "_offline_wait_deadline_ms", lambda total: 10**9
         ), patch.object(tp, "_add_task_log", record):
             with self.assertRaises(_StopLoop):
                 await manager.wait_all()
@@ -90,6 +91,39 @@ class _SlotCountingService(_FakeService):
 
     async def release_offline_slot(self):
         self.released += 1
+
+
+class OfflineFillNeverBlocksTest(unittest.IsolatedAsyncioTestCase):
+    """名额满时 fill() 必须立即返回、绝不等待：等待循环停在补交上就没人在轮询
+    落盘，在飞文件完成了也检测不到、名额永不释放，两个任务并发互抢会把彼此
+    全部冻死（2026-09-22 实测：两任务并发搬运，落盘 40 分钟无人认领、
+    23 个排队文件不前进，只能重启）。"""
+
+    async def test_fill_returns_without_submitting_when_slot_pool_full(self):
+        pipeline = _FakePipeline()
+
+        class _FullService(_FakeService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.acquire_calls = 0
+
+            async def try_acquire_offline_slot(self):
+                self.acquire_calls += 1
+                return False
+
+        service = _FullService()
+        pipeline.service = service
+        manager = _QuietManager(pipeline, max_inflight=5)
+        manager.queue(tp.OfflineItem({"name": "a.mkv", "size": 10, "targetDirId": "123", "method": "offline"}, "123", "0"))
+        manager.queue(tp.OfflineItem({"name": "b.mkv", "size": 10, "targetDirId": "123", "method": "offline"}, "123", "0"))
+
+        await asyncio.wait_for(manager.fill(), timeout=1)
+
+        self.assertEqual(len(manager.pending), 2, "抢不到名额时文件应留在排队里")
+        self.assertEqual(len(manager.items), 2)
+        self.assertFalse(manager.items[0].submitted, "没抢到名额绝不能提交")
+        self.assertFalse(manager.items[0].slot_held)
+        self.assertEqual(service.acquire_calls, 1, "试一次就收手，不空转")
 
 
 class OfflineSlotBookkeepingTest(unittest.IsolatedAsyncioTestCase):
