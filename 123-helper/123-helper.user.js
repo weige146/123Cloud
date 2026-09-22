@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.18
+// @version      1.3.19
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -6193,16 +6193,19 @@
   function firstText(...values) {
     return values.map((value) => String(value ?? "").trim()).find(Boolean) || "";
   }
-  function normalizeResolution(width, height) {
+  function normalizeResolution(width, height, scanType) {
     const size = Math.max(numberValue(width), numberValue(height));
-    if (size >= 7600) return "8K";
-    if (size >= 3800) return "2160p";
-    if (size >= 2500) return "2K";
-    if (size >= 1700) return "1080P";
-    if (size >= 1200) return "720P";
-    if (size >= 900) return "540P";
-    if (size >= 700) return "480P";
-    return "";
+    let label = "";
+    if (size >= 7600) label = "8K";
+    else if (size >= 3800) label = "2160p";
+    else if (size >= 2500) label = "2K";
+    else if (size >= 1700) label = "1080p";
+    else if (size >= 1200) label = "720p";
+    else if (size >= 900) label = "540p";
+    else if (size >= 700) label = "480p";
+    // 隔行扫描的 1080p/720p 按命名惯例写作 1080i/720i（8K/2K/540p/480p 不变）
+    if (label.endsWith("p") && /interlaced/i.test(String(scanType || ""))) label = `${label.slice(0, -1)}i`;
+    return label;
   }
   function normalizeVideoCodec(value) {
     const text2 = String(value || "").toLocaleLowerCase();
@@ -6215,7 +6218,9 @@
     return String(value || "").toUpperCase();
   }
   function normalizeAudioChannels(value) {
-    const channels = Math.round(numberValue(value));
+    // MediaInfo 的 Channels 可能是数字或「6 channels」这类字符串，取第一个数字
+    const match = String(value ?? "").match(/(\d+(?:\.\d+)?)/);
+    const channels = Math.round(Number(match?.[1] || 0));
     if (channels >= 8) return "7.1";
     if (channels >= 6) return "5.1";
     if (channels === 2) return "2.0";
@@ -6247,8 +6252,13 @@
   function normalizeFrameRate(value) {
     const raw = String(value || "").trim();
     if (!raw || raw === "0/0") return "";
-    const rate = raw.includes("/") ? Number(raw.split("/", 2)[0]) / Number(raw.split("/", 2)[1]) : Number(raw.replace(/fps$/i, ""));
-    return Number.isFinite(rate) && rate > 0 ? `${rate.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}fps` : "";
+    // MediaInfo 的帧率可能是纯小数、分数（24000/1001）或「23.976 (24000/1001) fps」文本
+    let rate = NaN;
+    const fraction = raw.match(/^(\d{2,5})\/(\d{2,5})$/);
+    const leading = fraction ? null : raw.match(/^(\d+(?:\.\d+)?)(?:\s*fps)?/i);
+    if (fraction) rate = Number(fraction[1]) / Number(fraction[2]);
+    else if (leading) rate = Number(leading[1]);
+    return Number.isFinite(rate) && rate > 0 && rate < 1000 ? `${rate.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}fps` : "";
   }
   function normalizeBitDepth(track = {}) {
     const value = firstText(track.BitDepth, track.BitDepth_Detected, track.BitDepth_Stored, track.Format_Profile);
@@ -6258,22 +6268,39 @@
     return "";
   }
   function normalizeDynamicRange(track = {}) {
-    const value = firstText(track.HDR_Format, track.Transfer_Characteristics, track.Colorimetry, track.ColorSpace).toLocaleLowerCase();
-    if (value.includes("smpte st 2084") || value.includes("smpte2084") || value.includes("pq")) return "HDR";
-    if (value.includes("arib std-b67") || value.includes("arib-std-b67") || value.includes("hlg")) return "HLG";
+    // HDR_Format_String 可能是「Dolby Vision, …, dvhe.08.06, BL+RPU / SMPTE ST 2084,
+    // HDR10 compatible」这类拼接串：先认 HDR10+/杜比视界基线，再认 PQ/HLG。
+    const value = firstText(track.HDR_Format, track.HDR_Format_String, track.Transfer_Characteristics, track.Colorimetry, track.ColorSpace).toLocaleLowerCase();
+    if (/st\s*2094|hdr10[+\s-]*(plus|\+)/.test(value)) return "HDR10+";
+    if (/smpte\s*st\s*2084|smpte2084|\bpq\b/.test(value)) return "HDR10";
+    if (/arib[\s-]*std[\s-]*b67|\bhlg\b/.test(value)) return "HLG";
     return "";
+  }
+  function normalizeDolbyVision(track = {}) {
+    const value = firstText(track.HDR_Format, track.HDR_Format_String, track.Format_Commercial, track.CodecID, track.Format_Profile).toLocaleLowerCase();
+    return /dolby[\s-]*vision|\bdvh1\b|\bdvhe\b|\bdva1\b|\bdovi\b/.test(value) ? "DV" : "";
   }
   function normalizeMediaInfo(result2 = {}) {
     const tracks = Array.isArray(result2?.media?.track) ? result2.media.track : [];
     const video = tracks.find((track) => track?.["@type"] === VIDEO_TYPE) || {};
-    const audio = tracks.find((track) => track?.["@type"] === AUDIO_TYPE) || {};
+    const audioTracks = tracks.filter((track) => track?.["@type"] === AUDIO_TYPE);
+    const audio = audioTracks[0] || {};
+    const videoFormat = normalizeResolution(video.Width, video.Height, video.ScanType);
+    const dolbyVision = normalizeDolbyVision(video);
+    const dynamicRange = normalizeDynamicRange(video);
+    let audioCodec = normalizeAudioCodec(audio);
+    // 多音轨按命名惯例追加 .NAudios（与文件名识别的「2Audios」写法一致）
+    if (audioCodec && audioTracks.length > 1) audioCodec += `.${audioTracks.length}Audios`;
     const fields = {
-      videoFormat: normalizeResolution(video.Width, video.Height),
+      videoFormat,
       videoCodec: normalizeVideoCodec(firstText(video.Format_Commercial, video.Format_String, video.Format, video.CodecID)),
-      audioCodec: normalizeAudioCodec(audio),
+      audioCodec,
       frameRate: normalizeFrameRate(firstText(video.FrameRate, video.FrameRate_Original, video.FrameRate_Nominal)),
       colorDepth: normalizeBitDepth(video),
-      dynamicRange: normalizeDynamicRange(video)
+      dolbyVision,
+      dynamicRange,
+      // effect 与文件名识别同一约定：杜比视界 + HDR（HDR10+ 记 HDR10）的空格拼接
+      effect: [dolbyVision, dynamicRange === "HDR10+" ? "HDR10" : dynamicRange].filter(Boolean).join(" ")
     };
     return Object.fromEntries(Object.entries(fields).filter(([, value]) => value));
   }
@@ -6598,6 +6625,18 @@
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.3.19",
+      notes: [
+        "整理预览的「命名字段」全部展开显示，识别不到的留空即可，留空不写入文件名",
+        "手动改技术字段只作用于文件名没写规格的文件，HDR、杜比视界这类标记不会再被整组改掉",
+        "单个文件可以在自己的文件行里单独改字段，个别文件标错不用先去改文件名",
+        "「识别文件元数据」能认出杜比视界、HDR10+、声道和音轨数，按实测结果直接更新文件名",
+        "同一部剧的几季整理时归入同一个分组，第二季的照样进第二季的目录；文件列表默认进第一季，点季标签切换",
+        "修复混有杜比视界和 HDR 文件的剧整理后，所有文件名都被写上杜比视界的问题",
+        "修复设置里选择媒体库根目录时报错的问题"
+      ]
+    },
     {
       version: "1.3.18",
       notes: [
@@ -17718,36 +17757,6 @@ ${end.comment}` : end.comment;
     }
     return 999;
   }
-  function variantParts(value) {
-    return String(value || "").split(/[&/]/).map((item) => item.trim()).filter(Boolean);
-  }
-  function collectVariants(values, separator2 = "/") {
-    const output = [];
-    const seen = /* @__PURE__ */ new Set();
-    for (const value of values.flatMap(variantParts)) {
-      const key = variantKey(value);
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-      output.push(value);
-    }
-    return output.sort((left, right) => variantOrderIndex(left) - variantOrderIndex(right) || naturalCompare(left, right)).join(separator2);
-  }
-  function collectTechnicalFields(filenames = [], mappings) {
-    const perFile = filenames.filter(isVideoFile).map((filename) => inferTechnicalFields(filename, mappings));
-    const collect = (key) => collectVariants(perFile.map((fields) => fields[key]), key === "videoFormat" ? "&" : "/");
-    return Object.fromEntries([
-      "videoFormat",
-      "mediaSource",
-      "resourceType",
-      "effect",
-      "originalEdition",
-      "dynamicRange",
-      "frameRate",
-      "colorDepth",
-      "videoCodec",
-      "audioCodec"
-    ].map((key) => [key, collect(key)]).filter(([, value]) => value));
-  }
   function findAudioMapping(value, mappings) {
     // 归一化只剥分隔符、保留 + 等有效记号：「DD+」若把 + 剥掉就退化成「DD」，表序
     // 又排在 DD 条目之前，DD2.0 会被前缀误判成 DDP（Dolby Digital Plus）。
@@ -18340,7 +18349,10 @@ ${end.comment}` : end.comment;
     const title = (genericSeasonFolder ? episodicTitle(videoNames, fixedMappings) : folderTitle) || episodicTitle(videoNames, fixedMappings) || (weakFileFallback ? "" : fileTitle) || "\u672A\u8BC6\u522B\u5A92\u4F53";
     const episode = parseSeasonEpisode(combined, 1);
     const mediaType = hasEpisodes ? "tv" : inferMediaType(combined, filenames);
-    const technical = { ...inferTechnicalFields(combined, fixedMappings), ...collectTechnicalFields(preparedFiles, fixedMappings) };
+    // 组级技术字段只从标题（目录名）推断，不拼接全部文件名：同剧一个文件带 DV、
+    // 另一个带 HDR10 时拼在一起会让组级变成「DV HDR10」，再经无标记文件的组级回退
+    // 把每一集都改名成 DV HDR。文件名的技术字段各归各文件，由 inferFileFields 覆盖。
+    const technical = inferTechnicalFields(preparedTitle, fixedMappings);
     return {
       title,
       namingTitle: title,
@@ -18358,12 +18370,17 @@ ${end.comment}` : end.comment;
     const episode = parseSeasonEpisode(prepared, Number(baseFields.season || 1));
     const parsedSeason = Number.isFinite(Number(episode.season)) ? Number(episode.season) : Number(baseFields.season || 1);
     const technical = inferTechnicalFields(prepared, config.recognition?.fixedMappings);
-    if (baseFields.resourceType?.includes("Remux") && ["", "Remux", "BluRay", "BluRay Remux", "UHD BluRay", "UHD BluRay Remux"].includes(technical.resourceType)) {
+    // 文件名带过任一技术标记（分辨率/编码/HDR…）就整体按文件名为准：标记没提的字段
+    // 保持空，不吃组级聚合——同剧 DV/HDR 混排时无 DV 的文件不会被组级补成 DV。
+    // 文件名完全没提规格（季包里的 S01E01.mkv）则沿用组级/目录名带的规格。
+    const technicalFromName = Object.values(technical).some(Boolean);
+    if (technicalFromName && baseFields.resourceType?.includes("Remux") && ["", "Remux", "BluRay", "BluRay Remux", "UHD BluRay", "UHD BluRay Remux"].includes(technical.resourceType)) {
       technical.resourceType = baseFields.resourceType;
     }
     return {
       ...baseFields,
-      ...technical,
+      ...(technicalFromName ? technical : {}),
+      technicalFromName,
       originalEdition: technical.originalEdition || baseFields.originalEdition || "",
       season: String(parsedSeason),
       seasonEpisode: episode.seasonEpisode || (baseFields.mediaType === "tv" ? `S${String(baseFields.season || 1).padStart(2, "0")}E${String(index + 1).padStart(2, "0")}` : ""),
@@ -19327,6 +19344,17 @@ ${end.comment}` : end.comment;
   function normalizedTitle(value) {
     return String(value || "").normalize("NFKC").replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim();
   }
+  // 文件是否自带完整季集标记（季号写在名字里，如 S02E05/第2季第5集）：换个兜底季号
+  // 解析结果不变才算显式——「第1集.mkv」这种纯集号文件解析时会兜底成 S01E01，跨季
+  // 并组后第二季的集会错编季号，必须视为非显式（兜底编号要按季独立枚举）。
+  function fileHasExplicitSeasonEpisode(file) {
+    const name = String(file?.relativePath || file?.name || "");
+    if (!name) return false;
+    const withDefault = parseSeasonEpisode(name, 0);
+    if (!withDefault.seasonEpisode) return false;
+    const withAlt = parseSeasonEpisode(name, 97);
+    return withAlt.seasonEpisode === withDefault.seasonEpisode;
+  }
   function targetSeasonFromFolder(name) {
     const text2 = normalizedTitle(name);
     if (/^\d{1,3}$/.test(text2)) return Number(text2);
@@ -19503,21 +19531,24 @@ ${end.comment}` : end.comment;
       // 结尾集号（01 / 第01集 / E02…）不参与分组键，同一标题的各集归为一组。
       let baseTitle;
       let key;
+      let kind = "title";
       let folderTitle = "";
       if (subfolderTitle) {
         folderTitle = subfolderTitle;
         baseTitle = subfolderTitle;
+        kind = "subfolder";
         key = `subfolder:${file.sourceFolderId || looseGroupAnchor(file)}:${String(subfolderTitle).replace(/[\s._-]+/g, "").toLocaleLowerCase()}`;
       } else if (folderCtx) {
         folderTitle = folderCtx.title;
         baseTitle = folderTitle;
+        kind = "epform";
         const normalizedFolder = String(folderTitle).replace(/[\s._-]+/g, "").toLocaleLowerCase() || "unknown";
         key = `epform:${normalizedFolder}${folderCtx.season ? `:s${String(folderCtx.season).padStart(3, "0")}` : ""}:${looseGroupAnchor(file)}`;
       } else {
         baseTitle = unidentified ? title : looseGroupBaseTitleForFile(title, text2);
         key = unidentified ? `unknown:${looseGroupAnchor(file)}:${targetSeason || ""}` : looseGroupKeyTitle(baseTitle, text2);
       }
-      if (!grouped.has(key)) grouped.set(key, { key, baseTitle, files: [], names: [], titles: [], unidentified: true, targetSeason: targetSeason || null, folderTitle });
+      if (!grouped.has(key)) grouped.set(key, { key, kind, baseTitle, files: [], names: [], titles: [], unidentified: true, targetSeason: targetSeason || null, folderTitle });
       const group = grouped.get(key);
       group.files.push(file);
       group.names.push(text2);
@@ -19560,6 +19591,35 @@ ${end.comment}` : end.comment;
         continue;
       }
       mergedEntries.push(entry);
+    }
+    // 同一剧集的各季分组并成条目一组（同一标题、键只差 :sNNN 季号）。只在两组的
+    // 全部文件都带显式季集标记（SxxEyy/第N季第N集/EPxx）时才并——组内各文件按自己
+    // 的季集号归季；裸集号文件（01.mkv）的兜底编号要按季独立枚举才正确，维持一季一组。
+    const seasonMerged = /* @__PURE__ */ new Set();
+    const seasonBuckets = /* @__PURE__ */ new Map();
+    for (const entry of mergedEntries) {
+      if (entry.kind !== "title" || entry.unidentified || !entry.baseTitle) continue;
+      const bucketKey = String(entry.baseTitle).replace(/[\s._-]+/g, "").toLocaleLowerCase();
+      if (!seasonBuckets.has(bucketKey)) seasonBuckets.set(bucketKey, []);
+      seasonBuckets.get(bucketKey).push(entry);
+    }
+    for (const bucket of seasonBuckets.values()) {
+      if (bucket.length < 2) continue;
+      if (!bucket.every((entry) => entry.files.every(fileHasExplicitSeasonEpisode))) continue;
+      const [lead, ...rest] = bucket;
+      for (const entry of rest) {
+        seasonMerged.add(entry);
+        lead.files.push(...entry.files);
+        lead.names.push(...entry.names);
+        lead.titles.push(...entry.titles);
+        if (entry.targetSeason && !lead.targetSeason) lead.targetSeason = entry.targetSeason;
+        lead.unidentified &&= entry.unidentified;
+      }
+    }
+    if (seasonMerged.size) {
+      const kept = mergedEntries.filter((entry) => !seasonMerged.has(entry));
+      mergedEntries.length = 0;
+      mergedEntries.push(...kept);
     }
     for (const entry2 of mergedEntries) {
       const files = entry2.files;
@@ -19661,6 +19721,44 @@ ${end.comment}` : end.comment;
     }
     return { files: output, sourceFolders };
   }
+  // 「剧名 第一季」「剧名 第二季」式分季目录各自成组；同一条目（TMDB 同 ID，或都
+  // 没匹配到 media 且剥掉季号后同名）且各自文件全部带显式季集标记时并成条目一组，
+  // 组内文件按自己的 SxxEyy 归季（Season 01/Season 02 各回各的目录）。裸集号文件
+  // 的兜底编号要按季独立枚举才正确，这类目录维持一季一组。
+  function stripTrailingSeasonToken(name) {
+    const text2 = normalizedTitle(name);
+    const stripped = text2.replace(/[\s._-]*(?:Season\s*\d{1,3}|S\d{1,3}|第?\s*[0-9零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟廿卅卌]+\s*季)\s*$/i, "").trim();
+    return cleanName(stripped) || text2;
+  }
+  function filesHaveExplicitSeasonEpisode(files) {
+    return (files || []).every(fileHasExplicitSeasonEpisode);
+  }
+  function mergeSameEntryFolderGroups(groups) {
+    const buckets = /* @__PURE__ */ new Map();
+    for (const group of groups) {
+      if (!String(group.id || "").startsWith("folder:")) continue;
+      const media = group.media;
+      const key = media && media.id ? `${String(media.mediaType || "tv")}:${Number(media.id)}` : `title:${String(stripTrailingSeasonToken(group.title || "")).replace(/[\s._-]+/g, "").toLocaleLowerCase()}`;
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(group);
+    }
+    for (const bucket of buckets.values()) {
+      if (bucket.length < 2) continue;
+      if (!bucket.every((group) => filesHaveExplicitSeasonEpisode(group.files))) continue;
+      const [lead, ...rest] = bucket;
+      for (const group of rest) {
+        const index = groups.indexOf(group);
+        if (index >= 0) groups.splice(index, 1);
+        for (const file of group.files) {
+          if (!file.targetSeason && group.targetSeason) file.targetSeason = group.targetSeason;
+          lead.files.push(file);
+        }
+        lead.targetSeason = lead.targetSeason || group.targetSeason;
+        if (!(lead.sourceFolders || []).length) lead.sourceFolders = group.sourceFolders;
+      }
+    }
+    return groups;
+  }
   async function collectOrganizeGroups(api, items, config, options = {}) {
     const groups = [];
     const loose = [];
@@ -19736,6 +19834,7 @@ ${end.comment}` : end.comment;
         loose.push({ ...item, relativePath: item.name, sourceFolders: [] });
       }
     }
+    mergeSameEntryFolderGroups(groups);
     return [...groups, ...buildLooseGroups(loose, config, options)];
   }
   function inferTitleLength(value) {
@@ -20018,9 +20117,13 @@ ${end.comment}` : end.comment;
       if (options.excludedItemIds?.has?.(String(file.id)) || options.excludedItemIds?.includes?.(String(file.id))) continue;
       if (excluded(file.name, config.library)) continue;
       let fileFields = inferFileFields(file.name, fields, index, config.library);
-      for (const key of ["videoFormat", "mediaSource", "resourceType", "effect", "originalEdition", "highQuality", "dolbyVision", "videoCodec", "audioCodec", "frameRate", "colorDepth", "dynamicRange", "releaseGroup"]) {
-        if (hasOwn(metadataFields, key)) fileFields[key] = metadataFields[key];
-        if (hasOwn(groupOverride, key)) fileFields[key] = groupOverride[key];
+      // 探测的实测元数据优先于文件名自带标记（显式动作、实测为准）；单文件纠偏最高。
+      for (const key of LOCAL_TECHNICAL_KEYS) {
+        if (!hasOwn(groupOverride, key) && hasOwn(metadataFields, key)) fileFields[key] = metadataFields[key];
+      }
+      const fileOverride = options.fileOverrides?.[String(file.id)];
+      if (fileOverride) {
+        for (const key of LOCAL_TECHNICAL_KEYS) if (hasOwn(fileOverride, key)) fileFields[key] = fileOverride[key];
       }
       const automaticMatch = episode.matches.get(String(file.id));
       const sourceSpecialContext = specialContext(file.name);
@@ -20187,11 +20290,17 @@ ${end.comment}` : end.comment;
     let videoIndex = 0;
     group.files = (group.files || []).map((file) => {
       const merged = { ...fields };
+      // 技术字段优先级：单文件手动覆盖 > 组级手动 > 探测实测 > 文件名自带 > 目录名。
+      // 探测是显式动作、实测为准，识别出的真实规格要直接更新文件名（文件名写法与
+      // 实测不一致的以实测为准，如 H265→HEVC）；组级手动只填裸文件的规则不变。
+      const perFileTechnical = Boolean(file.fields?.technicalFromName);
+      const fileOverride = options.fileOverrides?.[String(file.id)];
       for (const key of LOCAL_TECHNICAL_KEYS) {
-        if (hasOwn(groupOverride, key)) continue;
-        if (hasOwn(metadataFields, key)) merged[key] = metadataFields[key];
-        else if (file.fields?.[key]) merged[key] = file.fields[key];
+        if (fileOverride && hasOwn(fileOverride, key)) merged[key] = fileOverride[key];
+        else if (!hasOwn(groupOverride, key) && hasOwn(metadataFields, key)) merged[key] = metadataFields[key];
+        else if (perFileTechnical && hasOwn(file.fields || {}, key)) merged[key] = file.fields[key] || "";
       }
+      merged.technicalFromName = perFileTechnical;
       const baseEpisodeFields = file.baseEpisodeFields ? { ...file.baseEpisodeFields } : episodeFieldSnapshot(file.fields || {});
       for (const key of EPISODE_FIELD_KEYS) delete merged[key];
       const sourceEpisode = parseSeasonEpisode(baseEpisodeFields.seasonEpisode || file.name, Number(baseEpisodeFields.season || fields.season || 1));
@@ -22842,16 +22951,20 @@ ${end.comment}` : end.comment;
     const enabled = ui.collectionEnabledForGroup(group);
     return `<section class="detail-section"><div class="section-title"><div>${icon("grid", 17)}<h4>\u5408\u96C6\u5F52\u6863</h4><span class="chip">${escapeHtml(name)}</span></div><label class="check-line"><input type="checkbox" data-collection-group="${escapeHtml(group.id)}" ${enabled ? "checked" : ""}>\u6309\u5408\u96C6\u5F52\u6863</label></div><p class="section-hint">\u5F00\u542F\u540E\u76EE\u6807\u8DEF\u5F84\u4F1A\u63D2\u5165\u5408\u96C6\u5C42\u7EA7\uFF1A${escapeHtml(name)}/${escapeHtml(group.fields.mediaFolder || "\u7535\u5F71\u540D\uFF08\u5E74\u4EFD\uFF09")}\u3002</p></section>`;
   }
+  function organizeFieldLabel(key) {
+    return { mediaType: "类型", category: "分类", title: "标题", namingTitle: "别名", mediaFolder: "媒体文件夹" }[key] || TEMPLATE_FIELDS.find(([fieldKey]) => fieldKey === key)?.[1] || key;
+  }
   function fieldsPanel(ui, group) {
     const identityKeys = ["mediaType", "category", "title", "namingTitle", "year", "tmdbId", "mediaFolder"];
     const technicalKeys = ["videoFormat", "mediaSource", "resourceType", "effect", "originalEdition", "highQuality", "dolbyVision", "dynamicRange", "frameRate", "colorDepth", "videoCodec", "audioCodec", "releaseGroup"];
     const overrides = ui.organize.overrides[group.id] || {};
     const fields = { ...group.fields, ...overrides };
-    const visible2 = new Set(ui.organize.visibleFieldsByGroup?.[group.id] || []);
-    const keys = [...identityKeys, ...technicalKeys.filter((key) => fields[key] || Object.prototype.hasOwnProperty.call(overrides, key) || visible2.has(key))];
+    // 命名字段全部常驻展开：识别不到的就留空（空值不写入文件名），不再按「有值才显示」
+    // 隐藏，「加入字段」下拉随之取消（维护者 2026-09-22 定）。
+    const keys = [...identityKeys, ...technicalKeys];
     const controlFrame = (key, label, input) => `<div class="field organize-field"><div class="organize-field-head"><span>${escapeHtml(label)}</span></div>${input}</div>`;
     const controls = keys.map((key) => {
-      const label = { mediaType: "\u7C7B\u578B", category: "\u5206\u7C7B", title: "\u6807\u9898", namingTitle: "\u522B\u540D", mediaFolder: "\u5A92\u4F53\u6587\u4EF6\u5939" }[key] || TEMPLATE_FIELDS.find(([fieldKey]) => fieldKey === key)?.[1] || key;
+      const label = organizeFieldLabel(key);
       const attributes = `data-organize-field-group="${escapeHtml(group.id)}" data-organize-field="${key}"`;
       if (key === "mediaType") return controlFrame(key, label, `<select ${attributes}><option value="movie" ${fields[key] === "movie" ? "selected" : ""}>\u7535\u5F71</option><option value="tv" ${fields[key] === "tv" ? "selected" : ""}>\u5267\u96C6</option><option value="unknown" ${fields[key] === "unknown" ? "selected" : ""}>\u672A\u77E5</option></select>`);
       if (key === "category") {
@@ -22867,24 +22980,58 @@ ${end.comment}` : end.comment;
       }
       return controlFrame(key, label, `<input ${attributes} value="${escapeHtml(fields[key] || "")}">`);
     }).join("");
-    const available = technicalKeys.filter((key) => !keys.includes(key));
-    return `<section class="detail-section"><div class="section-title"><div>${icon("sliders", 17)}<h4>\u547D\u540D\u5B57\u6BB5</h4></div>${available.length ? `<select class="add-field-menu" data-organize-add-field="${escapeHtml(group.id)}" aria-label="\u52A0\u5165\u672A\u8BC6\u522B\u5B57\u6BB5"><option value="">\u52A0\u5165\u5B57\u6BB5</option>${available.map((key) => `<option value="${key}">${escapeHtml(TEMPLATE_FIELDS.find(([fieldKey]) => fieldKey === key)?.[1] || key)}</option>`).join("")}</select>` : `<span class="section-hint">\u4FEE\u6539\u540E\u5B9E\u65F6\u540C\u6B65</span>`}</div><div class="organize-fields">${controls}</div></section>`;
+    return `<section class="detail-section"><div class="section-title"><div>${icon("sliders", 17)}<h4>\u547D\u540D\u5B57\u6BB5</h4></div><span class="section-hint">\u7559\u7A7A\u4E0D\u5199\u5165\u6587\u4EF6\u540D\uFF1B\u6280\u672F\u5B57\u6BB5\u53EA\u5BF9\u6587\u4EF6\u540D\u6CA1\u5199\u89C4\u683C\u7684\u6587\u4EF6\u751F\u6548\uFF0C\u5355\u4E2A\u6587\u4EF6\u5728\u6587\u4EF6\u884C\u91CC\u5355\u72EC\u6539</span></div><div class="organize-fields">${controls}</div></section>`;
   }
   function episodeOptions(ui, file) {
     if (!file.candidates?.length) return "";
     const selected = ui.organize.episodeLocks[String(file.id)]?.id || "";
     return `<select class="episode-select" data-episode-file="${file.id}"><option value="">\u81EA\u52A8\u5B63\u96C6</option>${file.candidates.map((episode) => `<option value="${episode.id}" ${String(selected) === String(episode.id) ? "selected" : ""}>${escapeHtml(`${episode.seasonEpisode} \xB7 ${episode.airDate || "\u65E0\u65E5\u671F"} \xB7 ${episode.name || ""}`)}</option>`).join("")}</select>`;
   }
+  function fileFieldsEditor(ui, group, file) {
+    const fields = file.fields || {};
+    const controls = LOCAL_TECHNICAL_KEYS.map((key) => {
+      const attributes = `data-file-field-group="${escapeHtml(group.id)}" data-file-field="${escapeHtml(String(file.id))}" data-file-field-key="${key}"`;
+      return `<div class="field organize-field"><div class="organize-field-head"><span>${escapeHtml(organizeFieldLabel(key))}</span></div><input ${attributes} value="${escapeHtml(String(fields[key] ?? ""))}"></div>`;
+    }).join("");
+    return `<div class="organize-file-fields"><div class="organize-file-fields-head"><span>\u53EA\u6539\u8FD9\u4E2A\u6587\u4EF6\u7684\u6280\u672F\u5B57\u6BB5\uFF0C\u4F18\u5148\u4E8E\u6587\u4EF6\u540D\u4E0E\u7EC4\u7EA7</span><button class="button compact" data-action="organize-toggle-file-fields" data-group="${escapeHtml(group.id)}" data-file="${escapeHtml(String(file.id))}">\u6536\u8D77</button></div><div class="organize-fields">${controls}</div></div>`;
+  }
+  function organizeSeasonLabel(season) {
+    const value = String(season ?? "").trim();
+    if (!value || value === "?") return "\u672A\u8BC6\u522B\u5B63";
+    if (Number(value) === 0) return "S00 \u7279\u522B\u7BC7";
+    return `Season ${String(Number(value)).padStart(2, "0")}`;
+  }
   function filesPanel(ui, group) {
-    const pages = Math.max(1, Math.ceil(group.files.length / ORGANIZE_FILE_PAGE_SIZE));
+    const isTv = group.fields?.mediaType === "tv";
+    // TMDB 式分季预览：同条目多季合并后列表会很长，默认进第一季、点标签切季；
+    // 只有一季的分组不出现分季 UI，维持原来的平铺列表
+    const seasons = [];
+    if (isTv) {
+      const counts = /* @__PURE__ */ new Map();
+      for (const file of group.files) {
+        const key = String(file.fields?.season ?? "").trim() || "?";
+        counts.set(key, (counts.get(key) || 0) + 1);
+      }
+      seasons.push(...[...counts.entries()].sort((left, right) => (Number(left[0]) || 9999) - (Number(right[0]) || 9999)).map(([value, count]) => ({ value, count })));
+    }
+    const multiSeason = seasons.length > 1;
+    const seasonFilter = multiSeason ? String(ui.organize.fileSeasonByGroup?.[group.id] ?? seasons[0].value) : "";
+    let list = group.files;
+    if (multiSeason) list = group.files.filter((file) => (String(file.fields?.season ?? "").trim() || "?") === seasonFilter);
+    const seasonOf = (file) => Number(file.fields?.season ?? 0) || 0;
+    list = [...list].sort((left, right) => seasonOf(left) - seasonOf(right) || naturalCompare(left.relativePath || left.name, right.relativePath || right.name));
+    const pages = Math.max(1, Math.ceil(list.length / ORGANIZE_FILE_PAGE_SIZE));
     const page = Math.min(Math.max(1, Number(ui.organize.filePages?.[group.id]) || 1), pages);
-    const visible = group.files.slice((page - 1) * ORGANIZE_FILE_PAGE_SIZE, page * ORGANIZE_FILE_PAGE_SIZE);
+    const visible = list.slice((page - 1) * ORGANIZE_FILE_PAGE_SIZE, page * ORGANIZE_FILE_PAGE_SIZE);
     const rows = visible.map((file) => {
       const sourceName = String(file.relativePath || file.name);
       const seasonToken = file.fields.mediaType === "tv" ? seasonTokenRange(sourceName) : null;
-      return `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${markSeasonEpisodeHtml(sourceName, seasonToken)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><span class="name-stack"><span class="name-mirror" aria-hidden="true">${markSeasonEpisodeHtml(file.newName, file.fields.seasonEpisode)}</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></span></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${markSeasonEpisodeHtml(file.targetPath, file.fields.seasonEpisode)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></div>`;
+      const editorOpen = String(ui.organize.fileFieldEditor || "") === String(file.id);
+      const row = `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${markSeasonEpisodeHtml(sourceName, seasonToken)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><span class="name-stack"><span class="name-mirror" aria-hidden="true">${markSeasonEpisodeHtml(file.newName, file.fields.seasonEpisode)}</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></span></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${markSeasonEpisodeHtml(file.targetPath, file.fields.seasonEpisode)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><span class="row-actions"><button class="icon-button ${editorOpen ? "active" : ""}" data-action="organize-toggle-file-fields" data-group="${escapeHtml(group.id)}" data-file="${escapeHtml(String(file.id))}" title="\u4FEE\u6539\u6B64\u6587\u4EF6\u7684\u6280\u672F\u5B57\u6BB5">${icon("sliders", 15)}</button><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></span></div>`;
+      return `${row}${editorOpen ? fileFieldsEditor(ui, group, file) : ""}`;
     }).join("");
-    return `<section class="detail-section file-section"><div class="section-title"><div>${icon("list", 17)}<h4>\u6587\u4EF6\u4E0E\u76EE\u6807\u8DEF\u5F84</h4></div><span>${group.files.length} \u9879</span></div><div class="organize-files">${rows}</div>${organizePager("organize-file-page", page, group.files.length, ORGANIZE_FILE_PAGE_SIZE)}</section>`;
+    const seasonChips = multiSeason ? `<div class="organize-season-chips">${seasons.map(({ value, count }) => `<button class="season-chip ${seasonFilter === value ? "active" : ""}" data-action="organize-file-season" data-group="${escapeHtml(group.id)}" data-season="${escapeHtml(value)}">${escapeHtml(organizeSeasonLabel(value))}<i>${count}</i></button>`).join("")}</div>` : "";
+    return `<section class="detail-section file-section"><div class="section-title"><div>${icon("list", 17)}<h4>\u6587\u4EF6\u4E0E\u76EE\u6807\u8DEF\u5F84</h4></div><span>${group.files.length} \u9879</span></div>${seasonChips}<div class="organize-files">${rows}</div>${organizePager("organize-file-page", page, list.length, ORGANIZE_FILE_PAGE_SIZE)}</section>`;
   }
   function detailPane(ui, group) {
     if (!group) return emptyState("folder", "\u6CA1\u6709\u53EF\u6574\u7406\u7684\u5A92\u4F53\u6587\u4EF6", "\u8FD4\u56DE\u6587\u4EF6\u5217\u8868\u91CD\u65B0\u9009\u62E9\u540E\u518D\u8BD5");
@@ -23650,11 +23797,19 @@ ${end.comment}` : end.comment;
   .organize-fields { display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:9px; }
   .organize-field-head { min-height:17px; display:flex; align-items:center; gap:5px; color:var(--muted); font-size:11px; font-weight:600; }
   .organize-field-head > span:first-child { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-  .add-field-menu { width:auto; min-width:112px; min-height:31px; padding-block:5px; font-size:11px; }
   .file-section { position:relative; padding:0; overflow:hidden; border:1px solid var(--glass-border); border-radius:var(--radius-sm); box-shadow:var(--shadow-sm); background:var(--glass); backdrop-filter:blur(var(--blur-sm)); -webkit-backdrop-filter:blur(var(--blur-sm)); }
   .file-section .section-title { margin:0; padding:10px 13px; background:var(--surface-2); border-bottom:1px solid color-mix(in srgb,var(--glass-border) 72%,transparent); }
   .organize-files { display:grid; }
-  .organize-file { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.15fr) minmax(0,1.2fr) 32px; gap:12px; align-items:start; padding:10px 12px; border-bottom:1px solid color-mix(in srgb,var(--glass-border) 55%,transparent); transition:background .15s ease; }
+  .organize-file { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.15fr) minmax(0,1.2fr) auto; gap:12px; align-items:start; padding:10px 12px; border-bottom:1px solid color-mix(in srgb,var(--glass-border) 55%,transparent); transition:background .15s ease; }
+  .organize-file > .row-actions { display:flex; gap:4px; align-items:center; }
+  .organize-file-fields { padding:10px 12px; border-bottom:1px solid color-mix(in srgb,var(--glass-border) 55%,transparent); background:var(--surface-2); }
+  .organize-season-chips { display:flex; flex-wrap:wrap; gap:2px; margin:9px 12px; padding:3px; width:fit-content; border:1px solid color-mix(in srgb,var(--glass-border) 80%,transparent); border-radius:var(--radius-full); background:var(--surface-2); }
+  .season-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 12px; border-radius:var(--radius-full); font-size:11px; font-weight:600; color:var(--muted); background:transparent; border:0; cursor:pointer; transition:background .15s ease,color .15s ease; }
+  .season-chip:hover { color:var(--accent); }
+  .season-chip.active { background:var(--accent); color:#fff; }
+  .season-chip i { font-style:normal; font-size:10px; font-weight:500; opacity:.75; }
+  .organize-file-fields-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; color:var(--muted); font-size:11px; }
+  .icon-button.active { color:var(--accent); border-color:var(--accent); }
   .compact-rows .organize-file { padding-block:7px; }
   .organize-file:last-child { border-bottom:0; } .organize-file.discard { background:var(--danger-soft); }
   .organize-file:hover { background:var(--accent-soft); }
@@ -23998,9 +24153,9 @@ ${end.comment}` : end.comment;
     .episode-plan { grid-template-columns:repeat(2,minmax(0,1fr)); }
     .episode-plan .button { align-self:end; }
     .organize-fields { grid-template-columns:repeat(2,minmax(0,1fr)); }
-    .organize-file { grid-template-columns:minmax(130px,.8fr) minmax(180px,1fr) 32px; }
+    .organize-file { grid-template-columns:minmax(130px,.8fr) minmax(180px,1fr) auto; }
     .target-file { grid-column:1/3; grid-row:2; }
-    .organize-file > .icon-button { grid-column:3; grid-row:1; }
+    .organize-file > .row-actions { grid-column:3; grid-row:1; }
     .settings-layout { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); }
     .settings-nav { display:flex; overflow:auto; border-right:0; border-bottom:1px solid color-mix(in srgb,var(--glass-border) 72%,transparent); }
     .settings-nav button { flex:0 0 auto; }
@@ -24059,10 +24214,10 @@ ${end.comment}` : end.comment;
     .media-title-line .button { margin-top:8px; }
     .lookup-row { grid-template-columns:1fr; }
     .episode-plan { grid-template-columns:repeat(2,minmax(0,1fr)); }
-    .organize-file { grid-template-columns:minmax(0,1fr) 32px; }
+    .organize-file { grid-template-columns:minmax(0,1fr) auto; }
     .name-field,.target-file { grid-column:1/3; }
     .target-file { grid-row:auto; }
-    .organize-file > .icon-button { grid-column:2; grid-row:1; }
+    .organize-file > .row-actions { grid-column:2; grid-row:1; }
     .settings-brand { display:none; }
     .settings-nav { justify-content:flex-start; gap:0; padding:6px 4px; overflow-x:auto; overflow-y:hidden; scrollbar-width:none; }
     .settings-nav::-webkit-scrollbar { display:none; }
@@ -25902,6 +26057,7 @@ ${end.comment}` : end.comment;
         collectionByGroup: this.organize.collectionByGroup,
         strategyAssignments: prepareMergeStrategyAssignments(this.organize.preview?.groups || [], this.organize.strategies, this.organize.mergeScopes, this.organize.structureCache),
         metadataByGroup: this.organize.metadataByGroup,
+        fileOverrides: this.organize.fileOverrides,
         excludedGroupIds: this.organize.excludedGroupIds,
         excludedItemIds: this.organize.excludedItemIds,
         manualNames: this.organize.manualNames
@@ -25933,7 +26089,10 @@ ${end.comment}` : end.comment;
         metadataErrorByGroup: {},
         overrides: {},
         autoFieldsByGroup: {},
-        visibleFieldsByGroup: {},
+        fileOverrides: {},
+        fileFieldEditor: "",
+        fileSeasonByGroup: {},
+        metadataProbeRunning: false,
         episodeLocks: {},
         episodePlans: {},
         strategies: {},
@@ -26018,17 +26177,24 @@ ${end.comment}` : end.comment;
       const start = typeof target.selectionStart === "number" ? target.selectionStart : null;
       const end = typeof target.selectionEnd === "number" ? target.selectionEnd : null;
       return {
-        groupId: target.dataset.planGroup || target.dataset.organizeFieldGroup || "",
+        groupId: target.dataset.planGroup || target.dataset.organizeFieldGroup || target.dataset.fileFieldGroup || "",
         planField: target.dataset.planField || "",
         field: target.dataset.organizeField || "",
+        fileField: target.dataset.fileFieldKey ? target.dataset.fileField : "",
+        fileFieldKey: target.dataset.fileFieldKey || "",
         start,
         end
       };
     }
     restoreOrganizeFocus(focus) {
       if (!focus?.groupId) return;
-      const selector = focus.planField ? "[data-plan-field]" : "[data-organize-field]";
-      const next = [...this.root?.querySelectorAll(selector) || []].find((item) => focus.planField ? item.dataset.planGroup === focus.groupId && item.dataset.planField === focus.planField : item.dataset.organizeFieldGroup === focus.groupId && item.dataset.organizeField === focus.field);
+      let next = null;
+      if (focus.fileFieldKey) {
+        next = [...this.root?.querySelectorAll("[data-file-field-key]") || []].find((item) => item.dataset.fileFieldGroup === focus.groupId && item.dataset.fileField === focus.fileField && item.dataset.fileFieldKey === focus.fileFieldKey);
+      } else {
+        const selector = focus.planField ? "[data-plan-field]" : "[data-organize-field]";
+        next = [...this.root?.querySelectorAll(selector) || []].find((item) => focus.planField ? item.dataset.planGroup === focus.groupId && item.dataset.planField === focus.planField : item.dataset.organizeFieldGroup === focus.groupId && item.dataset.organizeField === focus.field);
+      }
       if (!next) return;
       next.focus();
       if (focus.start !== null && typeof next.setSelectionRange === "function") next.setSelectionRange(focus.start, focus.end);
@@ -26187,11 +26353,19 @@ ${end.comment}` : end.comment;
     }
     refreshOrganizeDraft(target, options = {}) {
       if (!this.organize?.preview) return;
-      const groupId = target.dataset.planGroup || target.dataset.organizeFieldGroup || "";
+      const groupId = target.dataset.planGroup || target.dataset.organizeFieldGroup || target.dataset.fileFieldGroup || "";
       const planField = target.dataset.planField;
       const field2 = target.dataset.organizeField;
+      const fileFieldKey = target.dataset.fileFieldKey;
       const group = this.organize.preview.groups.find((item) => item.id === groupId);
-      if (planField) {
+      if (fileFieldKey) {
+        const fileId = String(target.dataset.fileField || "");
+        this.organize.fileOverrides ||= {};
+        const overrides = { ...this.organize.fileOverrides[fileId] || {} };
+        overrides[fileFieldKey] = String(target.value ?? "").trim();
+        this.organize.fileOverrides[fileId] = overrides;
+        if (!group) return;
+      } else if (planField) {
         this.organize.episodePlans[groupId] = {
           ...this.organize.episodePlans[groupId] || {},
           [planField]: target.value
@@ -26529,7 +26703,7 @@ ${end.comment}` : end.comment;
       this.render();
     }
     async loadFolderPicker(parentId = "0", host = null) {
-      const store = host || (this.fastlink.picker ? this.fastlink : this.settings);
+      const store = host || (this.fastlink?.picker ? this.fastlink : this.settings);
       if (!store.picker) store.picker = { parentId: "0", path: [], folders: [], loading: false };
       store.picker.loading = true;
       this.render();
@@ -27061,13 +27235,20 @@ ${end.comment}` : end.comment;
             this.toast("\u8FD9\u4E00\u7EC4\u6CA1\u6709\u53EF\u8BC6\u522B\u7684\u89C6\u9891\u6587\u4EF6", "error");
             return;
           }
+          if (this.organize.metadataProbeRunning) {
+            this.toast("\u6B63\u5728\u8BC6\u522B\u53E6\u4E00\u7EC4\u7684\u6587\u4EF6\u5143\u6570\u636E\uFF0C\u7B49\u5B83\u5B8C\u6210\u540E\u518D\u8BD5", "warning");
+            return;
+          }
+          this.organize.metadataProbeRunning = true;
           this.organize.metadataErrorByGroup ||= {};
           delete this.organize.metadataErrorByGroup[groupId];
           let fields;
+          let fromCache = false;
           try {
             fields = await this.runTask(async (signal) => {
               this.setProgress(0, 1, "\u83B7\u53D6\u6587\u4EF6\u5143\u6570\u636E");
               return this.metadata.probe(file, signal, (progress = {}) => {
+                if (progress.cached) fromCache = true;
                 const count = Number(progress.requestCount || 0);
                 this.setProgress(progress.complete ? 1 : count, progress.complete ? 1 : Math.max(1, count + 1), progress.phase || "\u8BC6\u522B\u6587\u4EF6\u5143\u6570\u636E");
               });
@@ -27076,12 +27257,15 @@ ${end.comment}` : end.comment;
             this.organize.metadataErrorByGroup[groupId] = error?.message || "\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B\u5931\u8D25";
             this.refreshOrganizeSurface();
             throw error;
+          } finally {
+            this.organize.metadataProbeRunning = false;
           }
           delete this.organize.metadataErrorByGroup[groupId];
           if (!Object.keys(fields || {}).length) {
-            this.toast("\u672A\u8BC6\u522B\u5230\u53EF\u56DE\u5199\u7684\u6587\u4EF6\u5143\u6570\u636E");
+            this.toast("\u672A\u8BC6\u522B\u5230\u53EF\u56DE\u5199\u7684\u6587\u4EF6\u5143\u6570\u636E", "warning");
             return;
           }
+          const beforeNames = new Map((group.files || []).map((item) => [String(item.id), `${item.newName}|${item.targetPath}`]));
           this.organize.metadataByGroup[groupId] = { ...this.organize.metadataByGroup[groupId] || {}, ...fields };
           this.organize.autoFieldsByGroup ||= {};
           this.organize.autoFieldsByGroup[groupId] = { ...this.organize.autoFieldsByGroup[groupId] || group.fields || {}, ...fields };
@@ -27090,10 +27274,30 @@ ${end.comment}` : end.comment;
           this.organize.preview.tasks = this.organize.preview.groups.flatMap((item) => item.files || []);
           this.refreshOrganizeSummary();
           this.refreshOrganizeSurface();
-          this.toast(`\u5DF2\u8BC6\u522B ${Object.keys(fields).length} \u9879\u6587\u4EF6\u5143\u6570\u636E`, "success");
+          // 反馈要说清两件事：结果是不是同一文件的缓存；文件名动了几个——探测是
+          // 实测值、直接更新文件名，全部一致时也要明说「无需改动」免得像没生效。
+          const changed = (group.files || []).filter((item) => beforeNames.get(String(item.id)) !== `${item.newName}|${item.targetPath}`).length;
+          const cacheNote = fromCache ? "\uFF08\u540C\u4E00\u4E2A\u6587\u4EF6\u521A\u8BC6\u522B\u8FC7\uFF0C\u76F4\u63A5\u7528\u4E86\u7F13\u5B58\uFF09" : "";
+          if (!changed) {
+            this.toast(`\u8BC6\u522B\u5230 ${Object.keys(fields).length} \u9879\u5143\u6570\u636E${cacheNote}\uFF1B\u6587\u4EF6\u540D\u4E0E\u8BC6\u522B\u7ED3\u679C\u4E00\u81F4\uFF0C\u65E0\u9700\u6539\u52A8`, "success");
+          } else {
+            this.toast(`\u5DF2\u8BC6\u522B ${Object.keys(fields).length} \u9879\u5143\u6570\u636E${cacheNote}\uFF0C\u66F4\u65B0\u4E86 ${changed} \u4E2A\u6587\u4EF6`, "success");
+          }
         },
         "organize-remove-group": (control) => this.removeOrganizeGroup(control.dataset.group),
         "organize-remove-file": (control) => this.removeOrganizeFile(control.dataset.group, control.dataset.file),
+        "organize-toggle-file-fields": (control) => {
+          const fileId = String(control.dataset.file || "");
+          this.organize.fileFieldEditor = this.organize.fileFieldEditor === fileId ? "" : fileId;
+          this.render();
+        },
+        "organize-file-season": (control) => {
+          const groupId = control.dataset.group;
+          this.organize.fileSeasonByGroup ||= {};
+          this.organize.fileSeasonByGroup[groupId] = String(control.dataset.season ?? "");
+          this.organize.filePages[groupId] = 1;
+          this.render();
+        },
         "organize-plan-reset": (control) => {
           const groupId = control.dataset.group;
           this.organize.selectedGroupId = groupId;
@@ -27297,23 +27501,23 @@ ${end.comment}` : end.comment;
           await this.loadFolderPicker("0");
         },
         "folder-open": async (control) => {
-          const store = this.fastlink.picker ? this.fastlink : this.settings;
+          const store = this.fastlink?.picker ? this.fastlink : this.settings;
           const folder = store.picker.folders.find((item) => String(item.id) === String(control.dataset.id));
           if (!folder) return;
           store.picker.path.push({ id: String(folder.id), name: String(folder.name || "") });
           await this.loadFolderPicker(folder.id, store);
         },
         "folder-up": async () => {
-          const store = this.fastlink.picker ? this.fastlink : this.settings;
+          const store = this.fastlink?.picker ? this.fastlink : this.settings;
           store.picker.path.pop();
           await this.loadFolderPicker(store.picker.path.at(-1)?.id || "0", store);
         },
         "folder-cancel": () => {
-          (this.fastlink.picker ? this.fastlink : this.settings).picker = null;
+          (this.fastlink?.picker ? this.fastlink : this.settings).picker = null;
           this.render();
         },
         "folder-select": () => {
-          const store = this.fastlink.picker ? this.fastlink : this.settings;
+          const store = this.fastlink?.picker ? this.fastlink : this.settings;
           const picker = store.picker;
           const current = picker.path.at(-1);
           if (picker.target === "fastlinkSeed") {
@@ -27664,16 +27868,6 @@ ${end.comment}` : end.comment;
           this.refreshOrganizeDraft(target, { defer: true });
           return;
         }
-        if (target.dataset.organizeAddField) {
-          const key = String(target.value || "");
-          if (!key) return;
-          this.organize.visibleFieldsByGroup ||= {};
-          const fields = new Set(this.organize.visibleFieldsByGroup[target.dataset.organizeAddField] || []);
-          fields.add(key);
-          this.organize.visibleFieldsByGroup[target.dataset.organizeAddField] = [...fields];
-          this.refreshOrganizeSurface({ detailOnly: true });
-          return;
-        }
         if (target.id === "rename-keep-extension") {
           this.rename.keepExtension = target.checked;
           await this.updateRenamePreview();
@@ -27807,6 +28001,11 @@ ${end.comment}` : end.comment;
         this.refreshOrganizeDraft(target, { defer: true });
         return;
       }
+      if (target.dataset.fileFieldKey && target.dataset.fileField) {
+        if (event.isComposing) return;
+        this.refreshOrganizeDraft(target, { defer: true });
+        return;
+      }
       this.updateSettingsTarget(event.target);
     }
     handleCompositionEnd(event) {
@@ -27814,6 +28013,7 @@ ${end.comment}` : end.comment;
       if (target?.dataset?.ruleId && target.tagName === "INPUT" && target.type !== "checkbox") this.scheduleRenamePreview(target);
       if (target?.dataset?.planField && target.dataset.planGroup) this.refreshOrganizeDraft(target, { defer: true });
       if (target?.dataset?.organizeField && target.dataset.organizeFieldGroup) this.refreshOrganizeDraft(target, { defer: true });
+      if (target?.dataset?.fileFieldKey && target.dataset.fileField) this.refreshOrganizeDraft(target, { defer: true });
     }
     updateSettingsTarget(target) {
       if (!this.settings) return;

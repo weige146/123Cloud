@@ -17,19 +17,21 @@ const slice = (fromMarker, toMarker) => {
 const code = [
   slice("// src/core/utils.js", "// src/api.js"),
   slice("// src/core/recognition-maps.js", "// src/config.js"),
+  slice("// src/core/release-group.js", "// src/core/rename.js"),
   slice("// src/core/category-yaml.js", "// src/core/empty-folders.js")
 ].join("\n");
 const driver = `;
 globalThis.__organize = {
   inferTitle, mediaKey, buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle,
   looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames,
-  applyVariantTagsForCollisions, parseSeasonEpisode, specialContext, isVideoFile, collectOrganizeGroups
+  applyVariantTagsForCollisions, parseSeasonEpisode, specialContext, isVideoFile, collectOrganizeGroups,
+  inferFields, inferFileFields, refreshOrganizeGroupTargets, fileHasExplicitSeasonEpisode
 };
 `;
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle, parseSeasonEpisode, collectOrganizeGroups } = sandbox.__organize;
+const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle, parseSeasonEpisode, collectOrganizeGroups, inferFields, inferFileFields, refreshOrganizeGroupTargets, fileHasExplicitSeasonEpisode } = sandbox.__organize;
 
 const config = { library: { recognition: { customWords: [] } } };
 const file = (name, id = name) => ({ id, name });
@@ -365,4 +367,165 @@ test("单电影/剧集目录（子目录都是季目录）仍按整目录一组"
   const groups = await collectOrganizeGroups(api, [{ id: "top", name: "三体 (2023) {tmdb-808}", type: 1 }], config, { tmdb });
   assert.equal(groups.length, 1);
   assert.equal(groups[0].id, "folder:top", "季目录不算强片名子目录，维持整目录一组");
+});
+
+// —— 同条目一组：跨季散文件/分季目录合并（维护者 2026-09-22） ——
+test("同一剧集跨季散文件并成一组（文件带显式季集标记）", () => {
+  const groups = buildLooseGroups([
+    formFile("怪奇物语.S01E01.2160p.WEB-DL.mkv", "st1"),
+    formFile("怪奇物语.S01E02.2160p.WEB-DL.mkv", "st2"),
+    formFile("怪奇物语.S02E01.2160p.WEB-DL.mkv", "st3"),
+    formFile("怪奇物语.S02E02.2160p.WEB-DL.mkv", "st4")
+  ], config);
+  assert.equal(groups.length, 1, `同剧两季应并成一组，实际 ${groups.length}`);
+  assert.equal(groups[0].files.length, 4);
+});
+
+test("文件不带显式季集标记时保持一季一组（兜底编号按季独立）", () => {
+  const groups = buildLooseGroups([
+    formFile("剧名 2016 第1季合集.mkv", "q1"),
+    formFile("剧名 2016 第2季合集.mkv", "q2")
+  ], config);
+  assert.equal(groups.length, 2, "纯季名/无集号文件不跨季并组");
+});
+
+test("fileHasExplicitSeasonEpisode：季号写在名字里才算显式，纯集号不算", () => {
+  assert.equal(fileHasExplicitSeasonEpisode({ name: "三体.S02E01.2024.1080p.mkv" }), true);
+  assert.equal(fileHasExplicitSeasonEpisode({ name: "第2季 第05集.mkv" }), true);
+  assert.equal(fileHasExplicitSeasonEpisode({ name: "第1集.mkv" }), false, "纯集号解析会兜底成 S01E01，不算显式");
+  assert.equal(fileHasExplicitSeasonEpisode({ name: "三体.S00E01.特别篇.mkv" }), true);
+  assert.equal(fileHasExplicitSeasonEpisode({ name: "三体.2023.1080p.mkv" }), false);
+});
+
+test("同 TMDB 条目的分季目录并成一组", async () => {
+  const tree = {
+    top: [
+      { id: "d1", name: "三体 第一季 (2023) {tmdb-808}", type: 1 },
+      { id: "d2", name: "三体 第二季 (2024) {tmdb-808}", type: 1 }
+    ],
+    d1: [mkFile("f1", "三体.S01E01.2023.1080p.mkv", 100)],
+    d2: [mkFile("f2", "三体.S02E01.2024.1080p.mkv", 110)]
+  };
+  const api = { listAll: async (id) => tree[id] || [] };
+  const tmdb = { details: async (type, id) => ({ id: Number(id), mediaType: type, title: "三体", year: "2023", aliases: [], genres: [], overview: "", posterUrl: "", backdropUrl: "", voteAverage: 0 }) };
+  const groups = await collectOrganizeGroups(api, [{ id: "top", name: "三体系列", type: 1 }], config, { tmdb });
+  assert.equal(groups.length, 1, `同 TMDB 条目的两季目录应并成一组，实际 ${groups.length}`);
+  assert.equal(groups[0].files.length, 2);
+  assert.ok(groups[0].files.some((item) => item.id === "f2"), "第二季目录的文件并入同组");
+});
+
+test("分季目录文件不带显式季集时不并组（各自按 targetSeason 兜底编号）", async () => {
+  const tree = {
+    d1: [mkFile("f1", "第1集.mkv", 100)],
+    d2: [mkFile("f2", "第1集.mkv", 110)]
+  };
+  const api = { listAll: async (id) => tree[id] || [] };
+  const tmdb = { details: async (type, id) => ({ id: Number(id), mediaType: type, title: "剧名", year: "2023", aliases: [], genres: [], overview: "", posterUrl: "", backdropUrl: "", voteAverage: 0 }) };
+  const groups = await collectOrganizeGroups(api, [
+    { id: "d1", name: "剧名 第一季 {tmdb-808}", type: 1 },
+    { id: "d2", name: "剧名 第二季 {tmdb-808}", type: 1 }
+  ], config, { tmdb });
+  assert.equal(groups.length, 2, "纯集号文件跨季并组会把第二季编成 S01，维持分季");
+});
+
+// —— 技术字段不传染：组级只认目录名，文件名带标记才按文件覆盖 ——
+const testFieldBlock = (key) => ({ id: `f-${key}`, type: "field", key, value: "", prefix: "", suffix: "" });
+const testSepBlock = (value) => ({ id: `s-${value}`, type: "separator", key: "", value, prefix: "", suffix: "" });
+const templates = {
+  movie: [testFieldBlock("title"), testSepBlock("."), testFieldBlock("year")],
+  tv: [testFieldBlock("title"), testSepBlock("."), testFieldBlock("seasonEpisode"), testSepBlock("."), testFieldBlock("videoFormat"), testSepBlock("."), testFieldBlock("dolbyVision"), testSepBlock("."), testFieldBlock("dynamicRange")],
+  mediaFolder: [testFieldBlock("chineseTitle"), testSepBlock(" "), testFieldBlock("year")],
+  seasonFolder: [{ id: "t-season", type: "text", key: "", value: "Season ", prefix: "", suffix: "" }, testFieldBlock("season")],
+  inPlaceSeasonFolder: [testFieldBlock("season")]
+};
+const refreshConfig = { ...config, templates };
+
+test("同剧 DV/HDR10 混排不再互相传染：文件名带标记才按文件覆盖", () => {
+  const dvName = "怪奇物语.S01E01.2160p.DV.HDR10.WEB-DL.mkv";
+  const hdrName = "怪奇物语.S01E02.2160p.HDR10.WEB-DL.mkv";
+  const groupFields = inferFields("怪奇物语", [dvName, hdrName], config);
+  assert.equal(groupFields.dolbyVision || "", "", "组级技术字段不再聚合文件名里的 DV");
+  const f1 = inferFileFields(dvName, groupFields, 0, config);
+  const f2 = inferFileFields(hdrName, groupFields, 1, config);
+  assert.equal(f1.technicalFromName, true);
+  assert.equal(f1.dolbyVision, "DV");
+  assert.equal(f2.dolbyVision, "", "HDR10 文件不吃组级/其他文件的 DV");
+  assert.equal(f2.dynamicRange, "HDR10");
+  const group = {
+    id: "g-dv", title: "怪奇物语", fields: { ...groupFields }, files: [
+      { id: "f1", name: dvName, type: 0, size: 1, fields: f1 },
+      { id: "f2", name: hdrName, type: 0, size: 1, fields: f2 }
+    ]
+  };
+  refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true });
+  assert.equal(group.files[0].fields.dolbyVision, "DV");
+  assert.equal(group.files[1].fields.dolbyVision, "", "刷新后 HDR10 文件仍不带 DV");
+  assert.ok(!group.files[1].newName.includes("DV"), `新文件名不应出现 DV：${group.files[1].newName}`);
+});
+
+test("季包目录带规格时裸集号文件沿用组级规格", () => {
+  const fields = inferFields("剧名.S01.2160p.DV.WEB-DL", ["S01E01.mkv", "S01E02.mkv"], config);
+  assert.equal(fields.dolbyVision, "DV", "组级规格来自目录名");
+  const f1 = inferFileFields("S01E01.mkv", fields, 0, config);
+  assert.equal(f1.technicalFromName, false);
+  assert.equal(f1.dolbyVision, "DV", "文件名没提规格时沿用组级");
+  const group = {
+    id: "g-pack", title: "剧名", fields: { ...fields }, files: [
+      { id: "f1", name: "S01E01.mkv", type: 0, size: 1, fields: f1 },
+      { id: "f2", name: "S01E02.mkv", type: 0, size: 1, fields: inferFileFields("S01E02.mkv", fields, 1, config) }
+    ]
+  };
+  refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true });
+  assert.equal(group.files[0].fields.dolbyVision, "DV");
+  assert.ok(group.files[0].newName.includes("DV"), `季包裸集号文件名应带组级 DV：${group.files[0].newName}`);
+});
+
+test("探测的实测元数据覆盖文件名自带标记；单文件覆盖仍最高", () => {
+  const hdrName = "剧名.S01E02.2160p.HDR10.WEB-DL.mkv";
+  const bareName = "S01E03.mkv";
+  const fields = inferFields("剧名", [hdrName, bareName], config);
+  const group = {
+    id: "g-probe", title: "剧名", fields: { ...fields }, files: [
+      { id: "f2", name: hdrName, type: 0, size: 1, fields: inferFileFields(hdrName, fields, 0, config) },
+      { id: "f3", name: bareName, type: 0, size: 1, fields: inferFileFields(bareName, fields, 1, config) }
+    ]
+  };
+  refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true, metadataByGroup: { "g-probe": { dolbyVision: "DV", videoFormat: "2160p" } } });
+  assert.equal(group.files[0].fields.dolbyVision, "DV", "实测 DV 覆盖文件名没写 DV 的标记文件");
+  assert.equal(group.files[0].fields.videoFormat, "2160p");
+  assert.equal(group.files[0].fields.dynamicRange, "HDR10", "探测没测到的字段保留文件名自己的值");
+  assert.ok(group.files[0].newName.includes("DV"));
+  assert.equal(group.files[1].fields.dolbyVision, "DV", "裸文件照常吃到探测结果");
+  refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true, metadataByGroup: { "g-probe": { dolbyVision: "DV" } }, fileOverrides: { f2: { dolbyVision: "" } } });
+  assert.equal(group.files[0].fields.dolbyVision, "", "单文件覆盖压过探测");
+  assert.equal(group.files[1].fields.dolbyVision, "DV");
+});
+
+test("组级技术字段修改只填裸文件，不再整组联动；清空也不再压制文件名自带值", () => {
+  const dvName = "剧名.S01E01.2160p.DV.HDR10.WEB-DL.mkv";
+  const hdrName = "剧名.S01E02.2160p.HDR10.WEB-DL.mkv";
+  const bareName = "S01E03.mkv";
+  const fields = inferFields("剧名", [dvName, hdrName, bareName], config);
+  const mk = (id, name, index) => ({ id, name, type: 0, size: 1, fields: inferFileFields(name, fields, index, config) });
+  const group = { id: "g-ovr", title: "剧名", fields: { ...fields }, files: [mk("f1", dvName, 0), mk("f2", hdrName, 1), mk("f3", bareName, 2)] };
+  refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true, overrides: { "g-ovr": { dolbyVision: "DV" } } });
+  assert.equal(group.files[1].fields.dolbyVision, "", "组级 DV 不覆盖文件名写了 HDR 的文件");
+  assert.ok(!group.files[1].newName.includes("DV"), `HDR 文件新名不应出现 DV：${group.files[1].newName}`);
+  assert.equal(group.files[2].fields.dolbyVision, "DV", "裸文件吃到组级值");
+  refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true, overrides: { "g-ovr": { dolbyVision: "" } } });
+  assert.equal(group.files[0].fields.dolbyVision, "DV", "清空组级字段不压制文件名自带的 DV");
+  assert.equal(group.files[1].fields.dolbyVision, "");
+});
+
+test("文件级覆盖优先级最高：单文件纠正文件名写错的标记", () => {
+  const hdrName = "剧名.S01E02.2160p.HDR10.WEB-DL.mkv";
+  const fields = inferFields("剧名", [hdrName], config);
+  const f2 = inferFileFields(hdrName, fields, 0, config);
+  assert.equal(f2.dynamicRange, "HDR10");
+  const group = { id: "g-file", title: "剧名", fields: { ...fields }, files: [{ id: "f2", name: hdrName, type: 0, size: 1, fields: f2 }] };
+  refreshOrganizeGroupTargets(group, refreshConfig, { inPlace: true, fileOverrides: { f2: { dynamicRange: "", effect: "", dolbyVision: "DV" } } });
+  assert.equal(group.files[0].fields.dynamicRange, "", "写错的 HDR10 被单文件覆盖清掉");
+  assert.equal(group.files[0].fields.dolbyVision, "DV");
+  assert.ok(!group.files[0].newName.includes("HDR10"), `新文件名不应再出现 HDR10：${group.files[0].newName}`);
+  assert.ok(group.files[0].newName.includes("DV"), `新文件名应带上单文件覆盖的 DV：${group.files[0].newName}`);
 });
