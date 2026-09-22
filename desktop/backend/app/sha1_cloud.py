@@ -200,8 +200,12 @@ class Sha1CloudClient:
                 self._open_until = 0.0
                 self._half_open = True
 
-    def _record_success(self) -> None:
+    def _record_success(self, force: bool = False) -> None:
         with self._state_lock:
+            # 熔断打开期间的迟到成功（在途/排队请求碰巧赶上服务器放行）不算数：
+            # 一个偶发成功不该把熔断整个重开，否则下一波请求立刻又撞限流
+            if not force and self._open_until and time.monotonic() < self._open_until:
+                return
             recovered = bool(self._open_until or self._half_open or self._failure_count)
             self._failure_count = 0
             self._open_until = 0.0
@@ -212,7 +216,9 @@ class Sha1CloudClient:
     def _record_failure(self) -> None:
         with self._state_lock:
             if self._half_open:
-                # 半开探针失败：立即重新熔断一个完整周期
+                # 半开探针失败：立即重新熔断一个完整周期，并退出半开状态
+                # （留着 True 会让后续迟到的成功把熔断整个重开）
+                self._half_open = False
                 self._open_until = time.monotonic() + self.breaker_open_seconds
                 logger.warning(
                     "共享SHA1库半开探针失败，继续暂停 %d 分钟", self.breaker_open_seconds // 60,
@@ -412,8 +418,6 @@ class Sha1ApiClient(Sha1CloudClient):
     def _request(self, method: str, payload: dict) -> Optional[dict]:
         if self._breaker_open():
             return None
-        if self._open_until:
-            self._enter_half_open_if_expired()
         try:
             from urllib.parse import urlsplit
             url = os.environ.get("SHA1_POOL_API_URL", "").rstrip("/")
@@ -426,6 +430,14 @@ class Sha1ApiClient(Sha1CloudClient):
                 raise ValueError("API token missing")
             # 并发闸：一次逻辑请求（含代理重试）占一个名额，最多 3 路同时打服务器
             with self._gate:
+                # 排队等闸的间隙里熔断可能已被别的请求触发：拿到闸后再核一次，
+                # 不让已在闸前排队的请求绕过熔断继续打服务器
+                if self._breaker_open():
+                    return None
+                if self._open_until:
+                    self._enter_half_open_if_expired()
+                    if self._breaker_open():
+                        return None
                 try:
                     result = self._send(method, url, payload, proxy=None)
                 except Exception as error:
@@ -485,7 +497,7 @@ def set_pool_token_override(token: Optional[str]) -> None:
     _token_override = str(token or "").strip() or None
     reset = getattr(_client, "_record_success", None)
     if callable(reset):
-        reset()  # 换 Token 后清掉旧 Token 留下的失败计数/熔断状态
+        reset(True)  # 换 Token 是显式操作：强制清掉旧 Token 留下的失败计数/熔断状态
 
 
 def get_pool_token_override() -> Optional[str]:

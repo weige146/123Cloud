@@ -174,3 +174,79 @@ def test_breaker_params_class_scoped():
     assert Sha1ApiClient.breaker_open_seconds == 300
     assert sha1_cloud.Sha1CloudClient.breaker_threshold == sha1_cloud._BREAKER_THRESHOLD == 3
     assert sha1_cloud.Sha1CloudClient.breaker_open_seconds == sha1_cloud._BREAKER_OPEN_SECONDS == 600
+
+
+def test_breaker_stays_open_despite_late_success():
+    """熔断打开期间的迟到成功不重开熔断：429 风暴里偶发放行一次不代表服务恢复。
+
+    回归 2026-09-22 日志：旧逻辑 _record_success 无条件清掉 _open_until，
+    一个偶发成功把熔断整个重开，下一波请求马上又撞限流（日志里 429 中间
+    夹着"已恢复使用"即此抖动）。
+    """
+    client = Sha1ApiClient()
+    for _ in range(client.breaker_threshold):
+        client._record_failure()
+    assert client._breaker_open()
+    client._record_success()
+    assert client._breaker_open()
+    client._record_success(force=True)  # 换 Token 等显式操作才允许强制清掉
+    assert not client._breaker_open()
+
+
+def test_half_open_probe_failure_resets_flag_and_late_success_stays_open():
+    """半开探针失败重新熔断后必须退出半开状态：迟到的成功同样不得重开熔断。"""
+    client = Sha1ApiClient()
+    client._half_open = True
+    client._record_failure()
+    assert client._breaker_open()
+    assert not client._half_open
+    client._record_success()
+    assert client._breaker_open()
+
+
+def test_request_rechecks_breaker_after_waiting_on_gate():
+    """并发闸前排队的请求：等闸期间熔断触发后，拿到闸也不得再发请求。
+
+    回归 2026-09-22 日志：熔断检查在并发闸之前，搬运 5 并发时排在闸外的
+    请求已过检查，熔断触发后照样出网继续撞 429（熔断后日志仍在刷 429）。
+    """
+    calls = []
+
+    def fake_send(self, method, url, payload, proxy):
+        calls.append(proxy)
+        return {"etag": None}
+
+    checks = iter([False, True])  # 进门第一次检查放行，拿到闸后的复查触发熔断
+    client = Sha1ApiClient()
+    env = {"SHA1_POOL_API_URL": "https://195.0.0.1:9443", "SHA1_POOL_API_TOKEN": "t"}
+    with patch.object(Sha1ApiClient, "_send", fake_send), \
+            patch.object(Sha1ApiClient, "_breaker_open", lambda self: next(checks, True)), \
+            patch.dict(os.environ, env):
+        assert client._request("GET", {"sha1": "a" * 40, "size": 1}) is None
+
+    assert calls == []
+
+
+def test_breaker_stops_request_storm_under_concurrency():
+    """并发风暴端到端：熔断触发后其余请求全部短路，不再往服务器打。"""
+    calls = []
+    lock = threading.Lock()
+
+    def fake_send(self, method, url, payload, proxy):
+        with lock:
+            calls.append(1)
+        raise _status_error(429)
+
+    client = Sha1ApiClient()
+    env = {"SHA1_POOL_API_URL": "https://195.0.0.1:9443", "SHA1_POOL_API_TOKEN": "t"}
+    with patch.object(Sha1ApiClient, "_send", fake_send), \
+            patch.dict(os.environ, env):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(
+                lambda _: client._request("GET", {"sha1": "a" * 40, "size": 1}), range(40)))
+
+    assert client._breaker_open()
+    assert len(calls) < 20  # 只有熔断前赶上闸的请求出过网，绝不是 40 个全打
+    before = len(calls)
+    assert client._request("GET", {"sha1": "a" * 40, "size": 1}) is None
+    assert len(calls) == before
