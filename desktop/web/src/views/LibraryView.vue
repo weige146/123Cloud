@@ -16,6 +16,7 @@ import {
   type LibraryEnrichStats,
   type LibraryFacets,
   type LibraryFile,
+  type LibraryIdentifyCandidate,
   type LibraryLibInfo,
   type LibraryPlaybackSummary,
   type LibraryPlayEntry,
@@ -367,6 +368,63 @@ async function loadSources() {
   }
 }
 
+// ===== 来源管理：把碎来源（一集一个 JSON 积累的）多选合并到一个主来源名下 =====
+const mergeSelection = ref<string[]>([]);
+const mergeTarget = ref("");
+const mergingSources = ref(false);
+
+function toggleSourceSelection(name: string) {
+  const set = new Set(mergeSelection.value);
+  if (set.has(name)) set.delete(name);
+  else set.add(name);
+  mergeSelection.value = [...set];
+  if (mergeTarget.value && mergeSelection.value.includes(mergeTarget.value)) mergeTarget.value = "";
+}
+
+async function mergeSources() {
+  if (!mergeSelection.value.length || !mergeTarget.value || mergingSources.value) return;
+  const ok = await confirm(
+    `把 ${mergeSelection.value.length} 个来源的作品全部合并到「${mergeTarget.value}」？作品与文件内容不变，只改归属来源。`,
+    "合并来源",
+  );
+  if (!ok) return;
+  mergingSources.value = true;
+  try {
+    const data = await libraryApi.sourcesMerge(mergeSelection.value, mergeTarget.value, apiToken.value);
+    notifySuccess(`已合并 ${data.moved} 个作品到「${mergeTarget.value}」`);
+    mergeSelection.value = [];
+    mergeTarget.value = "";
+    await Promise.all([loadSources(), loadStatus(), loadFacets(), searchWorks()]);
+  } catch (error) {
+    notifyError(`合并失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    mergingSources.value = false;
+  }
+}
+
+const deletingSourceName = ref("");
+
+async function deleteSourceEntry(s: LibraryLibInfo) {
+  if (deletingSourceName.value) return;
+  const ok = await confirm(
+    `删除来源「${s.name}」会连带删除它名下的 ${s.fileCount} 个作品（含文件明细与播放记录），确定删除？`,
+    "删除来源",
+  );
+  if (!ok) return;
+  deletingSourceName.value = s.name;
+  try {
+    await libraryApi.deleteSource(s.name, apiToken.value);
+    notifySuccess(`已删除来源「${s.name}」`);
+    mergeSelection.value = mergeSelection.value.filter((n) => n !== s.name);
+    if (mergeTarget.value === s.name) mergeTarget.value = "";
+    await Promise.all([loadSources(), loadStatus(), loadCategories(), loadFacets(), loadEnrich(), searchWorks()]);
+  } catch (error) {
+    notifyError(`删除失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    deletingSourceName.value = "";
+  }
+}
+
 async function refreshLibrary() {
   scanning.value = true;
   try {
@@ -411,6 +469,7 @@ const activeResolution = ref("");  // 分辨率 4K/1080p/720p/SD
 const activeEdition = ref("");     // 片源版本 REMUX/BluRay/WEB-DL/...
 const activeTech = ref("");        // 技术属性 "字段:值"（dolbyVision:DV / dynamicRange:HDR10+ / videoCodec:H265 / audioCodec:TrueHD）
 const activeRating = ref(0);       // 评分下限 9/8/7，0=不限
+const activeEnrich = ref("");      // 整理状态筛选：failed(识别失败) / none(未识别) / pending(整理中)，空=不限
 const sortMode = ref("");          // "" 默认 / popularity 热度 / rating 评分 / title 片名 / recent 最新入库
 
 // ===== TMDB 分类信息充实进度 =====
@@ -424,7 +483,7 @@ const detailWork = ref<LibraryWork | null>(null);
 
 const activeFilterCount = computed(
   () => [activeMedia.value, activeGenre.value, activeRegion.value, activeLanguage.value,
-    activeResolution.value, activeEdition.value, activeTech.value].filter(Boolean).length
+    activeResolution.value, activeEdition.value, activeTech.value, activeEnrich.value].filter(Boolean).length
     + (activeDecade.value === "" ? 0 : 1)
     + (activeRating.value > 0 ? 1 : 0),
 );
@@ -441,6 +500,7 @@ const RATING_LABEL: Record<string, string> = { "9": "9分以上", "8": "8分以�
 function ratingLabel(k: string | number): string {
   return RATING_LABEL[String(k)] || `${k}分以上`;
 }
+const ENRICH_LABEL: Record<string, string> = { failed: "识别失败", none: "未识别", pending: "整理中" };
 
 // 搜索历史
 const HISTORY_KEY = "librarySearchHistory";
@@ -550,6 +610,7 @@ function toggleLanguage(v: string) { activeLanguage.value = activeLanguage.value
 function toggleResolution(v: string) { activeResolution.value = activeResolution.value === v ? "" : v; onFilterChange(); }
 function toggleEdition(v: string) { activeEdition.value = activeEdition.value === v ? "" : v; onFilterChange(); }
 function toggleTech(v: string) { activeTech.value = activeTech.value === v ? "" : v; onFilterChange(); }
+function toggleEnrich(v: string) { activeEnrich.value = activeEnrich.value === v ? "" : v; onFilterChange(); }
 function toggleRating(v: number) { activeRating.value = activeRating.value === v ? 0 : v; onFilterChange(); }
 function clearFilters() {
   activeMedia.value = "";
@@ -561,6 +622,7 @@ function clearFilters() {
   activeEdition.value = "";
   activeTech.value = "";
   activeRating.value = 0;
+  activeEnrich.value = "";
   onFilterChange();
 }
 function onFilterChange() {
@@ -583,6 +645,7 @@ async function searchWorks(record = false) {
       edition: activeEdition.value,
       rating: activeRating.value,
       tech: activeTech.value,
+      enrich: activeEnrich.value,
       sort: sortMode.value,
       page: page.value,
       size: pageSize.value,
@@ -626,6 +689,7 @@ const resultInfo = computed(() => {
     activeResolution.value,
     activeEdition.value,
     activeTech.value ? techChipLabel(activeTech.value) : "",
+    activeEnrich.value ? ENRICH_LABEL[activeEnrich.value] || activeEnrich.value : "",
     activeDecade.value === "" ? "" : decadeLabel(activeDecade.value),
     activeRating.value > 0 ? ratingLabel(activeRating.value) : "",
   ].filter(Boolean);
@@ -648,6 +712,89 @@ function closeDetail() {
   playStructure.value = null;
   playStructureDir.value = "";
   detailSeason.value = null;
+}
+
+// ===== 手动识别修正（Emby 式 Identify）：搜索 TMDB 选正确条目直接套用 =====
+const identifyOpen = ref(false);
+const identifyWork = ref<LibraryWork | null>(null);
+const identifyQuery = ref("");
+const identifyYear = ref(0);
+const identifyResults = ref<LibraryIdentifyCandidate[]>([]);
+const identifySearching = ref(false);
+const identifyApplying = ref("");
+const identifySearched = ref(false);
+
+function openIdentify(work: LibraryWork) {
+  identifyWork.value = work;
+  identifyQuery.value = work.title;
+  identifyYear.value = work.year || 0;
+  identifyResults.value = [];
+  identifySearched.value = false;
+  identifyOpen.value = true;
+  void runIdentifySearch();
+}
+
+async function runIdentifySearch() {
+  if (!identifyWork.value || !identifyQuery.value.trim()) return;
+  identifySearching.value = true;
+  try {
+    const data = await libraryApi.identifySearch(identifyQuery.value.trim(), identifyYear.value || 0, apiToken.value);
+    identifyResults.value = data.candidates || [];
+    identifySearched.value = true;
+  } catch (error) {
+    notifyError(`搜索失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    identifySearching.value = false;
+  }
+}
+
+async function applyIdentify(candidate: LibraryIdentifyCandidate) {
+  const work = identifyWork.value;
+  if (!work || identifyApplying.value) return;
+  const typeLabel = candidate.type === "tv" ? "剧集" : "电影";
+  const ok = await confirm(
+    `把《${work.title}》识别为 TMDB ${typeLabel}《${candidate.title}》（${candidate.year || "年份未知"}）？会覆盖现有的海报、简介与分类信息。`,
+    "识别修正",
+  );
+  if (!ok) return;
+  identifyApplying.value = `${candidate.type}-${candidate.id}`;
+  try {
+    const data = await libraryApi.identifyApply(work.dir, candidate.type, candidate.id, apiToken.value);
+    notifySuccess(`已修正：《${work.title}》 → ${typeLabel}《${candidate.title}》`);
+    identifyOpen.value = false;
+    if (detailWork.value && detailWork.value.dir === work.dir) {
+      detailWork.value = data.work;
+      void toggleWorkFiles(data.work);
+    }
+    await Promise.all([searchWorks(), loadFacets(), loadEnrich()]);
+  } catch (error) {
+    notifyError(`识别修正失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    identifyApplying.value = "";
+  }
+}
+
+// 详情页单独删除当前作品（TMDB 没有正主、修不回来的条目从这里清掉）
+const deletingDetailWork = ref(false);
+
+async function deleteDetailWork(work: LibraryWork) {
+  if (deletingDetailWork.value) return;
+  const ok = await confirm(
+    `删除《${work.title}》？会连同 ${work.count} 个文件与播放记录一起从本地数据库移除（不影响网盘里的文件）。`,
+    "删除作品",
+  );
+  if (!ok) return;
+  deletingDetailWork.value = true;
+  try {
+    const data = await libraryApi.worksDelete([work.dir], apiToken.value);
+    notifySuccess(`已删除《${work.title}》${data.files ? `（${data.files.toLocaleString()} 个文件）` : ""}`);
+    closeDetail();
+    await refreshAfterDeletion();
+  } catch (error) {
+    notifyError(`删除失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    deletingDetailWork.value = false;
+  }
 }
 
 function goToPage(next: number) {
@@ -1692,6 +1839,35 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <div v-if="enrich && (activeEnrich || enrich.failed > 0 || enrich.none > 0 || enrich.pending > 0)" class="facet-row">
+            <span class="facet-label">整理</span>
+            <div class="facet-chips">
+              <button
+                v-if="enrich.failed > 0 || activeEnrich === 'failed'"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeEnrich === 'failed' }"
+                title="TMDB 标记对不上又搜不到正主的作品，点筛选出来用「识别修正」手动处理"
+                @click="toggleEnrich('failed')"
+              >识别失败<small>{{ enrich.failed }}</small></button>
+              <button
+                v-if="enrich.none > 0 || activeEnrich === 'none'"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeEnrich === 'none' }"
+                title="目录没有 TMDB 标记、也未做过搜索匹配的作品"
+                @click="toggleEnrich('none')"
+              >未识别<small>{{ enrich.none }}</small></button>
+              <button
+                v-if="enrich.pending > 0 || activeEnrich === 'pending'"
+                type="button"
+                class="cat-chip"
+                :class="{ active: activeEnrich === 'pending' }"
+                @click="toggleEnrich('pending')"
+              >整理中<small>{{ enrich.pending }}</small></button>
+            </div>
+          </div>
+
           <div v-if="facets.genres.length" class="facet-row">
             <span class="facet-label">类型</span>
             <div class="facet-chips">
@@ -2019,6 +2195,7 @@ onUnmounted(() => {
         <div class="muted-hint">
           默认「合并新文件」：已有作品只补库里没有的新文件（新剧集、新版本自动进来），整理成果保留、只增不减。
           切到「跳过」则恢复旧行为（整作品跳过、同名来源重导整包替换）。
+          「从文件夹批量导入」以文件夹名作为来源，同一文件夹反复导出重导（内容递增）只算一条来源。
         </div>
         <FormField hint="重复作品导入策略：合并新文件（推荐，新更新的集自动进来）或跳过（保留先入库的，同名来源整包替换）。">
           <div class="port-row">
@@ -2087,6 +2264,47 @@ onUnmounted(() => {
             <v-btn variant="outlined" prepend-icon="mdi-folder-open-outline" :loading="openingExportDir" @click="openExportDir">打开</v-btn>
           </div>
         </FormField>
+      </GlassCard>
+
+      <GlassCard icon="mdi-source-merge" title="来源管理" desc="从文件夹导入时整夹共享一个来源（文件夹名），同一文件夹反复导出重导只算一条。碎来源可勾选合并到主来源（只改归属、内容不变）；行尾的删除按钮则连同该来源下的作品一起删除。">
+        <div v-if="!sources.length" class="muted-hint">还没有来源——导入影库后这里会出现来源列表。</div>
+        <template v-else>
+          <div class="identify-search-row">
+            <span class="muted-hint grow">已选 {{ mergeSelection.length }} 个来源</span>
+            <v-select
+              v-model="mergeTarget"
+              :items="sources.filter((s) => !mergeSelection.includes(s.name)).map((s) => s.name)"
+              label="合并到"
+              variant="outlined"
+              density="compact"
+              hide-details
+              class="grow"
+            />
+            <v-btn
+              color="primary" variant="tonal" prepend-icon="mdi-merge"
+              :disabled="!mergeSelection.length || !mergeTarget" :loading="mergingSources"
+              @click="mergeSources"
+            >合并所选</v-btn>
+          </div>
+          <div class="sources-list">
+            <label v-for="s in sources" :key="s.name" class="share-item-row">
+              <v-checkbox
+                :model-value="mergeSelection.includes(s.name)"
+                density="compact"
+                hide-details
+                :label="`${s.name}（${s.fileCount} 作品 · ${formatBytes(s.totalSize)}）`"
+                @update:model-value="toggleSourceSelection(s.name)"
+              />
+              <span class="share-item-meta">{{ s.loadDate }}</span>
+              <v-btn
+                icon="mdi-delete-outline" size="x-small" variant="text" color="error"
+                :loading="deletingSourceName === s.name"
+                title="删除来源（连带删除该来源下的作品与文件）"
+                @click.stop.prevent="deleteSourceEntry(s)"
+              />
+            </label>
+          </div>
+        </template>
       </GlassCard>
 
       <GlassCard icon="mdi-play" title="播放" desc="点海报墙「播放」时，客户端会把当季文件秒传进网盘的「秒传」目录，再交给本地播放器连续播放；每集开播时才取 123 直链。">
@@ -2206,6 +2424,11 @@ onUnmounted(() => {
               >{{ playBadge(detailWork)?.kind === "resume" ? "继续播放" : "播放" }}</v-btn>
               <v-btn size="small" variant="outlined" prepend-icon="mdi-download" :loading="exporting === detailWork.dir" @click="exportWork(detailWork)">导出全部</v-btn>
               <v-btn size="small" color="success" variant="tonal" prepend-icon="mdi-fast-forward" :loading="transferBusy === detailWork.dir" :disabled="Boolean(transferBusy)" @click="submitTransferWork(detailWork)">转存全部</v-btn>
+              <v-btn size="small" variant="outlined" prepend-icon="mdi-tag-edit-outline" @click="openIdentify(detailWork)">识别修正</v-btn>
+              <v-btn
+                size="small" variant="outlined" color="error" prepend-icon="mdi-delete-outline"
+                :loading="deletingDetailWork" @click="deleteDetailWork(detailWork)"
+              >删除作品</v-btn>
               <v-spacer />
               <v-btn size="small" variant="text" @click="closeDetail">关闭</v-btn>
             </div>
@@ -2381,6 +2604,63 @@ onUnmounted(() => {
               <v-btn size="small" color="success" variant="tonal" prepend-icon="mdi-fast-forward" :disabled="!detailSelected.size || Boolean(transferBusy)" @click="submitTransferSelectedFiles(detailWork)">转存选中</v-btn>
             </div>
           </template>
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+
+    <!-- ====================== 手动识别修正（Emby 式 Identify） ====================== -->
+    <v-dialog v-model="identifyOpen" max-width="720" scrollable>
+      <v-card class="dir-picker-card detail-card">
+        <v-card-text>
+          <div class="identify-head">
+            <strong>识别修正</strong>
+            <span v-if="identifyWork" class="muted-hint identify-work-dir" :title="identifyWork.dir">{{ identifyWork.title }}</span>
+            <v-spacer />
+            <v-btn size="small" variant="text" @click="identifyOpen = false">关闭</v-btn>
+          </div>
+          <div class="identify-search-row">
+            <v-text-field
+              v-model="identifyQuery"
+              label="片名"
+              variant="outlined"
+              density="compact"
+              hide-details
+              class="grow"
+              @keyup.enter="runIdentifySearch"
+            />
+            <v-text-field
+              v-model.number="identifyYear"
+              label="年份（可选）"
+              variant="outlined"
+              density="compact"
+              hide-details
+              type="number"
+              class="small-input"
+            />
+            <v-btn color="primary" variant="tonal" prepend-icon="mdi-magnify" :loading="identifySearching" @click="runIdentifySearch">搜索 TMDB</v-btn>
+          </div>
+          <div v-if="identifySearching" class="empty-state"><p>搜索中…</p></div>
+          <div v-else-if="identifySearched && !identifyResults.length" class="empty-state"><p>没有找到匹配的条目，换个关键词再试。</p></div>
+          <div v-else-if="identifyResults.length" class="identify-grid">
+            <button
+              v-for="c in identifyResults"
+              :key="`${c.type}-${c.id}`"
+              type="button"
+              class="identify-card"
+              :disabled="Boolean(identifyApplying)"
+              :title="`识别为 ${c.type === 'tv' ? '剧集' : '电影'}《${c.title}》`"
+              @click="applyIdentify(c)"
+            >
+              <img v-if="c.poster" :src="c.poster" loading="lazy" :alt="c.title" />
+              <div v-else class="identify-poster-fallback">{{ c.type === "tv" ? "📺" : "🎬" }}</div>
+              <div class="identify-meta">
+                <span class="identify-badge">{{ c.type === "tv" ? "剧集" : "电影" }}</span>
+                <span class="identify-title">{{ c.title }}</span>
+                <span class="identify-sub">{{ c.year || "—" }}<template v-if="c.originalTitle && c.originalTitle !== c.title"> · {{ c.originalTitle }}</template></span>
+              </div>
+            </button>
+          </div>
+          <div class="muted-hint">点选上面的条目即完成修正：会覆盖该作品现有的海报、简介、类型与频道分类（只改数据库，不动网盘目录名）。</div>
         </v-card-text>
       </v-card>
     </v-dialog>
@@ -3349,6 +3629,126 @@ onUnmounted(() => {
   flex: 1;
   min-width: 0;
   cursor: pointer;
+}
+
+/* 手动识别修正弹窗 */
+.identify-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.identify-work-dir {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.identify-search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.identify-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.identify-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: none;
+  padding: 8px;
+  cursor: pointer;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: inherit;
+}
+
+.identify-card:hover {
+  border-color: var(--primary, #5b8def);
+}
+
+.identify-card:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.identify-card img {
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: var(--radius-control);
+  background: rgba(127, 127, 127, 0.15);
+}
+
+.identify-poster-fallback {
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28px;
+  border-radius: var(--radius-control);
+  background: rgba(127, 127, 127, 0.15);
+}
+
+.identify-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.identify-badge {
+  font-size: 10px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  align-self: flex-start;
+}
+
+.identify-title {
+  font-size: 12px;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.identify-sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 来源管理（碎来源合并） */
+.sources-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 4px 8px;
+}
+
+.sources-list .share-item-row {
+  border-bottom: 1px solid var(--border);
+}
+
+.sources-list .share-item-row:last-child {
+  border-bottom: none;
 }
 
 .episode-title {

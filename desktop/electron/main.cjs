@@ -290,6 +290,26 @@ function getFreePort() {
   });
 }
 
+// 冷启动加载页：后端侧车启动约需数秒，这段时间窗口若停在 about:blank 只剩深色底
+// （用户看到的「启动黑屏」）。用一页自带转圈 + 文案的占位页顶上，就绪后换成 /admin。
+const LOADING_SPLASH_HTML = [
+  "<!doctype html><html><head><meta charset=\"utf-8\">",
+  "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\">",
+  "<style>html,body{margin:0;height:100%;background:#0a0c12;color:#8b93a7;",
+  "font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;",
+  "-webkit-font-smoothing:antialiased;user-select:none;overflow:hidden}",
+  ".wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px}",
+  ".ring{width:42px;height:42px;border-radius:50%;border:3px solid rgba(139,147,167,.22);",
+  "border-top-color:#5b8def;animation:spin .9s linear infinite}",
+  "@keyframes spin{to{transform:rotate(360deg)}}",
+  ".txt{font-size:13px;letter-spacing:.04px}",
+  "@media (prefers-color-scheme:light){html,body{background:#f2f4f8;color:#5a6478}",
+  ".ring{border-color:rgba(90,100,120,.2);border-top-color:#3b6ef0}}</style></head>",
+  "<body><div class=\"wrap\"><div class=\"ring\"></div>",
+  "<div class=\"txt\">正在启动本地服务…</div></div></body></html>",
+].join("");
+const LOADING_SPLASH_URL = "data:text/html;charset=utf-8," + encodeURIComponent(LOADING_SPLASH_HTML);
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1240,
@@ -334,8 +354,11 @@ function createWindow() {
     };
     backend.waitForHealth(30_000).then(loadAdmin).catch(loadAdmin);
   } else {
-    // The real /admin URL is loaded once the sidecar reports healthy.
-    mainWindow.loadURL("about:blank");
+    // 冷启动：窗口会在 ready-to-show 时立即显示，而真实的 /admin 要等 Python 侧车
+    // 启动并通过健康检查后才加载（约数秒）。直接 loadURL("about:blank") 会让窗口
+    // 在这几秒里只剩一片 #0a0c12 深色底 = 用户看到的「启动黑屏卡几秒」。改成一个
+    // 自带转圈的加载页，等后端就绪后再由 whenReady 尾部换成 /admin。
+    mainWindow.loadURL(LOADING_SPLASH_URL);
   }
   mainWindow.on("closed", () => {
     mainWindow = null;

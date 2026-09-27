@@ -577,6 +577,55 @@ class LibraryRouteTests(unittest.TestCase):
                     main.LibraryImportDirRequest(path=str(tmp / "不存在")), _StubRequest()))
             self.assertEqual(ctx.exception.status_code, 400)
 
+    def test_import_dir_uses_folder_name_as_source_and_recounts(self):
+        """文件夹导入以文件夹名当来源：同文件夹重导（内容递增）来源仍只有一条，
+        计数按库内实际累计而不是本次增量。"""
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(self._cleanup_dir, tmp)
+        _write_json(tmp / "A.json", _fastlink_payload("", [
+            {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 1},
+        ]))
+        with unittest.mock.patch.object(main, "store", self.store):
+            first = asyncio.run(main.import_library_dir(
+                main.LibraryImportDirRequest(path=str(tmp)), _StubRequest()))
+            self.assertEqual(first["source"], tmp.name)
+            self.assertEqual({s["name"] for s in movie_library_db.list_sources()}, {tmp.name})
+            # 同文件夹重导：内容新增一集 + 一个新作品
+            _write_json(tmp / "A.json", _fastlink_payload("", [
+                {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 1},
+                {"path": f"{WORK_A}/b.mkv", "fileName": "b.mkv", "etag": _etag(2), "size": 2},
+                {"path": f"{WORK_B}/b.mkv", "fileName": "b.mkv", "etag": _etag(3), "size": 3},
+            ]))
+            second = asyncio.run(main.import_library_dir(
+                main.LibraryImportDirRequest(path=str(tmp)), _StubRequest()))
+            self.assertEqual(second["source"], tmp.name)
+            sources = movie_library_db.list_sources()
+            self.assertEqual(len(sources), 1)  # 来源仍只有一条
+            self.assertEqual(sources[0]["fileCount"], 2)  # 计数重算为库内实际作品数（A + B）
+            rows = movie_library_db.search("", 1, 50, libs=[tmp.name])[1]
+            self.assertEqual(len(rows), 2)
+
+    def test_sources_merge_route(self):
+        """来源合并：碎来源的作品整体改挂到目标来源，来源行删除、目标计数重算。"""
+        with unittest.mock.patch.object(main, "store", self.store):
+            self._seed_library("碎A.json")
+            movie_library_db.import_payload("碎B.json", _fastlink_payload("", [
+                {"path": f"{WORK_B}/b.mkv", "fileName": "b.mkv", "etag": _etag(2), "size": 2},
+            ]))
+            self.assertEqual({s["name"] for s in movie_library_db.list_sources()}, {"碎A.json", "碎B.json"})
+            result = asyncio.run(main.merge_library_sources(
+                main.LibrarySourcesMergeRequest(fromNames=["碎A.json", "碎B.json"], toName="主库"), _StubRequest()))
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["moved"], 2)
+            self.assertEqual({s["name"] for s in result["sources"]}, {"主库"})
+            self.assertEqual(result["sources"][0]["fileCount"], 2)
+            rows = movie_library_db.search("", 1, 50, libs=["主库"])[1]
+            self.assertEqual({r["dir"] for r in rows}, {WORK_A, WORK_B})
+            # 目标来源不能出现在合并列表里
+            with self.assertRaises(HTTPException):
+                asyncio.run(main.merge_library_sources(
+                    main.LibrarySourcesMergeRequest(fromNames=["主库", "碎A.json"], toName="主库"), _StubRequest()))
+
     def test_sources_route_and_cascade_delete(self):
         with unittest.mock.patch.object(main, "store", self.store):
             self._seed_library("库A.json")
@@ -590,14 +639,26 @@ class LibraryRouteTests(unittest.TestCase):
                 main.LibrarySourceRequest(name="库A.json"), _StubRequest()))
             remaining = {s["name"] for s in movie_library_db.list_sources()}
             self.assertEqual(remaining, {"库B.json"})
-            # 级联：作品与文件都不剩
+            # 级联：作品、文件与播放记录都不剩
             self.assertFalse(movie_library_db.works_exist([WORK_A]))
             self.assertIsNone(movie_library_db.list_files(WORK_A))
+            self.assertEqual(movie_library_db.list_playback(WORK_A), [])
             # 删不存在的来源 → 404
             with self.assertRaises(HTTPException) as ctx:
                 asyncio.run(main.delete_library_source(
                     main.LibrarySourceRequest(name="不存在.json"), _StubRequest()))
             self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_source_delete_cascades_playback(self):
+        """按来源删除连播放记录一起清（对齐 delete_works 的三表级联）。"""
+        with unittest.mock.patch.object(main, "store", self.store):
+            work_dir = self._seed_library()
+            movie_library_db.upsert_playback(work_dir, f"{work_dir}/a.mkv", season=1, episode=1,
+                                             position_sec=100.0, watched=False)
+            self.assertEqual(len(movie_library_db.list_playback(work_dir)), 1)
+            asyncio.run(main.delete_library_source(
+                main.LibrarySourceRequest(name="库.json"), _StubRequest()))
+            self.assertEqual(movie_library_db.list_playback(work_dir), [])
 
     def test_search_files_export_routes(self):
         with unittest.mock.patch.object(main, "store", self.store):
@@ -968,6 +1029,39 @@ class LibraryEnrichTests(unittest.TestCase):
         self.assertEqual(self.db.reset_enrichment(only_failed=False), 1)  # 全量重排
         self.assertEqual(self.db.enrich_stats()["pending"], 1)
 
+    def test_migrate_requeues_channel_genre_mismatch(self):
+        """自相矛盾脏数据自愈：media_type=电影 但类型列表挂着剧集专属类型（儿童等）
+        → 打开库时自动重排进整理队列；正常的行不受影响。"""
+        import sqlite3
+        self._seed()
+        db_path = Path(self._directory.name) / "cloud123.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            with conn:
+                # 混合脏数据：早期错误整理（movie 落库）+ 后期正确整理（tv 类型列表）的混合残留
+                conn.execute(
+                    "UPDATE library_works SET media_type = '电影', genres = ?, tmdb_status = 'ok', enrich_attempts = 3"
+                    " WHERE dir = ?",
+                    (json.dumps(["儿童", "动作冒险", "Sci-Fi & Fantasy"], ensure_ascii=False), WORK_A),
+                )
+                # 两条不受影响的对照：频道本就正确 / 电影带电影类型
+                conn.execute(
+                    "INSERT INTO library_works (dir, title, norm_title, tmdb_id, media_type, genres, tmdb_status, source)"
+                    " VALUES ('电影/正常电影 (2020) {tmdb-11}', '正常电影', '正常电影', 11, '儿童', '[]', 'ok', '库.json')")
+                conn.execute(
+                    "INSERT INTO library_works (dir, title, norm_title, tmdb_id, media_type, genres, tmdb_status, source)"
+                    " VALUES ('电影/普通电影 (2021) {tmdb-12}', '普通电影', '普通电影', 12, '电影', '[\"动作\"]', 'ok', '库.json')")
+        finally:
+            conn.close()
+        # 重新打开库触发 _migrate
+        movie_library_db.LibraryDb(db_path)
+        rows = {r["dir"]: r for r in self.db.pending_works(50)}
+        self.assertIn(WORK_A, rows)  # 混合脏数据被重排
+        self.assertEqual(rows[WORK_A]["tmdb_id"], 297802)
+        stats = self.db.enrich_stats()
+        self.assertEqual(stats["pending"], 1)
+        self.assertEqual(stats["ok"], 2)  # 两条正常对照保持 ok
+
     def test_tmdb_enrich_fields_normalize(self):
         info = {
             "title": "Aquaman", "release_date": "2018-12-07", "overview": "o",
@@ -1000,6 +1094,7 @@ class LibraryEnrichTests(unittest.TestCase):
         for info, matched, expected in cases:
             fields = main._tmdb_enrich_fields(info, matched)
             self.assertEqual(fields["media_type"], expected, (matched, info))
+
 
     def test_infer_technical_detailed(self):
         """细粒度属性识别（对齐油猴整理字段）：资源类型/DV/HDR/编码/帧率/地区版。"""
@@ -1243,6 +1338,197 @@ class LibraryEnrichTests(unittest.TestCase):
         self.assertEqual(main._prefer_tmdb_type({"video_count": 5, "dir": "电影/海王"}), "tv")
         self.assertEqual(main._prefer_tmdb_type({"video_count": 1, "dir": "剧集/Show/Season 1"}), "tv")
         self.assertEqual(main._prefer_tmdb_type({"video_count": 1, "dir": "电影/海王 (2018)"}), "movie")
+
+
+
+# 错标记实例（维护者实测：《辉夜大小姐 初吻不会结束》目录标了 {tmdb-327521}，
+# 而 327521 是 2014 年的无关影片 The Transcend；正确条目是 tv 330299）
+_TRANSCEND_327521 = {
+    "id": 327521, "title": "The Transcend", "release_date": "2014-01-09",
+    "genres": [{"id": 10749, "name": "爱情"}, {"id": 18, "name": "剧情"}, {"id": 27, "name": "恐怖"}],
+    "vote_average": 5.0, "poster_path": "/transcend.jpg", "origin_country": ["CN"],
+}
+_KAGUYA_TV_330299 = {
+    "id": 330299, "name": "辉夜大小姐想让我告白：初吻不会结束", "first_air_date": "2023-03-31",
+    "genres": [{"id": 16, "name": "动画"}, {"id": 10749, "name": "爱情"}, {"id": 35, "name": "喜剧"}],
+    "vote_average": 7.5, "poster_path": "/kaguya.jpg", "origin_country": ["JP"],
+}
+
+
+class EnrichLookupGateTests(unittest.TestCase):
+    """ID 命中标题校验（Emby 式）：目录标记写错时标题对不上的条目不硬套，标题搜索兜底。"""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self._original_store = main.store
+        self.addCleanup(setattr, main, "store", self._original_store)
+        from app.session_store import SessionStore
+        main.store = SessionStore(Path(self._directory.name))
+        self.search_calls = []
+        self._original_search = main._tmdb_search_candidate
+        self.addCleanup(setattr, main, "_tmdb_search_candidate", self._original_search)
+        self._original_fetch = main._tmdb_fetch_info
+        self.addCleanup(setattr, main, "_tmdb_fetch_info", self._original_fetch)
+
+    def _patch_fetch(self, table):
+        async def fake_fetch(type_, tmdb_id):
+            return table.get((type_, int(tmdb_id)))
+        main._tmdb_fetch_info = fake_fetch
+
+    def _patch_search(self, result):
+        async def fake_search(title, year, year_filter=True, types=None):
+            self.search_calls.append((title, year, year_filter, types))
+            return result
+        main._tmdb_search_candidate = fake_search
+
+    def test_wrong_marker_rescued_by_title_search(self):
+        """错标记：movie 327521 完全对不上（评分 0），标题搜索命中 tv 330299 → 以它为准。"""
+        self._patch_fetch({("movie", 327521): _TRANSCEND_327521, ("tv", 330299): _KAGUYA_TV_330299})
+        self._patch_search(("tv", 330299))
+        fields = asyncio.run(main._tmdb_enrich_lookup(
+            327521, "辉夜大小姐想让我告白：初吻不会结束", 2023, prefer_type="tv"))
+        self.assertEqual(fields["media_type"], "动漫")  # 动画类型 → 动漫频道（不再是错误的电影）
+        self.assertEqual(fields["year"], 2023)
+        self.assertTrue(fields["poster_path"].endswith("/kaguya.jpg"))
+        self.assertEqual(json.loads(json.dumps(fields["genres"])), ["动画", "爱情", "喜剧"])
+        # 兜底搜索不带年份过滤，且按作品结构限定只搜 tv
+        self.assertEqual(self.search_calls, [("辉夜大小姐想让我告白：初吻不会结束", 2023, False, ("tv",))])
+        # 修正结果写进 v2 缓存
+        cached = main.store.read_value(main._enrich_cache_key("zh-CN", 327521))
+        self.assertEqual(cached["fields"]["media_type"], "动漫")
+
+    def test_no_signal_and_no_search_result_gives_up(self):
+        """评分 0 且搜索无果：宁缺勿错返回 None（记整理失败），不拿无关条目硬套。"""
+        self._patch_fetch({("movie", 327521): _TRANSCEND_327521})
+        self._patch_search(None)
+        fields = asyncio.run(main._tmdb_enrich_lookup(
+            327521, "辉夜大小姐想让我告白：初吻不会结束", 2023, prefer_type="tv"))
+        self.assertIsNone(fields)
+
+    def test_year_only_match_kept_when_search_fails(self):
+        """仅年份命中（评分 1）且搜索无果：保留 ID 结果（可能是译名差异的正主）。"""
+        info = {"id": 55, "title": "Whatever", "release_date": "2023-01-01", "genres": [],
+                "vote_average": 6.0, "poster_path": "/y.jpg"}
+        self._patch_fetch({("movie", 55): info})
+        self._patch_search(None)
+        fields = asyncio.run(main._tmdb_enrich_lookup(55, "别的名字", 2023, prefer_type="movie"))
+        self.assertIsNotNone(fields)
+        self.assertEqual(fields["year"], 2023)
+
+    def test_year_only_match_replaced_by_better_search(self):
+        """仅年份命中但同类型搜索到标题相符的：换成搜索结果（搜索按结构限定类型）。"""
+        weak = {"id": 55, "title": "Whatever", "release_date": "2023-01-01", "genres": [],
+                "vote_average": 6.0, "poster_path": "/y.jpg"}
+        better = {"id": 99, "title": "别的名字", "release_date": "2023-06-01",
+                  "genres": [{"id": 28, "name": "动作"}], "vote_average": 8.0, "poster_path": "/b.jpg"}
+        self._patch_fetch({("movie", 55): weak, ("movie", 99): better})
+        self._patch_search(("movie", 99))
+        fields = asyncio.run(main._tmdb_enrich_lookup(55, "别的名字", 2023, prefer_type="movie"))
+        self.assertEqual(fields["media_type"], "电影")
+        self.assertEqual(fields["vote_average"], 8.0)
+
+    def test_title_match_skips_search(self):
+        """标题相符（评分≥2）直接信任 ID 结果，不触发兜底搜索。"""
+        self._patch_fetch({("movie", 297802): {
+            "id": 297802, "title": "海王", "release_date": "2018-12-07",
+            "genres": [{"id": 28, "name": "动作"}], "vote_average": 7.0, "poster_path": "/a.jpg",
+        }})
+        self._patch_search(("tv", 1))
+        fields = asyncio.run(main._tmdb_enrich_lookup(297802, "海王", 2018, prefer_type="movie"))
+        self.assertEqual(fields["media_type"], "电影")
+        self.assertEqual(self.search_calls, [])
+
+    def test_search_lookup_returns_id_only(self):
+        self._patch_search(("tv", 330299))
+        self.assertEqual(asyncio.run(main._tmdb_search_lookup("辉夜", 2023)), 330299)
+
+    def test_episodic_work_keeps_tv_over_matching_movie(self):
+        """结构加权（爆上战队实例）：分集作品 tv 条目仅年份命中（TMDB 译名「爆燃」
+        与目录「爆上」差一字，原始评分 1），加权后稳赢电影条目；兜底搜索按结构限定
+        只搜 tv，标题更匹配的同号剧场版电影没有机会——分集内容不落成电影。"""
+        tv_entry = {"id": 234667, "name": "爆燃战队奔奔者", "first_air_date": "2024-03-03",
+                    "genres": [{"id": 10762, "name": "儿童"}, {"id": 10759, "name": "动作冒险"}],
+                    "vote_average": 8.0, "poster_path": "/boom.jpg"}
+        cats = {"id": 234667, "title": "Sufferin' Cats", "release_date": "1961-05-29",
+                "genres": [{"id": 16, "name": "动画"}], "vote_average": 5.0, "poster_path": "/c.jpg"}
+        movie_version = {"id": 760000, "title": "爆上战队奔奔者剧场版", "release_date": "2024-07-26",
+                         "genres": [{"id": 28, "name": "动作"}, {"id": 878, "name": "科幻"}],
+                         "vote_average": 7.0, "poster_path": "/mv.jpg"}
+        self._patch_fetch({("tv", 234667): tv_entry, ("movie", 234667): cats, ("movie", 760000): movie_version})
+        self._patch_search(("tv", 234667))  # 兜底搜索只搜 tv，找回的就是剧集自己
+        fields = asyncio.run(main._tmdb_enrich_lookup(234667, "爆上战队奔奔者", 2024, prefer_type="tv"))
+        self.assertEqual(fields["media_type"], "儿童")  # 结构证据压过标题匹配
+        self.assertEqual(fields["year"], 2024)
+        self.assertTrue(fields["poster_path"].endswith("/boom.jpg"))
+
+
+class IdentifyAndEnrichFilterTests(unittest.TestCase):
+    """整理状态筛选（找识别失败的作品）+ Emby 式手动识别修正。"""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self._original_store = main.store
+        self.addCleanup(setattr, main, "store", self._original_store)
+        from app.session_store import SessionStore
+        main.store = SessionStore(Path(self._directory.name))
+        self._original_db = movie_library_db._default_db
+        self.addCleanup(setattr, movie_library_db, "_default_db", self._original_db)
+        self.db = movie_library_db.LibraryDb(Path(self._directory.name) / "cloud123.db")
+        movie_library_db._default_db = self.db
+        self.db.import_payload("库.json", _fastlink_payload("", [
+            {"path": f"{WORK_A}/a.mkv", "fileName": "a.mkv", "etag": _etag(1), "size": 100},
+        ]))
+
+    def test_search_filter_by_enrich_status(self):
+        rows = movie_library_db.search("", 1, 50, enrich="pending")[1]
+        self.assertEqual([r["dir"] for r in rows], [WORK_A])
+        self.db.apply_enrichment(WORK_A, {"media_type": "movie", "genres": [], "region": "",
+                                          "poster_path": "", "vote_average": 0, "overview": "", "year": 2018})
+        rows = movie_library_db.search("", 1, 50, enrich="ok")[1]
+        self.assertEqual([r["dir"] for r in rows], [WORK_A])
+        self.assertEqual(movie_library_db.search("", 1, 50, enrich="failed")[1], [])
+        self.assertEqual(movie_library_db.search("", 1, 50)[0], 1)  # 不传筛选不过滤
+
+    def test_identify_apply_route(self):
+        """手动选定的条目直接套用（不过标题校验门）：tmdb_id/分类/状态一次写齐。"""
+        info = {"id": 330299, "name": "辉夜大小姐想让我告白：初吻不会结束", "first_air_date": "2023-03-31",
+                "genres": [{"id": 16, "name": "动画"}], "vote_average": 7.5, "poster_path": "/k.jpg",
+                "origin_country": ["JP"], "overview": "o", "popularity": 1.0}
+
+        async def fake_fetch(type_, tmdb_id):
+            return info if (type_, tmdb_id) == ("tv", 330299) else None
+
+        with unittest.mock.patch.object(main, "_tmdb_fetch_info", fake_fetch):
+            result = asyncio.run(main.identify_apply(
+                main.LibraryIdentifyApplyRequest(dir=WORK_A, type="tv", tmdbId=330299), _StubRequest()))
+        self.assertTrue(result["ok"])
+        work = result["work"]
+        self.assertEqual(work["tmdbId"], 330299)
+        self.assertEqual(work["mediaType"], "动漫")
+        self.assertEqual(work["tmdbStatus"], "ok")
+        rows = movie_library_db.search("", 1, 50, enrich="ok")[1]
+        self.assertEqual([r["dir"] for r in rows], [WORK_A])
+
+    def test_identify_apply_rejects_bad_params(self):
+        with self.assertRaises(HTTPException):
+            asyncio.run(main.identify_apply(
+                main.LibraryIdentifyApplyRequest(dir=WORK_A, type="book", tmdbId=1), _StubRequest()))
+        with self.assertRaises(HTTPException):
+            asyncio.run(main.identify_apply(
+                main.LibraryIdentifyApplyRequest(dir="", type="tv", tmdbId=1), _StubRequest()))
+
+    def test_identify_search_route(self):
+        async def fake_candidates(query, year):
+            return [{"type": "tv", "id": 330299, "title": query, "originalTitle": "", "year": 2023,
+                     "poster": "", "popularity": 1.0, "score": 3}]
+
+        with unittest.mock.patch.object(main, "_tmdb_identify_candidates", fake_candidates):
+            result = asyncio.run(main.identify_search(_StubRequest(), q="辉夜", year=2023, token=""))
+        self.assertEqual(result["candidates"][0]["id"], 330299)
+        with self.assertRaises(HTTPException):
+            asyncio.run(main.identify_search(_StubRequest(), q="", year=0, token=""))
 
 
 W_MOVIE_1 = "合集/甲 (2018) {tmdb-11}"

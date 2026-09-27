@@ -427,8 +427,14 @@ async def build_submission_draft(
     submitter: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     source_text = str(link.get("sourceText") or "").strip()
+    if link.get("skipReleaseGroup"):
+        # 油猴导出已去除文件名发布组的直投：整条草稿构建都不做发布组识别
+        config = {**config, "skipReleaseGroup": True}
     recognition = build_media_recognition_input(source_text, inspection)
     metadata = recognize_submission_metadata(recognition["text"], recognition["inspection"], config)
+    # 脚本直投带的结构化识别（全量清单+脚本识别管道算出的字段）逐字段优先于客户端
+    # 按截断样本的启发式；显示映射（原盘等 sourceLabels）、TMDB、路由、渲染仍走客户端逻辑
+    metadata = apply_submission_meta_overrides(metadata, link.get("meta"))
     cached_hit = should_use_cached_media(cached_media, metadata, cached_media_source)
     # 缓存存在但被弃用（标题对不上或数据全空）时，TMDB 24h 内存缓存里很可能还躺着
     # 同一份旧数据，强制绕过读缓存重查，「TMDB 补了海报/简介」的自愈才能拿到新数据
@@ -688,7 +694,10 @@ def apply_config_recognition_rules(
         if not isinstance(rule, dict) or rule.get("enabled") is False or not rule.get("pattern"):
             continue
         pattern = js_named_groups_to_python(str(rule.get("pattern") or ""))
-        rule_text = "\n".join(submission_video_file_names(file_names or [])) if "(?P<releaseGroup>" in pattern else text
+        release_group_rule = "(?P<releaseGroup>" in pattern
+        if release_group_rule and config.get("skipReleaseGroup"):
+            continue
+        rule_text = "\n".join(submission_video_file_names(file_names or [])) if release_group_rule else text
         if not rule_text:
             continue
         flags = re.I if "i" in str(rule.get("flags") or "") else 0
@@ -1007,6 +1016,42 @@ def normalize_submission_link(link: Dict[str, Any], source_text: str = "") -> Di
         "sourceText": str(link.get("sourceText") or source_text or clean_url),
         "documents": normalize_submission_documents(link.get("documents") or link.get("document")),
     }
+
+
+SUBMISSION_META_OVERRIDE_KEYS = (
+    "seasonEpisode",
+    "quality",
+    "source",
+    "effect",
+    "videoCodec",
+    "audioCodec",
+    "fps",
+    "bitDepth",
+    "webSource",
+)
+
+def apply_submission_meta_overrides(metadata: Dict[str, Any], meta: Any) -> Dict[str, Any]:
+    """脚本直投的结构化识别逐字段覆盖客户端启发式（脚本没给的字段保留客户端识别）。
+
+    覆盖的只是「识别值」；原盘等显示映射（sourceLabels）、TMDB 校准、频道路由、
+    文案渲染仍由客户端既有逻辑处理。"""
+    if not isinstance(meta, dict):
+        return metadata
+    changed = False
+    for key in SUBMISSION_META_OVERRIDE_KEYS:
+        value = str(meta.get(key) or "").strip()
+        if not value:
+            continue
+        metadata[key] = value
+        if key == "source":
+            metadata["resourceType"] = value
+        changed = True
+    if str(meta.get("mediaType") or "").strip() in {"movie", "tv"}:
+        metadata["mediaType"] = str(meta["mediaType"]).strip()
+        changed = True
+    if changed:
+        metadata["tags"] = build_submission_tags(metadata)
+    return metadata
 
 
 def normalize_submission_documents(value: Any) -> List[Dict[str, Any]]:
@@ -1396,12 +1441,37 @@ def first_season_episode(value: str) -> str:
     return ""
 
 
+# 裸集号命名（如「第1季/2021.E101.mkv」）：季号从目录（第N季/Season N/SN 目录名）推断，取不到按第 1 季
+_BARE_EPISODE_RE = re.compile(r"(?:^|[\s._\-/])(?:EP|E)(\d{1,4})(?=$|[\s._\-/])", re.I)
+
+
+def episode_season_hint(path: str) -> int:
+    segments = [segment for segment in str(path or "").replace("\\", "/").split("/") if segment]
+    for segment in reversed(segments[:-1]):
+        text = segment.strip()
+        match = (
+            re.search(r"第\s*(\d{1,3})\s*季", text)
+            or re.search(r"\bseason[\s._-]*(\d{1,3})", text, re.I)
+            or re.search(r"\bs(\d{1,3})(?=$|[\s._\-])", text, re.I)
+        )
+        if match:
+            for value in match.groups():
+                if value:
+                    return int(value)
+    return 1
+
+
 def summarize_season_episodes(file_names: Iterable[Any]) -> str:
     episodes: List[tuple[int, int]] = []
     for name in file_names:
-        match = re.search(r"\bS(?P<season>\d{1,3})\s*E(?P<episode>\d{1,5})\b", str(name or ""), re.I)
+        text = str(name or "")
+        match = re.search(r"\bS(?P<season>\d{1,3})\s*E(?P<episode>\d{1,5})\b", text, re.I)
         if match:
             episodes.append((int(match.group("season")), int(match.group("episode"))))
+            continue
+        bare = _BARE_EPISODE_RE.search(text)
+        if bare:
+            episodes.append((episode_season_hint(text), int(bare.group(1))))
     if not episodes:
         return ""
     seasons = sorted({season for season, _episode in episodes})
@@ -1665,6 +1735,9 @@ def _is_known_media_term(value: str) -> bool:
 
 
 def extract_release_group(value: str, config: Optional[Dict[str, Any]] = None) -> str:
+    # 秒传直投带 skipReleaseGroup 标记（油猴导出时已去除文件名发布组）：不再从尾段乱猜
+    if isinstance(config, dict) and config.get("skipReleaseGroup"):
+        return ""
     stem = strip_known_extension(str(value or ""))
     bracket = re.search(r"\[(?P<group>[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9._@-]{1,40})\]\s*$", stem)
     if bracket and is_release_group_suffix(bracket.group("group")):
@@ -2847,14 +2920,17 @@ async def publish_submission_draft(store: SessionStore, bot_token: str, config: 
         delete_submission_draft(store, str(draft.get("id") or ""))
         await safe_answer_callback_query(bot_token, callback_id, "已发布", timeout=4.0)
         await cleanup_submission_draft_messages(bot_token, draft, callback_message_id_value)
-        history_warning = await cleanup_previous_submission_publications(store, bot_token, config, draft, chat_id, message_id)
-        if history_warning:
-            logger.warning(
-                "Local channel publication cleanup finished with warning",
-                extra={"draft_id": str(draft.get("id") or ""), "channel_chat_id": str(chat_id), "message_id": message_id, "warning": history_warning},
-            )
+        # 频道级「发布后清理旧帖」开关：关掉后本地历史删除与 TG API 全频道扫描都不跑
+        if channel_old_post_cleanup_enabled(channel):
+            history_warning = await cleanup_previous_submission_publications(store, bot_token, config, draft, chat_id, message_id)
+            if history_warning:
+                logger.warning(
+                    "Local channel publication cleanup finished with warning",
+                    extra={"draft_id": str(draft.get("id") or ""), "channel_chat_id": str(chat_id), "message_id": message_id, "warning": history_warning},
+                )
         record_submission_publication(store, config, draft, channel, chat_id, message_id, ([photo_message_id] if photo_message_id > 0 else []) + seed_message_ids)
-        schedule_published_submission_history_cleanup(store, config, draft, chat_id, message_id)
+        if channel_old_post_cleanup_enabled(channel):
+            schedule_published_submission_history_cleanup(store, config, draft, chat_id, message_id)
         return {"action": "publish", "ok": True, "channelId": str(channel.get("id") or ""), "messageId": message_id, "seedMessageIds": seed_message_ids}
 
     try:
@@ -3142,6 +3218,11 @@ def channel_user_allowed(channel: Dict[str, Any], user_id: int, owner_user_id: i
 
 def enabled_submission_channels(channels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [channel for channel in channels if isinstance(channel, dict) and channel.get("enabled") is not False]
+
+
+def channel_old_post_cleanup_enabled(channel: Optional[Dict[str, Any]]) -> bool:
+    """频道级「发布后清理旧帖」开关。存量配置没有 cleanupOldPosts 键按开处理，只有显式 false 才跳过清理。"""
+    return bool(channel) and channel.get("cleanupOldPosts") is not False
 
 
 def build_publish_markup(draft: Dict[str, Any], config: Dict[str, Any]) -> Optional[Dict[str, Any]]:

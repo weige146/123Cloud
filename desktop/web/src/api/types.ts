@@ -47,6 +47,7 @@ export interface Channel {
   enabled: boolean;
   isDefault?: boolean;
   allowedUserIds?: number[];
+  cleanupOldPosts?: boolean;
   [key: string]: unknown;
 }
 

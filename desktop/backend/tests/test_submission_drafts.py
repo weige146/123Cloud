@@ -37,6 +37,7 @@ from app.submission import (
     submission_publication_message_ids,
     build_submission_resource_name,
     recognize_submission_metadata,
+    summarize_season_episodes,
     render_submission_caption,
     send_telegram_rich_message,
     submission_publication_identity,
@@ -235,6 +236,143 @@ class SubmissionDraftTests(unittest.TestCase):
             self.assertIn("📺 TMDB: 223911", text)
             self.assertEqual(send_mock.await_args.kwargs.get("parse_mode"), "HTML")
             self.assertIn("reply_markup", send_mock.await_args.kwargs)
+
+    def test_fastlink_direct_push_skip_release_group_flag_controls_recognition(self):
+        """油猴直投带 skipReleaseGroup 标记时客户端跳过发布组识别；不带标记维持原识别。"""
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.write_submission_config(
+                {
+                    "botToken": "telegram-token",
+                    "allowedUserIds": [123456],
+                    "channels": [
+                        {"id": "private", "title": "私有", "chatId": "-1001", "enabled": True, "isDefault": True, "role": "private"}
+                    ],
+                    "routing": {"fallbackChannelId": "private", "releaseGroupChannelId": "private"},
+                }
+            )
+            send_mock = AsyncMock()
+
+            def build_link(skip_release_group: bool):
+                link = {
+                    "url": "123FLCPV2$%f#1024#Renegade.Immortal.S01E01.mkv",
+                    "cleanUrl": "123FLCPV2$%f#1024#Renegade.Immortal.S01E01.mkv",
+                    "provider": "123fastlink",
+                    "title": "仙逆 (2023) {tmdb-223911}",
+                    "sourceText": "🎬：仙逆 (2023) {tmdb-223911}\n💾：1 GB\n📄：仙逆.2023.S01E01.2160p.WEB-DL.H265-HiveWeb.mkv",
+                    "inspection": {
+                        "title": "仙逆 (2023) {tmdb-223911}",
+                        "fileNames": ["仙逆.2023.S01E01.2160p.WEB-DL.H265-HiveWeb.mkv"],
+                        "size": "1GB",
+                        "rawText": "仙逆.2023.S01E01.2160p.WEB-DL.H265-HiveWeb.mkv",
+                    },
+                }
+                if skip_release_group:
+                    link["skipReleaseGroup"] = True
+                return link
+
+            def submit(skip_release_group: bool):
+                with patch("app.submission.send_telegram_text", send_mock):
+                    return asyncio.run(submit_submission_links(store, [build_link(skip_release_group)], "秒传链接", 123456))
+
+            control = submit(False)["drafts"][0]
+            self.assertEqual(control["metadata"].get("releaseGroup"), "HiveWeb", "不带标记时维持原有发布组识别")
+
+            skipped = submit(True)["drafts"][0]
+            self.assertFalse(skipped["metadata"].get("releaseGroup"), "带 skipReleaseGroup 标记应跳过发布组识别")
+            self.assertNotIn("HiveWeb", skipped["caption"])
+
+    def test_summarize_season_episodes_bare_episode_numbers(self):
+        """裸集号命名（第1季/2021.E101.mkv）要按目录推季号统计全量集数；不能退回目录名里的「100集」。"""
+        files = [f"万界独尊 (2021) {{tmdb-122612}}/第1季/2021.E{n}.mkv" for n in range(1, 131)]
+        self.assertEqual(summarize_season_episodes(files), "S01E01-E130")
+        # Season N 目录与 SNN 目录同样认季号
+        self.assertEqual(summarize_season_episodes([f"Show/Season 02/E{n}.mkv" for n in (5, 7)]), "S02E05-E07")
+        self.assertEqual(summarize_season_episodes(["Show/S03/E1.mkv", "Show/S03/E2.mkv"]), "S03E01-E02")
+        # 无季目录按第 1 季
+        self.assertEqual(summarize_season_episodes(["2021.E101.mkv", "2021.E102.mkv"]), "S01E101-E102")
+        # 跨季裸集号各自归季
+        multi = [f"番/第1季/E{n}.mkv" for n in (1, 2)] + [f"番/第2季/E{n}.mkv" for n in (1, 2, 3)]
+        self.assertEqual(summarize_season_episodes(multi), "S01-S02")
+        # SxxEyy 老格式行为不变；纯技术尾缀不得被裸集号误伤
+        self.assertEqual(summarize_season_episodes(["Show.S01E05.mkv", "Show.S01E07.mkv"]), "S01E05-E07")
+        self.assertEqual(summarize_season_episodes(["Movie.2020.1080p.WEB-DL.x265-EAC3.Atmos-HiveWeb.mkv"]), "")
+
+    def test_recognize_bare_episode_fastlink_uses_file_count_not_folder_claim(self):
+        """直投上下文只有裸集号文件 + 目录名写着「100集」时，集数按文件实况（130 集）识别。"""
+        file_names = [f"万界独尊 2021 100集(4K)/第1季/2021.E{n}.mkv" for n in range(1, 131)]
+        source_text = "🎬：万界独尊 (2021) {tmdb-122612}\n💾：217 GB\n" + "\n".join(f"📄：{name}" for name in file_names)
+        metadata = recognize_submission_metadata(
+            source_text,
+            {"title": "万界独尊 (2021) {tmdb-122612}", "fileNames": file_names, "size": "217 GB", "rawText": source_text},
+            {},
+        )
+        self.assertEqual(metadata["seasonEpisode"], "S01E01-E130")
+        self.assertEqual(metadata["mediaType"], "tv")
+
+    def test_fastlink_direct_push_meta_episode_range_wins(self):
+        """脚本 meta 的结构化识别逐字段优先；原盘显示映射等客户端逻辑照常套在 meta 原始值上。"""
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.write_submission_config(
+                {
+                    "botToken": "telegram-token",
+                    "allowedUserIds": [123456],
+                    "channels": [
+                        {"id": "private", "title": "私有", "chatId": "-1001", "enabled": True, "isDefault": True, "role": "private"}
+                    ],
+                    "routing": {"fallbackChannelId": "private", "releaseGroupChannelId": "private"},
+                }
+            )
+            file_names = [f"万界独尊 2021 100集(4K)/第1季/2021.E{n}.mkv" for n in range(1, 101)]
+            source_text = "🎬：万界独尊 (2021) {tmdb-122612}\n💾：217 GB\n" + "\n".join(f"📄：{name}" for name in file_names)
+            send_mock = AsyncMock()
+
+            def submit(meta):
+                link = {
+                    "url": "123FLCPV2$%f#1024#万界独尊.123fastlink.json",
+                    "cleanUrl": "123FLCPV2$%f#1024#万界独尊.123fastlink.json",
+                    "provider": "123fastlink",
+                    "title": "万界独尊 (2021) {tmdb-122612}",
+                    "sourceText": source_text,
+                    "inspection": {
+                        "title": "万界独尊 (2021) {tmdb-122612}",
+                        "fileNames": file_names,
+                        "size": "217 GB",
+                        "rawText": source_text,
+                    },
+                }
+                if meta is not None:
+                    link["meta"] = meta
+                    # 真实场景成套：带 meta 的秒传是脚本开了「去除发布组」导出的
+                    link["skipReleaseGroup"] = True
+                with patch("app.submission.send_telegram_text", send_mock):
+                    return asyncio.run(submit_submission_links(store, [link], "秒传链接", 123456))["drafts"][0]
+
+            control = submit(None)
+            self.assertEqual(control["metadata"]["seasonEpisode"], "S01E01-E100", "无 meta 时客户端按样本识别（裸集号）")
+
+            with_meta = submit(
+                {
+                    "seasonEpisode": "S01E01-E486",
+                    "mediaType": "tv",
+                    "quality": "2160p",
+                    "source": "UHD BluRay Remux",
+                    "videoCodec": "H265",
+                    "audioCodec": "TrueHD.7.1.Atmos",
+                    "fps": "25fps",
+                    "bitDepth": "10bit",
+                }
+            )
+            self.assertEqual(with_meta["metadata"]["seasonEpisode"], "S01E01-E486", "脚本全量算出的季集范围应覆盖截断样本")
+            self.assertEqual(with_meta["metadata"]["mediaType"], "tv")
+            self.assertEqual(with_meta["metadata"]["quality"], "2160p")
+            self.assertEqual(with_meta["metadata"]["source"], "UHD BluRay Remux", "meta 传原始识别值")
+            self.assertEqual(with_meta["metadata"]["resourceType"], "UHD BluRay Remux")
+            self.assertEqual(with_meta["metadata"]["audioCodec"], "TrueHD.7.1.Atmos")
+            # 原盘显示映射走客户端：meta 的 source+quality 被客户端映射成「4K蓝光原盘REMUX」渲染
+            self.assertIn("蓝光原盘REMUX", with_meta["caption"])
+            self.assertNotIn("蓝光原盘REMUX", control["caption"], "对照草稿没有原盘信号，映射不误触发")
 
     def test_fastlink_json_preview_does_not_send_seed_document_to_bot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1052,6 +1190,65 @@ class SubmissionDraftTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(events[:3], [("delete", 10), ("delete", 20), ("delete", 30)])
             self.assertIn(("history", 99), events)
+
+    def test_telegram_publish_channel_old_post_cleanup_toggle(self):
+        """频道 cleanupOldPosts 开关：显式 false 时两条旧帖清理路径都不跑；缺省或 true 维持清理（默认开）。"""
+        for cleanup_flag, should_cleanup in ((False, False), (None, True), (True, True)):
+            with self.subTest(cleanup_flag=cleanup_flag), tempfile.TemporaryDirectory() as directory:
+                store = SessionStore(Path(directory))
+                channel = {"id": "pub", "title": "公开", "chatId": "-1002", "enabled": True, "isDefault": True, "role": "public_completed"}
+                if cleanup_flag is not None:
+                    channel["cleanupOldPosts"] = cleanup_flag
+                store.write_submission_config(
+                    {
+                        "botToken": "telegram-token",
+                        "allowedUserIds": [123456],
+                        "telegramApi": {"apiId": "100", "apiHash": "hash", "session": "session"},
+                        "templates": {"shareName": "123", "caption": "🎬 <b>{title}</b>\n👤 分享：{shareLink}"},
+                        "channels": [channel],
+                    }
+                )
+                save_submission_draft(
+                    store,
+                    {
+                        "id": "draft1",
+                        "status": "draft",
+                        "ownerChatId": 123456,
+                        "ownerUserId": 123456,
+                        "share": {"provider": "123pan", "cleanUrl": "https://www.123pan.com/s/abc?pwd=ONWA"},
+                        "inspection": {"title": "电影 (2026)", "fileNames": ["Movie.2026.2160p.WEB-DL-HiveWeb.mkv"]},
+                        "metadata": {"title": "电影", "year": "2026", "mediaType": "movie", "quality": "2160p", "source": "WEB-DL"},
+                        "media": {"title": "电影", "year": "2026", "mediaType": "movie", "tmdbId": 1, "genres": [], "overview": ""},
+                        "caption": "预览",
+                        "text": "预览",
+                    },
+                )
+                events = []
+
+                async def fake_telegram_post(token, method, payload, timeout=20.0):
+                    if method in {"sendMessage", "sendPhoto"}:
+                        return {"message_id": 99}
+                    return {}
+
+                async def fake_history(config, draft, chat_id, message_id):
+                    events.append(("history", message_id))
+                    return ""
+
+                async def run_publish():
+                    with patch("app.submission.telegram_post", side_effect=fake_telegram_post), \
+                        patch("app.submission.cleanup_published_submission_history", side_effect=fake_history), \
+                        patch("app.submission.cleanup_previous_submission_publications", AsyncMock(return_value="")) as local_mock:
+                        result = await publish_submission_draft(
+                            store, "telegram-token", store.read_submission_config(),
+                            get_submission_draft(store, "draft1"),
+                        )
+                        await asyncio.sleep(0)
+                    return result, local_mock
+
+                result, local_mock = asyncio.run(run_publish())
+                self.assertTrue(result["ok"])
+                self.assertEqual(local_mock.await_count, 1 if should_cleanup else 0, "本地历史清理未按开关执行")
+                self.assertEqual(("history", 99) in events, should_cleanup, "TG API 全频道清理未按开关执行")
 
     def test_telegram_publish_deletes_previous_channel_post_from_database_history_even_when_fastlink_changes(self):
         with tempfile.TemporaryDirectory() as directory:

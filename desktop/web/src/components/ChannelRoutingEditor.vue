@@ -55,7 +55,10 @@ const roleItems = [
             <v-text-field v-model="channel.title" label="显示名称" placeholder="例如：我的私有频道" variant="outlined" density="comfortable" hide-details />
             <v-text-field v-model="channel.chatId" label="频道 Chat ID" placeholder="-100xxxxxxxxxx" variant="outlined" density="comfortable" hide-details />
             <v-select v-model="channel.role" label="频道类型" :items="roleItems" variant="outlined" density="comfortable" hide-details />
-            <v-switch v-model="channel.enabled" label="启用这个频道" color="primary" density="comfortable" hide-details />
+            <div class="channel-switches">
+              <v-switch v-model="channel.enabled" label="启用这个频道" color="primary" density="compact" hide-details />
+              <v-switch v-model="channel.cleanupOldPosts" label="发布后清理旧帖" color="primary" density="compact" hide-details />
+            </div>
           </div>
           <v-textarea
             v-model="channel.collaboratorText"
@@ -289,6 +292,13 @@ const roleItems = [
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.channel-switches {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding-left: 2px;
 }
 
 .collaborator-field {

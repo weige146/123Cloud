@@ -70,6 +70,7 @@ export function useChannelConfigEditor() {
       chatId: String(value.chatId || ""),
       role: value.role || "private",
       enabled: value.enabled !== false,
+      cleanupOldPosts: value.cleanupOldPosts !== false,
       isDefault: Boolean(value.isDefault),
       collaboratorText: (value.allowedUserIds || []).join("\n"),
     };
@@ -84,6 +85,7 @@ export function useChannelConfigEditor() {
         chatId: String(channel.chatId ?? "").trim(),
         role: channel.role,
         enabled: channel.enabled !== false,
+        cleanupOldPosts: channel.cleanupOldPosts !== false,
         isDefault: Boolean(channel.isDefault),
         collaboratorText: channel.collaboratorText,
       })),
@@ -141,6 +143,7 @@ export function useChannelConfigEditor() {
       chatId: "",
       role: "private",
       enabled: true,
+      cleanupOldPosts: true,
       isDefault: state.channels.length === 0,
       collaboratorText: "",
     });
@@ -193,6 +196,7 @@ export function useChannelConfigEditor() {
         chatId,
         role: channel.role || "private",
         enabled: channel.enabled !== false,
+        cleanupOldPosts: channel.cleanupOldPosts !== false,
         isDefault: Boolean(channel.isDefault),
         allowedUserIds: parseIds(channel.collaboratorText),
       });

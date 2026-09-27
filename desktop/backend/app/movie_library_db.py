@@ -173,6 +173,22 @@ class LibraryDb:
                             "UPDATE library_works SET media_type = ? WHERE dir = ?",
                             (channel_from_stored(str(row["media_type"]), genre_names), row["dir"]),
                         )
+            # 频道与类型自相矛盾的行（历史整理命中过错误条目的残留）：媒体类型是电影，
+            # 类型列表里却挂着剧集专属类型（儿童/真人秀/脱口秀/新闻——TMDB 里这些类型
+            # 只存在于剧集）——不同时期两次写入的混合脏数据，重排进整理队列重新拉取。
+            # 电影的官方类型名没有这些词，不会误伤；重整后 media_type 变儿童等，不再命中，天然幂等
+            mixed = conn.execute(
+                "SELECT dir FROM library_works WHERE tmdb_id IS NOT NULL"
+                " AND media_type = '电影'"
+                " AND (genres LIKE '%儿童%' OR genres LIKE '%真人秀%' OR genres LIKE '%脱口秀%' OR genres LIKE '%新闻%')"
+            ).fetchall()
+            if mixed:
+                with conn:
+                    for row in mixed:
+                        conn.execute(
+                            "UPDATE library_works SET tmdb_status = 'pending', enrich_attempts = 0 WHERE dir = ?",
+                            (row["dir"],),
+                        )
             # library_playback 旧脏数据：个别写入没带季/集号把列清成了 0，按 file_path 重新解析回填
             # （season/episode 列决定续看角标与集列表排序，0 会让「续看」算错）
             from .movie_library import parse_season_episode as _pse
@@ -375,10 +391,40 @@ class LibraryDb:
         try:
             with connection:
                 connection.execute(
+                    "DELETE FROM library_playback WHERE dir IN (SELECT dir FROM library_works WHERE source = ?)", (name,))
+                connection.execute(
                     "DELETE FROM library_work_files WHERE dir IN (SELECT dir FROM library_works WHERE source = ?)", (name,))
                 deleted = connection.execute("DELETE FROM library_works WHERE source = ?", (name,)).rowcount
                 row = connection.execute("DELETE FROM library_sources WHERE name = ?", (name,)).rowcount
             return bool(row or deleted)
+        finally:
+            connection.close()
+
+    def merge_sources(self, from_names: List[str], to_name: str) -> int:
+        """把若干来源的作品整体改挂到目标来源（只改归属，作品与文件内容不变），
+        删除来源行，目标来源计数按库内实际重算。目标来源不存在时自动建行。"""
+        clean = [str(n or "").strip() for n in from_names if str(n or "").strip() and str(n or "").strip() != to_name]
+        if not to_name or not clean:
+            return 0
+        connection = self._connect()
+        try:
+            with connection:
+                if not connection.execute("SELECT 1 FROM library_sources WHERE name = ?", (to_name,)).fetchone():
+                    connection.execute(
+                        "INSERT INTO library_sources (name, imported_at, common_path, work_count, file_count, total_size)"
+                        " VALUES (?, ?, '', 0, 0, 0)",
+                        (to_name, __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()))
+                moved = 0
+                for i in range(0, len(clean), 500):
+                    part = clean[i:i + 500]
+                    cur = connection.execute(
+                        f"UPDATE library_works SET source = ? WHERE source IN ({','.join('?' for _ in part)})",
+                        [to_name, *part])
+                    moved += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                connection.executemany(
+                    "DELETE FROM library_sources WHERE name = ?", [(n,) for n in clean])
+            self.recount_source(to_name)
+            return moved
         finally:
             connection.close()
 
@@ -630,10 +676,11 @@ class LibraryDb:
                libs: Optional[List[str]] = None, media_type: str = "", genre: str = "",
                region: str = "", decade: int = 0, sort: str = "", language: str = "",
                air_status: str = "", resolution: str = "", edition: str = "",
-               rating: float = 0, tech: str = ""):
+               rating: float = 0, tech: str = "", enrich: str = ""):
         """片名/拼音模糊搜索 + 分类维度筛选 + 分页。q 为空且无筛选=浏览。
         sort：popularity(热度)/rating(评分)/recent(入库顺序)/title(拼音)/year，空=默认。
-        tech：技术属性筛选，"字段:值"（如 dolbyVision:DV / dynamicRange:HDR10+ / videoCodec:H265）。"""
+        tech：技术属性筛选，"字段:值"（如 dolbyVision:DV / dynamicRange:HDR10+ / videoCodec:H265）。
+        enrich：整理状态筛选 ok/pending/failed/none（手动修错用，主要价值是 failed=识别失败）。"""
         nq = norm(q) if q else ""
         where: List[str] = []
         params: List[Any] = []
@@ -647,6 +694,9 @@ class LibraryDb:
             media_type, genre, region, decade, language, air_status, resolution, edition, rating, tech)
         where += cls_where
         params += cls_params
+        if enrich in ("ok", "pending", "failed", "none"):
+            where.append("tmdb_status = ?")
+            params.append(enrich)
         if libs:
             where.append(f"source IN ({','.join('?' for _ in libs)})")
             params.extend(libs)
@@ -870,6 +920,15 @@ class LibraryDb:
             out.append({"name": "全部文件", "count": all_count, "size": all_size, "subs": []})
         return out
 
+    def get_work(self, dirname: str) -> Optional[Dict[str, Any]]:
+        """单个作品的完整行（手动识别修正后回传前端刷新用）。"""
+        connection = self._connect()
+        try:
+            r = connection.execute("SELECT * FROM library_works WHERE dir = ?", (dirname,)).fetchone()
+            return self._row_to_work(r) if r is not None else None
+        finally:
+            connection.close()
+
     def list_files(self, dirname: str) -> Optional[Dict[str, Any]]:
         connection = self._connect()
         try:
@@ -1080,6 +1139,24 @@ class LibraryDb:
                     removed += 1
                 self._recompute_work_stats(connection, keep_dir)
             return {"mergedWorks": removed, "movedFiles": moved_files}
+        finally:
+            connection.close()
+
+    def recount_source(self, name: str) -> None:
+        """按库内实际行数重算来源统计（同名来源反复增量重导时，计数反映总量而不是本次增量）。"""
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    "UPDATE library_sources SET"
+                    " work_count = (SELECT COUNT(*) FROM library_works WHERE source = ?),"
+                    " file_count = (SELECT COUNT(*) FROM library_work_files f"
+                    "   JOIN library_works w ON f.dir = w.dir WHERE w.source = ?),"
+                    " total_size = (SELECT COALESCE(SUM(f.size),0) FROM library_work_files f"
+                    "   JOIN library_works w ON f.dir = w.dir WHERE w.source = ?)"
+                    " WHERE name = ?",
+                    (name, name, name, name),
+                )
         finally:
             connection.close()
 
@@ -1563,6 +1640,10 @@ def delete_source(name: str) -> bool:
     return _db().delete_source(name)
 
 
+def merge_sources(from_names: List[str], to_name: str) -> int:
+    return _db().merge_sources(from_names, to_name)
+
+
 def list_sources() -> List[Dict[str, Any]]:
     return _db().list_sources()
 
@@ -1574,9 +1655,9 @@ def totals() -> Dict[str, Any]:
 def search(q: str, page: int, size: int, cat: str = "", sub: str = "", libs: Optional[List[str]] = None,
            media_type: str = "", genre: str = "", region: str = "", decade: int = 0, sort: str = "",
            language: str = "", air_status: str = "", resolution: str = "", edition: str = "",
-           rating: float = 0, tech: str = ""):
+           rating: float = 0, tech: str = "", enrich: str = ""):
     return _db().search(q, page, size, cat, sub, libs, media_type, genre, region, decade, sort,
-                        language, air_status, resolution, edition, rating, tech)
+                        language, air_status, resolution, edition, rating, tech, enrich)
 
 
 def facets(media_type: str = "", genre: str = "", region: str = "", decade: int = 0,
@@ -1594,6 +1675,10 @@ def list_files(dirname: str) -> Optional[Dict[str, Any]]:
     return _db().list_files(dirname)
 
 
+def get_work(dirname: str) -> Optional[Dict[str, Any]]:
+    return _db().get_work(dirname)
+
+
 def enrich_stats() -> Dict[str, int]:
     return _db().enrich_stats()
 
@@ -1608,6 +1693,14 @@ def apply_enrichment(dirname: str, fields: Dict[str, Any]) -> None:
 
 def mark_enrich_failure(dirname: str, max_attempts: int = 3) -> None:
     return _db().mark_enrich_failure(dirname, max_attempts)
+
+
+def assign_tmdb_id(dirname: str, tmdb_id: int) -> None:
+    return _db().assign_tmdb_id(dirname, tmdb_id)
+
+
+def mark_untagged_failure(dirname: str) -> None:
+    return _db().mark_untagged_failure(dirname)
 
 
 def reset_enrichment(only_failed: bool = True) -> int:
@@ -1632,6 +1725,10 @@ def transfer_files(dirs: List[str], include_files: Optional[List[str]] = None) -
 
 def works_exist(dirs: List[str]) -> bool:
     return _db().works_exist(dirs)
+
+
+def recount_source(name: str) -> None:
+    return _db().recount_source(name)
 
 
 def upsert_playback(dirname: str, file_path: str, season: int = 0, episode: int = 0,

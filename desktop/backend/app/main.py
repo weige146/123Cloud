@@ -191,7 +191,9 @@ _TV_DIR_PATTERN = re.compile(r"season[ ._-]*\d|s\d{1,2}[-.e]\d{1,2}", re.I)
 
 
 def _enrich_cache_key(lang: str, tmdb_id: int) -> str:
-    return f"libraryEnrich:{lang or 'zh-CN'}:{int(tmdb_id)}"
+    # v3：v2 时期（只有标题门、没有结构加权）的中间构建会把「剧场版电影」当正确结果
+    # 写进缓存，换 key 让那批缓存全部失效；逻辑再变时继续递增
+    return f"libraryEnrich:v3:{lang or 'zh-CN'}:{int(tmdb_id)}"
 
 
 def _prefer_tmdb_type(row: Dict[str, Any]) -> str:
@@ -1177,6 +1179,10 @@ class SubmissionLinkItem(BaseModel):
     # 秒传直投附带的真实文件名/大小上下文（💾 总体积 + 📄 文件名若干），
     # 识别剧集类型、画质、大小全靠它；分享直投不传此字段
     sourceText: str = ""
+    # 油猴导出时已去除文件名发布组：客户端对这条跳过发布组识别（乱猜尾段没有意义）
+    skipReleaseGroup: bool = False
+    # 脚本按完整文件清单算好的结构化识别（seasonEpisode/mediaType），客户端优先于自身启发式
+    meta: Optional[Dict[str, Any]] = None
 
 
 class SubmissionSubmitRequest(BaseModel):
@@ -1626,6 +1632,8 @@ async def submit_submission(request: SubmissionSubmitRequest) -> Dict[str, Any]:
                     "cleanUrl": url,
                     "password": "",
                     "sourceText": str(item.sourceText or "").strip(),
+                    "skipReleaseGroup": bool(item.skipReleaseGroup),
+                    "meta": item.meta if isinstance(item.meta, dict) else None,
                 })
                 continue
             password = str(item.password or "").strip()
@@ -2303,6 +2311,7 @@ async def import_library_file(request: Request, name: str = Query(""), token: st
     safe_name = os.path.basename(str(name or "").strip()) or "导入"
     result = await asyncio.to_thread(
         movie_library_db.import_payload, safe_name, payload, _library_video_ext(), _library_config().get("importMode", "merge"))
+    await asyncio.to_thread(movie_library_db.recount_source, safe_name)
     library_enrich_kick.set()
     return result
 
@@ -2364,6 +2373,9 @@ async def import_library_paths(request: LibraryImportPathsRequest, request_obj: 
     merged_works = sum(r.get("mergedWorks", 0) for r in results)
     merged_files = sum(r.get("mergedFiles", 0) for r in results)
     failed = sum(1 for r in results if not r.get("ok"))
+    # 同名来源反复重导（增量更新）时，来源计数重算成库内实际总量而不是本次导入增量
+    for name in {str(r.get("name")) for r in results if r.get("name")}:
+        await asyncio.to_thread(movie_library_db.recount_source, name)
     logger.info(
         f"影库导入：批量导入 {len(results)} 个文件 — 新增 {added} 个作品、并入已有作品 {merged_works} 个"
         f"（新文件 {merged_files} 个）、重复跳过 {skipped} 个、失败 {failed} 个",
@@ -2380,11 +2392,13 @@ class LibraryImportDirRequest(BaseModel):
 
 @app.post("/api/library/import/dir")
 async def import_library_dir(request: LibraryImportDirRequest, request_obj: Request) -> Dict[str, Any]:
-    """从文件夹一次性批量导入（递归，跳过 _checkpoints/隐藏目录，深度 ≤3）。不驻留监控。"""
+    """从文件夹一次性批量导入影库索引文件（递归，跳过 _checkpoints/隐藏目录，深度 ≤3）。
+    不驻留监控。整个文件夹共享一条来源（= 文件夹名），同一文件夹反复重导只算一条。"""
     _guard_library_token(request_obj, request.token)
     root = os.path.abspath(os.path.expanduser(str(request.path or "").strip()))
     if not os.path.isdir(root):
         raise HTTPException(status_code=400, detail=f"目录不存在：{root}")
+    source_name = os.path.basename(root.rstrip(os.sep)) or "文件夹导入"
     walked: List[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         rel = os.path.relpath(dirpath, root)
@@ -2405,7 +2419,7 @@ async def import_library_dir(request: LibraryImportDirRequest, request_obj: Requ
     for path in sorted(walked):
         base = os.path.basename(path)
         try:
-            r = await asyncio.to_thread(_import_library_from_path, path, base, video_ext, import_mode)
+            r = await asyncio.to_thread(_import_library_from_path, path, source_name, video_ext, import_mode)
         except OSError as error:
             failed += 1
             results.append({"file": base, "status": "失败", "info": f"读取失败：{error}"})
@@ -2419,10 +2433,13 @@ async def import_library_dir(request: LibraryImportDirRequest, request_obj: Requ
         merged_works += r.get("mergedWorks", 0)
         merged_files += r.get("mergedFiles", 0)
         results.append({"file": base, "status": "完成", "info": f"新增 {r['added']} · 并入 {r.get('mergedWorks', 0)} · 重复 {r['skipped']} · {r['fileCount']} 个文件"})
-    logger.info(f"影库导入：文件夹批量导入 {len(walked)} 个文件 — 新增 {added} 个作品、重复跳过 {skipped} 个、失败 {failed} 个")
+    # 同名来源反复重导（增量更新）时，来源计数重算成库内实际总量而不是本次导入增量
+    await asyncio.to_thread(movie_library_db.recount_source, source_name)
+    logger.info(f"影库导入：文件夹批量导入 {len(walked)} 个文件（来源 {source_name}）— 新增 {added} 个作品、重复跳过 {skipped} 个、失败 {failed} 个")
     library_enrich_kick.set()
     return {"ok": True, "total": len(walked), "added": added, "skipped": skipped,
-            "mergedWorks": merged_works, "mergedFiles": merged_files, "failed": failed, "results": results}
+            "mergedWorks": merged_works, "mergedFiles": merged_files, "failed": failed,
+            "source": source_name, "results": results}
 
 
 TMDB_BUILTIN_KEY = "8265bd1679663a7ea12ac168da84d2e8"
@@ -2636,47 +2653,81 @@ def _tmdb_enrich_fields(info: Dict[str, Any], matched_type: str) -> Dict[str, An
 
 async def _tmdb_enrich_lookup(tmdb_id: int, title: str, year: int, prefer_type: str = "") -> Optional[Dict[str, Any]]:
     """movie/tv 双查择优，返回可直接入库的分类字段；查不到返回 None。
-    prefer_type 指定的类型先查，首查命中且标题匹配（评分≥2）就跳过另一类型。"""
+    prefer_type 指定的类型先查，首查命中且标题匹配（评分≥2）就跳过另一类型。
+    Emby 式两道校验：
+    ① 结构加权——prefer_type 命中且自身有信号（原始评分≥1，至少年份对得上）时排序 +4
+       （高于标题+年份满分 3）：目录/视频数证明是分集作品时，同号电影条目（剧场版与剧集
+       同名是常态）再匹配也不能反超，「爆上战队奔奔者」tv 译名「爆燃」差一字就是这种情况。
+       完全不相干的 preferred 条目（评分 0）不加权——视频数≥2 只是弱信号（电影+花絮也是
+       两个视频），不能把标题全对上的另一类型挤掉。
+    ② 标题校验门——择优结果原始评分 <2（标题对不上，标记写错/类型错了）按标题重搜
+       （限定 prefer_type、不带年份过滤），搜到排序更高的就换；原始评分 0 且搜不到的
+       宁缺勿错返回 None 记整理失败，不拿错误条目硬套。"""
     cached = store.read_value(_enrich_cache_key(_tmdb_credentials()[1], tmdb_id))
     if isinstance(cached, dict) and isinstance(cached.get("fields"), dict):
         return cached["fields"]
     types = ("tv", "movie") if prefer_type == "tv" else ("movie", "tv")
+    bonus = 4 if prefer_type in ("tv", "movie") else 0
+
+    def _ranked(type_: str, info: Dict[str, Any]) -> Tuple[int, int]:
+        raw = _tmdb_match_score(info, title, year)
+        boosted = raw + (bonus if type_ == prefer_type and raw > 0 else 0)
+        return boosted, raw
+
     best: Optional[Dict[str, Any]] = None
     best_type = ""
     best_score = -1
+    best_raw = -1
     for index, type_ in enumerate(types):
         info = await _tmdb_fetch_info(type_, tmdb_id)
         if info:
-            score = _tmdb_match_score(info, title, year)
+            score, raw = _ranked(type_, info)
             if score > best_score:
-                best, best_type, best_score = info, type_, score
-            if index == 0 and best_score >= 2:
+                best, best_type, best_score, best_raw = info, type_, score, raw
+            if index == 0 and best_raw >= 2:
                 break
     if best is None:
         return None
+    if best_raw < 2:
+        search_types = (prefer_type,) if prefer_type in ("tv", "movie") else ("tv", "movie")
+        candidate = await _tmdb_search_candidate(title, year, year_filter=False, types=search_types)
+        if candidate:
+            info = await _tmdb_fetch_info(candidate[0], candidate[1])
+            if info:
+                score, raw = _ranked(candidate[0], info)
+                if score > best_score:
+                    best, best_type, best_score, best_raw = info, candidate[0], score, raw
+        if best_raw < 1:
+            return None
     fields = _tmdb_enrich_fields(best, best_type)
     store.write_value(_enrich_cache_key(_tmdb_credentials()[1], tmdb_id), {"type": best_type, "fields": fields})
     return fields
 
 
-async def _tmdb_search_lookup(title: str, year: int) -> Optional[int]:
-    """无标记作品选配：按标题+年份搜 TMDB，标题匹配（评分≥2）才认，返回 tmdb_id。"""
+async def _tmdb_search_candidate(
+    title: str, year: int, year_filter: bool = True, types: Tuple[str, ...] = ("tv", "movie"),
+) -> Optional[Tuple[str, int]]:
+    """按标题+年份搜 TMDB，标题匹配（评分≥2）才认，返回 (类型, tmdb_id)。
+    year_filter=False 时不带年份过滤参数（只靠评分择优）——充实兜底用：目录标记
+    错误时正确条目的年份可能和目录写的对不上，年份过滤会把正确结果滤掉。
+    types 限定搜索的类型（充实兜底按作品结构只搜 tv 或 movie）。"""
     token, lang = _tmdb_credentials()
     query = url_quote(str(title or "").strip())
     client = _tmdb_http()
-    best_id: Optional[int] = None
+    best: Optional[Tuple[str, int]] = None
     best_score = 1  # 搜索结果必须至少标题匹配（+2）才采纳
-    for type_, year_param in (("tv", "first_air_date_year"), ("movie", "primary_release_year")):
+    for type_ in types:
+        year_param = "first_air_date_year" if type_ == "tv" else "primary_release_year"
         attempts = []
         if token:
             attempts.append((
                 f"https://api.themoviedb.org/3/search/{type_}?query={query}&language={lang}"
-                + (f"&{year_param}={int(year)}" if year else ""),
+                + (f"&{year_param}={int(year)}" if year_filter and year else ""),
                 {"Authorization": f"Bearer {token}"},
             ))
         attempts.append((
             f"https://api.tmdb.org/3/search/{type_}?query={query}&api_key={TMDB_BUILTIN_KEY}&language=zh-CN"
-            + (f"&{year_param}={int(year)}" if year else ""),
+            + (f"&{year_param}={int(year)}" if year_filter and year else ""),
             {},
         ))
         for url, headers in attempts:
@@ -2688,14 +2739,22 @@ async def _tmdb_search_lookup(title: str, year: int) -> Optional[int]:
                 for item in results[:5]:
                     score = _tmdb_match_score(item, title, year)
                     if score > best_score:
-                        best_id, best_score = int(item.get("id") or 0), score
+                        best, best_score = (type_, int(item.get("id") or 0)), score
             except Exception:
                 continue
-            if best_id:
+            if best:
                 break
-        if best_id:
+        if best:
             break
-    return best_id
+    if best and best[1] > 0:
+        return best
+    return None
+
+
+async def _tmdb_search_lookup(title: str, year: int) -> Optional[int]:
+    """无标记作品选配：按标题+年份搜 TMDB，标题匹配（评分≥2）才认，返回 tmdb_id。"""
+    candidate = await _tmdb_search_candidate(title, year)
+    return candidate[1] if candidate else None
 
 
 async def _library_enrich_pass(limit: int = LIBRARY_ENRICH_BATCH) -> int:
@@ -2792,6 +2851,97 @@ async def reset_library_enrich(request: LibraryEnrichResetRequest, request_obj: 
     requeued = await asyncio.to_thread(movie_library_db.reset_enrichment, not request.refreshAll)
     library_enrich_kick.set()
     return {"ok": True, "requeued": requeued, "stats": await asyncio.to_thread(movie_library_db.enrich_stats)}
+
+
+async def _tmdb_identify_candidates(query: str, year: int) -> List[Dict[str, Any]]:
+    """手动识别搜索：tv+movie 各取前几条合并（不做标题门槛——用户自己挑，按
+    标题匹配与热度排序）。"""
+    token, lang = _tmdb_credentials()
+    q = url_quote(query.strip())
+    client = _tmdb_http()
+    seen: set = set()
+    results: List[Dict[str, Any]] = []
+    for type_ in ("tv", "movie"):
+        year_param = "first_air_date_year" if type_ == "tv" else "primary_release_year"
+        attempts = []
+        if token:
+            attempts.append((
+                f"https://api.themoviedb.org/3/search/{type_}?query={q}&language={lang}"
+                + (f"&{year_param}={int(year)}" if year else ""),
+                {"Authorization": f"Bearer {token}"},
+            ))
+        attempts.append((
+            f"https://api.tmdb.org/3/search/{type_}?query={q}&api_key={TMDB_BUILTIN_KEY}&language=zh-CN"
+            + (f"&{year_param}={int(year)}" if year else ""),
+            {},
+        ))
+        for url, headers in attempts:
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    continue
+                for item in (resp.json().get("results") or [])[:6]:
+                    tid = int(item.get("id") or 0)
+                    key = (type_, tid)
+                    if not tid or key in seen:
+                        continue
+                    seen.add(key)
+                    date = str(item.get("release_date") or item.get("first_air_date") or "")
+                    results.append({
+                        "type": type_,
+                        "id": tid,
+                        "title": str(item.get("title") or item.get("name") or ""),
+                        "originalTitle": str(item.get("original_title") or item.get("original_name") or ""),
+                        "year": int(date[:4]) if date[:4].isdigit() else 0,
+                        "poster": f"https://image.tmdb.org/t/p/w185{item['poster_path']}" if item.get("poster_path") else "",
+                        "popularity": float(item.get("popularity") or 0),
+                        "score": _tmdb_match_score(item, query, year),
+                    })
+            except Exception:
+                continue
+            if any(r["type"] == type_ for r in results):
+                break
+    results.sort(key=lambda r: (-r["score"], -r["popularity"]))
+    return results[:10]
+
+
+class LibraryIdentifyApplyRequest(BaseModel):
+    dir: str = ""
+    type: str = ""
+    tmdbId: int = 0
+    token: str = ""
+
+
+@app.get("/api/library/identify/search")
+async def identify_search(request: Request, q: str = "", year: int = 0, token: str = "") -> Dict[str, Any]:
+    """手动识别：按标题搜 TMDB（电影+剧集合并，不做标题门槛，结果由用户挑选）。"""
+    _guard_library_token(request, token)
+    query = str(q or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="请输入要搜索的片名")
+    candidates = await _tmdb_identify_candidates(query, int(year))
+    return {"ok": True, "candidates": candidates}
+
+
+@app.post("/api/library/identify/apply")
+async def identify_apply(request: LibraryIdentifyApplyRequest, request_obj: Request) -> Dict[str, Any]:
+    """手动识别修正：直接套用用户选定的 TMDB 条目（人工选择即权威，不过标题校验门），
+    写回 tmdb_id 并置为已整理。"""
+    _guard_library_token(request_obj, request.token)
+    dirname = str(request.dir or "").strip()
+    type_ = str(request.type or "").strip().lower()
+    if not dirname or type_ not in ("tv", "movie") or request.tmdbId <= 0:
+        raise HTTPException(status_code=400, detail="参数不完整：需要作品目录、类型与 TMDB id")
+    info = await _tmdb_fetch_info(type_, int(request.tmdbId))
+    if not info:
+        raise HTTPException(status_code=404, detail="TMDB 条目拉取失败，请稍后再试")
+    await asyncio.to_thread(movie_library_db.assign_tmdb_id, dirname, int(request.tmdbId))
+    await asyncio.to_thread(movie_library_db.apply_enrichment, dirname, _tmdb_enrich_fields(info, type_))
+    work = await asyncio.to_thread(movie_library_db.get_work, dirname)
+    if work is None:
+        raise HTTPException(status_code=404, detail="作品不存在（可能已被删除）")
+    logger.info(f"影库手动识别：{dirname} → {type_} {request.tmdbId}（《{work['title']}》）")
+    return {"ok": True, "work": work}
 
 
 class LibraryDuplicatesMergeRequest(BaseModel):
@@ -2920,6 +3070,28 @@ async def read_library_sources() -> Dict[str, Any]:
     return {"ok": True, "sources": movie_library_db.list_sources()}
 
 
+class LibrarySourcesMergeRequest(BaseModel):
+    fromNames: List[str] = Field(default_factory=list)
+    toName: str = ""
+    token: str = ""
+
+
+@app.post("/api/library/sources/merge")
+async def merge_library_sources(request: LibrarySourcesMergeRequest, request_obj: Request) -> Dict[str, Any]:
+    """来源合并：把若干碎来源的作品整体改挂到目标来源名下（内容不变、只改归属），
+    删除来源行、目标来源计数重算。用于收敛「一集一个 JSON」积累的碎片来源。"""
+    _guard_library_token(request_obj, request.token)
+    to_name = str(request.toName or "").strip()
+    from_names = [str(n or "").strip() for n in request.fromNames if str(n or "").strip()]
+    if not to_name or not from_names:
+        raise HTTPException(status_code=400, detail="请选择要合并的来源和目标来源")
+    if to_name in from_names:
+        raise HTTPException(status_code=400, detail="目标来源不能同时出现在合并列表里")
+    moved = await asyncio.to_thread(movie_library_db.merge_sources, from_names, to_name)
+    logger.info(f"影库：来源合并 {len(from_names)} 个来源 → {to_name}（改挂 {moved} 个作品）")
+    return {"ok": True, "moved": moved, "sources": await asyncio.to_thread(movie_library_db.list_sources)}
+
+
 @app.post("/api/library/sources/delete")
 @app.delete("/api/library/sources")
 async def delete_library_source(request: LibrarySourceRequest, request_obj: Request) -> Dict[str, Any]:
@@ -2969,12 +3141,13 @@ async def search_library(
     edition: str = "",
     rating: float = 0,
     tech: str = "",
+    enrich: str = "",
     token: str = "",
 ) -> Dict[str, Any]:
     _guard_library_token(request, token)
     total, results = await asyncio.to_thread(
         movie_library_db.search, q, page, size, cat, sub, _split_lib_filter(lib),
-        mediaType, genre, region, decade, sort, language, status, resolution, edition, rating, tech,
+        mediaType, genre, region, decade, sort, language, status, resolution, edition, rating, tech, enrich,
     )
     return {"ok": True, "total": total, "page": page, "size": size, "dirs": results}
 

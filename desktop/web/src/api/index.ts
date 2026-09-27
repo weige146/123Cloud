@@ -282,6 +282,20 @@ export interface LibraryImportResult {
   fileCount: number;
 }
 
+export interface LibraryIdentifyCandidate {
+  type: "tv" | "movie";
+  id: number;
+  title: string;
+  originalTitle: string;
+  year: number;
+  poster: string;
+}
+
+export interface LibraryIdentifyResult {
+  ok: boolean;
+  work: LibraryWork;
+}
+
 export interface LibraryConfig {
   transferIntervalMs: number;
   transferConcurrency: number;
@@ -475,11 +489,13 @@ export const libraryApi = {
       { paths, token },
     ),
   importDir: (path: string, token: string) =>
-    api.post<{ ok: boolean; total: number; added: number; skipped: number; failed: number; results: Array<{ file: string; status: string; info: string }> }>(
+    api.post<{ ok: boolean; total: number; added: number; skipped: number; mergedWorks: number; mergedFiles: number; failed: number; source: string; results: Array<{ file: string; status: string; info: string }> }>(
       "/api/library/import/dir",
       { path, token },
     ),
   sources: () => api.get<{ ok: boolean; sources: LibraryLibInfo[] }>("/api/library/sources"),
+  sourcesMerge: (fromNames: string[], toName: string, token: string) =>
+    api.post<{ ok: boolean; moved: number; sources: LibraryLibInfo[] }>("/api/library/sources/merge", { fromNames, toName, token }),
   deleteSource: (name: string, token: string) =>
     api.post<{ ok: boolean }>("/api/library/sources/delete", { name, token }),
   categories: (token: string) =>
@@ -516,7 +532,7 @@ export const libraryApi = {
       mergeDirs,
       token,
     }),
-  search: (params: { q?: string; cat?: string; sub?: string; page?: number; size?: number; lib?: string; mediaType?: string; genre?: string; region?: string; decade?: number; sort?: string; language?: string; status?: string; edition?: string; rating?: number; tech?: string; token?: string }) => {
+  search: (params: { q?: string; cat?: string; sub?: string; page?: number; size?: number; lib?: string; mediaType?: string; genre?: string; region?: string; decade?: number; sort?: string; language?: string; status?: string; edition?: string; rating?: number; tech?: string; enrich?: string; token?: string }) => {
     const query = new URLSearchParams();
     if (params.q) query.set("q", params.q);
     if (params.cat) query.set("cat", params.cat);
@@ -531,6 +547,7 @@ export const libraryApi = {
     if (params.edition) query.set("edition", params.edition);
     if (params.rating) query.set("rating", String(params.rating));
     if (params.tech) query.set("tech", params.tech);
+    if (params.enrich) query.set("enrich", params.enrich);
     query.set("page", String(params.page ?? 1));
     query.set("size", String(params.size ?? 20));
     if (params.lib) query.set("lib", params.lib);
@@ -539,6 +556,12 @@ export const libraryApi = {
       `/api/library/search?${query.toString()}`,
     );
   },
+  identifySearch: (q: string, year: number, token: string) =>
+    api.get<{ ok: boolean; candidates: LibraryIdentifyCandidate[] }>(
+      `/api/library/identify/search?q=${encodeURIComponent(q)}&year=${year || 0}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+    ),
+  identifyApply: (dir: string, type: string, tmdbId: number, token: string) =>
+    api.post<LibraryIdentifyResult>("/api/library/identify/apply", { dir, type, tmdbId, token }),
   files: (dir: string, token: string) =>
     api.get<{ ok: boolean; dir: string; title: string; year: number | null; tmdbId: number | null; files: LibraryFile[] }>(
       `/api/library/files?dir=${encodeURIComponent(dir)}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
