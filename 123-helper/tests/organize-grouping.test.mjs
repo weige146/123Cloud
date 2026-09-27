@@ -414,6 +414,22 @@ test("同 TMDB 条目的分季目录并成一组", async () => {
   assert.ok(groups[0].files.some((item) => item.id === "f2"), "第二季目录的文件并入同组");
 });
 
+test("多选分季目录并组后 sourceFolders 含全部季（整理后各季目录都进清理名单）", async () => {
+  const tree = {
+    d1: [mkFile("f1", "三体.S01E01.2023.1080p.mkv", 100)],
+    d2: [mkFile("f2", "三体.S02E01.2024.1080p.mkv", 110)]
+  };
+  const api = { listAll: async (id) => tree[id] || [] };
+  const tmdb = { details: async (type, id) => ({ id: Number(id), mediaType: type, title: "三体", year: "2023", aliases: [], genres: [], overview: "", posterUrl: "", backdropUrl: "", voteAverage: 0 }) };
+  const groups = await collectOrganizeGroups(api, [
+    { id: "d1", name: "三体 第一季 {tmdb-808}", type: 1 },
+    { id: "d2", name: "三体 第二季 {tmdb-808}", type: 1 }
+  ], config, { tmdb });
+  assert.equal(groups.length, 1, `多选两季目录应并成一组，实际 ${groups.length}`);
+  const folderIds = (groups[0].sourceFolders || []).map((folder) => String(folder.id));
+  assert.ok(folderIds.includes("d1") && folderIds.includes("d2"), `sourceFolders 应含两季目录，实际 ${folderIds.join(",")}`);
+});
+
 test("分季目录文件不带显式季集时不并组（各自按 targetSeason 兜底编号）", async () => {
   const tree = {
     d1: [mkFile("f1", "第1集.mkv", 100)],

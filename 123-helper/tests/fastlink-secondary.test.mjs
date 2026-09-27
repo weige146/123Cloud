@@ -19,6 +19,10 @@ const slice = (fromMarker, toMarker) => {
 const code = [
   slice("// src/core/utils.js", "// src/api.js"),
   slice("// src/api.js", "// src/core/categories.js"),
+  slice("// src/core/categories.js", "// src/core/recognition-maps.js"),
+  slice("// src/core/recognition-maps.js", "// src/config.js"),
+  slice("// src/config.js", "// src/icons.js"),
+  slice("// src/core/category-yaml.js", "// src/core/empty-folders.js"),
   slice("// src/core/table-selection.js", "// src/public-share-cleanup.js")
 ].join("\n");
 const driver = `;
@@ -27,7 +31,8 @@ globalThis.__fastlink = {
   buildFastlinkText, buildFastlinkJson, parseFastlink,
   generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile,
   resolveAndImportFastlink, isSeedLikeName,
-  buildFastlinkSubmissionContext,
+  buildFastlinkSubmissionContext, buildFastlinkSubmissionMeta,
+  createFastlinkScanCheckpoint,
   normalizeSeedFolderId, readTableSelectionRecords
 };
 `;
@@ -41,7 +46,7 @@ sandbox.window = {};
 sandbox.document = { querySelectorAll: () => [], getElementById: () => null };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag, buildFastlinkText, buildFastlinkJson, parseFastlink, generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile, resolveAndImportFastlink, isSeedLikeName, buildFastlinkSubmissionContext, normalizeSeedFolderId, readTableSelectionRecords } = sandbox.__fastlink;
+const { md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag, buildFastlinkText, buildFastlinkJson, parseFastlink, generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile, resolveAndImportFastlink, isSeedLikeName, buildFastlinkSubmissionContext, buildFastlinkSubmissionMeta, createFastlinkScanCheckpoint, normalizeSeedFolderId, readTableSelectionRecords } = sandbox.__fastlink;
 
 const cases = [];
 const test = (name, fn) => cases.push([name, fn]);
@@ -313,15 +318,125 @@ test("直投上下文：V2 链接文本按 $/# 抽路径与体积", () => {
   assert.ok(lines.includes("📄：第02集.mkv"));
 });
 
-test("直投上下文：文件名封顶 100 条，空内容返回空串", () => {
+test("直投上下文：文件名封顶 1000 条并补「还有 N 个文件」，130 集完整带出；空内容返回空串", () => {
   const files = Array.from({ length: 130 }, (_, index) => ({ name: `f${index}`, etag: md5(`e${index}`), size: 1, path: `第${index}集.mkv` }));
   const context = buildFastlinkSubmissionContext("剧名", buildFastlinkText(files));
   const nameLines = context.split("\n").filter((line) => line.startsWith("📄："));
-  assert.equal(nameLines.length, 100);
+  assert.equal(nameLines.length, 130, "130 集不再被 100 条上限截断");
+  assert.ok(!context.includes("还有"), "未超上限不应出现补行");
+
+  const many = Array.from({ length: 1030 }, (_, index) => ({ name: `f${index}`, etag: md5(`e${index}`), size: 1, path: `第${index}集.mkv` }));
+  const manyContext = buildFastlinkSubmissionContext("剧名", buildFastlinkText(many));
+  const manyLines = manyContext.split("\n");
+  assert.equal(manyLines.filter((line) => line.startsWith("📄：") && !line.includes("还有")).length, 1000, "清单封顶 1000 条");
+  assert.equal(manyLines.at(-1), "📄：还有 30 个文件", "截断时补一行剩余数量");
+
+  const bigJson = JSON.stringify({ commonPath: "", files: Array.from({ length: 1050 }, (_, index) => ({ path: `p${index}.mkv`, etag: md5(`e${index}`), size: 1 })) });
+  assert.ok(buildFastlinkSubmissionContext("剧名", bigJson).endsWith("📄：还有 50 个文件"), "JSON 形态同样补行");
 
   assert.equal(buildFastlinkSubmissionContext("剧名", ""), "");
   // 只有种子记录、没有路径字段时也返回空串（回退旧文案，不带误导上下文）
   assert.equal(buildFastlinkSubmissionContext("剧名", "123FLCPV2$%abc#1#"), "");
+});
+
+// ---------- 直投结构化 meta（全量扫描算季集范围） ----------
+test("直投 meta：486 集裸集号按目录推季号算全量范围，📄 截断不影响", () => {
+  const files = Array.from({ length: 486 }, (_, index) => ({
+    path: `万界独尊 2021 100集(4K)/第1季/2021.E${index + 1}.mkv`,
+    fileName: `2021.E${index + 1}.mkv`,
+    etag: md5(`e${index}`),
+    size: 10
+  }));
+  const meta = buildFastlinkSubmissionMeta(buildFastlinkJson(files));
+  assert.equal(meta.seasonEpisode, "S01E01-E486");
+  assert.equal(meta.mediaType, "tv");
+  // 📄 上下文清单截断到 1000 条，meta 仍按全量算
+  const big = Array.from({ length: 1100 }, (_, index) => ({
+    path: `One.Piece/Season 1/E${index + 1}.mkv`,
+    fileName: `E${index + 1}.mkv`,
+    etag: md5(`b${index}`),
+    size: 10
+  }));
+  const bigMeta = buildFastlinkSubmissionMeta(buildFastlinkJson(big));
+  assert.equal(bigMeta.seasonEpisode, "S01E01-E1100");
+  assert.ok(buildFastlinkSubmissionContext("海贼王", buildFastlinkText(big)).split("\n").filter((line) => line.startsWith("📄：第") || line.startsWith("📄：E")).length < 1100, "文件名清单确实截断");
+});
+
+test("直投 meta：多季按季号区间、单文件范围号并入、电影也带技术字段", () => {
+  const multi = [
+    { path: "番/第1季/E1.mkv", fileName: "E1.mkv", etag: md5("a1"), size: 1 },
+    { path: "番/第1季/E2.mkv", fileName: "E2.mkv", etag: md5("a2"), size: 1 },
+    { path: "番/第2季/E1.mkv", fileName: "E1.mkv", etag: md5("b1"), size: 1 },
+    { path: "番/第3季/E5.mkv", fileName: "E5.mkv", etag: md5("c1"), size: 1 }
+  ];
+  assert.equal(buildFastlinkSubmissionMeta(buildFastlinkText(multi)).seasonEpisode, "S01-S03");
+  const ranged = [{ path: "Show/Season 1/Show.S01E01-E05.mkv", fileName: "Show.S01E01-E05.mkv", etag: md5("r1"), size: 1 }];
+  assert.equal(buildFastlinkSubmissionMeta(buildFastlinkText(ranged)).seasonEpisode, "S01E01-E05");
+  // 电影没有集号：不带 seasonEpisode/mediaType（类型仍由客户端判断），但技术字段以脚本识别为准
+  const movie = [{ path: "Movie.2019.2160p.WEB-DL.x265.EAC3.5.1.mkv", fileName: "Movie.2019.2160p.WEB-DL.x265.EAC3.5.1.mkv", etag: md5("m1"), size: 1 }];
+  const movieMeta = buildFastlinkSubmissionMeta(buildFastlinkText(movie));
+  assert.equal(movieMeta.seasonEpisode, undefined);
+  assert.equal(movieMeta.mediaType, undefined);
+  assert.equal(movieMeta.quality, "2160p");
+  assert.equal(movieMeta.source, "WEB-DL");
+  assert.equal(movieMeta.videoCodec, "HEVC", "编码归并到客户端词表（x265→HEVC）");
+  assert.equal(buildFastlinkSubmissionMeta(""), null);
+});
+
+test("直投 meta：同一编码多种写法归并一种，音轨数后缀不进备注", () => {
+  const files = [
+    { path: "S1/Show.S01E01.2160p.WEB-DL.x265.DDP.5.1.2Audios.mkv", fileName: "Show.S01E01.2160p.WEB-DL.x265.DDP.5.1.2Audios.mkv", etag: md5("c1"), size: 1 },
+    { path: "S1/Show.S01E02.2160p.WEB-DL.HEVC.DDP.5.1.mkv", fileName: "Show.S01E02.2160p.WEB-DL.HEVC.DDP.5.1.mkv", etag: md5("c2"), size: 1 },
+    { path: "S1/Show.S01E03.2160p.WEB-DL.H265.DDP.5.1.3Audios.mkv", fileName: "Show.S01E03.2160p.WEB-DL.H265.DDP.5.1.3Audios.mkv", etag: md5("c3"), size: 1 }
+  ];
+  const meta = buildFastlinkSubmissionMeta(buildFastlinkText(files));
+  assert.equal(meta.videoCodec, "HEVC", "x265/HEVC/H265 是同一种编码，备注只写一种");
+  assert.equal(meta.audioCodec, "DDP.5.1", "2Audios/3Audios 只是音轨数，归并后不重复罗列");
+  assert.equal(meta.seasonEpisode, "S01E01-E03");
+});
+
+test("直投 meta：多版本变体用 / 汇总、自定义映射表生效", () => {
+  const mixed = [
+    { path: "S1/Show.S01E01.2160p.WEB-DL.x265.mkv", fileName: "Show.S01E01.2160p.WEB-DL.x265.mkv", etag: md5("v1"), size: 1 },
+    { path: "S1/Show.S01E01.1080p.WEB-DL.x264.mkv", fileName: "Show.S01E01.1080p.WEB-DL.x264.mkv", etag: md5("v2"), size: 1 }
+  ];
+  const meta = buildFastlinkSubmissionMeta(buildFastlinkText(mixed));
+  assert.equal(meta.quality.split("/").sort().join(","), "1080p,2160p", "画质变体用 / 汇总（与客户端 join_variants 同格式）");
+  assert.equal(meta.videoCodec.split("/").sort().join(","), "AVC,HEVC");
+  // 自定义映射：把 WEB-DL 改写成 WEB 的映射表要影响输出
+  const custom = [{ id: "custom-web", field: "resourceType", aliases: ["WEB-DL"], output: "WEB" }];
+  const mapped = buildFastlinkSubmissionMeta(buildFastlinkText(mixed), custom);
+  assert.ok(!String(mapped.source).includes("WEB-DL"), "自定义映射表参与直投识别");
+});
+
+test("直投 meta 接线：push 按自定义映射计算并随条目提交，submitShares 只在有条目对象时带上", () => {
+  const bundle = lines.join("\n");
+  assert.ok(bundle.includes("const meta = buildFastlinkSubmissionMeta(artifact?.text, (this.config.library || {}).recognition?.fixedMappings);"), "直投要计算 meta（带自定义映射表）");
+  assert.ok(bundle.includes("...(item.meta && typeof item.meta === \"object\" ? { meta: item.meta } : {})"), "submitShares 要透传 meta 且不误导老后端");
+});
+
+test("二级链接成功要清扫描断点，上传种子失败保留断点可续扫", async () => {
+  const folders = new Map([
+    ["f1", [
+      { id: "v1", name: "Show.S01E01.1080p.WEB-DL.mkv", type: 0, size: 100, etag: md5("etag") },
+      { id: "v2", name: "Show.S01E02.1080p.WEB-DL.mkv", type: 0, size: 200, etag: md5("etag") }
+    ]]
+  ]);
+  const apiFor = (failUpload) => ({
+    async listAll(id) { return folders.get(String(id)) || []; },
+    async fileInfos() { return []; },
+    async uploadTextFile(fileName, content, parentId) {
+      if (failUpload) throw new Error("上传失败");
+      return { id: "seed1", etag: md5("etag"), size: content.length };
+    }
+  });
+  const items = [{ id: "f1", name: "剧集", type: 1 }];
+  const okCheckpoint = createFastlinkScanCheckpoint(items, {});
+  await generateSecondaryFastlink(apiFor(false), items, { useJson: true, seedFolderId: "9", checkpoint: okCheckpoint });
+  assert.equal(okCheckpoint.state, null, "全链成功后断点必须清掉，否则面板继续提示「上次扫描进度」");
+  const failCheckpoint = createFastlinkScanCheckpoint(items, {});
+  await assert.rejects(() => generateSecondaryFastlink(apiFor(true), items, { useJson: true, seedFolderId: "9", checkpoint: failCheckpoint }));
+  assert.ok(failCheckpoint.state, "种子上传失败要保留断点供续扫");
 });
 
 let failed = 0;

@@ -51,19 +51,21 @@ const { createRunLedger, filterResultDetails, buildResultCsv, resultTable, statu
   console.log(`ok 扫描明细计数与摘要（${summary}）`);
 }
 
-// —— 用例 2：日志封顶（紧凑模式不逐条刷文件行） ——
+// —— 用例 2：日志环形封顶（明细面板默认展开，文件行也逐条记，但条数绝不涨爆） ——
 {
   const ledger = createRunLedger({ limit: 30 });
   for (let index = 0; index < 500; index += 1) {
     ledger.detail({ kind: "file", path: `p/${index}.mkv`, size: 10, files: index + 1, folders: 1, bytes: (index + 1) * 10 });
     ledger.detail({ kind: "folder", path: `p/${index}`, entries: 3, folders: index + 1, files: index + 1, bytes: (index + 1) * 10 });
   }
-  assert.ok(ledger.lines.length <= 30, `紧凑模式日志应封顶 30 行（实际 ${ledger.lines.length}）`);
-  assert.ok(!ledger.lines.some((line) => line.text.startsWith("\u6587\u4EF6 ")), "紧凑模式不该把每条文件写进日志");
+  assert.ok(ledger.lines.length <= 30, `紧凑档日志应封顶 30 行（实际 ${ledger.lines.length}）`);
+  assert.ok(ledger.lines.some((line) => line.text.startsWith("\u6587\u4EF6 ")), "不开调试模式也要逐条记下扫过的文件（文件级进度）");
+  assert.ok(ledger.lines.at(-1).text.includes("p/499"), `保留的应是最近的明细（实际 ${ledger.lines.at(-1).text}）`);
   ledger.setVerbose(true);
   for (let index = 0; index < 500; index += 1) ledger.detail({ kind: "file", path: `q/${index}.mkv`, size: 10, files: 600 + index, folders: 2, bytes: 6000 });
-  assert.ok(ledger.lines.length <= 800, `展开模式日志也应封顶（实际 ${ledger.lines.length}）`);
-  console.log(`ok 日志环形封顶（紧凑 ${30} 行 / 展开上限 800 行）`);
+  assert.ok(ledger.lines.length <= 800, `展开档日志也应封顶（实际 ${ledger.lines.length}）`);
+  assert.ok(ledger.lines.at(-1).text.includes("q/499"), "切到展开档后仍是追加最近明细");
+  console.log(`ok 日志环形封顶（展开档 ${ledger.lines.length} 行）`);
 }
 
 // —— 用例 3：频控/暂停/换道通知进摘要，且带冷却倒计时文案 ——

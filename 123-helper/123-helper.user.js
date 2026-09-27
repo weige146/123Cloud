@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.3.20
+// @version      1.4.3
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -470,8 +470,9 @@
           counters.files = Math.max(counters.files, Number(event.files) || counters.files + 1);
           counters.bytes = Math.max(counters.bytes, Number(event.bytes) || 0);
           currentFile = String(event.path || event.name || "");
-          // 紧凑模式不逐条刷日志（十万级会把有用的目录/失败信息挤掉），当前文件显示在摘要里
-          if (verbose) push(`文件 ${currentFile}（${formatBytes(size)}）`, "success");
+          // 逐条记文件行（环形缓冲只留最近 200/800 条，大扫描也不会堆内存）：
+          // 明细面板默认展开，用户要看到「正在扫哪个文件」的文件级进度
+          push(`文件 ${currentFile}（${formatBytes(size)}）`, "success");
           pushSample();
           return;
         }
@@ -1331,8 +1332,10 @@
   };
   var DRIVE_ROUTE_CACHE_KEY = "Cloud123.Helper.DriveRoute";
   var DRIVE_ROUTE_CACHE_TTL = 30 * 60 * 1000;
+  // 默认换道顺序：先页面同源域名（点了就开跑、不探测），连撞频控才换 123865、再换镜像域名。
+  var DRIVE_ROUTE_DEFAULT_ORDER = ["page", "canonical", "mirror"];
   var driveRouteState = {
-    order: ["mirror", "canonical", "page"],
+    order: [...DRIVE_ROUTE_DEFAULT_ORDER],
     cursor: 0,
     listLimit: 0,
     probedAt: 0,
@@ -1441,10 +1444,10 @@
     if (!samples.length) return 0;
     return Math.max(...samples);
   }
-  // 应用秒传线路：任务开始前探测三条域名排序（结果新鲜就直接复用，不重复打），运行中撞限由
-  // noteRouteThrottle 自动换到下一候选。设置页不提供手动选路（也就没有测速入口）；线路偏好在
-  // 这里自动选中并缓存 30 分钟，「秒传设置 → 恢复默认」会清掉它与探测缓存，下一次任务重新探测。
-  // 旧 fastLane 开关仍兼容：开过它的用户继续只走镜像域名、不自动换道，行为不因改版漂移。
+  // 应用秒传线路：任务开始**一个探测请求都不发**（点了就开跑），默认走页面同源域名；运行中同一条
+  // 线路 60 秒内连撞 6 次频控，才由 noteRouteThrottle 按顺序换到 www.123865.com、api.123278.com。
+  // 只有近 30 分钟内跑过「测速对比接口线路」（调试模式里的手动按钮）才用那份排序当首选与换道顺序。
+  // 旧 fastLane 开关仍兼容：只走镜像域名、不自动换道，行为不因改版漂移。
   async function beginDriveRoute(api, options = {}) {
     if (options.fastLane === true) {
       driveRouteState.order = ["mirror", "page"];
@@ -1454,25 +1457,12 @@
       api.routeAuto = false;
       return { kind: "mirror", host: api.laneHost, auto: false, listLimit: api.listLimit };
     }
-    const fresh = Date.now() - Number(driveRouteState.probedAt || 0) < DRIVE_ROUTE_CACHE_TTL && String(driveRouteState.origin || "") === String(location.origin || "") && driveRouteState.order?.length;
-    if (!fresh) {
-      const cached = driveRouteCacheRead();
-      if (cached) {
-        driveRouteState.order = cached.order.filter((item) => DRIVE_ROUTE_KINDS[item] !== void 0);
-        driveRouteState.listLimit = Number(cached.listLimit) || 0;
-        driveRouteState.probedAt = Number(cached.probedAt) || 0;
-        driveRouteState.detail = cached.detail || {};
-        driveRouteState.origin = String(cached.origin || "");
-      }
-    }
-    if (!driveRouteState.order.length || (Date.now() - Number(driveRouteState.probedAt || 0) >= DRIVE_ROUTE_CACHE_TTL)) {
-      try {
-        await probeDriveRoute(api, { signal: options.signal, parentFileId: options.parentFileId });
-      } catch {
-        // 探测本身失败（未登录/网络异常）不阻断任务：退回默认顺序
-        if (!driveRouteState.order.length) driveRouteState.order = ["mirror", "canonical", "page"];
-      }
-    }
+    const cached = driveRouteCacheRead();
+    const useCached = Boolean(cached?.order?.length);
+    driveRouteState.order = useCached ? cached.order.filter((item) => DRIVE_ROUTE_KINDS[item] !== void 0) : [...DRIVE_ROUTE_DEFAULT_ORDER];
+    driveRouteState.listLimit = useCached ? Number(cached.listLimit) || 0 : 0;
+    driveRouteState.probedAt = useCached ? Number(cached.probedAt) || 0 : 0;
+    driveRouteState.detail = useCached ? cached.detail || {} : {};
     driveRouteState.origin = String(location.origin || "");
     driveRouteState.cursor = 0;
     const chosen = driveRouteState.order[0] || "page";
@@ -1480,7 +1470,7 @@
     api.laneHost = DRIVE_ROUTE_KINDS[chosen] ?? "";
     api.routeAuto = true;
     if (driveRouteState.listLimit >= 100) api.listLimit = Math.min(1000, Math.max(100, driveRouteState.listLimit));
-    return { kind: chosen, host: api.laneHost, auto: true, listLimit: api.listLimit, probed: true };
+    return { kind: chosen, host: api.laneHost, auto: true, listLimit: api.listLimit, probed: useCached };
   }
   // 运行中撞限自动换道：60 秒窗口内同一条线路连续撞 6 次，说明这条道的配额真的见底了，
   // 换到下一候选并清零门冷却（换道后按新车道档位重新起步，不用带着旧惩罚空转）。
@@ -1498,7 +1488,7 @@
     api.routeStrikes[kind] = bucket;
     if (bucket.count < 6) return false;
     bucket.count = 0;
-    const order = (driveRouteState.order || []).length ? driveRouteState.order : ["mirror", "canonical", "page"];
+    const order = (driveRouteState.order || []).length ? driveRouteState.order : [...DRIVE_ROUTE_DEFAULT_ORDER];
     const next = order.slice((driveRouteState.cursor || 0) + 1).find((item) => item !== kind) || order.find((item) => item !== kind);
     if (!next || next === kind) return false;
     driveRouteState.cursor = Math.max(0, order.indexOf(next));
@@ -3022,6 +3012,7 @@
       debugMode: false,
       useFolderNameForJson: true,
       appendDateToJson: false,
+      stripReleaseGroup: false,
       fastLane: false,
       routePreference: "auto",
       seedFolderId: "",
@@ -3188,6 +3179,10 @@
     config.fastlinkTools.seedFolderId = /^\d+$/.test(seedFolderId) ? seedFolderId : "";
     if (!config.fastlinkTools.seedFolderId) config.fastlinkTools.seedFolderName = "";
     config.fastlinkTools.secondaryUseJson = config.fastlinkTools.secondaryUseJson !== false;
+    // 高速域名开关（旧 fastLane）：默认关，只认严格 true；开着时整条任务钉在镜像域名、不自动换道
+    config.fastlinkTools.fastLane = config.fastlinkTools.fastLane === true;
+    // 导出秒传去除发布组：默认关，只认严格 true（老配置没这个键 → false）
+    config.fastlinkTools.stripReleaseGroup = config.fastlinkTools.stripReleaseGroup === true;
     // 线路偏好是内部状态（设置页无 UI）：只认 auto/mirror，其余值（含旧版 apiRoute 四档）一律回落 auto
     if (config.fastlinkTools.routePreference !== "mirror") config.fastlinkTools.routePreference = "auto";
     delete config.appearance.hideOfficialPromotions;
@@ -6626,6 +6621,42 @@
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
     {
+      version: "1.4.3",
+      notes: [
+        "投稿备注里同一种编码不再写成两种写法（HEVC/H265 只留一种）",
+        "投稿备注里音轨数不再来回刷屏",
+        "同一部作品真有多种版本时，备注照旧列出每种差异"
+      ]
+    },
+    {
+      version: "1.4.2",
+      notes: [
+        "投稿时把脚本算好的集数、画质、编码等识别结果直接发给客户端，几千集的番也能认对",
+        "导出时勾了「去除文件名发布组」的秒传，投稿后客户端不会再猜出一个发布组",
+        "二级链接生成成功后不再提示「继续/放弃上次扫描」，只有真的中断过才会遇到"
+      ]
+    },
+    {
+      version: "1.4.1",
+      notes: [
+        "秒传导出、转存点了就开跑，不再先花时间试接口地址",
+        "导出秒传时每扫完一个文件夹就立即下载一个，不用等全部扫完再出结果",
+        "已有秒传任务在跑时再点导出或转存会自动排队，右下角小窗能看到排了几个、可单独取消",
+        "进度条的文件明细默认展开，能直接看到每个文件的处理情况",
+        "秒传设置新增「导出时去除文件名发布组」，导出的秒传与二级链接文件名不再带组名",
+        "哪些算发布组沿用整理里的识别，你在设置里加的特殊发布组也一并去掉",
+        "去掉组名后与同目录别的文件重名的，那个文件保留原名"
+      ]
+    },
+    {
+      version: "1.4.0",
+      notes: [
+        "整理同一部剧的几季目录，执行完各季原来的空文件夹都会一起清掉",
+        "清理只删空了的文件夹，里面还有文件的目录不会受影响",
+        "原地整理和整理进媒体库都适用"
+      ]
+    },
+    {
       version: "1.3.20",
       notes: [
         "音频编码写在 Atmos 前面的命名，现在也能认出杜比全景声",
@@ -7283,7 +7314,35 @@
     }
     return parts.length ? `${parts.join("/")}/` : "";
   }
-  function buildFastlinkData(files) {
+  // 导出秒传时按需去掉文件名里的发布组：识别规则与批量重命名「去发布组」同源（方括号组名、
+  // 连字符尾缀、设置里「特殊发布组」名单），只动路径最后一段，目录层级不碰。去掉组名后与同批
+  // 别的记录撞名就保留原名，免得秒传落地时生成「名字 (1)」副本。records 为 {path, fileName}。
+  function applyFastlinkReleaseGroupStrip(records, options = {}) {
+    if (!options.stripReleaseGroup || !Array.isArray(records)) return records;
+    const configured = Array.isArray(options.releaseGroups) ? options.releaseGroups : [];
+    const finals = records.map((record) => {
+      const path = String(record?.path || "");
+      const slash = path.lastIndexOf("/");
+      const name = slash >= 0 ? path.slice(slash + 1) : path;
+      const stripped = stripReleaseGroupName(name, configured);
+      // 组名就是整个文件名时不去（去掉只剩扩展名），这类极端命名保持原样
+      const core = stripped.replace(EXTENSION, "").trim();
+      const changed = Boolean(stripped) && stripped !== name && /[A-Za-z0-9\u4e00-\u9fff]/.test(core);
+      return { path: changed ? `${path.slice(0, slash + 1)}${stripped}` : path, changed };
+    });
+    const taken = /* @__PURE__ */ new Set();
+    finals.forEach((item) => {
+      if (!item.changed) taken.add(item.path);
+    });
+    finals.forEach((item, index) => {
+      if (!item.changed || taken.has(item.path)) return;
+      taken.add(item.path);
+      records[index].path = item.path;
+      if (records[index].fileName) records[index].fileName = item.path.split("/").at(-1);
+    });
+    return records;
+  }
+  function buildFastlinkData(files, options = {}) {
     if (!Array.isArray(files) || !files.length) throw new Error("\u79D2\u4F20\u5185\u5BB9\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55");
     const sorted = [...files].sort((left, right) => naturalCompare(left.path, right.path));
     const prefix = commonPath(sorted);
@@ -7305,6 +7364,7 @@
       };
     });
     const totalSize = cleanFiles.reduce((sum, file) => sum + file.size, 0);
+    applyFastlinkReleaseGroupStrip(cleanFiles, options);
     return {
       scriptVersion: FASTLINK_VERSION,
       exportVersion: "1.0",
@@ -7316,11 +7376,11 @@
       files: cleanFiles
     };
   }
-  function buildFastlinkJson(files) {
-    return JSON.stringify(buildFastlinkData(files), null, 2);
+  function buildFastlinkJson(files, options = {}) {
+    return JSON.stringify(buildFastlinkData(files, options), null, 2);
   }
-  function buildFastlinkText(files) {
-    const data = buildFastlinkData(files);
+  function buildFastlinkText(files, options = {}) {
+    const data = buildFastlinkData(files, options);
     const entries = data.files.map((file) => [file.etag, file.size, file.path].join("#"));
     return `${FASTLINK_TEXT_PREFIX}${data.commonPath}%${entries.join("$")}`;
   }
@@ -7388,7 +7448,7 @@
     }
     return "";
   }
-  function splitFastlink(value, method = "folder", amount = 1) {
+  function splitFastlink(value, method = "folder", amount = 1, options = {}) {
     const parsed = typeof value === "string" ? parseFastlink(value) : parseFastlinkJson(value);
     const files = normalizedFastlinkFiles(parsed);
     if (!files.length) throw new Error("\u79D2\u4F20\u5185\u5BB9\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55");
@@ -7454,8 +7514,8 @@
         index: index + 1,
         fileCount: group.length,
         files: group,
-        text: buildFastlinkJson(group),
-        link: buildFastlinkText(group),
+        text: buildFastlinkJson(group, options),
+        link: buildFastlinkText(group, options),
         filename: label ? `123FastLink_${label}_part_${index + 1}.json` : `123FastLink_part_${index + 1}.json`
       };
     });
@@ -7478,9 +7538,9 @@
       }
       return { path: names.filter(Boolean).join("/"), fileName: names.at(-1), size: Number(item?.Size ?? item?.size ?? 0), etag: String(item?.Etag ?? item?.etag ?? item?.md5 ?? "") };
     });
-    return options.raw ? { commonPath: "", files } : JSON.parse(buildFastlinkJson(files));
+    return options.raw ? { commonPath: "", files } : JSON.parse(buildFastlinkJson(files, options));
   }
-  function convertJsonTo123Share(value) {
+  function convertJsonTo123Share(value, options = {}) {
     const parsed = typeof value === "string" ? parseFastlink(value) : parseFastlinkJson(value);
     const folders = /* @__PURE__ */ new Map();
     const raw = [];
@@ -7494,8 +7554,10 @@
       raw.push({ FileId: folderId, FileName: path.split("/").at(-1), Type: 1, Size: 0, Etag: "", ParentFileId: ensureFolder(parentPath) });
       return folderId;
     };
-    for (const file of normalizedFastlinkFiles(parsed)) {
-      const path = cleanFastlinkPath(file.path);
+    const files = normalizedFastlinkFiles(parsed).map((file) => ({ ...file, path: cleanFastlinkPath(file.path) }));
+    applyFastlinkReleaseGroupStrip(files, options);
+    for (const file of files) {
+      const path = file.path;
       const folderPath = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
       raw.push({ FileId: String(id++), FileName: path.split("/").at(-1), Type: 0, Size: Number(file.size) || 0, Etag: validEtag(file.etag) ? file.etag : base62ToHex(file.etag), ParentFileId: ensureFolder(folderPath) });
     }
@@ -8796,6 +8858,34 @@
     const folderName = options.useFolderName === false ? "123FastLink_Export" : cleanPathPart(name) || "123FastLink_Export";
     return `${folderName}${date}.123fastlink.json`;
   }
+  // 秒传任务排队的簿记部分（执行由控制器负责）：后台已有任务在跑时，新的导出/转存点下去不再被
+  // 拒绝，而是按当时的输入记成一条排队意图，前一个任务收尾后依次开跑。
+  function createFastlinkTaskQueue() {
+    const entries = [];
+    return {
+      get length() {
+        return entries.length;
+      },
+      add(label, run) {
+        const entry = { id: uniqueId("fastlink-queue"), label: String(label || "\u79D2\u4F20\u4EFB\u52A1"), run };
+        entries.push(entry);
+        return entry;
+      },
+      next() {
+        return entries.shift() || null;
+      },
+      remove(id) {
+        const index = entries.findIndex((entry) => entry.id === id);
+        return index >= 0 ? entries.splice(index, 1)[0] : null;
+      },
+      clear() {
+        return entries.splice(0, entries.length);
+      },
+      snapshot() {
+        return entries.map((entry) => ({ id: entry.id, label: entry.label }));
+      }
+    };
+  }
   async function exportFastlinkItems(api, items, options = {}) {
     const artifacts = [];
     const checkpoint = options.checkpoint || null;
@@ -8812,13 +8902,16 @@
         checkpointRoots: [index]
       });
       if (!files.length) throw new Error(`\u6240\u9009\u9879\u76EE\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u6587\u4EF6\uFF1A${item.name}`);
-      artifacts.push({
+      const artifact = {
         item,
         filename: fastlinkArtifactName(item.name, options),
-        text: buildFastlinkJson(files),
-        link: buildFastlinkText(files),
+        text: buildFastlinkJson(files, options),
+        link: buildFastlinkText(files, options),
         fileCount: files.length
-      });
+      };
+      artifacts.push(artifact);
+      // 逐顶层项交付：这个项扫完就立刻交给调用方（下载一个是一个），不用等全部目录扫完
+      if (options.onArtifact) await options.onArtifact(artifact, index + 1, items.length);
       options.onProgress?.(index + 1, items.length, `${item.name}\uFF1A\u5BFC\u51FA\u5B8C\u6210`);
     }
     checkpoint?.clear();
@@ -8986,7 +9079,7 @@
     const rootNames = Array.isArray(state?.rootNames) ? state.rootNames : [];
     return [...groups.entries()].map(([rootIndex, groupFiles]) => {
       const name = rootNames[rootIndex] || `Part_${rootIndex + 1}`;
-      return { item: { name }, filename: fastlinkArtifactName(name, options), text: buildFastlinkJson(groupFiles), link: buildFastlinkText(groupFiles), fileCount: groupFiles.length };
+      return { item: { name }, filename: fastlinkArtifactName(name, options), text: buildFastlinkJson(groupFiles, options), link: buildFastlinkText(groupFiles, options), fileCount: groupFiles.length };
     });
   }
   async function collectPublicShareFiles(api, value, options = {}) {
@@ -9088,7 +9181,7 @@
     const sharedFolderName = options.useFolderName !== false && hasSharedFolderRoot && roots.size === 1 ? [...roots][0] : "";
     const safeName = cleanPathPart(options.name || sharedFolderName || input.shareKey || "123FastLink_PublicShare") || "123FastLink_PublicShare";
     const date = options.appendDate ? `_${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10).replace(/-/g, "")}` : "";
-    return { item: { name: safeName }, fileCount: files.length, filename: `${safeName}${date}.123fastlink.json`, text: buildFastlinkJson(files), link: buildFastlinkText(files), shareKey: input.shareKey, sharePwd: input.sharePwd };
+    return { item: { name: safeName }, fileCount: files.length, filename: `${safeName}${date}.123fastlink.json`, text: buildFastlinkJson(files, options), link: buildFastlinkText(files, options), shareKey: input.shareKey, sharePwd: input.sharePwd };
   }
   async function exportPublicShare(api, value, options = {}) {
     const input = typeof value === "string" ? parsePublicShareInput(value) : value;
@@ -9127,11 +9220,13 @@
       checkpointRoots: items.map((item, index) => index)
     });
     const { fileName, useJson } = buildSecondarySeedName(items, options);
-    const content = useJson ? buildFastlinkJson(files) : buildFastlinkText(files);
+    const content = useJson ? buildFastlinkJson(files, options) : buildFastlinkText(files, options);
     const parentId = normalizeSeedFolderId(options.seedFolderId) || String(options.currentDir || "0");
     options.onProgress?.(1, 2, `\u4E0A\u4F20\u79CD\u5B50\u6587\u4EF6\uFF1A${fileName}`);
     const seed = await api.uploadTextFile(fileName, content, parentId, options.signal);
-    const link = buildFastlinkText([{ name: fileName, fileName, etag: seed.etag, size: seed.size, path: fileName }]);
+    const link = buildFastlinkText([{ name: fileName, fileName, etag: seed.etag, size: seed.size, path: fileName }], { ...options, stripReleaseGroup: false });
+    // 全链成功才清扫描断点（对齐 exportFastlinkItems）：不清的话下次打开面板还提示「继续/放弃上次扫描」
+    options.checkpoint?.clear();
     options.onProgress?.(2, 2, "\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210");
     return { item: { name: fileName }, fileCount: files.length, filename: fileName, text: content, link, seedFile: { id: seed.id, name: fileName, etag: seed.etag, size: seed.size } };
   }
@@ -9256,20 +9351,26 @@
   // 二级链接直投投稿时随链接带给客户端的识别上下文：从种子内容里抽真实文件名（前 100 条）
   // 与总体积，客户端识别剧集/电影、画质、大小才有据可依（对齐旧「JSON 文件发机器人」流程
   // 的素材；种子名本身没有这些信息，会被当成种子文件自己识别）。轻量正则抽取，不整包 JSON.parse。
+  // 文件名清单上限 1000 条：单部作品的视频数很少超过它，超长列表截断时补一行「还有 N 个文件」
+  //（客户端解析时会跳过这行），集数多的番剧不再被前 100 条截断数错。
+  var FASTLINK_CONTEXT_FILE_LIMIT = 1000;
   function buildFastlinkSubmissionContext(name, text) {
     const content = String(text || "");
     if (!content) return "";
     const title = String(name || "").trim();
     const lines = title ? [`\u{1F3AC}\uFF1A${title}`] : [];
     const names = [];
+    let pathCount = 0;
     let totalSize = 0;
     if (/^\s*\{/.test(content)) {
       const headerTotal = Number((content.match(/"totalSize"\s*:\s*(\d+)/) || [])[1]);
       if (Number.isSafeInteger(headerTotal) && headerTotal > 0) totalSize = headerTotal;
       const pathRe = /"path"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
       let match = null;
-      while ((match = pathRe.exec(content)) && names.length < 100) {
-        if (match[1]) names.push(match[1]);
+      while ((match = pathRe.exec(content))) {
+        if (!match[1]) continue;
+        pathCount += 1;
+        if (names.length < FASTLINK_CONTEXT_FILE_LIMIT) names.push(match[1]);
       }
       if (totalSize <= 0) {
         const sizeRe = /"size"\s*:\s*(\d+)/g;
@@ -9282,13 +9383,124 @@
         const size = Number(parts[1]);
         if (Number.isSafeInteger(size) && size > 0) totalSize += size;
         const path = parts.slice(2).join("#");
-        if (path && names.length < 100) names.push(path);
+        if (!path) continue;
+        pathCount += 1;
+        if (names.length < FASTLINK_CONTEXT_FILE_LIMIT) names.push(path);
       }
     }
     if (!names.length) return "";
     if (totalSize > 0) lines.push(`\u{1F4BE}\uFF1A${formatBytes(totalSize)}`);
     for (const item of names) lines.push(`\u{1F4C4}\uFF1A${item}`);
+    if (pathCount > names.length) lines.push(`\u{1F4C4}\uFF1A\u8FD8\u6709 ${pathCount - names.length} \u4E2A\u6587\u4EF6`);
     return lines.join("\n");
+  }
+  // 秒传直投结构化识别：脚本手里有完整文件清单和成熟的识别管道，把画质/来源/编码/
+  // 集数范围等直接算好发给客户端（meta），客户端逐字段优先采用、不再自己从截断样本猜；
+  // 显示映射（原盘等 sourceLabels）、TMDB 校准、频道路由、文案渲染仍走客户端逻辑。
+  // mappings 传设置里的自定义映射表（不传用内置默认表），与整理预览同源。
+  function fastlinkSubmissionSeasonFromPath(path) {
+    const segments = String(path || "").replace(/\\/g, "/").split("/");
+    for (let index = segments.length - 2; index >= 0; index -= 1) {
+      const segment = segments[index].trim();
+      const hit = segment.match(/\u7B2C\s*(\d{1,3})\s*\u5B63|(?:season|series)[\s._-]*(\d{1,3})/i) || segment.match(/^s(\d{1,3})(?:\s*\u5B63)?(?=$|[\s._-])/i);
+      if (hit) {
+        const value = Number(hit[1] || hit[2] || hit[3]);
+        if (value > 0) return value;
+      }
+    }
+    return 1;
+  }
+  var FASTLINK_META_TECH_SAMPLE = 200;
+  // 投稿备注走的是客户端词表：整理映射表里 HEVC 与 H265 是两条独立条目（文件名各写各的），
+  // 汇总时必须归并成一种写法，否则备注出现「HEVC/H265」；音轨数后缀（2Audios）是整理命名
+  // 字段，对投稿备注没有信息量，聚合时剥掉。
+  var FASTLINK_META_VIDEO_CODEC_CANON = {
+    HEVC: "HEVC", H265: "HEVC", "H.265": "HEVC", X265: "HEVC", "X.265": "HEVC",
+    AVC: "AVC", H264: "AVC", "H.264": "AVC", X264: "AVC", "X.264": "AVC"
+  };
+  function fastlinkMetaCanonicalValue(field, value) {
+    const clean = String(value || "").trim();
+    if (!clean) return "";
+    if (field === "videoCodec") return FASTLINK_META_VIDEO_CODEC_CANON[clean.toUpperCase()] || clean;
+    if (field === "audioCodec") return clean.replace(/\.?\d+Audios$/i, "");
+    return clean;
+  }
+  function fastlinkMetaJoinVariants(field, values) {
+    const out = [];
+    const seen = new Set();
+    for (const value of values) {
+      const clean = fastlinkMetaCanonicalValue(field, value);
+      const key = clean.toUpperCase();
+      if (clean && !seen.has(key)) {
+        seen.add(key);
+        out.push(clean);
+      }
+    }
+    return out.join("/");
+  }
+  function buildFastlinkSubmissionMeta(text, mappings) {
+    const content = String(text || "");
+    if (!content) return null;
+    const paths = [];
+    if (/^\s*\{/.test(content)) {
+      const pathRe = /"path"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+      let match = null;
+      while ((match = pathRe.exec(content))) {
+        if (match[1]) paths.push(match[1]);
+      }
+    } else {
+      for (const chunk of content.replace(/^123FLCPV2\$%?/i, "").split("$")) {
+        const parts = chunk.split("#");
+        if (parts.length < 3) continue;
+        const path = parts.slice(2).join("#");
+        if (path) paths.push(path);
+      }
+    }
+    const seasons = new Map();
+    const technical = { quality: [], source: [], effect: [], videoCodec: [], audioCodec: [], fps: [], bitDepth: [], webSource: [] };
+    let technicalSamples = 0;
+    for (const path of paths) {
+      const base = String(path).split("/").pop() || "";
+      if (!/\.(?:mkv|mp4|ts|avi|rmvb|rm|wmv|mpg|mpeg|m4v|mov|flv|webm|vob|m2ts|mts|iso)$/i.test(base)) continue;
+      // 集数按全量文件算；技术字段取前 200 个视频文件足够覆盖多版本（省得几千集的番逐文件跑映射）
+      if (technicalSamples < FASTLINK_META_TECH_SAMPLE) {
+        technicalSamples += 1;
+        const fields = inferTechnicalFields(base, mappings);
+        technical.quality.push(fields.videoFormat);
+        technical.source.push(fields.resourceType);
+        technical.effect.push(fields.effect);
+        technical.videoCodec.push(fields.videoCodec);
+        technical.audioCodec.push(fields.audioCodec);
+        technical.fps.push(fields.frameRate);
+        technical.bitDepth.push(fields.colorDepth);
+        technical.webSource.push(fields.mediaSource);
+      }
+      const parsed = parseSeasonEpisode(base, fastlinkSubmissionSeasonFromPath(path));
+      const episode = Number(parsed?.episode) || 0;
+      if (!episode) continue;
+      const season = Number(parsed.season) || 1;
+      const range = seasons.get(season) || { min: episode, max: episode };
+      if (episode < range.min) range.min = episode;
+      if (episode > range.max) range.max = episode;
+      const endEpisode = Number(parsed.endEpisode) || 0;
+      if (endEpisode > range.max) range.max = endEpisode;
+      seasons.set(season, range);
+    }
+    const meta = {};
+    if (seasons.size) {
+      const pad = (value) => String(value).padStart(2, "0");
+      const seasonNumbers = [...seasons.keys()].sort((left, right) => left - right);
+      const single = seasons.get(seasonNumbers[0]);
+      meta.seasonEpisode = seasonNumbers.length === 1
+        ? `S${pad(seasonNumbers[0])}E${pad(single.min)}${single.max > single.min ? `-E${pad(single.max)}` : ""}`
+        : `S${pad(seasonNumbers[0])}-S${pad(seasonNumbers[seasonNumbers.length - 1])}`;
+      meta.mediaType = "tv";
+    }
+    for (const [key, values] of Object.entries(technical)) {
+      const joined = fastlinkMetaJoinVariants(key, values);
+      if (joined) meta[key] = joined;
+    }
+    return Object.keys(meta).length ? meta : null;
   }
 
   // src/public-share-cleanup.js
@@ -9417,6 +9629,8 @@
         const source = options.locationRef?.href || target.defaultView?.location?.href || "";
         const artifact = await exportPublicShare(options.api, source, {
           useFolderName: true,
+          stripReleaseGroup: options.stripReleaseGroup === true,
+          releaseGroups: options.releaseGroups || [],
           // 分享接口触发风控冷却时把倒计时透到状态条，用户能看见"歇几秒后自动继续"
           onProgress: (_done, _total, message) => showStatus(target, message)
         });
@@ -10133,7 +10347,7 @@
         return;
       }
       const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-      downloadJson(target, `官方搜索秒传-${stamp}.123fastlink.json`, buildFastlinkJson(filtered));
+      downloadJson(target, `官方搜索秒传-${stamp}.123fastlink.json`, buildFastlinkJson(filtered, options));
       showStatus(target, `秒传 JSON 已下载：${filtered.length} 个文件${skipped ? `（跳过 ${skipped} 个无特征值结果）` : ""}`);
     }));
     csvButton.addEventListener("click", () => runWithButton(csvButton, "导出 CSV", async (setLabel) => {
@@ -10405,7 +10619,7 @@
         }
         const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
         const filename = `分享搜索秒传-${stamp}.123fastlink.json`;
-        downloadJson(target, filename, buildFastlinkJson(filtered));
+        downloadJson(target, filename, buildFastlinkJson(filtered, options));
         finish(`秒传 JSON 已下载：${filtered.length} 个文件${skipped ? `（跳过 ${skipped} 个无特征值结果）` : ""}`);
       } catch (error) {
         if (error?.name === "AbortError") {
@@ -19770,7 +19984,8 @@ ${end.comment}` : end.comment;
           lead.files.push(file);
         }
         lead.targetSeason = lead.targetSeason || group.targetSeason;
-        if (!(lead.sourceFolders || []).length) lead.sourceFolders = group.sourceFolders;
+        // 整理完删原目录按 sourceFolders 判空清理，并组后必须并集，否则只有 lead 季的目录会被删
+        lead.sourceFolders = [...new Map([...(lead.sourceFolders || []), ...(group.sourceFolders || [])].map((folder) => [folder.id, folder])).values()];
       }
     }
     return groups;
@@ -22542,8 +22757,10 @@ ${end.comment}` : end.comment;
             method: "POST",
             // 结构化直投：链接数组直接给客户端后端扫成草稿（跳过归属判断，快一倍）；
             // 老后端不认识 links 字段时会返回 400，此时回退拼接文本形式。
-            // sourceText：秒传直投附带的真实文件名/大小上下文（分享直投没有此字段）
-            body: { links: batch.map((item) => ({ name: item.name || "", url: item.url || "", ...(item.sourceText ? { sourceText: String(item.sourceText) } : {}) })) },
+            // sourceText：秒传直投附带的真实文件名/大小上下文（分享直投没有此字段）；
+            // skipReleaseGroup：导出时已去除文件名发布组，让客户端别再做发布组识别（老后端自动忽略此字段）；
+            // meta：脚本按完整清单算好的结构化识别（seasonEpisode/mediaType），客户端优先采用
+            body: { links: batch.map((item) => ({ name: item.name || "", url: item.url || "", ...(item.sourceText ? { sourceText: String(item.sourceText) } : {}), ...(item.skipReleaseGroup ? { skipReleaseGroup: true } : {}), ...(item.meta && typeof item.meta === "object" ? { meta: item.meta } : {}) })) },
             signal: options.signal,
             timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS
           }).catch(async (error) => {
@@ -22572,6 +22789,13 @@ ${end.comment}` : end.comment;
   };
 
   // src/ui/components.js
+  // 排队的秒传任务：进度条与右下角小窗里都能看到排了什么、能单独取消或全部取消
+  function renderFastlinkQueue(ui) {
+    const queued = typeof ui?.fastlinkQueue?.snapshot === "function" ? ui.fastlinkQueue.snapshot() : [];
+    if (!queued.length) return "";
+    const chips = queued.map((entry) => `<span class="fastlink-queue-item">${escapeHtml(entry.label)}<button class="icon-button tiny" data-action="fastlink-queue-remove" data-id="${escapeHtml(entry.id)}" title="\u53D6\u6D88\u8FD9\u4E2A\u6392\u961F" aria-label="\u53D6\u6D88\u8FD9\u4E2A\u6392\u961F">${icon("close", 12)}</button></span>`).join("");
+    return `<div class="fastlink-queue"><span class="fastlink-queue-title">\u6392\u961F ${queued.length} \u4E2A\uFF1A</span>${chips}<button class="button ghost compact" data-action="fastlink-queue-clear">\u5168\u90E8\u53D6\u6D88</button></div>`;
+  }
   function renderProgress(ui, minimized = false, canMinimizeToBackground = false) {
     const progress = ui?.state?.progress;
     if (!progress) return "";
@@ -22591,6 +22815,7 @@ ${end.comment}` : end.comment;
     <div class="progress-head"><span>${icon("loading", 16, "spin")} ${escapeHtml(progress.message || "\u5904\u7406\u4E2D")}</span><div class="progress-head-actions"><strong>${Number(progress.done || 0)}/${Math.max(1, Number(progress.total || 1))}</strong><button class="icon-button" data-action="${minimizeAction}" title="${minimizeTitle}" aria-label="${minimizeTitle}">${icon("chevronDown", 15)}</button></div></div>
     <div class="progress-track"><div class="progress-bar ${Number(progress.done || 0) === 0 ? "indeterminate" : ""}" style="width:${percent}%"></div></div>
     <div class="progress-foot">${pauseButton}<button class="button ghost compact" data-action="cancel-task">\u505C\u6B62\u540E\u7EED\u64CD\u4F5C</button>${ledgerToggle}${routeNote}</div>
+    ${renderFastlinkQueue(ui)}
     ${ledgerPanel}
   </div>`;
   }
@@ -22605,14 +22830,14 @@ ${end.comment}` : end.comment;
     const label = FASTLINK_TASK_LABELS[task.kind] || "\u79D2\u4F20\u4EFB\u52A1";
     if (running) {
       const message = task.status === "cancelling" ? "\u6B63\u5728\u53D6\u6D88\u4EFB\u52A1" : progress?.message || "\u6B63\u5728\u5904\u7406";
-      return `<section class="background-task" role="status" aria-live="polite"><div class="background-task-copy"><span>${icon("loading", 16, "spin")}</span><div><strong>${label}</strong><small>${escapeHtml(message)} ${percent}%</small></div></div><div class="background-task-actions"><button class="icon-button" data-action="background-task-open" title="\u6062\u590D\u4EFB\u52A1\u7A97\u53E3" aria-label="\u6062\u590D\u4EFB\u52A1\u7A97\u53E3">${icon("chevronDown", 15)}</button><button class="icon-button danger" data-action="background-task-cancel" title="\u53D6\u6D88\u4EFB\u52A1" aria-label="\u53D6\u6D88\u4EFB\u52A1">${icon("close", 15)}</button></div></section>`;
+      return `<section class="background-task" role="status" aria-live="polite"><div class="background-task-copy"><span>${icon("loading", 16, "spin")}</span><div><strong>${label}</strong><small>${escapeHtml(message)} ${percent}%</small>${renderFastlinkQueue(ui)}</div></div><div class="background-task-actions"><button class="icon-button" data-action="background-task-open" title="\u6062\u590D\u4EFB\u52A1\u7A97\u53E3" aria-label="\u6062\u590D\u4EFB\u52A1\u7A97\u53E3">${icon("chevronDown", 15)}</button><button class="icon-button danger" data-action="background-task-cancel" title="\u53D6\u6D88\u4EFB\u52A1" aria-label="\u53D6\u6D88\u4EFB\u52A1">${icon("close", 15)}</button></div></section>`;
     }
     const failed = task.status === "failed" || task.status === "cancelled";
     const partial = task.status === "partial";
     const status = task.status === "cancelled" ? "\u5DF2\u53D6\u6D88" : task.status === "failed" ? "\u5904\u7406\u5931\u8D25" : partial ? "\u90E8\u5206\u5B8C\u6210" : "\u5DF2\u5B8C\u6210";
     const detail = failed ? task.error || "\u4EFB\u52A1\u672A\u5B8C\u6210" : task.kind === "secondaryExport" ? `\u5DF2\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\uFF08\u542B ${Number(task.result?.fileCount || 0)} \u4E2A\u6587\u4EF6\uFF09` : FASTLINK_IMPORT_TASK_KINDS.includes(task.kind) ? `\u6210\u529F ${Number(task.result?.ok || 0)} \u9879${Number(task.result?.fail || 0) ? `\uFF0C\u5931\u8D25 ${Number(task.result.fail)} \u9879` : ""}` : `\u5DF2\u751F\u6210 ${Number(task.result?.length || 0)} \u4E2A\u79D2\u4F20\u6587\u4EF6`;
     const actionLabel = failed ? "\u8FD4\u56DE\u79D2\u4F20" : "\u67E5\u770B\u7ED3\u679C";
-    return `<section class="background-task ${failed ? "danger" : partial ? "warning" : "success"}" role="status" aria-live="polite"><div class="background-task-copy"><span>${icon(failed || partial ? "alert" : "check", 16)}</span><div><strong>${label}${status}</strong><small>${escapeHtml(detail)}</small></div></div><div class="background-task-actions"><button class="button compact" data-action="background-task-open">${actionLabel}</button><button class="icon-button" data-action="background-task-dismiss" title="\u5173\u95ED\u63D0\u793A" aria-label="\u5173\u95ED\u63D0\u793A">${icon("close", 15)}</button></div></section>`;
+    return `<section class="background-task ${failed ? "danger" : partial ? "warning" : "success"}" role="status" aria-live="polite"><div class="background-task-copy"><span>${icon(failed || partial ? "alert" : "check", 16)}</span><div><strong>${label}${status}</strong><small>${escapeHtml(detail)}</small>${renderFastlinkQueue(ui)}</div></div><div class="background-task-actions"><button class="button compact" data-action="background-task-open">${actionLabel}</button><button class="icon-button" data-action="background-task-dismiss" title="\u5173\u95ED\u63D0\u793A" aria-label="\u5173\u95ED\u63D0\u793A">${icon("close", 15)}</button></div></section>`;
   }
   function metric(title, value, iconName = "sparkles", tone = "") {
     return `<span class="metric ${tone}">${icon(iconName, 14)}<small>${escapeHtml(title)}</small><strong>${escapeHtml(value)}</strong></span>`;
@@ -22757,7 +22982,7 @@ ${end.comment}` : end.comment;
     const splitPane = `${notice("\u652F\u6301\u9879\u76EE JSON\u3001123FLCPV2 \u94FE\u63A5\u548C\u65E7\u7248 V1/V2 \u6587\u672C\u3002\u6309\u76EE\u5F55\u5C42\u7EA7\u4F1A\u4E3A\u6BCF\u4E2A\u76EE\u5F55\u7EC4\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\uFF0C\u6309\u6570\u91CF\u4F1A\u6309\u6761\u76EE\u5207\u5206\uFF0C\u6309\u5B63\u96C6/\u5267\u540D\u4F1A\u4E3A\u6BCF\u90E8\u4F5C\u54C1\uFF08\u5267\u540D+\u5B63\uFF09\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\u3002", "", "download")}<div class="button-row"><button class="button" data-action="fastlink-split-file-open">${icon("folderOpen", 15)}\u9009\u62E9 JSON</button><span>${escapeHtml(state.splitFileName || "\u4E5F\u53EF\u4EE5\u76F4\u63A5\u7C98\u8D34")}</span><input id="fastlink-split-file" type="file" accept=".json,.txt,.123fastlink" hidden></div><div class="editor-surface"><textarea id="fastlink-split-input" placeholder="\u7C98\u8D34 JSON \u6216\u79D2\u4F20\u94FE\u63A5">${state.splitInput && state.splitInput.length > 2000000 ? "" : escapeHtml(state.splitInput || "")}</textarea></div>${state.splitInput && state.splitInput.length > 2000000 ? `<span class="footer-note">\u7C98\u8D34\u5185\u5BB9\u8F83\u5927\uFF08${formatBytes(stringByteSize(state.splitInput))}\uFF09\uFF0C\u5DF2\u4FDD\u7559\u4F46\u4E0D\u56DE\u663E\uFF0C\u53EF\u76F4\u63A5\u5F00\u59CB\u62C6\u5206</span>` : ""}<div class="inline-fields"><label class="field"><span>\u62C6\u5206\u65B9\u5F0F</span><select id="fastlink-split-method"><option value="folder" ${state.splitMethod === "folder" ? "selected" : ""}>\u6309\u76EE\u5F55\u5C42\u7EA7</option><option value="count" ${state.splitMethod === "count" ? "selected" : ""}>\u6309\u6587\u4EF6\u6570\u91CF</option><option value="work" ${state.splitMethod === "work" ? "selected" : ""}>\u6309\u5B63\u96C6/\u5267\u540D</option></select></label>${state.splitMethod === "work" ? "" : `<label class="field"><span>${state.splitMethod === "count" ? "\u6BCF\u4EFD\u6587\u4EF6\u6570" : "\u76EE\u5F55\u5C42\u6570"}</span><input id="fastlink-split-amount" type="number" min="1" value="${Math.max(1, Number(state.splitAmount) || 1)}"></label>`}</div>`;
     const convertPane = `${notice("\u5728 .123share \u4E0E\u9879\u76EE\u6807\u51C6 JSON \u4E4B\u95F4\u4E92\u8F6C\u3002\u8F6C\u6362\u53EA\u5728\u672C\u5730\u5B8C\u6210\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u6587\u4EF6\u3002", "", "settings")}<div class="button-row"><button class="button" data-action="fastlink-convert-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u6587\u4EF6</button><span>${escapeHtml(state.convertFileName || "\u652F\u6301 .123share / .json")}</span><input id="fastlink-convert-file" type="file" accept=".123share,.json" hidden></div><div class="editor-surface"><textarea id="fastlink-convert-input" placeholder="\u4E5F\u53EF\u4EE5\u7C98\u8D34\u6587\u4EF6\u5185\u5BB9">${escapeHtml(state.convertInput || "")}</textarea></div>${state.converted ? notice(`\u5DF2\u8F6C\u6362\u4E3A ${state.converted === "json" ? "JSON" : ".123share"} \u5E76\u5F00\u59CB\u4E0B\u8F7D\u3002`, "success", "check") : ""}`;
     const filterPane =`${notice("\u542F\u7528\u540E\uFF0C\u751F\u6210\u6216\u8F6C\u5B58\u65F6\u4F1A\u8DF3\u8FC7\u5BF9\u5E94\u6269\u5C55\u540D\u3002\u8BBE\u7F6E\u4FDD\u5B58\u5728\u9879\u76EE\u914D\u7F6E\u4E2D\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-filter="share" ${settings.filterOnShareEnabled ? "checked" : ""}>\u751F\u6210\u65F6\u542F\u7528\u8FC7\u6EE4</label><label class="check-line"><input type="checkbox" data-fastlink-filter="transfer" ${settings.filterOnTransferEnabled ? "checked" : ""}>\u8F6C\u5B58\u65F6\u542F\u7528\u8FC7\u6EE4</label></div><div class="filter-actions"><button class="button compact" data-action="fastlink-filter-all">\u5168\u9009</button><button class="button compact" data-action="fastlink-filter-none">\u5168\u4E0D\u9009</button><button class="button compact" data-action="fastlink-filter-reset">\u6062\u590D\u9ED8\u8BA4</button></div><div class="fastlink-filter-list">${filters.map((item, index) => `<label class="check-line"><input type="checkbox" data-fastlink-filter="extension" data-index="${index}" ${item.enabled ? "checked" : ""}><span>.${escapeHtml(item.ext)}</span><small>${escapeHtml(item.name || "\u81EA\u5B9A\u4E49\u7C7B\u578B")}</small></label>`).join("")}</div>`;
-    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? settings.seedFolderName ? `${settings.seedFolderName}\uFF08${settings.seedFolderId}\uFF09` : `ID ${settings.seedFolderId}` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002\u5E76\u53D1\u53EA\u662F\u6D41\u6C34\u6DF1\u5EA6\uFF0C\u5B9E\u9645\u901F\u7387\u7531\u5185\u7F6E\u9650\u901F\u95E8\u7EDF\u4E00\u4FDD\u8BC1\uFF08\u649E\u9891\u63A7\u4F1A\u5168\u5C40\u51B7\u5374\u540E\u81EA\u52A8\u6062\u590D\uFF09\uFF1B\u300C\u5199\u5165\u5E76\u53D1\u300D\u5728\u76F4\u8FDE\u7EBF\u8DEF\u4E0A \u226516 \u65F6\u751F\u6548\uFF0C\u5426\u5219\u9ED8\u8BA4 24\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div>` : ""}`;
+    const settingsPane = `${notice("\u6587\u4EF6\u547D\u540D\u3001\u8C03\u8BD5\u548C\u9879\u76EE\u683C\u5F0F\u8BF4\u660E\u3002\u9879\u76EE\u8F93\u51FA\u56FA\u5B9A\u4F7F\u7528 Base62 ETag \u7684\u6807\u51C6 V2 \u683C\u5F0F\uFF0C\u907F\u514D\u4E0D\u540C\u811A\u672C\u4E4B\u95F4\u683C\u5F0F\u6F02\u79FB\u3002", "", "settings")}<div class="check-grid"><label class="check-line"><input type="checkbox" data-fastlink-setting="debugMode" ${settings.debugMode ? "checked" : ""}>\u8C03\u8BD5\u6A21\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="useFolderNameForJson" ${settings.useFolderNameForJson !== false ? "checked" : ""}>\u4F7F\u7528\u6587\u4EF6\u5939\u540D\u4F5C\u4E3A JSON \u6587\u4EF6\u540D</label><label class="check-line"><input type="checkbox" data-fastlink-setting="appendDateToJson" ${settings.appendDateToJson ? "checked" : ""}>\u6587\u4EF6\u540D\u8FFD\u52A0\u65E5\u671F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="secondaryUseJson" ${settings.secondaryUseJson !== false ? "checked" : ""}>\u4E8C\u7EA7\u79D2\u4F20\u79CD\u5B50\u4F7F\u7528 JSON \u683C\u5F0F</label><label class="check-line"><input type="checkbox" data-fastlink-setting="stripReleaseGroup" ${settings.stripReleaseGroup ? "checked" : ""}>导出时去除文件名发布组</label><label class="check-line"><input type="checkbox" checked disabled>\u4F7F\u7528 Base62 \u683C\u5F0F ETag\uFF08\u9879\u76EE\u56FA\u5B9A\uFF09</label></div><label class="field"><span>\u79CD\u5B50\u6587\u4EF6\u4FDD\u5B58\u6587\u4EF6\u5939\uFF08\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u7559\u7A7A\u7528\u5F53\u524D\u76EE\u5F55\uFF09</span><div class="inline-fields"><input readonly value="${escapeHtml(settings.seedFolderId ? settings.seedFolderName ? `${settings.seedFolderName}\uFF08${settings.seedFolderId}\uFF09` : `ID ${settings.seedFolderId}` : "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5F53\u524D\u76EE\u5F55"><button class="button" data-action="fastlink-pick-seed">${icon("folderOpen", 15)}\u9009\u62E9\u76EE\u5F55</button><button class="button compact" data-action="fastlink-folder-clear" data-key="seedFolderId" ${settings.seedFolderId ? "" : "disabled"}>\u6E05\u9664</button></div></label><div class="fastlink-format-note">JSON \u4E0E\u94FE\u63A5\u5747\u4F7F\u7528\u9879\u76EE\u6807\u51C6\u683C\u5F0F\uFF0C\u4E0D\u4F1A\u751F\u6210\u4E0D\u517C\u5BB9\u7684\u975E Base62 \u7248\u672C\u3002\u5E76\u53D1\u53EA\u662F\u6D41\u6C34\u6DF1\u5EA6\uFF0C\u5B9E\u9645\u901F\u7387\u7531\u5185\u7F6E\u9650\u901F\u95E8\u7EDF\u4E00\u4FDD\u8BC1\uFF08\u649E\u9891\u63A7\u4F1A\u5168\u5C40\u51B7\u5374\u540E\u81EA\u52A8\u6062\u590D\uFF09\uFF1B\u52FE\u9009\u300C\u5BFC\u51FA\u65F6\u53BB\u9664\u6587\u4EF6\u540D\u53D1\u5E03\u7EC4\u300D\u540E\uFF0C\u5BFC\u51FA\u7684 JSON\u3001V2 \u94FE\u63A5\u4E0E\u4E8C\u7EA7\u94FE\u63A5\u91CC\u7684\u6587\u4EF6\u540D\u90FD\u4F1A\u53BB\u6389\u672B\u5C3E\u53D1\u5E03\u7EC4\uFF08\u6CBF\u7528\u6574\u7406\u7684\u53D1\u5E03\u7EC4\u8BC6\u522B\u4E0E\u300C\u7279\u6B8A\u53D1\u5E03\u7EC4\u300D\u540D\u5355\uFF09\uFF0C\u62C6\u5206\u3001\u683C\u5F0F\u8F6C\u6362\u4E0E\u5206\u4EAB\u9875\u641C\u7D22\u751F\u6210\u7684\u79D2\u4F20\u540C\u6837\u9002\u7528\uFF0C\u76EE\u5F55\u540D\u4E0E\u7F51\u76D8\u6587\u4EF6\u4E0D\u53D7\u5F71\u54CD\u3002\u79D2\u4F20\u4EFB\u52A1\u9ED8\u8BA4\u8D70\u9875\u9762\u540C\u6E90\u57DF\u540D\u3001\u70B9\u4E86\u5C31\u5F00\u8DD1\uFF0C\u53EA\u6709\u8FDE\u649E\u9891\u63A7\u624D\u81EA\u52A8\u6362\u5230 123865 / \u955C\u50CF\u57DF\u540D\uFF1B\u5BFC\u51FA\u65F6\u6BCF\u626B\u5B8C\u4E00\u4E2A\u9876\u5C42\u9879\u76EE\u5C31\u4E0B\u8F7D\u4E00\u4E2A\uFF0C\u5DF2\u6709\u4EFB\u52A1\u5728\u8DD1\u65F6\u518D\u70B9\u4F1A\u81EA\u52A8\u6392\u961F\u3002\u5343\u4E07\u7EA7\u5BFC\u5165\u5ACC\u6162\u65F6\u53EF\u5728\u8C03\u8BD5\u6A21\u5F0F\u70B9\u4E00\u6B21\u300C\u6D4B\u901F\u5BF9\u6BD4\u63A5\u53E3\u7EBF\u8DEF\u300D\uFF0C\u63A5\u4E0B\u6765 30 \u5206\u949F\u7684\u4EFB\u52A1\u4F1A\u4F18\u5148\u8D70\u6700\u5FEB\u7684\u90A3\u6761\u3002</div>${settings.debugMode ? `<div class="fastlink-debug-card"><div><strong>API \u6D4B\u8BD5</strong><span>\u8BFB\u53D6\u5F53\u524D\u76EE\u5F55\u9996\u6761\u8BB0\u5F55\uFF0C\u7ED3\u679C\u4F1A\u663E\u793A\u4E3A\u63D0\u793A\u3002</span></div><button class="button compact" data-action="fastlink-api-test">\u6D4B\u8BD5\u5F53\u524D\u76EE\u5F55 API</button></div><div class="fastlink-debug-card"><div><strong>\u63A5\u53E3\u7EBF\u8DEF\u6D4B\u901F</strong><span>\u5E38\u89C4\u4E0D\u9700\u8981\u7BA1\u7EBF\u8DEF\uFF1A\u79D2\u4F20\u4EFB\u52A1\u9ED8\u8BA4\u8D70\u9875\u9762\u540C\u6E90\u57DF\u540D\u3001\u70B9\u4E86\u5C31\u5F00\u8DD1\uFF0C\u53EA\u6709\u8FDE\u8DD1\u9891\u63A7\u624D\u81EA\u52A8\u6362\u3002\u6000\u7591\u57DF\u540D\u4E0D\u901A\u65F6\u53EF\u5728\u8FD9\u91CC\u628A\u4E09\u6761\u5404\u62C9\u4E24\u9875\u5BF9\u6BD4\uFF0C\u7ED3\u679C 30 \u5206\u949F\u5185\u88AB\u4E0B\u4E00\u6B21\u4EFB\u52A1\u5F53\u9996\u9009\u3002</span></div><button class="button compact" data-action="fastlink-route-probe">\u6D4B\u901F\u5BF9\u6BD4\u63A5\u53E3\u7EBF\u8DEF</button></div>` : ""}`;
     const tools = [["export", "\u751F\u6210\u79D2\u4F20", "download"], ["import", "\u94FE\u63A5/\u6587\u4EF6\u8F6C\u5B58", "import"], ["public", "\u5206\u4EAB\u94FE\u63A5\u751F\u6210 JSON", "share"], ["batch", "\u6279\u91CF\u89E3\u6790\u5206\u4EAB\u94FE\u63A5", "share"], ["split", "\u62C6\u5206 JSON", "download"], ["convert", "\u8F6C\u6362 .123share", "settings"], ["filters", "\u8FC7\u6EE4\u8BBE\u7F6E", "settings"], ["settings", "\u79D2\u4F20\u8BBE\u7F6E", "settings"], ["library", "\u5F71\u5E93\u641C\u7D22", "film"]];
     const libraryPane = (() => {
       const lib = state.library ||= librarySearchState();
@@ -23701,6 +23926,10 @@ ${end.comment}` : end.comment;
   .background-task-copy strong { font-size:12px; }
   .background-task-copy small { color:var(--muted); font-size:11px; }
   .background-task-actions { display:flex; align-items:center; gap:3px; flex:0 0 auto; }
+  .fastlink-queue { display:flex; align-items:center; flex-wrap:wrap; gap:4px; margin-top:4px; font-size:11px; color:var(--muted); }
+  .fastlink-queue-title { color:var(--muted); }
+  .fastlink-queue-item { display:inline-flex; align-items:center; gap:2px; padding:1px 4px 1px 6px; border-radius:999px; background:var(--glass-soft,rgba(148,163,184,.16)); color:var(--text); }
+  .fastlink-queue-item .icon-button.tiny { width:16px; height:16px; }
   .background-task-actions .icon-button { width:28px; height:28px; }
   .progress-track { align-self:center; height:6px; overflow:hidden; border-radius:var(--radius-full); background:var(--surface-3); position:relative; }
   .progress-bar { height:100%; min-width:2px; border-radius:var(--radius-full); background:var(--grad-accent); background-size:200% 100%; transition:width .18s ease; position:relative; overflow:hidden; }
@@ -24409,11 +24638,12 @@ ${end.comment}` : end.comment;
       this.submissionClient = submissionClient || new SubmissionClient();
       this.config = configStore.get();
       this.sampleFields = SAMPLE_FIELDS;
-      this.state = { view: "", title: "", toast: [], progress: null, progressMinimized: false, result: null, resultPage: 1, dialog: null, confirm: null };
+      this.state = { view: "", title: "", toast: [], progress: null, progressMinimized: false, progressLedgerOpen: true, result: null, resultPage: 1, dialog: null, confirm: null };
       this.selection = bridge.snapshot();
       this.commandContext = null;
       this.abortController = null;
       this.backgroundTask = null;
+      this.fastlinkQueue = createFastlinkTaskQueue();
       this.toolbar = null;
       this.shareToolbar = null;
       this.toolbarObserver = null;
@@ -24962,6 +25192,19 @@ ${end.comment}` : end.comment;
       if (this.state.progress) this.state.progress.message = "\u6B63\u5728\u505C\u6B62\u540E\u7EED\u64CD\u4F5C";
       this.renderTransient();
     }
+    // 调试模式里的「测速对比接口线路」：三条各拉两页比延迟与频控，结果缓存 30 分钟，
+    // 会被下一次秒传任务当成首选线路与换道顺序（常规任务不会自动发探测请求）。
+    async probeDriveRouteSpeed() {
+      const outcome = await this.runTask((signal) => probeDriveRoute(this.api, { signal, parentFileId: this.fastlink.currentDir || "0" }));
+      const detail = outcome?.detail || {};
+      const parts = (outcome?.order || []).map((kind) => {
+        const record = detail[kind] || {};
+        const slowest = Math.max(0, ...(record.samples || []).map(Number));
+        return `${driveRouteLabel(kind)} ${record.ok ? `${slowest}ms${record.throttled ? `\u00B7 \u649E\u9650 ${record.throttled}` : ""}` : "\u4E0D\u901A"}`;
+      });
+      this.toast(`\u7EBF\u8DEF\u6D4B\u901F\uFF1A${parts.join(" | ")}\uFF0C\u4E0B\u4E00\u6B21\u79D2\u4F20\u4EFB\u52A1\u6309\u8FD9\u4E2A\u987A\u5E8F\u8D70`, parts.length ? "success" : "warning");
+      this.render();
+    }
     // 暂停/继续秒传长任务：只切全局闸门，请求在门口排队等待，断点照常落盘（不取消、不丢进度）
     toggleTaskPause() {
       if (!this.ledger) return;
@@ -25023,6 +25266,42 @@ ${end.comment}` : end.comment;
       this.abortController = null;
       this.endFastlinkLedger();
     }
+    // 秒传任务排队入口：没有后台任务在跑也没人排队就立刻开跑并把任务 Promise 返回给调用方
+    // （await 语义不变）；否则记成一条排队意图、马上提示用户，返回 null 表示本次不用等。
+    // 前一个任务收尾后由 drainFastlinkQueue 依次开跑。
+    queueFastlinkTask(label, run) {
+      if (!this.backgroundTask && !this.fastlinkQueue.length) return run();
+      const entry = this.fastlinkQueue.add(label, run);
+      this.toast(`\u5DF2\u6392\u961F\u300C${entry.label}\u300D\uFF0C\u524D\u9762\u8FD8\u6709 ${this.fastlinkQueue.length - 1} \u4E2A\u4EFB\u52A1`, "info");
+      this.renderTransient();
+      return null;
+    }
+    // 收尾时机（任务完成、结果被查看或被关闭）后再跑队列；后台任务卡片没处理完就继续等
+    scheduleFastlinkDrain(delay = 0) {
+      setTimeout(() => this.drainFastlinkQueue(), Math.max(0, Number(delay) || 0));
+    }
+    drainFastlinkQueue() {
+      if (this.backgroundTask) return;
+      // 队列与重命名/分享这些非秒传任务共用一个中止控制器，别的任务还在跑就过两秒再看
+      if (this.state.progress) {
+        if (this.fastlinkQueue.length) this.scheduleFastlinkDrain(2000);
+        return;
+      }
+      const entry = this.fastlinkQueue.next();
+      if (!entry) return;
+      this.renderTransient();
+      Promise.resolve().then(() => entry.run()).catch((error) => this.toast(`${entry.label}\u5931\u8D25\uFF1A${error?.message || error || "\u672A\u77E5\u9519\u8BEF"}`, "error")).finally(() => this.scheduleFastlinkDrain());
+    }
+    removeQueuedFastlinkTask(id) {
+      const removed = this.fastlinkQueue.remove(id);
+      if (removed) this.toast(`\u5DF2\u53D6\u6D88\u6392\u961F\u300C${removed.label}\u300D`, "info");
+      this.renderTransient();
+    }
+    clearQueuedFastlinkTasks() {
+      const removed = this.fastlinkQueue.clear();
+      this.toast(removed.length ? `\u5DF2\u6E05\u7A7A ${removed.length} \u4E2A\u6392\u961F\u4EFB\u52A1` : "\u6CA1\u6709\u6392\u961F\u7684\u4EFB\u52A1", removed.length ? "info" : "warning");
+      this.renderTransient();
+    }
     hasActiveBackgroundTask() {
       return this.backgroundTask?.status === "running" || this.backgroundTask?.status === "cancelling";
     }
@@ -25039,6 +25318,7 @@ ${end.comment}` : end.comment;
       task.error = "";
       if (!task.minimized) {
         this.backgroundTask = null;
+        this.scheduleFastlinkDrain();
         return false;
       }
       this.renderTransient();
@@ -25046,8 +25326,8 @@ ${end.comment}` : end.comment;
     }
     async runFastlinkTask(kind, worker) {
       const task = this.startFastlinkTask(kind);
-      // 秒传线路窗口：导入/导出任务期间按探测结果选择接口域名（哪条最快最宽松就走哪条，
-      // 运行中撞限还会自动换道），任务结束（含失败/取消）恢复。设置页不提供手动选路。
+      // 秒传线路窗口：任务开始不探测域名（直接按页面同源域名开跑），运行中一条线路连撞频控
+      // 才自动换到 123865 / 镜像域名；任务结束（含失败/取消）恢复。
       const laneWanted = ["import", "cloudImport", "export"].includes(kind);
       let routeInfo = null;
       if (laneWanted) {
@@ -25059,7 +25339,8 @@ ${end.comment}` : end.comment;
         } catch {
           applied = null;
         }
-        if (applied) routeInfo = { kind: applied.kind, label: `\u7EBF\u8DEF ${driveRouteLabel(applied.kind)}${applied.auto ? "\uFF08\u81EA\u52A8\uFF09" : ""}` };
+        // 页面域名就是默认车道，不占进度条一格；换了线路或用过测速结果才标出来
+        if (applied && applied.kind !== "page") routeInfo = { kind: applied.kind, label: `\u7EBF\u8DEF ${driveRouteLabel(applied.kind)}${applied.auto ? "\uFF08\u81EA\u52A8\uFF09" : ""}` };
       }
       const ledger = this.beginFastlinkLedger(kind, routeInfo);
       try {
@@ -25069,7 +25350,10 @@ ${end.comment}` : end.comment;
         if (this.backgroundTask === task) {
           task.status = error?.name === "AbortError" ? "cancelled" : "failed";
           task.error = error?.message || (task.status === "cancelled" ? "\u4EFB\u52A1\u5DF2\u53D6\u6D88" : "\u4EFB\u52A1\u5931\u8D25");
-          if (!backgrounded) this.backgroundTask = null;
+          if (!backgrounded) {
+            this.backgroundTask = null;
+            this.scheduleFastlinkDrain();
+          }
           this.renderTransient();
         }
         if (backgrounded) return { task, error };
@@ -25104,6 +25388,7 @@ ${end.comment}` : end.comment;
         return;
       }
       this.backgroundTask = null;
+      this.scheduleFastlinkDrain();
       if (FASTLINK_IMPORT_TASK_KINDS.includes(task.kind) && task.result) {
         const resultTitle = task.kind === "secondaryImport" ? "\u4E8C\u7EA7\u79D2\u4F20\u8F6C\u5B58\u7ED3\u679C" : task.kind === "cloudImport" ? "\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58\u7ED3\u679C" : "\u79D2\u4F20\u5BFC\u5165\u7ED3\u679C";
         this.setResult(resultTitle, task.result);
@@ -25118,6 +25403,7 @@ ${end.comment}` : end.comment;
     dismissBackgroundTask() {
       if (this.hasActiveBackgroundTask()) return;
       this.backgroundTask = null;
+      this.scheduleFastlinkDrain();
       if (this.state.view) this.renderTransient();
       else this.render();
     }
@@ -25552,19 +25838,34 @@ ${end.comment}` : end.comment;
         }
       }
     }
-    async generateFastlink() {
-      if (!this.fastlink.items.length) throw new Error("\u8BF7\u5148\u9009\u62E9\u8981\u5BFC\u51FA\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
-      const checkpoint = createFastlinkScanCheckpoint(this.fastlink.items, this.fastlinkExportOptions());
+    async generateFastlink(itemsOverride = null) {
+      const items = (Array.isArray(itemsOverride) && itemsOverride.length ? itemsOverride : this.fastlink.items).slice();
+      if (!items.length) throw new Error("\u8BF7\u5148\u9009\u62E9\u8981\u5BFC\u51FA\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
+      return this.queueFastlinkTask("\u751F\u6210\u79D2\u4F20", () => this.runGenerateFastlink(items));
+    }
+    async runGenerateFastlink(items) {
+      const checkpoint = createFastlinkScanCheckpoint(items, this.fastlinkExportOptions());
       if (checkpoint.resumed) this.toast(`\u7EED\u63A5\u4E0A\u6B21\u626B\u63CF\uFF1A\u5DF2\u6709 ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6`, "info");
       this.fastlink.salvage = null;
       try {
+        let delivered = 0;
         const outcome = await this.runFastlinkTask("export", async (signal) => {
-          this.setProgress(0, this.fastlink.items.length, checkpoint.resumed ? `\u7EED\u63A5\u626B\u63CF\uFF08\u5DF2\u626B ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\uFF09` : "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
-          return exportFastlinkItems(this.api, this.fastlink.items, {
+          this.setProgress(0, items.length, checkpoint.resumed ? `\u7EED\u63A5\u626B\u63CF\uFF08\u5DF2\u626B ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\uFF09` : "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
+          return exportFastlinkItems(this.api, items, {
             signal,
             ...this.fastlinkExportOptions(),
             checkpoint,
             onDetail: (event) => this.fastlinkDetail(event),
+            // 逐顶层项交付：这个项扫完立即下载，不用等全部目录扫完（几千项时按 15 个一批歇 300ms，
+            // 连续触发下载会把主线程压死）
+            onArtifact: async (artifact, done) => {
+              delivered += 1;
+              downloadText(filenameSafe(artifact.filename), artifact.text);
+              this.fastlink.artifacts = [...this.fastlink.artifacts || [], artifact];
+              this.fastlink.fileCount = this.fastlink.artifacts.reduce((sum, item) => sum + item.fileCount, 0);
+              this.ledger?.note(`\u5DF2\u5BFC\u51FA ${artifact.filename}\uFF08${artifact.fileCount} \u4E2A\u6587\u4EF6\uFF09`);
+              if (done < items.length && delivered % 15 === 0) await sleep(300);
+            },
             onProgress: (done, total, message) => this.setProgress(done, total, message)
           });
         });
@@ -25575,7 +25876,7 @@ ${end.comment}` : end.comment;
         const artifacts = outcome.result;
         this.fastlink.artifacts = artifacts;
         this.fastlink.fileCount = artifacts.reduce((sum, artifact) => sum + artifact.fileCount, 0);
-        for (const artifact of artifacts) downloadText(filenameSafe(artifact.filename), artifact.text);
+        if (!delivered) for (const artifact of artifacts) downloadText(filenameSafe(artifact.filename), artifact.text);
         this.toast(`\u5DF2\u6309 ${artifacts.length} \u4E2A\u9876\u5C42\u9879\u76EE\u5206\u522B\u5BFC\u51FA`, "success");
         this.syncFastlinkCheckpointSummary();
         if (this.completeFastlinkTask(outcome.task, artifacts)) return;
@@ -25666,9 +25967,15 @@ ${end.comment}` : end.comment;
     async restoreFastlink() {
       const file = this.fastlink.importFile || null;
       const inputText = file ? "" : String(this.fastlink.input || "").trim();
+      if (!file && !inputText) throw new Error("\u8BF7\u7C98\u8D34\u79D2\u4F20\u5185\u5BB9\u6216\u9009\u62E9\u79D2\u4F20\u6587\u4EF6");
+      return this.queueFastlinkTask("\u5BFC\u5165\u79D2\u4F20", () => this.runRestoreFastlink({ file, inputText, targetDir: this.fastlink.currentDir }));
+    }
+    async runRestoreFastlink(snapshot) {
+      const file = snapshot.file || null;
+      const inputText = snapshot.inputText || "";
       const outcome = await this.runFastlinkTask("import", async (signal) => {
         this.setProgress(0, 1, file ? `流式读取：${file.name}` : "解析秒传内容");
-        return resolveAndImportFastlinkInput(this.api, file ? { file } : { text: inputText }, this.fastlink.currentDir, {
+        return resolveAndImportFastlinkInput(this.api, file ? { file } : { text: inputText }, snapshot.targetDir || "0", {
           signal,
           seedFolderId: (this.config.fastlinkTools || {}).seedFolderId,
           concurrency: this.config.requests.writeConcurrency,
@@ -25770,9 +26077,12 @@ ${end.comment}` : end.comment;
     }
     async importLibraryPayload(payload, label) {
       if (!payload?.files?.length) throw new Error("\u5F71\u5E93\u8FD4\u56DE\u7684\u79D2\u4F20\u6570\u636E\u4E3A\u7A7A");
+      return this.queueFastlinkTask(`\u5F71\u5E93\u8F6C\u5B58\uFF1A${label}`, () => this.runImportLibraryPayload(payload, label, this.fastlink.currentDir));
+    }
+    async runImportLibraryPayload(payload, label, targetDir = "0") {
       const outcome = await this.runFastlinkTask("import", async (signal) => {
         this.setProgress(0, 1, `\u89E3\u6790\u5F71\u5E93\u79D2\u4F20\uFF1A${label}`);
-        return importFastlink(this.api, parseFastlinkJson(payload), this.fastlink.currentDir, {
+        return importFastlink(this.api, parseFastlinkJson(payload), targetDir || "0", {
           signal,
           concurrency: this.config.requests.writeConcurrency,
           importProgress: true,
@@ -25826,18 +26136,22 @@ ${end.comment}` : end.comment;
       const settings = this.config.fastlinkTools || {};
       return { seedFolderId: settings.seedFolderId, currentDir: this.fastlink.currentDir };
     }
-    async generateSecondaryFastlink() {
-      if (!this.fastlink.items.length) throw new Error("\u8BF7\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u8981\u5BFC\u51FA\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
+    async generateSecondaryFastlink(itemsOverride = null) {
+      const items = (Array.isArray(itemsOverride) && itemsOverride.length ? itemsOverride : this.fastlink.items).slice();
+      if (!items.length) throw new Error("\u8BF7\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u8981\u5BFC\u51FA\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
+      return this.queueFastlinkTask("\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5", () => this.runGenerateSecondaryFastlink(items, this.fastlinkSeedOptions()));
+    }
+    async runGenerateSecondaryFastlink(items, seedOptions = null) {
       const settings = this.config.fastlinkTools || {};
-      const checkpoint = createFastlinkScanCheckpoint(this.fastlink.items, this.fastlinkExportOptions());
+      const checkpoint = createFastlinkScanCheckpoint(items, this.fastlinkExportOptions());
       if (checkpoint.resumed) this.toast(`\u7EED\u63A5\u4E0A\u6B21\u626B\u63CF\uFF1A\u5DF2\u6709 ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6`, "info");
       this.fastlink.salvage = null;
       try {
         const outcome = await this.runFastlinkTask("secondaryExport", async (signal) => {
           this.setProgress(0, 2, checkpoint.resumed ? `\u7EED\u63A5\u626B\u63CF\uFF08\u5DF2\u626B ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\uFF09` : "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
-          return generateSecondaryFastlink(this.api, this.fastlink.items, {
+          return generateSecondaryFastlink(this.api, items, {
             signal,
-            ...this.fastlinkSeedOptions(),
+            ...(seedOptions || this.fastlinkSeedOptions()),
             useJson: settings.secondaryUseJson !== false,
             ...this.fastlinkExportOptions(),
             checkpoint,
@@ -25852,6 +26166,7 @@ ${end.comment}` : end.comment;
         const artifact = outcome.result;
         this.fastlink.artifacts = [artifact];
         this.fastlink.fileCount = artifact.fileCount;
+        this.syncFastlinkCheckpointSummary();
         // 生成成功即自动直投：二级短链推给客户端生成投稿草稿（与分享直投同一接口）。
         // 只推短链种子（单条记录，必不超 TG「秒传链接」复制按钮 256 字符上限），
         // 频道帖靠复制按钮取内容，不再附带秒传 JSON 文件。
@@ -25877,10 +26192,16 @@ ${end.comment}` : end.comment;
       if (!submissionUrl) return "还没配置投稿地址，本次只生成了链接（设置 → 分享与秒传 → 投稿地址）";
       const name = String(artifact.item?.name || artifact.filename || "秒传分享").replace(/\.123fastlink\.(?:json|txt)$/i, "").trim() || "秒传分享";
       try {
-        // 带上种子内容里抽出的真实文件名/总体积（前 100 条）：
+        // 带上种子内容里抽出的真实文件名/总体积（前 1000 条）：
         // 客户端识别剧集类型、画质、真实大小全靠这些，种子名里没有
         const sourceText = buildFastlinkSubmissionContext(name, artifact?.text);
-        const results = await this.submissionClient.submitShares(submissionUrl, [{ name, url: link, sourceText }]);
+        // 开了「导出时去除文件名发布组」时告诉客户端别再识别发布组——名字里已经没有了，
+        // 客户端按尾段乱猜反而会把画质/编码等尾缀当成发布组
+        const skipReleaseGroup = (this.config.fastlinkTools || {}).stripReleaseGroup === true;
+        // 脚本全量算好的技术识别（季集范围/画质/来源/编码等），客户端逐字段优先采用；
+        // 自定义映射表与整理同源
+        const meta = buildFastlinkSubmissionMeta(artifact?.text, (this.config.library || {}).recognition?.fixedMappings);
+        const results = await this.submissionClient.submitShares(submissionUrl, [{ name, url: link, sourceText, skipReleaseGroup, meta }]);
         const failed = results.find((item) => item.status === "failed");
         return failed ? `投稿草稿推送失败：${failed.message || "客户端没有返回结果"}` : "";
       } catch (error) {
@@ -25894,9 +26215,12 @@ ${end.comment}` : end.comment;
       if (items.length !== 1) throw new Error("\u8BF7\u5728\u6587\u4EF6\u5217\u8868\u52FE\u9009 1 \u4E2A\u79D2\u4F20\u6587\u4EF6\uFF08\u5185\u5BB9\u4E3A\u94FE\u63A5\u6216 JSON \u7684\u6587\u672C\u6587\u4EF6\uFF09");
       const item = items[0];
       if (Number(item.type) === 1) throw new Error("\u8BF7\u52FE\u9009\u6587\u4EF6\u800C\u4E0D\u662F\u6587\u4EF6\u5939");
+      return this.queueFastlinkTask("\u8F6C\u5B58\u79D2\u4F20\u6587\u4EF6", () => this.runRestoreFastlinkFromCloudFile(item, this.fastlink.currentDir));
+    }
+    async runRestoreFastlinkFromCloudFile(item, targetDir = "0") {
       const outcome = await this.runFastlinkTask("cloudImport", async (signal) => {
         this.setProgress(0, 1, `\u8BFB\u53D6\u6587\u4EF6\u5185\u5BB9\uFF1A${item.name}`);
-        return saveFastlinkFromCloudFile(this.api, item, this.fastlink.currentDir, {
+        return saveFastlinkFromCloudFile(this.api, item, targetDir || "0", {
           signal,
           concurrency: this.config.requests.writeConcurrency,
           importProgress: true,
@@ -25944,7 +26268,10 @@ ${end.comment}` : end.comment;
         useFolderName: settings.useFolderNameForJson !== false,
         appendDate: settings.appendDateToJson === true,
         filterEnabled: settings.filterOnShareEnabled === true,
-        filterExtensions: filters.filter((item) => item.enabled).map((item) => item.ext)
+        filterExtensions: filters.filter((item) => item.enabled).map((item) => item.ext),
+        // 导出秒传去发布组：识别沿用整理的发布组规则 + 设置里的「特殊发布组」名单
+        stripReleaseGroup: settings.stripReleaseGroup === true,
+        releaseGroups: this.config.library?.recognition?.releaseGroups || []
       };
     }
     fastlinkTransferOptions() {
@@ -26037,7 +26364,7 @@ ${end.comment}` : end.comment;
     }
     async splitFastlinkFile() {
       if (!this.fastlink.splitInput) throw new Error("\u8BF7\u5148\u9009\u62E9\u6216\u7C98\u8D34 JSON/\u79D2\u4F20\u94FE\u63A5");
-      const artifacts = splitFastlink(this.fastlink.splitInput, this.fastlink.splitMethod, this.fastlink.splitAmount);
+      const artifacts = splitFastlink(this.fastlink.splitInput, this.fastlink.splitMethod, this.fastlink.splitAmount, this.fastlinkExportOptions());
       // 大 JSON 会拆出几千份：逐份连续触发下载会把主线程压死（实测 4 千份直接黑屏），
       // 分批节奏化 + 进度提示，给浏览器消化 blob 下载的时间
       const batch = 15;
@@ -26057,11 +26384,11 @@ ${end.comment}` : end.comment;
       if (!this.fastlink.convertInput) throw new Error("\u8BF7\u5148\u9009\u62E9 .123share \u6216 JSON \u6587\u4EF6");
       const source = this.fastlink.convertFileName.toLowerCase();
       if (source.endsWith(".123share")) {
-        const json = convert123ShareToJson(this.fastlink.convertInput);
+        const json = convert123ShareToJson(this.fastlink.convertInput, this.fastlinkExportOptions());
         downloadText(`${filenameSafe(this.fastlink.convertFileName.replace(/\.123share$/i, ""))}.json`, JSON.stringify(json, null, 2));
         this.fastlink.converted = "json";
       } else {
-        const link = convertJsonTo123Share(this.fastlink.convertInput);
+        const link = convertJsonTo123Share(this.fastlink.convertInput, this.fastlinkExportOptions());
         downloadText(`${filenameSafe(this.fastlink.convertFileName.replace(/\.json$/i, ""))}.123share`, link, "text/plain;charset=utf-8");
         this.fastlink.converted = "123share";
       }
@@ -26777,6 +27104,8 @@ ${end.comment}` : end.comment;
         "background-task-open": () => this.openBackgroundTask(),
         "background-task-cancel": () => this.cancelTask(),
         "background-task-dismiss": () => this.dismissBackgroundTask(),
+        "fastlink-queue-clear": () => this.clearQueuedFastlinkTasks(),
+        "fastlink-queue-remove": (control) => this.removeQueuedFastlinkTask(control.dataset.id),
         "toggle-progress-minimized": () => {
           if (!this.state.progress) return;
           this.state.progressMinimized = !this.state.progressMinimized;
@@ -27013,6 +27342,7 @@ ${end.comment}` : end.comment;
         "fastlink-share-resume": () => this.resumeFastlinkShareScan(),
         "fastlink-share-salvage-export": () => this.exportSalvagedShareScan(),
         "fastlink-share-salvage-discard": () => this.discardFastlinkShareScanProgress(),
+        "fastlink-route-probe": () => this.probeDriveRouteSpeed(),
         "fastlink-api-test": async () => {
           const result2 = await this.api.listPage(this.fastlink.currentDir, 1, { limit: 1 });
           this.toast(`API \u6B63\u5E38\uFF1A\u5F53\u524D\u76EE\u5F55\u5171 ${result2.total} \u9879`, "success");
@@ -27033,12 +27363,12 @@ ${end.comment}` : end.comment;
           this.render();
         },
         "fastlink-filter-reset": () => {
-          // 恢复默认 = 连自动选出来的线路偏好与探测缓存一起清掉（下一次秒传任务重新探测线路）
+          // 恢复默认 = 连手动测速结果一起清掉（下一次秒传任务回到「页面同源域名 + 撞限才换」的默认走法）
           try {
             checkpointStorageRemove(DRIVE_ROUTE_CACHE_KEY);
           } catch {
           }
-          driveRouteState.order = ["mirror", "canonical", "page"];
+          driveRouteState.order = [...DRIVE_ROUTE_DEFAULT_ORDER];
           driveRouteState.cursor = 0;
           driveRouteState.probedAt = 0;
           driveRouteState.listLimit = 0;
@@ -27783,7 +28113,7 @@ ${end.comment}` : end.comment;
       if (!action) return;
       const handler = this.actionHandlers[action];
       if (!handler) return;
-      if (this.state.progress && !["cancel-task", "toggle-task-pause", "toggle-progress-ledger", "toggle-progress-minimized", "minimize-background-task", "background-task-open", "background-task-cancel", "background-task-dismiss", "stop"].includes(action)) return;
+      if (this.state.progress && !["cancel-task", "toggle-task-pause", "toggle-progress-ledger", "toggle-progress-minimized", "minimize-background-task", "background-task-open", "background-task-cancel", "background-task-dismiss", "fastlink-queue-clear", "fastlink-queue-remove", "stop"].includes(action)) return;
       try {
         await handler(control, event);
       } catch (error) {
@@ -28312,7 +28642,18 @@ ${end.comment}` : end.comment;
     const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
     if (isPublicShareHost()) {
       const publicApi = new Pan123Api({ host: location.origin, retryAttempts: 3 });
-      installPublicShareCleanup(document, { api: publicApi, locationRef: location });
+      // 分享页也吃「秒传设置 → 导出时去除文件名发布组」：配置存在油猴存储里，跨域名可读，
+      // 读不到（异常/未装过配置）就按关闭处理，不影响原有导出行为
+      let publicExportSettings = {};
+      try {
+        const publicConfig = new ConfigStore().get();
+        publicExportSettings = {
+          stripReleaseGroup: publicConfig.fastlinkTools?.stripReleaseGroup === true,
+          releaseGroups: publicConfig.library?.recognition?.releaseGroups || []
+        };
+      } catch {
+      }
+      installPublicShareCleanup(document, { api: publicApi, locationRef: location, ...publicExportSettings });
     }
     const start = () => {
       try {
