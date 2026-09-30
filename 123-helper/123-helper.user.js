@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.4.3
+// @version      1.4.4
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -3742,6 +3742,10 @@
     shareRoots: '.mfy-share-list, .share-list-content-box, [class*="share-list-content"], [class*="shareListContent"]'
   };
   var TOOLBAR_CONTROL_SELECTOR = 'button, a, [role="button"], .file-operator-group-button';
+  // 官方 2026-09 起在左侧「云盘空间」卡片里加了一个「容量刷新」按钮（tooltip「容量刷新」，图标名
+  // 与列表刷新同为 general_refresh，DOM 顺序还排在列表刷新前面），点它会弹「手动刷新容量」确认框、
+  // 走重新计算容量的接口。找列表刷新按钮时必须把这一带整个排除掉。
+  var CAPACITY_REFRESH_SCOPE = '[class*="spaceCard"], [class*="totalUsage"], [class*="refreshWrap"], [class*="refreshButton"]';
   var DIRECT_OFFICIAL_ACTIONS = /* @__PURE__ */ new Set(["\u91CD\u547D\u540D", "\u4FEE\u6539\u540D\u79F0", "\u6279\u91CF\u91CD\u547D\u540D", "\u4E0B\u8F7D", "\u5206\u4EAB", "\u521B\u5EFA\u5206\u4EAB", "\u5220\u9664", "\u79FB\u52A8"]);
   function controlText(control) {
     return [control?.textContent, control?.getAttribute?.("aria-label"), control?.getAttribute?.("title")].map((value) => String(value || "").replace(/\s+/g, "").trim()).find(Boolean) || "";
@@ -3952,6 +3956,31 @@
     } catch {
       return true;
     }
+  }
+  // 官方「刷新列表和直链缓存」按钮定位（整理/重命名/分享等操作后靠它做一次正常刷新）。
+  // 图标兜底绝不能按图标名取第一个：侧栏「云盘空间」卡片的「容量刷新」用的是同一个
+  // general_refresh 图标且排在前面，点它会弹「手动刷新容量」确认框并触发容量重算接口。
+  function findOfficialListRefreshButton(root = document) {
+    const iconHref = (element) => `${element.getAttribute("href") || ""} ${element.getAttribute("xlink:href") || ""}`;
+    const exact = [...root.querySelectorAll(SELECTORS.refreshButtons)].filter((element) => visibleElement(element));
+    if (exact.length) return exact[0];
+    const labelled = [...root.querySelectorAll('button, [role="button"]')].filter((element) => !element.closest("[data-cloud123-helper]") && visibleElement(element) && /刷新列表和直链缓存/.test(controlText(element)));
+    if (labelled.length) return labelled[0];
+    const uses = [...root.querySelectorAll("svg use")].filter((element) => /general_refresh/.test(iconHref(element)) && !element.closest(CAPACITY_REFRESH_SCOPE));
+    const operateIcon = uses.map((element) => element.closest(".layout-operate-icon")).find((element) => element && visibleElement(element));
+    if (operateIcon) return operateIcon;
+    return uses.map((element) => element.closest('[role="button"], button, .mfy-tooltip')).find((element) => element && visibleElement(element)) || null;
+  }
+  // 「手动刷新容量」确认框的自动收起：只按标题文案认框、只点「取消」（拿不到取消按钮时点关闭叉），
+  // 任何情况下都不点「刷新容量」，不去调官方那个容量重算接口。
+  function dismissManualCapacityRefreshDialog(root = document) {
+    const modal = [...root.querySelectorAll('[class*="modal"], [role="dialog"]')].find((element) => visibleElement(element) && /手动刷新容量/.test(String(element.textContent || "")));
+    if (!modal) return false;
+    const buttons = [...modal.querySelectorAll("button")];
+    const cancel = buttons.find((element) => String(element.textContent || "").replace(/\s+/g, "") === "取消") || buttons.find((element) => /close/i.test(String(element.className || "")));
+    if (!cancel) return false;
+    cancel.click();
+    return true;
   }
   function activeShareRoot() {
     const roots = [...document.querySelectorAll(SELECTORS.shareRoots)].filter((root) => !root.closest("[data-cloud123-helper]"));
@@ -4811,13 +4840,12 @@
           location.replace(currentUrl);
         }
       };
-      const exactButtons = [...document.querySelectorAll(SELECTORS.refreshButtons)].filter((element) => visibleElement(element));
-      const labelledButtons = [...document.querySelectorAll('button, [role="button"]')].filter((element) => !element.closest("[data-cloud123-helper]") && visibleElement(element) && /刷新列表和直链缓存/.test(controlText(element)));
-      const refreshIcon = [...document.querySelectorAll("svg use")].find((element) => /general_refresh(?:_24)?/.test(`${element.getAttribute("href") || ""} ${element.getAttribute("xlink:href") || ""}`));
-      const iconButton = refreshIcon?.closest(".layout-operate-icon") || refreshIcon?.closest('[role="button"], button, .mfy-tooltip');
-      const button = exactButtons[0] || labelledButtons[0] || (iconButton && visibleElement(iconButton) ? iconButton : null);
+      const button = findOfficialListRefreshButton(document);
       if (button) {
         button.click();
+        // 兜底：万一官方改版让排除规则失效、这一下点成了侧栏「容量刷新」，把弹出来的
+        // 「手动刷新容量」确认框自动取消掉，别让它压在列表上挡操作。
+        setTimeout(() => dismissManualCapacityRefreshDialog(document), 250);
         setTimeout(reloadWithPreservedUrl, 1200);
         return;
       }
@@ -6621,6 +6649,16 @@
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
     {
+      version: "1.4.4",
+      notes: [
+        "秒传导入框支持一次粘贴多条秒传链接，一行一条，逐条导入",
+        "网盘里可以勾选多个秒传文件一起转存",
+        "多条里某条出错不会中断，跳过出错的那条继续导入其余",
+        "导入结果页逐条列出每条链接的成功与失败情况",
+        "整理、重命名等操作完成后不再弹「手动刷新容量」提示框"
+      ]
+    },
+    {
       version: "1.4.3",
       notes: [
         "投稿备注里同一种编码不再写成两种写法（HEVC/H265 只留一种）",
@@ -8089,6 +8127,108 @@
     if (converted123Share) return converted123Share;
     return parseFastlinkText(text2, options);
   }
+  // —— 多条秒传一次导入 ——
+  // 把粘贴文本按「完整内容起点」切段：行首出现 123FLCPVx$/123FSLinkVx$ 前缀或行首 {（JSON，
+  // 括号配平跨行聚合）即开新段；其余行并入当前段——单条秒传文本内部本来就允许换行分条，不能按
+  // 空行硬切。只切出一段时返回整段原文，旧解析路径与报错文案零变化。
+  function scanJsonObjectEnd(text, startIndex) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = Math.max(0, Number(startIndex) || 0); index < text.length; index += 1) {
+      const ch = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === "\\") escaped = true;
+        else if (ch === "\"") inString = false;
+        continue;
+      }
+      if (ch === "\"") inString = true;
+      else if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth <= 0) return index;
+      }
+    }
+    return -1;
+  }
+  function splitFastlinkImportPayloads(value) {
+    const text = String(value || "").trim();
+    if (!text) return [];
+    const prefixes = Object.keys(FASTLINK_PREFIXES);
+    const lines = text.split(/\r?\n/);
+    const offsets = [];
+    let walk = 0;
+    for (const line of lines) {
+      offsets.push(walk);
+      walk += line.length + 1;
+    }
+    const segments = [];
+    let current = "";
+    let index = 0;
+    const pushCurrent = () => {
+      const trimmed = current.trim();
+      if (trimmed) segments.push(trimmed);
+      current = "";
+    };
+    while (index < lines.length) {
+      const line = lines[index];
+      const trimmed = line.trim();
+      if (!trimmed) {
+        index += 1;
+        continue;
+      }
+      if (prefixes.some((candidate) => trimmed.startsWith(candidate))) {
+        pushCurrent();
+        current = line;
+        index += 1;
+        continue;
+      }
+      if (trimmed.startsWith("{")) {
+        pushCurrent();
+        const start = offsets[index] + line.indexOf("{");
+        const end = scanJsonObjectEnd(text, start);
+        if (end < 0) {
+          // 截断 JSON：剩余输入全归本段，解析时按原样报错
+          segments.push(text.slice(start));
+          break;
+        }
+        segments.push(text.slice(start, end + 1));
+        index += 1;
+        while (index < lines.length && offsets[index] <= end) index += 1;
+        continue;
+      }
+      current += (current ? "\n" : "") + line;
+      index += 1;
+    }
+    pushCurrent();
+    if (segments.length <= 1) return [text];
+    return segments;
+  }
+  // 段的展示名：二级链接取种子文件名，JSON 取 name 字段，其余取首行
+  function fastlinkSegmentPreview(segment) {
+    const text = String(segment || "").trim();
+    if (!text) return "";
+    const prefix = Object.keys(FASTLINK_PREFIXES).find((candidate) => text.startsWith(candidate));
+    if (prefix) {
+      let body = text.slice(prefix.length);
+      const separator = body.indexOf("%");
+      if (separator >= 0) body = body.slice(separator + 1);
+      const first = String(body.split("$")[0] || "").trim();
+      const parts = first.split("#");
+      const name = parts.length >= 3 ? parts.slice(2).join("#") : parts[0] || "";
+      return name || first || prefix;
+    }
+    if (text.startsWith("{")) {
+      const raw = String((text.match(/"name"\s*:\s*"((?:[^"\\]|\\.)*)"/) || [])[1] || "");
+      try {
+        return raw ? JSON.parse(`"${raw}"`) : "秒传 JSON";
+      } catch {
+        return raw || "秒传 JSON";
+      }
+    }
+    return text.split(/\r?\n/)[0].slice(0, 80);
+  }
   function fastlinkImportFileKey(file) {
     return `${String(file.path || file.fileName || "")}|${String(file.etag || "").toLowerCase()}`;
   }
@@ -8155,9 +8295,11 @@
     let skipped = 0;
     // 条目键只算一次缓存在条目上：百万级时 fastlinkImportFileKey 的重复拼接会多出几百 MB 字符串
     const importKey = (file) => file._c123ImportKey ||= fastlinkImportFileKey(file);
+    // 多条秒传一次导入时按段序加后缀，各段断点互不顶掉（单条导入后缀为空 = 原键不变）
+    const importCheckpointKey = FASTLINK_IMPORT_CHECKPOINT_KEY + String(options.checkpointKeySuffix || "");
     if (options.importProgress) {
       const contentHash = typeof value?.contentFingerprint === "string" ? value.contentFingerprint : await fastlinkImportContentHash(rootId, filtered, options);
-      const existing = readFastlinkImportCheckpoint();
+      const existing = readFastlinkImportCheckpoint(options.checkpointKeySuffix);
       if (existing && existing.contentHash === contentHash) {
         progress = existing;
         progressShards = existing.shards;
@@ -8165,7 +8307,7 @@
         // 内容变了（或没有旧档）：清掉旧分片再开新档，避免残留键被下次误恢复
         if (existing && Number(existing.shardCount) > 0) {
           for (let index = 0; index < Number(existing.shardCount); index += 1) {
-            checkpointStorageRemove(FASTLINK_IMPORT_CHECKPOINT_KEY + FASTLINK_IMPORT_SHARD_SUFFIX + index);
+            checkpointStorageRemove(importCheckpointKey + FASTLINK_IMPORT_SHARD_SUFFIX + index);
           }
         }
         progress = { kind: "import", version: 2, savedAt: Date.now(), contentHash, rootId: String(rootId || "0"), total: filtered.length, done: {}, doneCount: 0, shardCount: 1 };
@@ -8190,12 +8332,12 @@
       // 每轮最多落 2 个脏分片（单片 2 万键，约 2-4MB），分片全部落盘后才更新主记录
       let flushed = 0;
       for (const index of progressDirtyShards) {
-        checkpointStorageSet(FASTLINK_IMPORT_CHECKPOINT_KEY + FASTLINK_IMPORT_SHARD_SUFFIX + index, { kind: "import-shard", version: 2, shard: index, keys: progressShards[index] });
+        checkpointStorageSet(importCheckpointKey + FASTLINK_IMPORT_SHARD_SUFFIX + index, { kind: "import-shard", version: 2, shard: index, keys: progressShards[index] });
         progressDirtyShards.delete(index);
         flushed += 1;
         if (flushed >= 2) return;
       }
-      checkpointStorageSet(FASTLINK_IMPORT_CHECKPOINT_KEY, progress);
+      checkpointStorageSet(importCheckpointKey, progress);
     };
     const markProgress = (file) => {
       if (!progress) return;
@@ -8341,15 +8483,15 @@
         // 收尾落盘：脏分片全部落完 + 更新主记录，失败/未命中续传不丢进度
         // （未命中条目没写 done 集合，只统计 failed 会把断点误清、丢掉同轮成功项的进度）
         for (const index of progressDirtyShards) {
-          checkpointStorageSet(FASTLINK_IMPORT_CHECKPOINT_KEY + FASTLINK_IMPORT_SHARD_SUFFIX + index, { kind: "import-shard", version: 2, shard: index, keys: progressShards[index] });
+          checkpointStorageSet(importCheckpointKey + FASTLINK_IMPORT_SHARD_SUFFIX + index, { kind: "import-shard", version: 2, shard: index, keys: progressShards[index] });
         }
         progressDirtyShards.clear();
         saveProgressNow();
       } else {
         // 全部成功：主记录与所有分片一并清除，重跑幂等
-        checkpointStorageRemove(FASTLINK_IMPORT_CHECKPOINT_KEY);
+        checkpointStorageRemove(importCheckpointKey);
         for (let index = 0; index < progressShards.length; index += 1) {
-          checkpointStorageRemove(FASTLINK_IMPORT_CHECKPOINT_KEY + FASTLINK_IMPORT_SHARD_SUFFIX + index);
+          checkpointStorageRemove(importCheckpointKey + FASTLINK_IMPORT_SHARD_SUFFIX + index);
         }
       }
     }
@@ -8742,8 +8884,9 @@
   function clearFastlinkScanCheckpoint() {
     checkpointStorageRemove(FASTLINK_SCAN_CHECKPOINT_KEY);
   }
-  function readFastlinkImportCheckpoint() {
-    const state = checkpointStorageGet(FASTLINK_IMPORT_CHECKPOINT_KEY);
+  function readFastlinkImportCheckpoint(suffix = "") {
+    const key = FASTLINK_IMPORT_CHECKPOINT_KEY + String(suffix || "");
+    const state = checkpointStorageGet(key);
     if (!state || state.kind !== "import" || !state.contentHash) return null;
     if (!Number(state.savedAt) || Date.now() - Number(state.savedAt) > FASTLINK_CHECKPOINT_TTL) return null;
     // v2：done 拆在分片键里（百万级 done 全量内联会让每次存档序列化几百 MB），按分片顺序合并恢复；
@@ -8753,7 +8896,7 @@
       state.done = {};
       const shardCount = Math.max(1, Number(state.shardCount) || 1);
       for (let index = 0; index < shardCount; index += 1) {
-        const shard = checkpointStorageGet(FASTLINK_IMPORT_CHECKPOINT_KEY + FASTLINK_IMPORT_SHARD_SUFFIX + index);
+        const shard = checkpointStorageGet(key + FASTLINK_IMPORT_SHARD_SUFFIX + index);
         const keys = shard && Array.isArray(shard.keys) ? shard.keys : [];
         shards.push(keys);
         for (const key of keys) state.done[key] = 1;
@@ -9323,7 +9466,9 @@
       }
       return importer.finish({ invalid: summary?.invalid || null });
     }
-    return resolveAndImportFastlink(api, input?.text, rootId, options);
+    const segments = splitFastlinkImportPayloads(input?.text);
+    if (segments.length <= 1) return resolveAndImportFastlink(api, input?.text, rootId, options);
+    return resolveAndImportFastlinkSegments(api, segments, rootId, options);
   }
   async function saveFastlinkFromCloudFile(api, item, rootId, options = {}) {
     if (!item || Number(item.type) === 1) throw new Error("\u8BF7\u5728\u6587\u4EF6\u5217\u8868\u52FE\u9009\u4E00\u4E2A\u79D2\u4F20\u6587\u4EF6\uFF08\u800C\u975E\u6587\u4EF6\u5939\uFF09");
@@ -9339,6 +9484,130 @@
       }
       throw error;
     }
+  }
+  // —— 多条秒传一次导入（粘贴多条链接 / 勾选多个秒传文件） ——
+  // 批量结果归并：把每条链接/每个文件的导入结果合成一个 batchResult 形状的对象；
+  // 整条失败（链接级错误）以伪明细行进结果页（可筛选、可导出 CSV），links 摘要供结果页逐条展示。
+  function mergeFastlinkBatchResults(results, links = []) {
+    const details = [];
+    const affected = /* @__PURE__ */ new Set();
+    let ok = 0;
+    let fail = 0;
+    let miss = 0;
+    let skipped = 0;
+    let invalid = 0;
+    let sanitized = 0;
+    const reasons = { ...EMPTY_FASTLINK_INVALID_REASONS };
+    const samples = [];
+    for (const result of results) {
+      if (!result) continue;
+      ok += Number(result.ok) || 0;
+      fail += Number(result.fail) || 0;
+      miss += Number(result.miss) || 0;
+      skipped += Number(result.skipped) || 0;
+      invalid += Number(result.invalid) || 0;
+      sanitized += Number(result.sanitized) || 0;
+      if (result.invalidReasons) for (const key of Object.keys(reasons)) reasons[key] += Number(result.invalidReasons[key]) || 0;
+      if (Array.isArray(result.invalidSamples)) for (const sample of result.invalidSamples) {
+        if (samples.length >= FASTLINK_IMPORT_RESULT_DETAILS_CAP) break;
+        samples.push(sample);
+      }
+      if (Array.isArray(result.details)) details.push(...result.details);
+      for (const dir of result.affectedDirIds || []) affected.add(String(dir));
+    }
+    for (const link of links) {
+      if (!link?.error) continue;
+      fail += 1;
+      details.push({ name: `${link.label || `第 ${link.index} 条`}：${link.name || "秒传内容"}`, status: "failed", message: String(link.error) });
+    }
+    return {
+      status: fail === 0 ? "success" : ok > 0 || links.some((link) => link && !link.error) ? "partial" : "failed",
+      ok,
+      fail,
+      miss,
+      total: details.length,
+      done: details.length,
+      skipped,
+      invalid,
+      sanitized,
+      invalidReasons: reasons,
+      invalidSamples: samples,
+      details,
+      affectedDirIds: [...affected],
+      links
+    };
+  }
+  // 段断点键：批量导入（多条粘贴 / 多个勾选文件）按段序各存各的，中断续跑不互相清档
+  // （单条导入不带后缀，仍是原键）。段数变少时回收残留的段键（内容变了哈希不符本就会自愈，这里只是清存储）。
+  var FASTLINK_SEGMENT_CHECKPOINT_SWEEP = 16;
+  function fastlinkSegmentCheckpointKey(index) {
+    return `${FASTLINK_IMPORT_CHECKPOINT_KEY}#seg${index}`;
+  }
+  function fastlinkSegmentCheckpointSuffix(index) {
+    return `#seg${index}`;
+  }
+  function clearFastlinkImportSegmentCheckpoint(index) {
+    const key = fastlinkSegmentCheckpointKey(index);
+    const state = checkpointStorageGet(key);
+    const shardCount = state && Number(state.shardCount) || 0;
+    checkpointStorageRemove(key);
+    for (let shard = 0; shard < shardCount; shard += 1) checkpointStorageRemove(key + FASTLINK_IMPORT_SHARD_SUFFIX + shard);
+  }
+  function sweepStaleFastlinkSegmentCheckpoints(count) {
+    const total = Number(count) || 0;
+    for (let index = total; index < total + FASTLINK_SEGMENT_CHECKPOINT_SWEEP; index += 1) {
+      clearFastlinkImportSegmentCheckpoint(index);
+    }
+  }
+  // 多段逐条导入：单段失败（非用户取消）记入摘要继续下一段，AbortError 照常上抛。
+  async function resolveAndImportFastlinkSegments(api, segments, rootId, options = {}) {
+    const list = (Array.isArray(segments) ? segments : []).map((segment) => String(segment || "").trim()).filter(Boolean);
+    if (!list.length) throw new Error("请粘贴秒传内容或选择秒传文件");
+    sweepStaleFastlinkSegmentCheckpoints(list.length);
+    const results = [];
+    const links = [];
+    for (let index = 0; index < list.length; index += 1) {
+      const segment = list[index];
+      const name = fastlinkSegmentPreview(segment);
+      const label = `第 ${index + 1} 条`;
+      options.onSegmentStart?.(index + 1, list.length, name);
+      try {
+        const result = await resolveAndImportFastlink(api, segment, rootId, { ...options, checkpointKeySuffix: fastlinkSegmentCheckpointSuffix(index) });
+        results.push(result);
+        links.push({ index: index + 1, label, name, ok: Number(result?.ok) || 0, fail: Number(result?.fail) || 0, miss: Number(result?.miss) || 0, error: "" });
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        results.push(null);
+        links.push({ index: index + 1, label, name, ok: 0, fail: 0, miss: 0, error: error?.message || String(error) });
+      }
+    }
+    return mergeFastlinkBatchResults(results, links);
+  }
+  // 云盘勾选的多个秒传文件逐个转存；单个文件保持原语义（错误直接上抛，任务失败页显示原因）。
+  // 多个文件各用各的段断点键：中途取消/失败时前一个文件已成功的进度不会被后一个清档，
+  // 重跑不会把已转好的条目再转一遍（123 的 duplicate 语义下会生成「名字 (1)」副本）。
+  async function saveFastlinkFromCloudFiles(api, items, rootId, options = {}) {
+    const list = (Array.isArray(items) ? items : [items]).filter(Boolean);
+    if (!list.length) throw new Error("请在文件列表勾选秒传文件（内容为链接或 JSON 的文本文件）");
+    if (list.length === 1) return saveFastlinkFromCloudFile(api, list[0], rootId, options);
+    sweepStaleFastlinkSegmentCheckpoints(list.length);
+    const results = [];
+    const links = [];
+    for (let index = 0; index < list.length; index += 1) {
+      const item = list[index];
+      const label = `第 ${index + 1} 个文件`;
+      options.onSegmentStart?.(index + 1, list.length, item.name);
+      try {
+        const result = await saveFastlinkFromCloudFile(api, item, rootId, { ...options, checkpointKeySuffix: fastlinkSegmentCheckpointSuffix(index) });
+        results.push(result);
+        links.push({ index: index + 1, label, name: String(item.name || ""), ok: Number(result?.ok) || 0, fail: Number(result?.fail) || 0, miss: Number(result?.miss) || 0, error: "" });
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        results.push(null);
+        links.push({ index: index + 1, label, name: String(item.name || ""), ok: 0, fail: 0, miss: 0, error: error?.message || String(error) });
+      }
+    }
+    return mergeFastlinkBatchResults(results, links);
   }
   async function saveFastlinkLinkFile(api, artifact, parentId, options = {}) {
     if (!artifact?.text && !artifact?.link) throw new Error("\u6CA1\u6709\u53EF\u4FDD\u5B58\u7684\u79D2\u4F20\u5185\u5BB9");
@@ -22920,6 +23189,17 @@ ${end.comment}` : end.comment;
     });
     return `\uFEFF\u9879\u76EE,\u72B6\u6001,\u8BF4\u660E,\u5927\u5C0F\n${rows.join("\n")}`;
   }
+  // 多条秒传一次导入的逐条摘要：每条链接/文件一行（名字 + 成败计数 + 失败原因），只在批量结果里出现
+  function fastlinkLinksTable(result2) {
+    const links = Array.isArray(result2?.links) ? result2.links : [];
+    if (links.length < 2) return "";
+    const rows = links.map((link) => {
+      const status = link?.error ? "failed" : link?.fail || link?.miss ? "partial" : "success";
+      const label = link?.error ? `\u5931\u8D25\uFF1A${link.error}` : [`${Number(link?.ok) || 0} \u6210\u529F`, Number(link?.miss) ? `${link.miss} \u672A\u547D\u4E2D` : "", Number(link?.fail) ? `${link.fail} \u5931\u8D25` : ""].filter(Boolean).join(" \u00B7 ");
+      return `<tr><td>${escapeHtml(`${link?.label || `\u7B2C ${Number(link?.index) || 0} \u6761`}\uFF1A${link?.name || "\u79D2\u4F20\u5185\u5BB9"}`)}</td><td class="${status === "failed" ? "danger" : status === "partial" ? "warning" : "success"}">${status === "failed" ? "\u5931\u8D25" : status === "partial" ? "\u90E8\u5206\u5B8C\u6210" : "\u6210\u529F"}</td><td>${escapeHtml(label)}</td></tr>`;
+    }).join("");
+    return `<div class="table-wrap"><table><thead><tr><th>\u79D2\u4F20\u5185\u5BB9\uFF08${links.length} \u6761\uFF09</th><th>\u72B6\u6001</th><th>\u8BF4\u660E</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }
   function resultTable(result2, page = 1, filter = "all") {
     const details = filterResultDetails(result2, filter);
     const pages = Math.max(1, Math.ceil(details.length / RESULT_PAGE_SIZE));
@@ -22932,7 +23212,7 @@ ${end.comment}` : end.comment;
     const bytesCount = Number(result2?.bytes) || 0;
     const totalDetails = Array.isArray(result2?.details) ? result2.details.length : 0;
     const toolbar = totalDetails ? `<div class="result-toolbar"><label class="field inline-field"><span>筛选</span><select id="result-filter" aria-label="明细筛选">${Object.entries(RESULT_FILTERS).map(([key, label]) => `<option value="${key}" ${key === filter ? "selected" : ""}>${label}</option>`).join("")}</select></label><button class="button compact" data-action="result-csv" data-filter="${escapeHtml(filter)}">${icon("download", 15)}\u4E0B\u8F7D\u660E\u7EC6 CSV</button></div>` : "";
-    return `${result2?.invalid || result2?.sanitized ? fastlinkInvalidNote(result2) : ""}<div class="result-summary"><div><span class="stat-icon success">${icon("check", 16)}</span><span>\u6210\u529F</span><strong>${Number(result2?.ok || 0)}</strong></div><div><span class="stat-icon danger">${icon("alert", 16)}</span><span>\u5931\u8D25</span><strong>${Number(result2?.fail || 0)}</strong></div>${missCount ? `<div><span class="stat-icon warning">${icon("alert", 16)}</span><span>\u672A\u547D\u4E2D</span><strong>${missCount}</strong></div>` : ""}${skippedCount ? `<div><span class="stat-icon" style="color:var(--c123-muted)">${icon("restart", 16)}</span><span>\u5DF2\u5BFC\u5165\u8DF3\u8FC7</span><strong>${skippedCount}</strong></div>` : ""}${bytesCount ? `<div><span class="stat-icon">${icon("archiveRestore", 16)}</span><span>\u5DF2\u8F6C\u5B58\u4F53\u79EF</span><strong>${escapeHtml(formatBytes(bytesCount))}</strong></div>` : ""}</div>${toolbar}<div class="table-wrap result-table"><table><thead><tr><th>\u9879\u76EE</th><th>\u72B6\u6001</th><th>\u8BF4\u660E</th><th>\u5927\u5C0F</th></tr></thead><tbody>${rows}</tbody></table></div>${result2?.detailsTruncated && totalDetails ? `<span class="footer-note">\u6837\u672C\u4EC5\u5C55\u793A\u524D ${totalDetails} \u6761\uFF0C\u5176\u4F59\u540C\u7C7B\u539F\u56E0\u4E0D\u518D\u9010\u6761\u5217\u51FA\u3002</span>` : ""}${pager}`;
+    return `${fastlinkLinksTable(result2)}${result2?.invalid || result2?.sanitized ? fastlinkInvalidNote(result2) : ""}<div class="result-summary"><div><span class="stat-icon success">${icon("check", 16)}</span><span>\u6210\u529F</span><strong>${Number(result2?.ok || 0)}</strong></div><div><span class="stat-icon danger">${icon("alert", 16)}</span><span>\u5931\u8D25</span><strong>${Number(result2?.fail || 0)}</strong></div>${missCount ? `<div><span class="stat-icon warning">${icon("alert", 16)}</span><span>\u672A\u547D\u4E2D</span><strong>${missCount}</strong></div>` : ""}${skippedCount ? `<div><span class="stat-icon" style="color:var(--c123-muted)">${icon("restart", 16)}</span><span>\u5DF2\u5BFC\u5165\u8DF3\u8FC7</span><strong>${skippedCount}</strong></div>` : ""}${bytesCount ? `<div><span class="stat-icon">${icon("archiveRestore", 16)}</span><span>\u5DF2\u8F6C\u5B58\u4F53\u79EF</span><strong>${escapeHtml(formatBytes(bytesCount))}</strong></div>` : ""}</div>${toolbar}<div class="table-wrap result-table"><table><thead><tr><th>\u9879\u76EE</th><th>\u72B6\u6001</th><th>\u8BF4\u660E</th><th>\u5927\u5C0F</th></tr></thead><tbody>${rows}</tbody></table></div>${result2?.detailsTruncated && totalDetails ? `<span class="footer-note">\u6837\u672C\u4EC5\u5C55\u793A\u524D ${totalDetails} \u6761\uFF0C\u5176\u4F59\u540C\u7C7B\u539F\u56E0\u4E0D\u518D\u9010\u6761\u5217\u51FA\u3002</span>` : ""}${pager}`;
   }
   // src/ui/views/actions.js
   function statusLabel(status) {
@@ -22976,7 +23256,7 @@ ${end.comment}` : end.comment;
     const artifactCards = state.artifacts.slice(0, 30);
     const generatedLinks = state.artifacts.length ? `<div class="fastlink-results">${artifactCards.map((artifact, index) => `<section class="fastlink-result-card"><div><strong>${escapeHtml(artifact.item?.name || artifact.filename || `第 ${index + 1} 份`)}</strong><span>${artifact.fileCount} 个文件</span></div><textarea readonly aria-label="${escapeHtml(artifact.item?.name || artifact.filename || `第 ${index + 1} 份`)} 秒传链接">${escapeHtml(artifact.link || "")}</textarea><button class="button" data-action="fastlink-copy-link" data-index="${index}">${icon("copy", 15)}复制链接</button></section>`).join("")}</div>${state.artifacts.length > artifactCards.length ? `<span class="footer-note">链接仅回显前 ${artifactCards.length} 份（共 ${state.artifacts.length} 份），其余文件已下载到本地，不逐条塞进页面。</span>` : ""}` : "";
     const exportPane = state.items.length ? `${notice("\u6BCF\u4E2A\u9876\u5C42\u9879\u76EE\u4F1A\u5206\u522B\u751F\u6210\u9879\u76EE\u683C\u5F0F\u7684 JSON \u4E0E 123FLCPV2 \u94FE\u63A5\uFF0C\u5BFC\u51FA\u4E0D\u4F1A\u4FEE\u6539\u6E90\u6587\u4EF6\u3002\u70B9\u300C\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\uFF08\u77ED\u94FE\uFF09\u300D\u6210\u529F\u540E\u4F1A\u81EA\u52A8\u628A\u77ED\u94FE\u63A8\u9001\u5230\u5BA2\u6237\u7AEF\u751F\u6210\u6295\u7A3F\u8349\u7A3F\u3002", "", "download")}<div class="table-wrap"><table><thead><tr><th>\u9876\u5C42\u9879\u76EE</th><th>\u8303\u56F4</th></tr></thead><tbody>${exportRows}</tbody></table></div><div class="button-row"><button class="button" data-action="fastlink-secondary-generate">${icon("link", 15)}\u751F\u6210\u4E8C\u7EA7\u94FE\u63A5\uFF08\u77ED\u94FE\uFF09</button><button class="button" data-action="fastlink-secondary-save-link">${icon("download", 15)}\u628A\u5DF2\u751F\u6210\u94FE\u63A5\u4FDD\u5B58\u5230\u4E91\u76D8</button></div>${state.artifacts.length ? `${notice(`\u5DF2\u5BFC\u51FA ${state.artifacts.length} \u4E2A\u79D2\u4F20\u6587\u4EF6\uFF0C\u5171\u5305\u542B ${state.fileCount} \u4E2A\u4E91\u76D8\u6587\u4EF6\u3002`, "success", "check")}${generatedLinks}` : ""}` : notice("\u5BFC\u51FA\u9700\u8981\u5148\u5728\u6587\u4EF6\u5217\u8868\u9009\u62E9\u4E00\u4E2A\u6216\u591A\u4E2A\u6587\u4EF6\u3001\u6587\u4EF6\u5939\u3002", "warning", "alert");
-    const importPane = `${notice("\u652F\u6301 123FastLink JSON\u3001V1/V2 \u79D2\u4F20\u6587\u672C\u3001.123share \u4E0E\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE\uFF08\u81EA\u52A8\u8BC6\u522B\uFF09\uFF1B\u6587\u4EF6\u4F1A\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55\u5E76\u4FDD\u7559\u539F\u76EE\u5F55\u7ED3\u6784\u3002", "", "import")}<div class="button-row"><button class="button" data-action="fastlink-secondary-from-file">${icon("folderOpen", 15)}\u4ECE\u52FE\u9009\u7684\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58</button><button class="button" data-action="fastlink-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u672C\u5730\u79D2\u4F20\u6587\u4EF6</button></div><span class="footer-note">${state.importFile ? `\u5DF2\u9009\u62E9\uFF1A${escapeHtml(state.importFileName || "")}\uFF08${formatBytes(state.importFileSize)}\uFF09\u00B7 \u70B9\u300C\u5F00\u59CB\u8F6C\u5B58\u300D\u65F6\u6D41\u5F0F\u8BFB\u53D6\uFF0C\u4E0D\u6574\u8BFB\u8FDB\u5185\u5B58` : escapeHtml(state.importFileName || "\u672A\u9009\u62E9\u672C\u5730\u6587\u4EF6")}</span>${state.importFile ? `<button class="button compact" data-action="fastlink-import-file-clear">\u6E05\u9664\u6587\u4EF6</button>` : ""}<input id="fastlink-file" type="file" accept=".json,.txt,.123fastlink,.123share,application/json,text/plain" hidden>${state.input && state.input.length > 2000000 ? `<span class="footer-note">\u7C98\u8D34\u5185\u5BB9\u8F83\u5927\uFF08${formatBytes(stringByteSize(state.input))}\uFF09\uFF0C\u5DF2\u4FDD\u7559\u4F46\u4E0D\u56DE\u663E\uFF0C\u53EF\u76F4\u63A5\u5F00\u59CB\u8F6C\u5B58</span>` : ""}<div class="editor-surface"><textarea id="fastlink-input" placeholder="\u7C98\u8D34\u79D2\u4F20 JSON\u3001\u94FE\u63A5\u3001.123share \u6216\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE">${state.input && state.input.length > 2000000 ? "" : escapeHtml(state.input || "")}</textarea></div>`;
+    const importPane = `${notice("\u652F\u6301 123FastLink JSON\u3001V1/V2 \u79D2\u4F20\u6587\u672C\u3001.123share \u4E0E\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE\uFF08\u81EA\u52A8\u8BC6\u522B\uFF09\uFF1B\u53EF\u4E00\u6B21\u7C98\u8D34\u591A\u6761\uFF0C\u4E00\u884C\u4E00\u6761\u9010\u6761\u5BFC\u5165\uFF1B\u6587\u4EF6\u4F1A\u5BFC\u5165\u5230\u5F53\u524D\u76EE\u5F55\u5E76\u4FDD\u7559\u539F\u76EE\u5F55\u7ED3\u6784\u3002", "", "import")}<div class="button-row"><button class="button" data-action="fastlink-secondary-from-file">${icon("folderOpen", 15)}\u4ECE\u52FE\u9009\u7684\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58\uFF08\u53EF\u591A\u9009\uFF09</button><button class="button" data-action="fastlink-file-open">${icon("folderOpen", 15)}\u9009\u62E9\u672C\u5730\u79D2\u4F20\u6587\u4EF6</button></div><span class="footer-note">${state.importFile ? `\u5DF2\u9009\u62E9\uFF1A${escapeHtml(state.importFileName || "")}\uFF08${formatBytes(state.importFileSize)}\uFF09\u00B7 \u70B9\u300C\u5F00\u59CB\u8F6C\u5B58\u300D\u65F6\u6D41\u5F0F\u8BFB\u53D6\uFF0C\u4E0D\u6574\u8BFB\u8FDB\u5185\u5B58` : escapeHtml(state.importFileName || "\u672A\u9009\u62E9\u672C\u5730\u6587\u4EF6")}</span>${state.importFile ? `<button class="button compact" data-action="fastlink-import-file-clear">\u6E05\u9664\u6587\u4EF6</button>` : ""}<input id="fastlink-file" type="file" accept=".json,.txt,.123fastlink,.123share,application/json,text/plain" hidden>${state.input && state.input.length > 2000000 ? `<span class="footer-note">\u7C98\u8D34\u5185\u5BB9\u8F83\u5927\uFF08${formatBytes(stringByteSize(state.input))}\uFF09\uFF0C\u5DF2\u4FDD\u7559\u4F46\u4E0D\u56DE\u663E\uFF0C\u53EF\u76F4\u63A5\u5F00\u59CB\u8F6C\u5B58</span>` : ""}<div class="editor-surface"><textarea id="fastlink-input" placeholder="\u7C98\u8D34\u79D2\u4F20 JSON\u3001\u94FE\u63A5\u3001.123share \u6216\u4E8C\u7EA7\u79D2\u4F20\u77ED\u94FE\uFF1B\u591A\u6761\u65F6\u4E00\u884C\u4E00\u6761">${state.input && state.input.length > 2000000 ? "" : escapeHtml(state.input || "")}</textarea></div>`;
     const publicPane = `${notice("\u8F93\u5165 123 \u4E91\u76D8\u5206\u4EAB\u94FE\u63A5\uFF0C\u9012\u5F52\u8BFB\u53D6\u5176\u4E2D\u7684\u6587\u4EF6\u5E76\u4E0B\u8F7D\u53EF\u76F4\u63A5\u8F6C\u5B58\u7684\u6807\u51C6 JSON\uFF1B\u540C\u65F6\u4FDD\u7559 123FLCPV2 \u94FE\u63A5\u4F9B\u590D\u5236\u3002", "", "share")}<label class="field"><span>\u5206\u4EAB\u94FE\u63A5 / Key</span><input id="fastlink-public-input" value="${escapeHtml(state.publicInput || "")}" placeholder="\u652F\u6301 www.123865.com/s/... \u4E0E share.123pan.cn/123pan/..."></label><label class="field"><span>\u63D0\u53D6\u7801\uFF08\u53EF\u9009\uFF0C\u94FE\u63A5\u5DF2\u5305\u542B\u65F6\u65E0\u9700\u586B\u5199\uFF09</span><input id="fastlink-public-password" value="${escapeHtml(state.publicPassword || "")}"></label>`;
     const batchPane = `${notice("\u6BCF\u884C\u4E00\u4E2A\u5206\u4EAB\u94FE\u63A5\u3001Key \u6216\u5E26\u63D0\u53D6\u7801\u7684\u6587\u672C\uFF1B\u6BCF\u4E2A\u5206\u4EAB\u4F1A\u72EC\u7ACB\u4E0B\u8F7D\u4E00\u4E2A\u6807\u51C6 JSON\u3002", "", "share")}<div class="editor-surface"><textarea id="fastlink-public-batch" placeholder="https://www.123865.com/s/xxxx?pwd=ABCD&#10;xxxx \u63D0\u53D6\u7801:ABCD">${escapeHtml(state.publicBatch || "")}</textarea></div>`;
     const splitPane = `${notice("\u652F\u6301\u9879\u76EE JSON\u3001123FLCPV2 \u94FE\u63A5\u548C\u65E7\u7248 V1/V2 \u6587\u672C\u3002\u6309\u76EE\u5F55\u5C42\u7EA7\u4F1A\u4E3A\u6BCF\u4E2A\u76EE\u5F55\u7EC4\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\uFF0C\u6309\u6570\u91CF\u4F1A\u6309\u6761\u76EE\u5207\u5206\uFF0C\u6309\u5B63\u96C6/\u5267\u540D\u4F1A\u4E3A\u6BCF\u90E8\u4F5C\u54C1\uFF08\u5267\u540D+\u5B63\uFF09\u751F\u6210\u4E00\u4E2A\u6587\u4EF6\u3002", "", "download")}<div class="button-row"><button class="button" data-action="fastlink-split-file-open">${icon("folderOpen", 15)}\u9009\u62E9 JSON</button><span>${escapeHtml(state.splitFileName || "\u4E5F\u53EF\u4EE5\u76F4\u63A5\u7C98\u8D34")}</span><input id="fastlink-split-file" type="file" accept=".json,.txt,.123fastlink" hidden></div><div class="editor-surface"><textarea id="fastlink-split-input" placeholder="\u7C98\u8D34 JSON \u6216\u79D2\u4F20\u94FE\u63A5">${state.splitInput && state.splitInput.length > 2000000 ? "" : escapeHtml(state.splitInput || "")}</textarea></div>${state.splitInput && state.splitInput.length > 2000000 ? `<span class="footer-note">\u7C98\u8D34\u5185\u5BB9\u8F83\u5927\uFF08${formatBytes(stringByteSize(state.splitInput))}\uFF09\uFF0C\u5DF2\u4FDD\u7559\u4F46\u4E0D\u56DE\u663E\uFF0C\u53EF\u76F4\u63A5\u5F00\u59CB\u62C6\u5206</span>` : ""}<div class="inline-fields"><label class="field"><span>\u62C6\u5206\u65B9\u5F0F</span><select id="fastlink-split-method"><option value="folder" ${state.splitMethod === "folder" ? "selected" : ""}>\u6309\u76EE\u5F55\u5C42\u7EA7</option><option value="count" ${state.splitMethod === "count" ? "selected" : ""}>\u6309\u6587\u4EF6\u6570\u91CF</option><option value="work" ${state.splitMethod === "work" ? "selected" : ""}>\u6309\u5B63\u96C6/\u5267\u540D</option></select></label>${state.splitMethod === "work" ? "" : `<label class="field"><span>${state.splitMethod === "count" ? "\u6BCF\u4EFD\u6587\u4EF6\u6570" : "\u76EE\u5F55\u5C42\u6570"}</span><input id="fastlink-split-amount" type="number" min="1" value="${Math.max(1, Number(state.splitAmount) || 1)}"></label>`}</div>`;
@@ -24848,9 +25128,10 @@ ${end.comment}` : end.comment;
       this.toolbar.hidden = !this.selection.hasSelection && !pinnedVisible;
       this.toolbar.dataset.hasSelection = this.selection.hasSelection ? "true" : "false";
       let seedReady = false;
-      if (this.selection.hasSelection && !this.selection.selectAll && this.selection.selectedIds.size === 1) {
+      if (this.selection.hasSelection && !this.selection.selectAll && this.selection.selectedIds.size >= 1) {
         const records = readTableSelectionRecords();
-        seedReady = Array.isArray(records) && records.length === 1 && Number(records[0].type ?? records[0].Type ?? 0) !== 1 && isSeedLikeName(records[0].name || records[0].FileName || "");
+        // 多选也支持：勾选的全部都是秒传种子文件（.123fastlink.json / .txt）即整批一起转存
+        seedReady = Array.isArray(records) && records.length === this.selection.selectedIds.size && records.length >= 1 && records.every((record) => Number(record.type ?? record.Type ?? 0) !== 1 && isSeedLikeName(record.name || record.FileName || ""));
       }
       const seedButton = this.toolbar.querySelector('[data-command="fastlinkImport"]');
       for (const button of this.toolbar.querySelectorAll("[data-requires-selection]")) {
@@ -24862,15 +25143,15 @@ ${end.comment}` : end.comment;
         if (button !== seedButton) button.hidden = !this.selection.hasSelection;
       }
       if (seedButton) {
-        // 只在校验通过时（恰好勾选了 1 个秒传种子文件 .123fastlink.json / .txt）
-        // 才显示「转存秒传」按钮；选中文件夹、普通文件、多选或未选中时直接隐藏。
+        // 只在校验通过时（勾选了 1 个或多个秒传种子文件 .123fastlink.json / .txt）
+        // 才显示「转存秒传」按钮；选中文件夹、掺了普通文件或未选中时直接隐藏。
         // 这样避免出现"置灰却点不出提示"的迷惑交互。
         seedButton.hidden = !seedReady;
         seedButton.disabled = !seedReady;
         seedButton.setAttribute("aria-disabled", seedReady ? "false" : "true");
         seedButton.dataset.seedReady = seedReady ? "true" : "false";
         seedButton.style.opacity = "";
-        seedButton.title = "\u8F6C\u5B58\u9009\u4E2D\u7684\u79D2\u4F20\u6587\u4EF6\uFF08\u652F\u6301\u666E\u901A\u4E0E\u4E8C\u7EA7\u79D2\u4F20\uFF09";
+        seedButton.title = "\u8F6C\u5B58\u9009\u4E2D\u7684\u79D2\u4F20\u6587\u4EF6\uFF08\u652F\u6301\u666E\u901A\u4E0E\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u53EF\u591A\u9009\uFF09";
       }
     }
     toast(message, type = "") {
@@ -24895,9 +25176,9 @@ ${end.comment}` : end.comment;
       if (autoShare) this.shareSubmissionRunning = true;
       if (command === "fastlinkImport") {
         const records = readTableSelectionRecords();
-        const seedPicked = this.selection.hasSelection && !this.selection.selectAll && this.selection.selectedIds.size === 1 && Array.isArray(records) && records.length === 1 && Number(records[0].type ?? records[0].Type ?? 0) !== 1 && isSeedLikeName(records[0].name || records[0].FileName || "");
+        const seedPicked = this.selection.hasSelection && !this.selection.selectAll && this.selection.selectedIds.size >= 1 && Array.isArray(records) && records.length === this.selection.selectedIds.size && records.every((record) => Number(record.type ?? record.Type ?? 0) !== 1 && isSeedLikeName(record.name || record.FileName || ""));
         if (!seedPicked) {
-          this.toast("\u300C\u8F6C\u5B58\u79D2\u4F20\u300D\u4EC5\u652F\u6301\u52FE\u9009 1 \u4E2A\u79D2\u4F20\u79CD\u5B50\u6587\u4EF6\uFF08.123fastlink.json / .txt\uFF09", "warning");
+          this.toast("\u300C\u8F6C\u5B58\u79D2\u4F20\u300D\u4EC5\u652F\u6301\u52FE\u9009\u79D2\u4F20\u79CD\u5B50\u6587\u4EF6\uFF08.123fastlink.json / .txt\uFF0C\u53EF\u591A\u9009\uFF09", "warning");
           return;
         }
       }
@@ -25801,7 +26082,9 @@ ${end.comment}` : end.comment;
     async openFastlink(items, currentDir, options = {}) {
       const singleFile = items.length === 1 && Number(items[0].type) !== 1;
       const autoImport = options.autoImport === true;
-      const openOnSecondary = autoImport || singleFile && isSeedLikeName(items[0].name);
+      // 工具栏「转存秒传」：勾选的全部是种子文件（可多个）时打开面板即自动转存
+      const allSeeds = items.length >= 1 && items.every((item) => Number(item.type) !== 1 && isSeedLikeName(item.name));
+      const openOnSecondary = (autoImport && allSeeds) || singleFile && isSeedLikeName(items[0].name);
       this.fastlink = {
         items: items.map((item) => ({ ...item })),
         currentDir: String(currentDir || "0"),
@@ -25830,7 +26113,7 @@ ${end.comment}` : end.comment;
       this.syncFastlinkCheckpointSummary();
       this.state.view = "fastlink";
       this.render();
-      if (singleFile && (autoImport || isSeedLikeName(items[0].name))) {
+      if ((autoImport && allSeeds) || singleFile && isSeedLikeName(items[0].name)) {
         try {
           await this.restoreFastlinkFromCloudFile();
         } catch (error) {
@@ -25973,6 +26256,7 @@ ${end.comment}` : end.comment;
     async runRestoreFastlink(snapshot) {
       const file = snapshot.file || null;
       const inputText = snapshot.inputText || "";
+      let segmentLabel = "";
       const outcome = await this.runFastlinkTask("import", async (signal) => {
         this.setProgress(0, 1, file ? `流式读取：${file.name}` : "解析秒传内容");
         return resolveAndImportFastlinkInput(this.api, file ? { file } : { text: inputText }, snapshot.targetDir || "0", {
@@ -25982,7 +26266,12 @@ ${end.comment}` : end.comment;
           importProgress: true,
           ...this.fastlinkTransferOptions(),
           onDetail: (event) => this.fastlinkDetail(event),
-          onProgress: (done, total, name) => this.setProgress(done, total, name ? `\u5BFC\u5165\u79D2\u4F20\uFF1A${truncateMiddle(name, 40)}` : "\u5BFC\u5165\u79D2\u4F20")
+          onSegmentStart: (index, count, name) => {
+            segmentLabel = count > 1 ? `第 ${index}/${count} 条 ` : "";
+            this.setProgress(0, 1, `${segmentLabel}导入秒传`);
+            this.ledger?.note?.(`${segmentLabel}${name ? truncateMiddle(name, 60) : "开始导入"}`);
+          },
+          onProgress: (done, total, name) => this.setProgress(done, total, `${segmentLabel}${name ? `导入秒传：${truncateMiddle(name, 40)}` : "导入秒传"}`)
         });
       });
       if (outcome.error) return;
@@ -25993,6 +26282,8 @@ ${end.comment}` : end.comment;
         if (Number(result2?.sanitized) > 0) parts.push(`${result2.sanitized} \u6761\u8DEF\u5F84\u5DF2\u81EA\u52A8\u6E05\u7406\u540E\u5BFC\u5165`);
         this.toast(`\u5171 ${parts.join("\uFF0C")}\uFF0C\u8BE6\u89C1\u5BFC\u5165\u7ED3\u679C`, "info");
       }
+      const failedSegments = Array.isArray(result2?.links) ? result2.links.filter((link) => link?.error).length : 0;
+      if (failedSegments) this.toast(`${failedSegments} \u6761\u79D2\u4F20\u5185\u5BB9\u5BFC\u5165\u5931\u8D25\uFF0C\u8BE6\u89C1\u5BFC\u5165\u7ED3\u679C`, "warning");
       this.bridge.refresh();
       if (this.completeFastlinkTask(outcome.task, result2)) return;
       this.setResult("\u79D2\u4F20\u5BFC\u5165\u7ED3\u679C", result2);
@@ -26212,21 +26503,28 @@ ${end.comment}` : end.comment;
     async restoreFastlinkFromCloudFile() {
       const snapshot = frozenSelection(this.bridge.readSelection());
       const items = await this.bridge.selectedItems(void 0, snapshot);
-      if (items.length !== 1) throw new Error("\u8BF7\u5728\u6587\u4EF6\u5217\u8868\u52FE\u9009 1 \u4E2A\u79D2\u4F20\u6587\u4EF6\uFF08\u5185\u5BB9\u4E3A\u94FE\u63A5\u6216 JSON \u7684\u6587\u672C\u6587\u4EF6\uFF09");
-      const item = items[0];
-      if (Number(item.type) === 1) throw new Error("\u8BF7\u52FE\u9009\u6587\u4EF6\u800C\u4E0D\u662F\u6587\u4EF6\u5939");
-      return this.queueFastlinkTask("\u8F6C\u5B58\u79D2\u4F20\u6587\u4EF6", () => this.runRestoreFastlinkFromCloudFile(item, this.fastlink.currentDir));
+      const files = items.filter((item) => Number(item.type) !== 1);
+      if (!files.length) throw new Error("\u8BF7\u5728\u6587\u4EF6\u5217\u8868\u52FE\u9009\u79D2\u4F20\u6587\u4EF6\uFF08\u5185\u5BB9\u4E3A\u94FE\u63A5\u6216 JSON \u7684\u6587\u672C\u6587\u4EF6\uFF0C\u53EF\u591A\u9009\uFF09");
+      return this.queueFastlinkTask("\u8F6C\u5B58\u79D2\u4F20\u6587\u4EF6", () => this.runRestoreFastlinkFromCloudFile(files, this.fastlink.currentDir));
     }
-    async runRestoreFastlinkFromCloudFile(item, targetDir = "0") {
+    async runRestoreFastlinkFromCloudFile(items, targetDir = "0") {
+      const itemList = Array.isArray(items) ? items : [items];
+      const single = itemList.length === 1 ? itemList[0] : null;
+      let segmentLabel = "";
       const outcome = await this.runFastlinkTask("cloudImport", async (signal) => {
-        this.setProgress(0, 1, `\u8BFB\u53D6\u6587\u4EF6\u5185\u5BB9\uFF1A${item.name}`);
-        return saveFastlinkFromCloudFile(this.api, item, targetDir || "0", {
+        this.setProgress(0, 1, single ? `\u8BFB\u53D6\u6587\u4EF6\u5185\u5BB9\uFF1A${single.name}` : `\u9010\u4E2A\u8F6C\u5B58 ${itemList.length} \u4E2A\u79D2\u4F20\u6587\u4EF6`);
+        return saveFastlinkFromCloudFiles(this.api, itemList, targetDir || "0", {
           signal,
           concurrency: this.config.requests.writeConcurrency,
           importProgress: true,
           ...this.fastlinkTransferOptions(),
           onDetail: (event) => this.fastlinkDetail(event),
-          onProgress: (done, total, name) => this.setProgress(done, total, name ? truncateMiddle(name, 40) : "\u8F6C\u5B58\u79D2\u4F20\u6587\u4EF6")
+          onSegmentStart: (index, count, name) => {
+            segmentLabel = count > 1 ? `第 ${index}/${count} 条 ` : "";
+            this.setProgress(0, 1, `${segmentLabel}读取 ${name || "秒传文件"}`);
+            this.ledger?.note?.(`${segmentLabel}${name ? truncateMiddle(name, 60) : "开始转存"}`);
+          },
+          onProgress: (done, total, name) => this.setProgress(done, total, `${segmentLabel}${name ? truncateMiddle(name, 40) : "转存秒传文件"}`)
         });
       });
       if (outcome.error) return;
@@ -26237,6 +26535,8 @@ ${end.comment}` : end.comment;
         if (Number(result2?.sanitized) > 0) parts.push(`${result2.sanitized} \u6761\u8DEF\u5F84\u5DF2\u81EA\u52A8\u6E05\u7406\u540E\u5BFC\u5165`);
         this.toast(`\u5171 ${parts.join("\uFF0C")}\uFF0C\u8BE6\u89C1\u5BFC\u5165\u7ED3\u679C`, "info");
       }
+      const failedSegments = Array.isArray(result2?.links) ? result2.links.filter((link) => link?.error).length : 0;
+      if (failedSegments) this.toast(`${failedSegments} \u4E2A\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58\u5931\u8D25\uFF0C\u8BE6\u89C1\u8F6C\u5B58\u7ED3\u679C`, "warning");
       this.bridge.refresh();
       if (this.completeFastlinkTask(outcome.task, result2)) return;
       this.setResult("\u79D2\u4F20\u6587\u4EF6\u8F6C\u5B58\u7ED3\u679C", result2);

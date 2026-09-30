@@ -30,23 +30,33 @@ globalThis.__fastlink = {
   md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag,
   buildFastlinkText, buildFastlinkJson, parseFastlink,
   generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile,
-  resolveAndImportFastlink, isSeedLikeName,
+  resolveAndImportFastlink, resolveAndImportFastlinkInput, resolveAndImportFastlinkSegments,
+  saveFastlinkFromCloudFiles, mergeFastlinkBatchResults,
+  splitFastlinkImportPayloads, fastlinkSegmentPreview,
+  readFastlinkImportCheckpoint, FASTLINK_IMPORT_CHECKPOINT_KEY,
+  isSeedLikeName,
   buildFastlinkSubmissionContext, buildFastlinkSubmissionMeta,
   createFastlinkScanCheckpoint,
   normalizeSeedFolderId, readTableSelectionRecords
 };
 `;
+const checkpointStore = new Map();
 const sandbox = {
   console, Date, Math, JSON, Number, String, Array, Object, Set, Map, WeakSet, WeakMap,
   RegExp, Intl, Symbol, Error, DOMException, Promise, TextEncoder, TextDecoder, BigInt,
-  Uint8Array, ArrayBuffer, structuredClone, setTimeout, clearTimeout, AbortController, fetch
+  Uint8Array, ArrayBuffer, structuredClone, setTimeout, clearTimeout, AbortController, fetch,
+  localStorage: {
+    getItem: (key) => (checkpointStore.has(key) ? checkpointStore.get(key) : null),
+    setItem: (key, value) => checkpointStore.set(key, String(value)),
+    removeItem: (key) => checkpointStore.delete(key)
+  }
 };
 sandbox.globalThis = sandbox;
 sandbox.window = {};
 sandbox.document = { querySelectorAll: () => [], getElementById: () => null };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag, buildFastlinkText, buildFastlinkJson, parseFastlink, generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile, resolveAndImportFastlink, isSeedLikeName, buildFastlinkSubmissionContext, buildFastlinkSubmissionMeta, createFastlinkScanCheckpoint, normalizeSeedFolderId, readTableSelectionRecords } = sandbox.__fastlink;
+const { md5Hex, stringByteSize, hexToBase62, base62ToHex, validEtag, buildFastlinkText, buildFastlinkJson, parseFastlink, generateSecondaryFastlink, saveSecondaryFastlink, saveFastlinkFromCloudFile, resolveAndImportFastlink, resolveAndImportFastlinkInput, resolveAndImportFastlinkSegments, saveFastlinkFromCloudFiles, mergeFastlinkBatchResults, splitFastlinkImportPayloads, fastlinkSegmentPreview, readFastlinkImportCheckpoint, FASTLINK_IMPORT_CHECKPOINT_KEY, isSeedLikeName, buildFastlinkSubmissionContext, buildFastlinkSubmissionMeta, createFastlinkScanCheckpoint, normalizeSeedFolderId, readTableSelectionRecords } = sandbox.__fastlink;
 
 const cases = [];
 const test = (name, fn) => cases.push([name, fn]);
@@ -437,6 +447,331 @@ test("二级链接成功要清扫描断点，上传种子失败保留断点可�
   const failCheckpoint = createFastlinkScanCheckpoint(items, {});
   await assert.rejects(() => generateSecondaryFastlink(apiFor(true), items, { useJson: true, seedFolderId: "9", checkpoint: failCheckpoint }));
   assert.ok(failCheckpoint.state, "种子上传失败要保留断点供续扫");
+});
+
+// ---------- 多条秒传一次导入（1.4.4） ----------
+const seedLinkFor = (name, content) => `123FLCPV2$%${hexToBase62(md5(content))}#${Buffer.byteLength(content, "utf8")}#${name}`;
+const episodeJsonFor = (title, fileName, etagSeed) => buildFastlinkJson([{ name: fileName, etag: md5(etagSeed), size: 5, path: `${title}/${fileName}` }]);
+
+test("切分：多条二级链接一行一条切成多段，每段可独立解析", () => {
+  const c1 = episodeJsonFor("剧A", "A01.mp4", "a1");
+  const c2 = episodeJsonFor("剧B", "B01.mp4", "b1");
+  const c3 = episodeJsonFor("剧C", "C01.mp4", "c1");
+  const l1 = seedLinkFor("剧A.123fastlink.json", c1);
+  const l2 = seedLinkFor("剧B.123fastlink.json", c2);
+  const l3 = seedLinkFor("剧C.123fastlink.json", c3);
+  const segments = splitFastlinkImportPayloads(`${l1}\n${l2}\n${l3}`);
+  assert.equal(segments.length, 3);
+  assert.equal(parseFastlink(segments[0]).files[0].fileName, "剧A.123fastlink.json");
+  assert.equal(parseFastlink(segments[1]).files[0].fileName, "剧B.123fastlink.json");
+  assert.equal(parseFastlink(segments[2]).files[0].fileName, "剧C.123fastlink.json");
+});
+
+test("切分：单条内容内部换行分条不会被切开（旧语义保留）", () => {
+  const built = buildFastlinkText([
+    { name: "第01集.mp4", etag: md5("e1"), size: 5, path: "剧/第01集.mp4" },
+    { name: "第02集.mp4", etag: md5("e2"), size: 6, path: "剧/第02集.mp4" }
+  ]);
+  // 记录分隔符 $ 换成换行：一条链接内部本来就允许换行分条
+  const separator = built.indexOf("%");
+  const multiline = built.slice(0, separator + 1) + built.slice(separator + 1).split("$").join("\n");
+  const segments = splitFastlinkImportPayloads(multiline);
+  assert.equal(segments.length, 1, "单条多记录内容应保持一段");
+  assert.equal(parseFastlink(segments[0]).files.length, 2, "换行分条记录照常解析");
+  assert.equal(segments[0], multiline.trim());
+});
+
+test("切分：JSON 对象跨行聚合成段，两个 JSON 切成两段，截断 JSON 归一段", () => {
+  const j1 = JSON.stringify({ name: "剧A", commonPath: "剧A/", files: [{ path: "1.mp4", etag: md5("a1"), size: 1 }] }, null, 2);
+  const j2 = JSON.stringify({ name: "剧B", commonPath: "剧B/", files: [{ path: "2.mp4", etag: md5("b1"), size: 1 }] }, null, 2);
+  const segments = splitFastlinkImportPayloads(`${j1}\n${j2}`);
+  assert.equal(segments.length, 2);
+  assert.equal(JSON.parse(segments[0]).name, "剧A");
+  assert.equal(JSON.parse(segments[1]).name, "剧B");
+  const truncated = splitFastlinkImportPayloads(j1.slice(0, 40));
+  assert.equal(truncated.length, 1, "截断 JSON 不抛错，整段交由解析层报原文错误");
+  const mixed = splitFastlinkImportPayloads(`${j1}\n\n${seedLinkFor("剧B.123fastlink.json", j2)}`);
+  assert.equal(mixed.length, 2, "JSON 与二级链接混排各成一段，空行跳过");
+});
+
+test("切分：行首空白的前缀也断段；纯文本/空输入返回单段或空数组", () => {
+  const l1 = seedLinkFor("剧A.123fastlink.json", episodeJsonFor("剧A", "A01.mp4", "a1"));
+  const l2 = seedLinkFor("剧B.123fastlink.json", episodeJsonFor("剧B", "B01.mp4", "b1"));
+  const segments = splitFastlinkImportPayloads(`  ${l1}\n\n\t${l2}`);
+  assert.equal(segments.length, 2, "行首空白缩进的前缀同样断段");
+  assert.equal(splitFastlinkImportPayloads("随便什么文本\n第二行").length, 1);
+  // 沙箱里创建的数组原型与宿主不同，deepEqual 会误判，按长度比
+  assert.equal(splitFastlinkImportPayloads("   ").length, 0, "空白输入返回空数组（入口照旧报「请粘贴秒传内容」）");
+});
+
+test("fastlinkSegmentPreview：二级链接取种子名，JSON 取 name 字段，纯文本取首行", () => {
+  assert.equal(fastlinkSegmentPreview(seedLinkFor("剧A.123fastlink.json", "{}")), "剧A.123fastlink.json");
+  assert.equal(fastlinkSegmentPreview(JSON.stringify({ name: "剧B", files: [] })), "剧B");
+  assert.equal(fastlinkSegmentPreview("第一行内容\n第二行"), "第一行内容");
+});
+
+test("批量导入端到端：两条二级链接逐条转存并汇总，进度回调带段序", async () => {
+  const contentA = episodeJsonFor("剧A", "A01.mp4", "a1");
+  const contentB = episodeJsonFor("剧B", "B01.mp4", "b1");
+  const state = {
+    uploadSeq: 0,
+    uploads: [],
+    tree: {},
+    info: {},
+    cloud: {
+      [`${md5(contentA)}:${Buffer.byteLength(contentA, "utf8")}:剧A.123fastlink.json`]: "9001",
+      [`${md5(contentB)}:${Buffer.byteLength(contentB, "utf8")}:剧B.123fastlink.json`]: "9002"
+    },
+    filesById: { 9001: { name: "剧A.123fastlink.json", content: contentA }, 9002: { name: "剧B.123fastlink.json", content: contentB } },
+    transferred: []
+  };
+  const api = createMockApi(state);
+  api.reuseFile = async (file, parentFileId) => {
+    const name = file.fileName || file.name;
+    state.transferred.push({ name, parentId: String(parentFileId) });
+    const key = `${file.etag}:${file.size}:${name}`;
+    if (state.cloud[key]) return state.cloud[key];
+    return `t-${state.transferred.length}`;
+  };
+  const events = [];
+  const input = `${seedLinkFor("剧A.123fastlink.json", contentA)}\n${seedLinkFor("剧B.123fastlink.json", contentB)}`;
+  const result = await resolveAndImportFastlinkInput(api, { text: input }, "7", {
+    concurrency: 2,
+    onSegmentStart: (index, count, name) => events.push([index, count, name])
+  });
+  assert.deepEqual(events, [[1, 2, "剧A.123fastlink.json"], [2, 2, "剧B.123fastlink.json"]], "每段开始回调带段序与名字");
+  assert.equal(result.ok, 2, "两条链接各导入 1 个文件");
+  assert.equal(result.fail, 0);
+  assert.equal(result.links.length, 2);
+  assert.ok(!result.links[0].error && !result.links[1].error);
+  assert.ok(state.transferred.some((item) => item.name === "剧A.123fastlink.json"), "第一条先转存种子");
+  assert.ok(state.transferred.some((item) => item.name === "B01.mp4"), "第二条内容照常导入");
+  assert.equal(result.status, "success");
+});
+
+test("批量导入：某条失败跳过继续其余，汇总为部分完成并带失败原因", async () => {
+  const contentA = episodeJsonFor("剧A", "A01.mp4", "a1");
+  const contentB = episodeJsonFor("剧B", "B01.mp4", "b1");
+  const state = {
+    uploadSeq: 0,
+    uploads: [],
+    tree: {},
+    info: {},
+    // 种子 A 不在云端：转存种子这步直接失败
+    cloud: { [`${md5(contentB)}:${Buffer.byteLength(contentB, "utf8")}:剧B.123fastlink.json`]: "9002" },
+    filesById: { 9002: { name: "剧B.123fastlink.json", content: contentB } },
+    transferred: []
+  };
+  const api = createMockApi(state);
+  api.reuseFile = async (file, parentFileId) => {
+    const name = file.fileName || file.name;
+    const key = `${file.etag}:${file.size}:${name}`;
+    if (state.cloud[key]) {
+      state.transferred.push({ name, parentId: String(parentFileId) });
+      return state.cloud[key];
+    }
+    // 只有「种子不在云端」才算整条失败；普通内容文件按新转存落地（与端到端用例同一套 mock 语义）
+    if (isSeedLikeName(name)) throw new Error("云端没有可复用的同哈希文件");
+    state.transferred.push({ name, parentId: String(parentFileId) });
+    return `t-${state.transferred.length}`;
+  };
+  const input = `${seedLinkFor("剧A.123fastlink.json", contentA)}\n${seedLinkFor("剧B.123fastlink.json", contentB)}`;
+  const result = await resolveAndImportFastlinkInput(api, { text: input }, "7", { concurrency: 2 });
+  assert.equal(result.status, "partial");
+  assert.equal(result.ok, 1, "第二条照常导入");
+  assert.equal(result.fail, 1, "失败的那条按 1 条失败计入");
+  assert.match(result.links[0].error, /云端没有/);
+  assert.ok(!result.links[1].error);
+  const failedRow = result.details.find((item) => item.status === "failed");
+  assert.ok(failedRow && failedRow.name.includes("第 1 条"), "失败链接以伪明细行进结果页");
+  assert.ok(state.transferred.some((item) => item.name === "B01.mp4"), "后续条目不受前一条失败影响");
+});
+
+test("批量导入：用户中止（AbortError）立即上抛，不再继续后面的段", async () => {
+  const contentA = episodeJsonFor("剧A", "A01.mp4", "a1");
+  const contentB = episodeJsonFor("剧B", "B01.mp4", "b1");
+  const abortError = new Error("用户取消");
+  abortError.name = "AbortError";
+  const state = {
+    uploadSeq: 0,
+    uploads: [],
+    tree: {},
+    info: {},
+    cloud: {
+      [`${md5(contentA)}:${Buffer.byteLength(contentA, "utf8")}:剧A.123fastlink.json`]: "9001",
+      [`${md5(contentB)}:${Buffer.byteLength(contentB, "utf8")}:剧B.123fastlink.json`]: "9002"
+    },
+    filesById: {},
+    reads: []
+  };
+  const api = createMockApi(state);
+  api.readFileText = async (file) => {
+    state.reads.push(String(file.id));
+    throw abortError;
+  };
+  await assert.rejects(
+    resolveAndImportFastlinkSegments(api, [seedLinkFor("剧A.123fastlink.json", contentA), seedLinkFor("剧B.123fastlink.json", contentB)], "7", { concurrency: 2 }),
+    (error) => error.name === "AbortError"
+  );
+  assert.equal(state.reads.length, 1, "第一条中止后不再读第二条");
+});
+
+test("批量导入断点：各段各存各的键，全成功的段清档、未完成的段保留", async () => {
+  checkpointStore.clear();
+  const missError = new Error("秒传未命中");
+  missError.fastlinkMiss = true;
+  const contentA = episodeJsonFor("剧A", "A01.mp4", "a1");
+  const contentB = episodeJsonFor("剧B", "B01.mp4", "b1");
+  const state = {
+    uploadSeq: 0,
+    uploads: [],
+    tree: {},
+    info: {},
+    cloud: {
+      [`${md5(contentA)}:${Buffer.byteLength(contentA, "utf8")}:剧A.123fastlink.json`]: "9001",
+      [`${md5(contentB)}:${Buffer.byteLength(contentB, "utf8")}:剧B.123fastlink.json`]: "9002"
+    },
+    filesById: { 9001: { name: "剧A.123fastlink.json", content: contentA }, 9002: { name: "剧B.123fastlink.json", content: contentB } },
+    missNames: ["A01.mp4"]
+  };
+  const api = createMockApi(state);
+  api.reuseFile = async (file) => {
+    const name = file.fileName || file.name;
+    if (state.missNames.includes(name)) throw missError;
+    const key = `${file.etag}:${file.size}:${name}`;
+    if (state.cloud[key]) return state.cloud[key];
+    return `t-${name}`;
+  };
+  const input = `${seedLinkFor("剧A.123fastlink.json", contentA)}\n${seedLinkFor("剧B.123fastlink.json", contentB)}`;
+  const result = await resolveAndImportFastlinkInput(api, { text: input }, "7", { concurrency: 2, importProgress: true });
+  assert.equal(result.miss, 1, "A 的正片未命中单列，不算失败");
+  assert.equal(result.ok, 1, "B 照常成功");
+  const seg0Key = `${FASTLINK_IMPORT_CHECKPOINT_KEY}#seg0`;
+  const seg1Key = `${FASTLINK_IMPORT_CHECKPOINT_KEY}#seg1`;
+  assert.ok(checkpointStore.has(seg0Key), "未完成段（A）的断点保留在自己的段键上");
+  assert.ok(!checkpointStore.has(seg1Key), "全部成功段（B）的段键已清");
+  assert.ok(!checkpointStore.has(String(FASTLINK_IMPORT_CHECKPOINT_KEY)), "批量导入不碰单条导入的主断点键");
+  const seg0 = readFastlinkImportCheckpoint("#seg0");
+  assert.ok(seg0 && seg0.contentHash, "段断点可按后缀读回");
+});
+
+test("云盘多文件：勾选两个秒传文件逐个转存汇总；一个失败继续另一个", async () => {
+  const contentA = episodeJsonFor("剧A", "A01.mp4", "a1");
+  const contentB = episodeJsonFor("剧B", "B01.mp4", "b1");
+  const buildState = (failSecond) => ({
+    uploadSeq: 0,
+    uploads: [],
+    tree: {},
+    info: {},
+    cloud: {},
+    filesById: { 5001: { name: "剧A.json", content: contentA }, 5002: { name: "剧B.json", content: contentB } },
+    transferred: [],
+    failSecond
+  });
+  const makeApi = (state) => {
+    const api = createMockApi(state);
+    api.readFileText = async (file) => {
+      if (state.failSecond && String(file.id) === "5002") throw new Error("读取失败");
+      const record = state.filesById[String(file.id)];
+      assert.ok(record, `readFileText: 文件 ${file.id} 应存在`);
+      return { name: record.name, text: record.content };
+    };
+    api.reuseFile = async (file, parentFileId) => {
+      state.transferred.push({ name: file.fileName || file.name, parentId: String(parentFileId) });
+      return `t-${state.transferred.length}`;
+    };
+    return api;
+  };
+  const okResult = await saveFastlinkFromCloudFiles(makeApi(buildState(false)), [
+    { id: "5001", name: "剧A.json", type: 0 },
+    { id: "5002", name: "剧B.json", type: 0 }
+  ], "42", { concurrency: 2 });
+  assert.equal(okResult.ok, 2);
+  assert.equal(okResult.links.length, 2);
+  assert.ok(!okResult.links[0].error && !okResult.links[1].error);
+
+  const partialResult = await saveFastlinkFromCloudFiles(makeApi(buildState(true)), [
+    { id: "5001", name: "剧A.json", type: 0 },
+    { id: "5002", name: "剧B.json", type: 0 }
+  ], "42", { concurrency: 2 });
+  assert.equal(partialResult.status, "partial");
+  assert.equal(partialResult.ok, 1, "成功的那个照常导入");
+  assert.match(partialResult.links[1].error, /读取失败/);
+  // 单文件路径保持原语义：失败直接上抛
+  await assert.rejects(
+    saveFastlinkFromCloudFiles(makeApi(buildState(true)), [{ id: "5002", name: "剧B.json", type: 0 }], "42", { concurrency: 2 }),
+    /读取失败/
+  );
+});
+
+test("云盘多文件断点：每个文件各存各的段键，没转完的保留、全转完的清档", async () => {
+  checkpointStore.clear();
+  const missError = new Error("秒传未命中");
+  missError.fastlinkMiss = true;
+  const contentA = episodeJsonFor("剧A", "A01.mp4", "a1");
+  const contentB = episodeJsonFor("剧B", "B01.mp4", "b1");
+  const state = {
+    uploadSeq: 0,
+    uploads: [],
+    tree: {},
+    info: {},
+    cloud: {},
+    filesById: { 5001: { name: "剧A.json", content: contentA }, 5002: { name: "剧B.json", content: contentB } },
+    missNames: ["A01.mp4"]
+  };
+  const api = createMockApi(state);
+  api.reuseFile = async (file) => {
+    const name = file.fileName || file.name;
+    if (state.missNames.includes(name)) throw missError;
+    return `t-${name}`;
+  };
+  const result = await saveFastlinkFromCloudFiles(api, [
+    { id: "5001", name: "剧A.json", type: 0 },
+    { id: "5002", name: "剧B.json", type: 0 }
+  ], "42", { concurrency: 2, importProgress: true });
+  assert.equal(result.miss, 1, "第一个文件里的未命中单列一桶");
+  assert.equal(result.ok, 1, "第二个文件照常转完");
+  const seg0Key = `${FASTLINK_IMPORT_CHECKPOINT_KEY}#seg0`;
+  const seg1Key = `${FASTLINK_IMPORT_CHECKPOINT_KEY}#seg1`;
+  assert.ok(checkpointStore.has(seg0Key), "没转完的第一个文件断点留在自己的段键上（重跑不重转已成功条目）");
+  assert.ok(!checkpointStore.has(seg1Key), "全转完的第二个文件段键已清");
+  assert.ok(!checkpointStore.has(String(FASTLINK_IMPORT_CHECKPOINT_KEY)), "批量转存不碰单条导入的主断点键");
+  checkpointStore.clear();
+});
+
+test("mergeFastlinkBatchResults：计数累加、失败链接补伪明细、状态判定", () => {
+  const merged = mergeFastlinkBatchResults([
+    { ok: 2, fail: 0, miss: 1, skipped: 1, invalid: 1, sanitized: 2, invalidReasons: { path: 1, etag: 0, size: 0, hidden: 0 }, invalidSamples: [{ index: 1 }], details: [{ name: "a", status: "success" }, { name: "b", status: "miss" }], affectedDirIds: ["7", "8"] },
+    null,
+    { ok: 1, fail: 0, miss: 0, skipped: 0, invalid: 0, sanitized: 0, invalidReasons: { path: 0, etag: 0, size: 0, hidden: 0 }, invalidSamples: [], details: [{ name: "c", status: "success" }], affectedDirIds: ["8"] }
+  ], [
+    { index: 1, label: "第 1 条", name: "x", ok: 3, fail: 0, miss: 1, error: "" },
+    { index: 2, label: "第 2 条", name: "y", ok: 0, fail: 0, miss: 0, error: "坏链接" }
+  ]);
+  assert.equal(merged.ok, 3);
+  assert.equal(merged.miss, 1);
+  assert.equal(merged.skipped, 1);
+  assert.equal(merged.invalid, 1);
+  assert.equal(merged.sanitized, 2);
+  assert.equal(merged.invalidReasons.path, 1);
+  assert.equal(merged.fail, 1, "失败链接按 1 条失败计入");
+  assert.equal(merged.details.length, 4, "明细拼接 + 失败伪明细");
+  assert.equal(merged.status, "partial");
+  // 沙箱数组原型与宿主不同，deepEqual 会误判，按拼接串比
+  assert.equal(merged.affectedDirIds.slice().sort().join(","), "7,8", "受影响目录去重并集");
+  assert.equal(merged.links.length, 2);
+});
+
+test("多条导入源码契约：控制器与工具栏接线到位", () => {
+  const bundle = lines.join("\n");
+  assert.ok(bundle.includes("const segments = splitFastlinkImportPayloads(input?.text);"), "粘贴导入要先切分再决定单段/多段");
+  assert.ok(bundle.includes("resolveAndImportFastlinkSegments(api, segments, rootId, options)"), "多段走批量执行层");
+  assert.ok(!bundle.includes("items.length !== 1"), "云盘转存入口不再硬性只允许 1 个文件");
+  assert.ok(bundle.includes("saveFastlinkFromCloudFiles(this.api, itemList"), "云盘转存走多文件批量函数");
+  assert.ok(bundle.includes("records.length === this.selection.selectedIds.size"), "工具栏与命令守卫按多选校验全部是种子");
+  assert.ok(bundle.includes("fastlinkLinksTable(result2)"), "结果页渲染逐条摘要块");
+  assert.ok(bundle.includes("saveFastlinkFromCloudFile(api, item, rootId, { ...options, checkpointKeySuffix: fastlinkSegmentCheckpointSuffix(index) });"), "云盘多文件逐个转存各用各的段断点键");
+  assert.ok(bundle.includes("sweepStaleFastlinkSegmentCheckpoints(list.length)"), "批量开跑前回收残留的段断点");
 });
 
 let failed = 0;
