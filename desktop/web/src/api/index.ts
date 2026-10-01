@@ -19,6 +19,8 @@ import type {
   TransferTask,
   Channel,
   Routing,
+  RoutingSchema,
+  RoutingSimulateResult,
   TelegramSessionStartResult,
   TelegramSessionVerifyResult,
 } from "./types";
@@ -85,6 +87,7 @@ export const submissionApi = {
 
 // 桌面端「投稿路由」管理接口：按频道主 UID 读写频道/路由配置。
 export const channelOwnerApi = {
+  routingSchema: () => api.get<{ ok: boolean; schema: RoutingSchema }>("/api/submission/routing/schema"),
   owners: () => api.get<{ ok: boolean; owners: number[]; defaultOwnerUserId: number }>("/api/submission/channel-owners"),
   get: (userId: number) =>
     api.get<{ ok: boolean; config: MyChannelConfig }>(`/api/submission/channel-owners/${encodeURIComponent(String(userId))}`),
@@ -92,6 +95,8 @@ export const channelOwnerApi = {
     api.put<{ ok: boolean; config: MyChannelConfig }>(`/api/submission/channel-owners/${encodeURIComponent(String(userId))}`, config),
   delete: (userId: number) =>
     api.delete<{ ok: boolean; deleted: boolean }>(`/api/submission/channel-owners/${encodeURIComponent(String(userId))}`),
+  simulate: (userId: number, text: string) =>
+    api.post<{ ok: boolean; results: RoutingSimulateResult[] }>(`/api/submission/channel-owners/${encodeURIComponent(String(userId))}/simulate`, { text }),
 };
 
 // ====== 115 Cookie 扫码 ======

@@ -68,7 +68,10 @@ from .submission import (
     handle_submission_callback,
     list_submission_drafts,
     normalize_web_share_url,
+    normalize_submission_link,
+    inspect_submission_link,
     parse_fastlink,
+    route_submission_draft,
     send_telegram_text,
     start_telegram_client,
     strip_fastlink_seed_ext,
@@ -79,6 +82,7 @@ from .submission import (
     telegram_message_text,
     telegram_user_allowed,
 )
+from .submission_routing import routing_schema
 from .telegram_history import TelegramHistoryCleaner, reset_telegram_client_state
 from .telegram_session import (
     TelegramLoginError,
@@ -1233,6 +1237,13 @@ class OwnUserChannelConfigRequest(BaseModel):
     channelOwnerUserIds: Optional[List[int]] = None
 
 
+class ChannelRoutingSimulateRequest(BaseModel):
+    """路由规则模拟器：贴一段分享/秒传文本，按当前账号配置试跑路由（不落草稿）。"""
+
+    text: str = ""
+    maxLinks: int = 2
+
+
 class DraftSubmitRequest(BaseModel):
     targetUserId: Optional[int] = None
 
@@ -1517,6 +1528,49 @@ async def delete_channel_owner_config(user_id: int) -> Dict[str, Any]:
     _require_channel_owner_user_id(user_id)
     deleted = store.delete_user_channel_config(user_id)
     return {"ok": True, "deleted": deleted}
+
+
+@app.get("/api/submission/routing/schema")
+async def get_routing_schema() -> Dict[str, Any]:
+    """路由规则字段/取值词表（单一事实源，前端按此渲染条件编辑区）。"""
+    return {"ok": True, "schema": routing_schema()}
+
+
+@app.post("/api/submission/channel-owners/{user_id}/simulate")
+async def simulate_channel_routing(user_id: int, payload: ChannelRoutingSimulateRequest) -> Dict[str, Any]:
+    """路由规则模拟器：按该账号当前配置试跑一遍路由，返回事实与命中规则（不落草稿、不推送）。"""
+    _require_channel_owner_user_id(user_id)
+    limit = max(1, min(int(payload.maxLinks or 1), 3))
+    links = extract_submission_links(payload.text)[:limit]
+    if not links:
+        raise HTTPException(status_code=400, detail="文本里没有识别到 123 分享链接或秒传链接")
+    results: List[Dict[str, Any]] = []
+    for link in links:
+        item: Dict[str, Any] = {"url": str(link.get("cleanUrl") or link.get("url") or "")[:120], "provider": str(link.get("provider") or "")}
+        try:
+            normalized = normalize_submission_link(link, payload.text)
+            inspection = await inspect_submission_link(normalized)
+            draft = {
+                "ownerUserId": user_id,
+                "routeOwnerUserId": user_id,
+                "share": {
+                    "provider": str(normalized.get("provider") or "123pan"),
+                    "cleanUrl": str(normalized.get("cleanUrl") or ""),
+                    "title": str(normalized.get("title") or ""),
+                },
+                "inspection": inspection,
+                "metadata": {},
+                "media": {},
+            }
+            channel, decision = route_submission_draft(store, user_id, draft)
+            item["title"] = str(inspection.get("title") or "")
+            item["channel"] = {"id": str(channel.get("id") or ""), "title": str(channel.get("title") or "")} if channel else None
+            item["decision"] = {key: value for key, value in decision.items() if key != "facts"}
+            item["facts"] = decision.get("facts") or {}
+        except Exception as error:
+            item["error"] = str(error)
+        results.append(item)
+    return {"ok": True, "results": results}
 
 
 @app.get("/api/submission/status")

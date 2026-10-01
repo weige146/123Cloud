@@ -51,12 +51,75 @@ export interface Channel {
   [key: string]: unknown;
 }
 
+export interface RuleCondition {
+  linkType?: string[];
+  mediaType?: string[];
+  completion?: string[];
+  releaseGroupState?: string[];
+  /** 与「发布组白名单」比较：notIn = 有任一发布组不在白名单；in = 全部在白名单 */
+  releaseGroupWhitelist?: string[];
+  /** 自定义发布组名单（任一命中） */
+  releaseGroups?: string[];
+  quality?: string[];
+  source?: string[];
+  submitter?: string[];
+  /** 数字数组 = 指定 ID 名单；"required" = 已匹配到 TMDB 即可 */
+  tmdbId?: number[] | "required";
+}
+
+export interface RoutingRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  when: RuleCondition;
+  channelId: string;
+}
+
 export interface Routing {
+  version?: number;
+  rules?: RoutingRule[];
+  fallbackChannelId?: string;
+  publicReleaseGroups?: string[];
+  // v1 影子字段（后端读时迁移自动生成，只给旧消费者看）
   releaseGroupChannelId?: string;
   noReleaseGroupCompletedChannelId?: string;
   noReleaseGroupUpdatingChannelId?: string;
-  fallbackChannelId?: string;
-  publicReleaseGroups?: string[];
+}
+
+export interface RoutingSchemaField {
+  key: string;
+  label: string;
+  kind: "multi" | "single" | "freeMulti" | "idList";
+  values: { value: string; label: string }[];
+}
+
+export interface RoutingSchema {
+  version: number;
+  fields: RoutingSchemaField[];
+  maxRules: number;
+}
+
+export interface RoutingSimulateFacts {
+  linkType: string;
+  mediaType: string;
+  completion: string;
+  releaseGroupState: string;
+  releaseGroups: string[];
+  quality: string[];
+  source: string[];
+  submitter: string;
+  tmdbId: number;
+}
+
+export interface RoutingSimulateResult {
+  url: string;
+  provider: string;
+  title?: string;
+  inspection?: { title?: string; fileNames?: string[]; size?: string };
+  channel?: { id: string; title: string } | null;
+  decision?: { mode?: string; ruleId?: string; ruleName?: string; summary?: string };
+  facts?: RoutingSimulateFacts;
+  error?: string;
 }
 
 export interface AliasRule {
@@ -293,6 +356,7 @@ export interface SubmissionDraft {
   sent?: boolean;
   linkCount?: number;
   channelTitle?: string;
+  routeDecision?: { mode?: string; ruleId?: string; ruleName?: string; summary?: string };
   createdAt?: string;
 }
 

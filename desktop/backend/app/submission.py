@@ -20,6 +20,7 @@ from .pan115 import (
     submit_115_offline_from_text,
 )
 from .session_store import SessionStore, utc_now_iso
+from .submission_routing import decide_submission_channel
 from .version_semantics import (
     extract_version_alias,
     format_episode_ranges,
@@ -427,6 +428,7 @@ async def build_submission_draft(
     submitter: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     source_text = str(link.get("sourceText") or "").strip()
+    link_meta = link.get("meta") if isinstance(link.get("meta"), dict) else {}
     if link.get("skipReleaseGroup"):
         # 油猴导出已去除文件名发布组的直投：整条草稿构建都不做发布组识别
         config = {**config, "skipReleaseGroup": True}
@@ -452,6 +454,15 @@ async def build_submission_draft(
         if version_note:
             metadata["note"] = version_note
     documents = normalize_submission_documents(link.get("documents") or link.get("document"))
+    # 脚本直投 meta 里携带的发布组信息只喂路由事实（文件名已被油猴导出洗掉组名时，
+    # 客户端识别不到、但路由要能按「原始发布组」决定公开/私有档）；不参与渲染
+    routing_meta = {
+        key: str(link_meta.get(key) or "").strip()
+        for key in ("releaseGroup", "releaseGroupStripped")
+        if str(link_meta.get(key) or "").strip()
+    }
+    if link.get("skipReleaseGroup"):
+        routing_meta["skipReleaseGroup"] = "1"
     draft = {
         "id": uuid.uuid4().hex,
         "ownerChatId": int(owner_chat_id or 0),
@@ -474,6 +485,7 @@ async def build_submission_draft(
         "inspection": recognition["inspection"],
         "metadata": metadata,
         "media": media,
+        **({"routingMeta": routing_meta} if routing_meta else {}),
         **({"databaseNote": {**database_note, "mode": "rich"}} if database_note else {}),
         "appendFooter": True,
         "createdAt": utc_now_iso(),
@@ -481,12 +493,10 @@ async def build_submission_draft(
     }
     if documents:
         draft["documents"] = documents
-    channel = select_submission_channel(store, int(owner_user_id or 0), draft) if store else select_submission_channel(config, draft)
+    channel, decision = route_submission_draft(store, owner_user_id, draft) if store else route_submission_draft(config, draft)
+    apply_route_decision(draft, channel, decision)
     if channel:
         draft["routeOwnerUserId"] = int(owner_user_id or 0)
-        draft["routeChannelId"] = str(channel.get("id") or "")
-        draft["routeChannelTitle"] = str(channel.get("title") or "")
-        draft["routeChannelChatId"] = str(channel.get("chatId") or "")
         draft["channelTitle"] = str(channel.get("title") or "")
         draft["channelChatId"] = str(channel.get("chatId") or "")
     caption = render_submission_caption(draft, config, store)
@@ -901,38 +911,58 @@ def select_submission_channel(
     owner_user_id_or_draft: Any,
     draft: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Resolve a route from a legacy config or one isolated user config."""
+    channel, _decision = route_submission_draft(store_or_config, owner_user_id_or_draft, draft)
+    return channel
+
+
+def route_submission_draft(
+    store_or_config: Any,
+    owner_user_id_or_draft: Any,
+    draft: Optional[Dict[str, Any]] = None,
+) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """v2 规则引擎路由入口：返回 (频道, 决策说明)。兼容旧式整体 config 与新式按用户隔离配置。"""
+    empty_decision: Dict[str, Any] = {}
+    store = store_or_config if isinstance(store_or_config, SessionStore) else None
     if draft is None:
         user_config = store_or_config if isinstance(store_or_config, dict) else {}
         current_draft = owner_user_id_or_draft if isinstance(owner_user_id_or_draft, dict) else {}
+        owner_user_id = safe_int(current_draft.get("ownerUserId"))
     else:
-        store = store_or_config if isinstance(store_or_config, SessionStore) else None
-        owner_user_id = safe_int(owner_user_id_or_draft)
         current_draft = draft
-        route_owner_user_id = safe_int(current_draft.get("routeOwnerUserId")) or owner_user_id
-        if not store or not store.has_user_channel_config(route_owner_user_id):
-            return None
-        user_config = store.read_user_channel_config(route_owner_user_id)
+        owner_user_id = safe_int(owner_user_id_or_draft)
+        if store:
+            route_owner_user_id = safe_int(current_draft.get("routeOwnerUserId")) or owner_user_id
+            if not store.has_user_channel_config(route_owner_user_id):
+                return None, empty_decision
+            user_config = store.read_user_channel_config(route_owner_user_id)
+            owner_user_id = route_owner_user_id
+        else:
+            # route_channel_label(draft, config) 兼容调用：config 即整体用户配置（含频道与路由）
+            user_config = owner_user_id_or_draft if isinstance(owner_user_id_or_draft, dict) else {}
     channels = [channel for channel in user_config.get("channels") or [] if isinstance(channel, dict) and channel.get("enabled") is not False]
     if not channels:
-        return None
-    if len(channels) == 1:
-        return channels[0]
-    manual_id = str(current_draft.get("channelId") or "").strip()
-    if manual_id:
-        manual = find_channel(channels, manual_id)
-        if manual:
-            return manual
+        return None, empty_decision
     routing = user_config.get("routing") if isinstance(user_config.get("routing"), dict) else {}
-    metadata = current_draft.get("metadata") if isinstance(current_draft.get("metadata"), dict) else {}
-    release_group = str(metadata.get("releaseGroup") or "").strip()
-    if release_group:
-        public_groups = {str(item or "").strip().lower() for item in routing.get("publicReleaseGroups") or []}
-        if release_group.lower() not in public_groups:
-            return find_channel(channels, routing.get("releaseGroupChannelId")) or find_channel_by_role(channels, "private") or find_default_channel(channels)
-    if is_completed_media(current_draft):
-        return find_channel(channels, routing.get("noReleaseGroupCompletedChannelId")) or find_channel_by_role(channels, "public_completed") or find_default_channel(channels)
-    return find_channel(channels, routing.get("noReleaseGroupUpdatingChannelId")) or find_channel_by_role(channels, "public_updating") or find_default_channel(channels)
+    return decide_submission_channel(channels, routing, current_draft, owner_user_id)
+
+
+def apply_route_decision(draft: Dict[str, Any], channel: Optional[Dict[str, Any]], decision: Dict[str, Any]) -> None:
+    """把路由结果与命中原因写回草稿（routeChannel* 四件套 + routeDecision）。"""
+    if channel:
+        draft["routeChannelId"] = str(channel.get("id") or "")
+        draft["routeChannelTitle"] = str(channel.get("title") or "")
+        draft["routeChannelChatId"] = str(channel.get("chatId") or "")
+        if isinstance(decision, dict):
+            draft["routeDecision"] = {
+                "mode": str(decision.get("mode") or ""),
+                "ruleId": str(decision.get("ruleId") or ""),
+                "ruleName": str(decision.get("ruleName") or ""),
+                "summary": str(decision.get("summary") or ""),
+            }
+    else:
+        draft["routeChannelId"] = ""
+        draft["routeChannelTitle"] = ""
+        draft["routeChannelChatId"] = ""
 
 
 def submission_channel_candidates(store: SessionStore, user_id: int) -> List[Dict[str, Any]]:
@@ -1757,17 +1787,19 @@ def extract_release_group(value: str, config: Optional[Dict[str, Any]] = None) -
             return cfg_dash
 
     # Fallback: last dot-separated segment (e.g. "...Atmos.HiveWeb" -> "HiveWeb")
+    # 候选含连字符就拒绝：连字符分支已按尾段判过（流媒体来源标签如 NF 会被它正确拒掉），
+    # 点段里带连字符的是「编码-来源」组合（H.264-NF → "264-NF"），不是真发布组，别误捞。
     dot_index = stem.rfind(".")
     if dot_index >= 0:
         last_seg = stem[dot_index + 1:].strip()
-        if last_seg and is_release_group_suffix(last_seg) and not _is_known_media_term(last_seg):
+        if last_seg and "-" not in last_seg and is_release_group_suffix(last_seg) and not _is_known_media_term(last_seg):
             return normalize_release_group(last_seg)
 
     # Fallback: last space-separated segment (e.g. "Season 1 ... HiveWeb" -> "HiveWeb")
     space_index = stem.rfind(" ")
     if space_index >= 0:
         last_seg = stem[space_index + 1:].strip()
-        if last_seg and is_release_group_suffix(last_seg) and not _is_known_media_term(last_seg):
+        if last_seg and "-" not in last_seg and is_release_group_suffix(last_seg) and not _is_known_media_term(last_seg):
             return normalize_release_group(last_seg)
 
     return ""
@@ -2221,12 +2253,16 @@ def render_share_url_value(draft: Dict[str, Any]) -> str:
     return ""
 
 
-def route_channel_label(draft: Dict[str, Any], store: Optional["SessionStore"]) -> str:
+def route_channel_label(draft: Dict[str, Any], store_or_config: Optional["SessionStore"] = None) -> str:
     owner_user_id = safe_int(draft.get("ownerUserId")) or 0
-    channel = select_submission_channel(store, owner_user_id, draft)
+    store = store_or_config if isinstance(store_or_config, SessionStore) else None
+    channel, decision = route_submission_draft(store, owner_user_id if store else store_or_config, draft)
     if not channel:
         return "未匹配"
-    mode = "手动" if str(draft.get("channelId") or "").strip() else "自动"
+    mode = str(decision.get("mode") or ("手动" if str(draft.get("channelId") or "").strip() else "自动"))
+    rule_name = str(decision.get("ruleName") or "").strip()
+    if rule_name and mode == "自动":
+        return f"{channel.get('title') or channel.get('id') or '频道'}（{mode} · 命中「{rule_name}」）"
     return f"{channel.get('title') or channel.get('id') or '频道'}（{mode}）"
 
 
@@ -3151,11 +3187,9 @@ async def cleanup_published_submission_history(config: Dict[str, Any], draft: Di
 
 def refresh_submission_caption(draft: Dict[str, Any], config: Dict[str, Any], store: "SessionStore") -> None:
     owner_user_id = safe_int(draft.get("ownerUserId")) or 0
-    channel = select_submission_channel(store, owner_user_id, draft)
+    channel, decision = route_submission_draft(store, owner_user_id, draft)
     if channel:
-        draft["routeChannelId"] = str(channel.get("id") or "")
-        draft["routeChannelTitle"] = str(channel.get("title") or "")
-        draft["routeChannelChatId"] = str(channel.get("chatId") or "")
+        apply_route_decision(draft, channel, decision)
         if str(draft.get("channelId") or ""):
             draft["channelTitle"] = str(channel.get("title") or "")
             draft["channelChatId"] = str(channel.get("chatId") or "")
@@ -3163,9 +3197,7 @@ def refresh_submission_caption(draft: Dict[str, Any], config: Dict[str, Any], st
             draft["channelTitle"] = str(channel.get("title") or "")
             draft["channelChatId"] = str(channel.get("chatId") or "")
     else:
-        draft["routeChannelId"] = ""
-        draft["routeChannelTitle"] = ""
-        draft["routeChannelChatId"] = ""
+        apply_route_decision(draft, None, decision)
     caption = render_submission_caption(draft, config, store)
     draft["caption"] = caption
     draft["text"] = caption
@@ -3755,6 +3787,8 @@ def normalize_submission_draft(value: Dict[str, Any]) -> Dict[str, Any]:
         "routeChannelId": str(value.get("routeChannelId") or ""),
         "routeChannelTitle": str(value.get("routeChannelTitle") or ""),
         "routeChannelChatId": str(value.get("routeChannelChatId") or ""),
+        **({"routingMeta": value["routingMeta"]} if isinstance(value.get("routingMeta"), dict) and value.get("routingMeta") else {}),
+        **({"routeDecision": value["routeDecision"]} if isinstance(value.get("routeDecision"), dict) and value.get("routeDecision") else {}),
         "media": value.get("media") if isinstance(value.get("media"), dict) else {},
         "metadata": value.get("metadata") if isinstance(value.get("metadata"), dict) else {},
         "share": value.get("share") if isinstance(value.get("share"), dict) else {},

@@ -571,7 +571,7 @@ onMounted(() => {
                     {{ draft.sent ? "已投稿" : "未投稿" }}
                   </span>
                   <span class="muted-line">{{ draft.linkCount || 0 }} 个链接</span>
-                  <span v-if="draft.channelTitle" class="muted-line">路由 {{ draft.channelTitle }}</span>
+                  <span v-if="draft.channelTitle" class="muted-line">路由 {{ draft.channelTitle }}<template v-if="draft.routeDecision?.mode === '自动' && draft.routeDecision?.ruleName">（命中「{{ draft.routeDecision.ruleName }}」）</template></span>
                   <span class="muted-line">{{ draft.createdAt || "" }}</span>
                 </div>
               </div>

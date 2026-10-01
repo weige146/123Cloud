@@ -50,6 +50,7 @@ from app.submission import (
     schedule_published_submission_history_cleanup,
     _detect_multi_version_note,
 )
+from app.submission_routing import decide_submission_channel, extract_routing_facts
 
 
 class SubmissionDraftTests(unittest.TestCase):
@@ -297,6 +298,59 @@ class SubmissionDraftTests(unittest.TestCase):
         # SxxEyy 老格式行为不变；纯技术尾缀不得被裸集号误伤
         self.assertEqual(summarize_season_episodes(["Show.S01E05.mkv", "Show.S01E07.mkv"]), "S01E05-E07")
         self.assertEqual(summarize_season_episodes(["Movie.2020.1080p.WEB-DL.x265-EAC3.Atmos-HiveWeb.mkv"]), "")
+
+    def test_fastlink_direct_push_meta_release_group_feeds_routing(self):
+        """脚本去组直投的秒传 = stripped 档（频道主自己重发布、已洗组名），即使 meta 带回原始组名
+        也不落 detected→私有；原始组名仍留在 routingMeta 供「stripped + 组∉白名单」细规则可选用。"""
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.write_submission_config({"botToken": "telegram-token", "allowedUserIds": [123456]})
+            store.write_user_channel_config(
+                123456,
+                {
+                    "channels": [
+                        {"id": "private", "title": "私有", "chatId": "-1001", "enabled": True, "isDefault": True, "role": "private"},
+                        {"id": "fastlink", "title": "秒传频道", "chatId": "-1002", "enabled": True, "role": ""},
+                    ],
+                    "routing": {
+                        "version": 2,
+                        "publicReleaseGroups": ["HiveWeb"],
+                        "rules": [
+                            {"id": "r1", "name": "非白名单发布组", "when": {"releaseGroupState": ["detected"], "releaseGroupWhitelist": ["notIn"]}, "channelId": "private"},
+                            {"id": "r2", "name": "去组秒传帖", "when": {"releaseGroupState": ["stripped"]}, "channelId": "fastlink"},
+                        ],
+                        "fallbackChannelId": "",
+                    },
+                },
+            )
+            file_names = [f"Show.S01E{n}.2026.2160p.WEB-DL.10bit.HEVC.mkv" for n in range(1, 5)]
+            source_text = "🎬：京城奇探 (2026)\n💾：8 GB\n" + "\n".join(f"📄：{name}" for name in file_names)
+            send_mock = AsyncMock()
+
+            def submit(extra):
+                link = {
+                    "url": "123FLCPV2$%f#1024#京城奇探.123fastlink.json",
+                    "cleanUrl": "123FLCPV2$%f#1024#京城奇探.123fastlink.json",
+                    "provider": "123fastlink",
+                    "title": "京城奇探 (2026)",
+                    "sourceText": source_text,
+                    "skipReleaseGroup": True,
+                    "meta": {"seasonEpisode": "S01E01-E04", "mediaType": "tv", **extra},
+                    "inspection": {"title": "京城奇探 (2026)", "fileNames": file_names, "size": "8 GB", "rawText": source_text},
+                }
+                with patch("app.submission.send_telegram_text", send_mock):
+                    return asyncio.run(submit_submission_links(store, [link], "秒传链接", 123456))["drafts"][0]
+
+            with_group = submit({"releaseGroup": "WiKi", "releaseGroupStripped": "1"})
+            self.assertEqual(with_group["routingMeta"]["releaseGroup"], "WiKi", "原始组名仍带进路由事实供细规则用")
+            self.assertNotIn("releaseGroup", with_group["metadata"], "meta 组名只喂路由，不参与识别渲染")
+            # 关键：开了去组的秒传 = stripped 档（频道主自己重发布），即使原始有组也不落 detected→私有
+            self.assertEqual(with_group["routeChannelId"], "fastlink")
+            self.assertEqual(with_group["routeDecision"]["ruleName"], "去组秒传帖")
+
+            stripped_only = submit({})
+            self.assertEqual(stripped_only["routeChannelId"], "fastlink")
+            self.assertEqual(stripped_only["routeDecision"]["ruleName"], "去组秒传帖")
 
     def test_recognize_bare_episode_fastlink_uses_file_count_not_folder_claim(self):
         """直投上下文只有裸集号文件 + 目录名写着「100集」时，集数按文件实况（130 集）识别。"""
@@ -883,6 +937,45 @@ class SubmissionDraftTests(unittest.TestCase):
             "metadata": {"seasonEpisode": "S01E01-E07", "releaseGroup": "Mo Cuishle"},
         }
         self.assertEqual(select_submission_channel(config, private_draft)["id"], "private")
+
+    def test_streaming_source_tag_not_misdetected_as_release_group(self):
+        """流媒体 WEB-DL 命名里「编码/音效-来源」组合（H.264-NF、Atmos-NF、x264-DSNP）不是发布组——
+        连字符分支已按尾段（NF 是来源）正确拒绝，点/空格兜底不得把带连字符的整段误捞成组；
+        真发布组（连字符尾段 NTb/HiveWeb、配置组）照常识别。这类误判会把秒传帖从公开错分到私有。"""
+        config = {"ruleConfig": {"recognition": {"releaseGroups": ["Mo Cuishle"]}}}
+        for name in [
+            "Fakhar.S01E01.1080p.WEB-DL.AAC2.0.H.264-NF.mkv",
+            "Fakhar.S01E01.2026.1080p.WEB-DL.AVC.DDP.5.1.Atmos-NF.mkv",
+            "Fakhar.S01E01.1080p.WEB-DL.H264-ATVP.mkv",
+            "Fakhar.S01E01.1080p.WEB-DL.x264-DSNP.mkv",
+            "Fakhar.S01E01.2026.1080p.WEB-DL-DDP5.1-Atmos.mkv",
+        ]:
+            self.assertEqual(extract_release_group(name, config), "", f"流媒体来源标签不该被当发布组：{name}")
+        self.assertEqual(extract_release_group("Some.Show.S01E01.1080p.WEB-DL.H264-NTb.mkv", config), "NTb")
+        self.assertEqual(extract_release_group("Show.S01E01.WEB-DL.HiveWeb.mkv", config), "HiveWeb")
+        self.assertEqual(extract_release_group("Movie.Name.2026.2160p.WEB-DL-Mo Cuishle.mkv", config), "Mo Cuishle")
+
+    def test_streaming_fastlink_routes_to_public_when_group_is_false_positive(self):
+        """Netflix WEB-DL 秒传（文件名 H.264-NF）：识别不到真发布组 → 发布组状态 none → 命中「秒传+无组→公开」规则。"""
+        channels = [
+            {"id": "private", "title": "私有", "chatId": "-1001", "enabled": True, "isDefault": True, "role": "private"},
+            {"id": "public", "title": "公开", "chatId": "-1002", "enabled": True, "role": "public_completed"},
+        ]
+        routing = {"version": 2, "publicReleaseGroups": [], "fallbackChannelId": "", "rules": [
+            {"id": "r1", "name": "秒传", "enabled": True, "when": {"linkType": ["fastlink"], "releaseGroupState": ["stripped", "none"]}, "channelId": "public"},
+            {"id": "r2", "name": "默认", "enabled": True, "when": {}, "channelId": "private"},
+        ]}
+        draft = {
+            "share": {"provider": "123fastlink", "cleanUrl": "123FLCPV2$%f#1024#seed.json", "title": "疯狂穷富翁 (2026)"},
+            "media": {"mediaType": "movie", "status": "Released", "tmdbId": 1763619},
+            "metadata": {"mediaType": "movie", "quality": "1080p", "source": "WEB-DL"},
+            "inspection": {"title": "疯狂穷富翁 (2026)", "fileNames": ["Fakhar.2026.1080p.WEB-DL.AAC2.0.H.264-NF.mkv"]},
+        }
+        facts = extract_routing_facts(draft)
+        self.assertEqual(facts["releaseGroupState"], "none", "H.264-NF 不得被误判成发布组")
+        channel, decision = decide_submission_channel(channels, routing, draft)
+        self.assertEqual(channel["id"], "public")
+        self.assertEqual(decision["ruleName"], "秒传")
 
     def test_share_and_fastlink_use_tmdb_episode_count_for_completed_season(self):
         config = {

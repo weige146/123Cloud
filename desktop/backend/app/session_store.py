@@ -121,16 +121,25 @@ class SessionStore:
         return {
             "ownerUserId": user_id,
             "channels": channels,
-            "routing": routing if isinstance(routing, dict) else copy.deepcopy(DEFAULT_USER_ROUTING),
+            "routing": self._normalized_routing(routing),
             "updatedAt": str(row["updated_at"] or ""),
             "createdAt": str(row["created_at"] or ""),
         }
+
+    @staticmethod
+    def _normalized_routing(routing: Any) -> Dict[str, Any]:
+        """路由读取口径：旧三槽配置在此一次性迁移成 v2 规则（不落库），引擎与 UI 只见 v2。"""
+        from .submission_routing import normalize_routing
+
+        if not isinstance(routing, dict):
+            routing = copy.deepcopy(DEFAULT_USER_ROUTING)
+        return normalize_routing(routing)
 
     def write_user_channel_config(self, user_id: int, config: Dict[str, Any]) -> Dict[str, Any]:
         self._ensure_initialized()
         now = utc_now_iso()
         channels = config.get("channels") if isinstance(config.get("channels"), list) else copy.deepcopy(DEFAULT_USER_CHANNELS)
-        routing = config.get("routing") if isinstance(config.get("routing"), dict) else copy.deepcopy(DEFAULT_USER_ROUTING)
+        routing = self._normalized_routing(config.get("routing"))
         normalized_channels, grants = self._normalize_channels_and_grants(channels)
         channels_json = json.dumps(normalized_channels, ensure_ascii=False)
         routing_json = json.dumps(routing, ensure_ascii=False)
@@ -186,7 +195,7 @@ class SessionStore:
             result.append({
                 "ownerUserId": user_id,
                 "channels": channels,
-                "routing": routing if isinstance(routing, dict) else {},
+                "routing": self._normalized_routing(routing),
                 "channelCount": len(channels) if isinstance(channels, list) else 0,
                 "updatedAt": str(row["updated_at"] or ""),
                 "createdAt": str(row["created_at"] or ""),

@@ -171,7 +171,7 @@ onMounted(async () => {
       :hover="false"
     >
       <v-progress-linear v-if="loadingConfig" indeterminate color="primary" class="config-progress" />
-      <ChannelRoutingEditor v-if="selectedOwner && !loadingConfig" :editor="editor" />
+      <ChannelRoutingEditor v-if="selectedOwner && !loadingConfig" :editor="editor" :owner-user-id="selectedOwner" />
 
       <div class="editor-footer">
         <div class="save-note">
