@@ -205,14 +205,17 @@ class LibraryDb:
                                 (p_season, p_episode, row["dir"], row["file_path"]),
                             )
             # tech 列（杜比视界/HDR/编码/帧率等，筛选与详情用）：补列后对没算过的作品按文件名回填；
-            # 旧格式 tech JSON（缺 mediaSource/colorDepth 键的）也一并重算
+            # 旧格式 tech JSON（缺 mediaSource/colorDepth 键的）也一并重算。
+            # 另外要重算「口径改过」的旧值（与油猴 1.4.5 同步）：帧率取整成 PT 常用档、
+            # 8bit 不再标。重算后这两个模式就不会再出现，所以条件是幂等的（第二次打开 0 行）。
             if "tech" not in existing:
                 conn.execute("ALTER TABLE library_works ADD COLUMN tech TEXT NOT NULL DEFAULT ''")
             need_tech = conn.execute(
                 "SELECT COUNT(*) AS c FROM library_works WHERE tech = ''"
-                " OR tech NOT LIKE '%\"mediaSource\"%'").fetchone()["c"]
+                " OR tech NOT LIKE '%\"mediaSource\"%'"
+                " OR tech LIKE '%\"colorDepth\":\"8bit\"%'"
+                " OR tech LIKE '%\"frameRate\":\"%.%fps\"%'").fetchone()["c"]
             if need_tech:
-                import json as _json
                 files = conn.execute(
                     "SELECT dir, file_name FROM library_work_files WHERE is_video = 1 ORDER BY dir"
                 ).fetchall()
@@ -221,12 +224,15 @@ class LibraryDb:
                     names_by_dir.setdefault(str(row["dir"]), []).append(str(row["file_name"]))
                 with conn:
                     for dir_name, names in names_by_dir.items():
-                        tech = infer_technical_detailed(names)
-                        if any(tech.get(k) for k in _TECH_KEYS):
-                            conn.execute(
-                                "UPDATE library_works SET tech = ? WHERE dir = ?",
-                                (_json.dumps(tech, ensure_ascii=False, separators=(",", ":")), dir_name),
-                            )
+                        # 一律按 _tech_json 的口径写（全空写空串，保持「空串＝没算过」的约定）：
+                        # 只在值真的变了时写，避免每次开库都产生无谓的 UPDATE。
+                        # 旧写法带「有值才写」的守卫，会让只剩脏值的行（例如唯一字段是 8bit、
+                        # 按新口径重算什么都不剩）永远清不掉，还会每次开库被重扫一遍。
+                        payload = _tech_json(infer_technical_detailed(names))
+                        conn.execute(
+                            "UPDATE library_works SET tech = ? WHERE dir = ? AND tech <> ?",
+                            (payload, dir_name, payload),
+                        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30)

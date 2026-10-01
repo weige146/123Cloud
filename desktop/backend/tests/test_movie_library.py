@@ -1062,6 +1062,51 @@ class LibraryEnrichTests(unittest.TestCase):
         self.assertEqual(stats["pending"], 1)
         self.assertEqual(stats["ok"], 2)  # 两条正常对照保持 ok
 
+    def test_migrate_recomputes_stale_pt_tech_values(self):
+        """口径改过要自愈：旧版本入库的小数帧率 / 8bit 色深，重开库按新口径重算，且幂等。"""
+        import sqlite3
+        name = "Aquaman.2160p.UHD.BluRay.HDR.H.265.23.976fps.8bit.mkv"
+        self.db.import_payload("库.json", _fastlink_payload("", [
+            {"path": f"{WORK_A}/{name}", "fileName": name, "etag": _etag(9), "size": 100},
+        ]))
+        db_path = Path(self._directory.name) / "cloud123.db"
+        stale = json.dumps({"mediaSource": "WEB", "frameRate": "23.976fps", "colorDepth": "8bit"},
+                           ensure_ascii=False, separators=(",", ":"))
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE library_works SET tech = ? WHERE dir = ?", (stale, WORK_A))
+        movie_library_db.LibraryDb(db_path)  # 重开库触发 _migrate
+        # get_work 不返回 tech 列（详情接口另有取法），迁移测试直接读库
+        with sqlite3.connect(db_path) as conn:
+            stored = conn.execute(
+                "SELECT tech FROM library_works WHERE dir = ?", (WORK_A,)).fetchone()[0]
+        tech = json.loads(stored)
+        self.assertEqual(tech["frameRate"], "24fps", "小数帧率要按 PT 口径重算成整数档")
+        self.assertNotEqual(tech.get("colorDepth"), "8bit", "8bit 不再标")
+        # 重算是按文件名现算的：旧值里的 mediaSource=WEB 本就不属于这个片名，会被纠正掉
+        self.assertEqual(tech["mediaSource"], "")
+        self.assertEqual(tech["resourceType"], "UHD BluRay", "其它字段一并重算补齐")
+        self.assertEqual(tech["videoCodec"], "H265")
+        self.assertEqual(tech["dynamicRange"], "HDR")
+        # 只剩脏值的行（按新口径什么都算不出来）也要被清掉，不能永远留着旧值
+        stale_only = "电影/只剩脏值 (2019) {tmdb-77}"
+        self.db.import_payload("库2.json", _fastlink_payload("", [
+            {"path": f"{stale_only}/v.mkv", "fileName": "v.mkv", "etag": _etag(8), "size": 10},
+        ]))
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE library_works SET tech = ? WHERE dir = ?", (stale, stale_only))
+        movie_library_db.LibraryDb(db_path)
+        with sqlite3.connect(db_path) as conn:
+            cleared = conn.execute(
+                "SELECT tech FROM library_works WHERE dir = ?", (stale_only,)).fetchone()[0]
+        self.assertEqual(cleared, "", "算不出任何字段时旧脏值要被清空，而不是留着每次开库重扫")
+        # 幂等：新口径写出的值不会再命中重算条件（否则每次开库都全表重算）
+        condition = ("tech LIKE '%\"mediaSource\"%'"
+                     " AND (tech LIKE '%\"colorDepth\":\"8bit\"%'"
+                     " OR tech LIKE '%\"frameRate\":\"%.%fps\"%')")
+        with sqlite3.connect(db_path) as conn:
+            self.assertEqual(conn.execute(
+                f"SELECT COUNT(*) FROM library_works WHERE {condition}").fetchone()[0], 0)
+
     def test_tmdb_enrich_fields_normalize(self):
         info = {
             "title": "Aquaman", "release_date": "2018-12-07", "overview": "o",
@@ -1116,7 +1161,7 @@ class LibraryEnrichTests(unittest.TestCase):
         self.assertEqual(tech2["resourceType"], "Remux")  # REMUX 档位高于 UHD BluRay
         self.assertEqual(tech2["videoCodec"], "H265")  # H.265 → H265；作品级取优先级最高（H265 > AVC）
         self.assertEqual(tech2["audioCodec"], "TrueHD")
-        self.assertEqual(tech2["frameRate"], "23.976fps")
+        self.assertEqual(tech2["frameRate"], "24fps")  # PT 口径：23.976 写成整数 24fps
         self.assertIn("IMAX", tech2["originalEdition"])
         self.assertIn("REPACK", tech2["originalEdition"])
 
@@ -1125,9 +1170,35 @@ class LibraryEnrichTests(unittest.TestCase):
         tech = movie_library.infer_technical_detailed(["Show.S01E01.H.265.25fps.1080p.mkv"])
         self.assertEqual(tech["frameRate"], "25fps")
         tech2 = movie_library.infer_technical_detailed(["Show.23.976fps.mkv"])
-        self.assertEqual(tech2["frameRate"], "23.976fps")
+        self.assertEqual(tech2["frameRate"], "24fps")  # PT 口径：取整写成 24fps
         tech3 = movie_library.infer_technical_detailed(["Show.1080p.mkv"])
         self.assertEqual(tech3["frameRate"], "")
+
+    def test_infer_technical_frame_rate_pt_only(self):
+        """帧率 PT 化（与油猴 normalizeFrameRate / PT_FRAME_RATES 同口径）：取整、只留常用档、冷门档不标。"""
+        def fps(name):
+            return movie_library.infer_technical_detailed([name])["frameRate"]
+        self.assertEqual(fps("Show.23.976fps.1080p.mkv"), "24fps")
+        self.assertEqual(fps("Show.24fps.1080p.mkv"), "24fps")
+        self.assertEqual(fps("Show.25fps.1080p.mkv"), "25fps")
+        self.assertEqual(fps("Show.29.97fps.1080p.mkv"), "30fps")
+        self.assertEqual(fps("Show.30fps.1080p.mkv"), "30fps")
+        self.assertEqual(fps("Show.50fps.2160p.UHDTV.mkv"), "50fps")
+        self.assertEqual(fps("Show.59.94fps.1080p.mkv"), "60fps")
+        self.assertEqual(fps("Show.119.880fps.2160p.mkv"), "120fps")
+        # 冷门档不标；一个文件不标不影响同组其它文件补上
+        self.assertEqual(fps("Show.48fps.1080p.mkv"), "")
+        self.assertEqual(fps("Show.100fps.1080p.mkv"), "")
+        self.assertEqual(movie_library.infer_technical_detailed(
+            ["Show.100fps.1080p.mkv", "Movie.25fps.1080p.mkv"])["frameRate"], "25fps")
+
+    def test_infer_technical_bit_depth_skips_8bit(self):
+        """色深 PT 化：8bit 是默认值不标（与油猴 normalizeBitDepth 同口径），10bit/12bit 取最高档。"""
+        self.assertEqual(movie_library.infer_technical_detailed(["Show.1080p.8bit.H.264.mkv"])["colorDepth"], "")
+        self.assertEqual(movie_library.infer_technical_detailed(["Show.1080p.10bit.HEVC.mkv"])["colorDepth"], "10bit")
+        self.assertEqual(movie_library.infer_technical_detailed(["Show.2160p.12bit.HEVC.mkv"])["colorDepth"], "12bit")
+        self.assertEqual(movie_library.infer_technical_detailed(
+            ["A.1080p.8bit.H.264.mkv", "B.1080p.12bit.HEVC.mkv"])["colorDepth"], "12bit")
 
     def test_infer_technical_remux_resolution_gap(self):
         """REMUX 记号隔分辨率段：BluRay.1080p.Remux 补升 BluRay Remux；纯 Remux 不误升。"""

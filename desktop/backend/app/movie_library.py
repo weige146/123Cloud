@@ -886,6 +886,29 @@ _TECH_SOURCES = (
 )
 
 
+# PT 命名里只会出现这几档帧率：23.976 / 29.97 / 59.94 / 119.88 按惯例进位写成整数，
+# 48、100 这类冷门档干脆不标（宁可少一个字段，也不要一个没人这么写的值）。
+# 口径与油猴脚本 normalizeFrameRate / PT_FRAME_RATES 一致，两端要一起改。
+_PT_FRAME_RATES = (24, 25, 30, 50, 60, 120)
+
+
+def _normalize_frame_rate(upper: str) -> str:
+    """从文件名抽帧率并按 PT 口径写成整数档；解析不出或不是常用档返回空。"""
+    m = re.search(r"(\d{2,3}(?:\.\d{1,3})?)FPS", upper)
+    if not m:
+        return ""
+    value = m.group(1)
+    if "." in value and float(value) > 120:
+        # 左最匹配把前面的版本号并进来了（H.265.25fps 会被吃成 265.25fps）：去掉 FPS 尾巴后
+        # 只留 fps 紧前那一段数字
+        value = m.group(0)[: -len("FPS")].rpartition(".")[2]
+    try:
+        rate = round(float(value))
+    except ValueError:
+        return ""
+    return f"{rate}fps" if rate in _PT_FRAME_RATES else ""
+
+
 def _tech_first_match(upper: str, table) -> str:
     """按优先级返回首个命中的输出名；都不中返回空。"""
     for pattern, label in table:
@@ -935,15 +958,10 @@ def update_detail_state(state: Dict[str, Any], name: str) -> Dict[str, Any]:
         if label not in editions and re.search(pattern, upper):
             editions.append(label)
     if not state["fps"]:
-        m = re.search(r"(\d{2,3}(?:\.\d{1,3})?)FPS", upper)
-        if m:
-            value = m.group(1)
-            if "." in value and float(value) > 120:
-                # 左最匹配把前面的版本号并进来了（如 265.25fps）：只留 fps 紧前一段
-                value = m.group(0).rpartition(".")[2]
-            state["fps"] = value.lower().rstrip("fps") + "fps"
-    # 色深取全部文件里出现的最高档（10bit/12bit 是画质正向信号）
-    m = re.search(r"(?<![0-9])(8|10|12)[ ._-]?BIT(?![A-Z0-9])", upper)
+        # 解析不出或不是 PT 常用档时留空，state 仍为假值，后面的文件还能补上
+        state["fps"] = _normalize_frame_rate(upper)
+    # 色深取全部文件里出现的最高档（10bit/12bit 是画质正向信号；8bit 是默认值，PT 命名不标）
+    m = re.search(r"(?<![0-9])(10|12)[ ._-]?BIT(?![A-Z0-9])", upper)
     if m:
         rank = int(m.group(1))
         if rank > state["bit"][1]:
