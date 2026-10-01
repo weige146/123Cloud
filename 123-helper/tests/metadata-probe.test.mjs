@@ -112,9 +112,38 @@ test("常规 1080p HEVC AAC 探测输出", () => {
   });
   assert.equal(fields.videoFormat, "1080p");
   assert.equal(fields.videoCodec, "HEVC");
-  assert.equal(fields.frameRate, "23.976fps");
+  assert.equal(fields.frameRate, "24fps", "23.976 按 PT 惯例写成 24fps");
   assert.equal(fields.colorDepth, "10bit");
   assert.equal(fields.audioCodec, "AAC.2.0");
+});
+
+test("帧率：只留 PT 常用档并取整，冷门帧率不写", () => {
+  const { normalizeFrameRate } = sandbox.__metadata;
+  assert.equal(normalizeFrameRate("23.976 (24000/1001) fps"), "24fps");
+  assert.equal(normalizeFrameRate("24000/1001"), "24fps");
+  assert.equal(normalizeFrameRate("25"), "25fps");
+  assert.equal(normalizeFrameRate("29.970 (30000/1001) fps"), "30fps");
+  assert.equal(normalizeFrameRate("30000/1001"), "30fps");
+  assert.equal(normalizeFrameRate("50"), "50fps");
+  assert.equal(normalizeFrameRate("59.940 (60000/1001) fps"), "60fps");
+  assert.equal(normalizeFrameRate("119.880 (120000/1001) fps"), "120fps");
+  assert.equal(normalizeFrameRate("47.952 (48000/1001) fps"), "", "48fps 不是 PT 常用档，不写");
+  assert.equal(normalizeFrameRate("100"), "", "100fps 不写");
+  assert.equal(normalizeFrameRate("0/0"), "");
+});
+
+test("编码与色深：MediaInfo 原始串不糊进命名", () => {
+  const { normalizeVideoCodec, normalizeAudioCodec, normalizeBitDepth } = sandbox.__metadata;
+  assert.equal(normalizeVideoCodec("ISO Media / AVC"), "AVC", "串里带 AVC 仍按 AVC 写");
+  assert.equal(normalizeVideoCodec("Format profile@Level@Main"), "", "没有编码记号就不写");
+  assert.equal(normalizeVideoCodec("MPEG-4 Visual"), "", "认不出的编码不写");
+  assert.equal(normalizeVideoCodec("hevc"), "HEVC");
+  assert.equal(normalizeVideoCodec("AVS2"), "AVS2");
+  assert.equal(normalizeAudioCodec({ Format: "A_AAC", Channels: "2 channels" }), "AAC.2.0");
+  assert.equal(normalizeAudioCodec({ Format: "Unknown", Channels: "2 channels" }), "", "认不出的音轨格式不写");
+  assert.equal(normalizeAudioCodec({ Format: "PCM", Channels: "2 channels" }), "LPCM.2.0");
+  assert.equal(normalizeBitDepth({ BitDepth: "8 bits" }), "", "8bit 是默认值，PT 不标");
+  assert.equal(normalizeBitDepth({ BitDepth: "10 bits" }), "10bit");
 });
 
 console.log(`metadata-probe: ${passed} 项通过`);

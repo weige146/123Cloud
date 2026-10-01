@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.4.4
+// @version      1.4.5
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -1977,6 +1977,39 @@
       }
       throw new Error(`\u83B7\u53D6 123 \u6587\u4EF6\u4E0B\u8F7D\u76F4\u94FE\u5931\u8D25\uFF1A${errors.join("\uFF1B") || "\u63A5\u53E3\u65E0\u8FD4\u56DE"}`);
     }
+    // 同一个文件官方会给多条分发地址（dispatchList 里 5 个节点）。实测某个节点会持续 403
+    // 而换一条同样的分段请求就 206，所以重试时要换节点，而不是拿同一条死磕。
+    async getDownloadUrlCandidates(file, signal) {
+      const fileId = Number(file?.id || file?.fileId || 0);
+      if (!fileId) return [];
+      const body = {
+        driveId: 0,
+        etag: String(file.etag || ""),
+        fileId,
+        s3keyFlag: String(file.s3KeyFlag || file.s3keyFlag || file.s3keyFlag2 || ""),
+        type: Number(file.type || 0),
+        fileName: String(file.name || file.filename || ""),
+        size: Number(file.size || 0)
+      };
+      const out = [];
+      try {
+        const data = await this.request("POST", "/b/api/v2/file/download_info", { signal, body });
+        const info = data?.data || {};
+        const path = String(info.downloadPath || "");
+        const list = Array.isArray(info.dispatchList) ? info.dispatchList : [];
+        if (path) {
+          for (const item of list) {
+            const prefix = String(item?.prefix || item?.Prefix || "").replace(/\/+$/, "");
+            if (prefix) out.push(`${prefix}/${path.replace(/^\/+/, "")}`);
+          }
+        }
+        const single = findDownloadUrl(data);
+        if (single) out.push(decodeDownloadV2Url(single));
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+      }
+      return [...new Set(out.filter(Boolean))];
+    }
     rename(fileId, fileName, signal) {
       return this.request("POST", "/b/api/file/rename", { signal, body: { driveId: 0, fileId: Number(fileId), fileName: String(fileName).trim(), duplicate: 1 } });
     }
@@ -2989,7 +3022,7 @@
     },
     requests: { writeConcurrency: 10, retryAttempts: 6, moveInterval: 120, moveBatchSize: 100 },
     organize: { setupCompleted: false },
-    tmdb: { credential: "", language: "zh-CN", region: "CN", apiBase: "" },
+    tmdb: { credential: "", language: "zh-CN", region: "CN", apiBase: "", showAllSpecials: false },
     library: {
       rootId: "",
       rootName: "",
@@ -3191,6 +3224,8 @@
     if (tmdbApiBaseRaw) {
       config.tmdb.apiBase = (/^https?:\/\//i.test(tmdbApiBaseRaw) ? tmdbApiBaseRaw : `https://${tmdbApiBaseRaw}`).replace(/\/+$/, "");
     } else config.tmdb.apiBase = "";
+    // 校准候选不过滤 S00 特典：默认关（过滤），只认严格 true
+    config.tmdb.showAllSpecials = config.tmdb.showAllSpecials === true;
     applySpecialKeywordMappings(config.library.recognition.fixedMappings);
     config.schemaVersion = 16;
     delete config.metadata;
@@ -3746,7 +3781,20 @@
   // 与列表刷新同为 general_refresh，DOM 顺序还排在列表刷新前面），点它会弹「手动刷新容量」确认框、
   // 走重新计算容量的接口。找列表刷新按钮时必须把这一带整个排除掉。
   var CAPACITY_REFRESH_SCOPE = '[class*="spaceCard"], [class*="totalUsage"], [class*="refreshWrap"], [class*="refreshButton"]';
-  var DIRECT_OFFICIAL_ACTIONS = /* @__PURE__ */ new Set(["\u91CD\u547D\u540D", "\u4FEE\u6539\u540D\u79F0", "\u6279\u91CF\u91CD\u547D\u540D", "\u4E0B\u8F7D", "\u5206\u4EAB", "\u521B\u5EFA\u5206\u4EAB", "\u5220\u9664", "\u79FB\u52A8"]);
+  // 官方选中条里由助手收进「更多」的动作（维护者 2026-10-01 定）：下载、移动、复制、移入保险箱、
+  // 导出目录树、启用/占用直链空间都收起来，条上只留 分享/收藏/批量重命名/删除/更多 + 助手按钮。
+  // 用固定白名单而不是「除可见集之外全收」：官方新增动作时默认保持原样，不会被顺手藏掉。
+  var OFFICIAL_FOLD_ACTIONS = /* @__PURE__ */ new Set(["\u4E0B\u8F7D", "\u6536\u85CF", "\u590D\u5236", "\u79FB\u5165\u4FDD\u9669\u7BB1", "\u5BFC\u51FA\u76EE\u5F55\u6811", "\u542F\u7528\u76F4\u94FE\u7A7A\u95F4", "\u5360\u7528\u76F4\u94FE\u7A7A\u95F4"]);
+  var OFFICIAL_RENAME_LABEL = /^(?:\u91CD\u547D\u540D|\u4FEE\u6539\u540D\u79F0|\u6279\u91CF\u91CD\u547D\u540D)$/;
+  // 官方未选中条（上传/新建/离线下载）的特征按钮：用来区分「官方还在换装空档」与「真的取消勾选」
+  var OFFICIAL_PLAIN_LABELS = /* @__PURE__ */ new Set(["\u4E0A\u4F20", "\u65B0\u5EFA", "\u79BB\u7EBF\u4E0B\u8F7D"]);
+  function officialPlainBarPresent(host) {
+    for (const control of officialToolbarControls(host, { visibleOnly: false })) {
+      if (OFFICIAL_PLAIN_LABELS.has(controlText(control))) return true;
+    }
+    return false;
+  }
+
   function controlText(control) {
     return [control?.textContent, control?.getAttribute?.("aria-label"), control?.getAttribute?.("title")].map((value) => String(value || "").replace(/\s+/g, "").trim()).find(Boolean) || "";
   }
@@ -3874,20 +3922,63 @@
     const labels = [];
     for (const control of controls) {
       const label = controlText(control);
-      if (!label || label === "\u66F4\u591A" || DIRECT_OFFICIAL_ACTIONS.has(label)) continue;
+      if (!label || !OFFICIAL_FOLD_ACTIONS.has(label)) continue;
       if (!labels.includes(label)) labels.push(label);
     }
     const hidden = /* @__PURE__ */ new Set();
     for (const control of controls) {
-      const label = controlText(control);
-      if (!labels.includes(label)) continue;
+      if (!OFFICIAL_FOLD_ACTIONS.has(controlText(control))) continue;
       const child = topLevelToolbarChild(officialGroup, control);
       if (!child || child.classList.contains("measuring-container")) continue;
       child.dataset.c123ToolbarOverflow = "true";
       hidden.add(child);
     }
+    // 收起来之后，官方条里「第一个还看得见的按钮」往往不是 :first-child（那颗被我们藏了），
+    // 圆角会丢；打个标记交给 CSS 补回左圆角。
+    for (const element of officialGroup.children) {
+      const isHead = !hidden.has(element) && !element.classList.contains("measuring-container") && element.getClientRects().length > 0;
+      if (isHead) {
+        element.dataset.c123BarHead = "true";
+        break;
+      }
+      delete element.dataset.c123BarHead;
+    }
     clearOfficialOverflowControls(hidden);
     return labels;
+  }
+  /* 官方条的当前形态写成属性交给 CSS（在 MutationObserver 同步阶段写，与官方那一帧同批上屏）：
+     data-c123-bar-ready        就绪 = 官方选中条里真的有可见按钮（官方换装是先挂空壳量宽度、下一拍
+                                才把按钮翻成可见；只看 .file-operator-group 在不在会让助手按钮早一拍
+                                出现，那一帧条上只有助手的几颗）；两棵条都不在的换装空档沿用上一拍，
+                                避免出现「只剩助手按钮」或「整条空白」的中间帧。
+     data-c123-official-rename  官方选中条里已有自己的「批量重命名」，助手那颗不重复出现 */
+  function officialBarReady(officialGroup) {
+    if (!officialGroup) return false;
+    return officialToolbarControls(officialGroup, { visibleOnly: true }).length > 0;
+  }
+  // 官方这一帧是不是「一颗可见按钮都没有」：换装空档（两棵条都不在）与选中条空壳阶段
+  // （子按钮还在 measuring 容器里量宽）都算。这段时间条上只该有官方原生会有的东西——
+  // 也就是什么都没有，所以助手的常驻「秒传」和紧凑「更多」要一起藏掉，别留孤立按钮乱跳。
+  function officialBarBlank(host, officialGroup) {
+    if (!host) return false;
+    if (!officialToolbarControls(host, { visibleOnly: false }).length) return true;
+    if (!officialGroup) return false;   // 未选中条在场，按钮归官方自己管
+    return officialToolbarControls(officialGroup, { visibleOnly: true }).length === 0;
+  }
+  function markOfficialBarState(host, officialGroup) {
+    if (!host) return;
+    let ready;
+    if (officialGroup) ready = officialBarReady(officialGroup);
+    else if (officialPlainBarPresent(host)) ready = false;
+    else ready = host.dataset.c123BarReady === "true";   // 官方换装空档：沿用上一拍
+    const value = ready ? "true" : "false";
+    if (host.dataset.c123BarReady !== value) host.dataset.c123BarReady = value;
+    if (host.dataset.c123BarSelected !== value) host.dataset.c123BarSelected = value;
+    const blank = officialBarBlank(host, officialGroup) ? "true" : "false";
+    if (host.dataset.c123BarBlank !== blank) host.dataset.c123BarBlank = blank;
+    const has = ready && officialGroup ? officialToolbarControls(officialGroup, { visibleOnly: false }).some((control) => OFFICIAL_RENAME_LABEL.test(controlText(control))) : false;
+    const renameValue = has ? "true" : "false";
+    if (host.dataset.c123OfficialRename !== renameValue) host.dataset.c123OfficialRename = renameValue;
   }
   function closeOfficialMore(group) {
     const more = officialToolbarControls(group, { visibleOnly: false }).find((control) => controlText(control) === "\u66F4\u591A");
@@ -3936,6 +4027,18 @@
     } catch {
       return true;
     }
+  }
+  // 官方「选中条」容器：实测官方勾选后把 .home-operator-button-group 的子树整体换成
+  // .file-operator-group（取消时再换回上传/新建那组），所以它是每次切换都被重建的不稳定节点。
+  // 直查类名，拿不到再退回按动作按钮聚类的兜底算法。
+  function officialSelectedGroup(host) {
+    if (!host) return null;
+    const direct = host.querySelector(":scope > .file-operator-group");
+    if (direct) return direct;
+    const controls = officialToolbarControls(host);
+    const boundary = officialActionBoundary(host, controls);
+    const count = boundary ? controls.filter((control) => topLevelToolbarChild(host, control) === boundary).length : 0;
+    return count > 1 ? boundary : null;
   }
   function activeToolbarHost() {
     const hosts = [...document.querySelectorAll(SELECTORS.toolbar)].filter((host) => !host.closest("[data-cloud123-helper]"));
@@ -4149,6 +4252,25 @@
         this.emit();
       }, 90);
     }
+    syncOfficialBarLayout() {
+      try {
+        if (isShareListRoute()) return;
+        const host = activeToolbarHost();
+        if (!host || host.dataset.cloud123HelperToolbarHost !== "true") return;
+        const group = officialSelectedGroup(host);
+        const fingerprint = group ? [...group.children].map((child) => controlText(child)).join("|") : "";
+        // 选中条在场期间必须每批重算：空壳⇄按钮翻牌就发生在这一拍，早退会把空白标记漏掉。
+        // 其余情况（未选中、官方条内容没变、已经不在空白/就绪态）走廉价短路，不读布局。
+        const steady = !group && this.officialBarFingerprint === fingerprint
+          && host.dataset.c123BarReady !== "true" && host.dataset.c123BarBlank !== "true";
+        if (steady) return;
+        this.officialBarFingerprint = fingerprint;
+        markOfficialBarState(host, group);
+        // 折叠只在「就绪」那一帧做一次：早了会在官方测量阶段干扰它，晚了就会先铺开再收窄
+        configureOfficialOverflow(group, host.dataset.c123BarReady === "true" ? Boolean(group) : false);
+      } catch {
+      }
+    }
     updateConfig(config = {}) {
       this.config = config;
       syncOfficialPageMode(this.config);
@@ -4171,7 +4293,19 @@
         }
         setTimeout(() => this.syncPage(), 0);
       }, true);
-      this.observer = new MutationObserver(() => this.syncPage());
+      // 绘制前排版（MutationObserver 同步阶段）：官方选中条挂载/卸载的那一帧就把
+      // 「收进更多」和「官方自带重命名」两个标记打好，避免先画平铺再收缩的跳变。
+      // 只在官方条指纹（子项文案）变化时真干活，其余批次直接返回，不做布局读取。
+      this.observer = new MutationObserver((mutations) => {
+        // 官方翻牌（子按钮 display:none → 可见）改的是 class/style 属性，不是新增节点；
+        // 只盯 addedNodes 就会漏掉那一帧，助手按钮早一拍出现 → 空壳中间帧。
+        let touch = false;
+        for (const mutation of mutations) {
+          if (mutation.addedNodes.length || (mutation.type === "attributes" && mutation.target !== document.body)) { touch = true; break; }
+        }
+        if (touch) this.syncOfficialBarLayout();
+        this.syncPage();
+      });
       window.addEventListener("popstate", () => this.syncPage());
       window.addEventListener("hashchange", () => this.syncPage());
       const start = () => {
@@ -4591,20 +4725,31 @@
       const signature = JSON.stringify(newItems);
       if (extension.dataset.signature === signature) return;
       extension.dataset.signature = signature;
+      // 注入项直接克隆官方菜单项节点：类名/内边距/行高全继承官方，自绘 button 会和官方项错位。
+      const nativeItem = [...host.children].find((element) => !element.closest("[data-cloud123-helper]") && controlText(element) && !element.querySelector('li, [role="menuitem"]'));
       extension.replaceChildren(...newItems.map((item) => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "c123-official-more-item";
-        button.setAttribute("role", "menuitem");
-        button.textContent = item.label;
-        button.addEventListener("click", (event) => {
+        let entry;
+        if (nativeItem) {
+          entry = nativeItem.cloneNode(true);
+          for (const attr of ["id", "data-menu-id", "aria-disabled", "aria-selected", "tabindex"]) entry.removeAttribute(attr);
+          for (const cls of ["active", "selected", "-active"]) entry.className = String(entry.className || "").split(/\s+/).filter((name) => !name.includes(cls)).join(" ");
+          entry.textContent = item.label;
+        } else {
+          entry = document.createElement("button");
+          entry.type = "button";
+          entry.className = "c123-official-more-item";
+          entry.textContent = item.label;
+        }
+        entry.setAttribute("role", "menuitem");
+        entry.setAttribute("data-c123-cloned-item", "true");
+        entry.addEventListener("click", (event) => {
           event.preventDefault();
           event.stopPropagation();
           closeOfficialMore(officialGroup);
           if (item.command) this.commands[item.command]?.();
           else clickOfficialAction(officialGroup, item.official);
         });
-        return button;
+        return entry;
       }));
     }
     ensureCompactMore(officialGroup, items, host) {
@@ -4740,14 +4885,15 @@
       const boundary = officialActionBoundary(host, officialControls);
       const boundaryControlCount = boundary ? officialControls.filter((control) => topLevelToolbarChild(host, control) === boundary).length : 0;
       const officialGroup = boundaryControlCount > 1 ? boundary : null;
-      const hasSelection = this.snapshot().hasSelection;
-      const officialOverflowActions = configureOfficialOverflow(officialGroup, hasSelection);
+      // 排版只看官方条本身，不读 JS 的选中快照：快照要等 rAF/防抖才更新，靠它决定就会先宽后窄跳一下。
+      markOfficialBarState(host, officialGroup);
+      const officialOverflowActions = configureOfficialOverflow(officialGroup, host.dataset.c123BarReady === "true" ? Boolean(officialGroup) : false);
       const customMoreItems = this.commands.moreCommands?.() || [];
       const allMoreItems = [
         ...customMoreItems,
         ...officialOverflowActions.map((label) => ({ label, official: label }))
       ];
-      const toolbarHost = officialGroup || host;
+      const toolbarHost = host;
       this.ensureCompactMore(officialGroup, allMoreItems, toolbarHost);
       const toolbars = [...document.querySelectorAll(".c123-helper-toolbar")];
       let toolbar = toolbars.find((candidate) => candidate.parentElement === toolbarHost) || toolbars[0];
@@ -4757,12 +4903,13 @@
         toolbar.dataset.cloud123Helper = "toolbar";
       }
       host.dataset.cloud123HelperToolbarHost = "true";
-      if (officialGroup?.parentElement === host) {
-        if (toolbar.parentElement !== officialGroup || toolbar !== officialGroup.firstElementChild) officialGroup.insertBefore(toolbar, officialGroup.firstChild);
-      } else if (toolbar.parentElement !== host) host.append(toolbar);
+      // 只挂在稳定父节点（.home-operator-button-group）下，绝不插进官方选中条 .file-operator-group：
+      // 插进去的节点每次勾选/取消都会被 React 连锅端走（实测取消方向整条缺席 ~95ms、
+      // 勾选方向助手按钮迟到 ~150ms），那就是闪烁的根因。位置与显隐都由 data-c123-bar-ready 控制。
+      if (toolbar.parentElement !== host) host.append(toolbar);
       for (const stale of toolbars) if (stale !== toolbar) stale.remove();
       const officialShare = allOfficialControls.find((control) => /^(?:分享|创建分享)$/.test(controlText(control))) || null;
-      const officialRename = allOfficialControls.find((control) => /^(?:重命名|修改名称|批量重命名)$/.test(controlText(control))) || null;
+      const officialRename = allOfficialControls.find((control) => OFFICIAL_RENAME_LABEL.test(controlText(control))) || null;
       const reference = officialControls.find((control) => control.classList.contains("file-operator-group-button")) || officialControls.find((control) => control.tagName === "BUTTON" && !isPrimaryControl(control)) || officialControls.find((control) => !isPrimaryControl(control)) || null;
       const context = {
         buttonClassName: reference?.getAttribute("class") || "",
@@ -4773,18 +4920,18 @@
         officialBoundary: officialGroup,
         pageToolbarHost: host
       };
+      // 签名只留真正改变按钮结构的两项：官方 class 名与标签名。勾选态（官方分享/重命名在不在、
+      // 折叠了哪些动作）以前也在签名里，于是每次勾选都要 innerHTML 重建整条助手按钮——
+      // 那本身就是第二次闪烁，现在交给 CSS 与标记处理。
       const signature = JSON.stringify({
         buttonClassName: context.buttonClassName,
-        controlTagName: context.controlTagName,
-        hasOfficialShare: context.hasOfficialShare,
-        hasOfficialRename: context.hasOfficialRename,
-        officialOverflowActions
+        controlTagName: context.controlTagName
       });
-      const boundaryChanged = toolbar.c123OfficialBoundary !== officialGroup;
-      if (toolbar.dataset.mountSignature === signature && !boundaryChanged) return;
-      toolbar.dataset.mountSignature = signature;
-      toolbar.c123OfficialBoundary = officialGroup;
-      this.commands.mountToolbar?.(toolbar, context);
+      if (toolbar.dataset.mountSignature !== signature) {
+        toolbar.dataset.mountSignature = signature;
+        this.commands.mountToolbar?.(toolbar, context);
+      }
+      this.commands.updateToolbarState?.();
     }
     ensureShareToolbar() {
       for (const toolbar2 of document.querySelectorAll(".c123-helper-toolbar")) toolbar2.remove();
@@ -4936,15 +5083,44 @@
       position:relative; display:inline-flex; align-items:stretch; flex:0 0 auto; flex-wrap:nowrap; gap:0; min-width:0;
       margin:0; padding:0;
     }
-    .file-operator-group > .c123-helper-toolbar { display:contents; }
-    .file-operator-group > .c123-helper-toolbar > [data-toolbar-direct="true"] { order:-10; }
-    /* 「秒传」常驻按钮固定到「更多」左侧（「离线下载」旁）：order 999 介于官方按钮(0)与「更多」(≥1000)之间；
-       官方「更多」可见时由 ensureCompactMore 给它内联 order:1002，秒传照样排其左侧紧邻位；
-       flex:0 0 auto 防挤压、不参与官方溢出收编（configureOfficialOverflow 不碰 helper 节点），窄屏也不被布局吞掉。 */
-    .file-operator-group > .c123-helper-toolbar > [data-toolbar-direct="true"][data-c123-pin-more="true"] { order:999; flex:0 0 auto; }
-    .home-operator-button-group > .c123-helper-toolbar { order:999; flex:0 0 auto; }
+    /* 助手按钮挂在稳定父节点 .home-operator-button-group 下，恒定是一个 inline-flex 盒子：
+       盒子模型不随勾选切换（在 contents / flex 之间来回切会多一次重排，那就是残留的闪）。 */
+    .home-operator-button-group > .c123-helper-toolbar { display:inline-flex; align-items:stretch; order:999; flex:0 0 auto; }
+    .home-operator-button-group > .c123-helper-toolbar > [data-toolbar-direct="true"] { flex:0 0 auto; }
+    /* 显隐与排版都看 data-c123-bar-ready（官方条里真的有可见按钮才算就绪，由 MutationObserver
+       同步阶段写，和官方那一帧同批上屏）。只看 :has(.file-operator-group) 会在官方「空壳测量」
+       阶段就放行助手按钮，出现「只有助手三颗、官方一颗都没有」的中间帧。 */
+    .home-operator-button-group[data-c123-bar-ready="true"] > .c123-helper-toolbar { order:-1; margin-right:-16px; }
+    /* 已知取舍（维护者 2026-10-01 定：保留、不再优化）：未选中 order:999（排在官方按钮之后）、
+       就绪 order:-1（整块挪到官方条左侧并抵掉容器 16px gap），勾选瞬间助手组会向左移一段。
+       想彻底消掉它只有两条路，都已实测否决：① 两态固定同一侧 → 另一侧观感变差；
+       ② 给官方选中条加 width:min-content 压掉它被 flex 撑出来的空白 → 选中条宽度正是官方
+       自己算「放得下几颗」的基准，压窄后它会把整排按钮全折进「更多」。 */
+    .home-operator-button-group[data-c123-bar-ready="true"] > .c123-helper-toolbar > [data-toolbar-direct="true"]:first-child { border-top-left-radius:6px; border-bottom-left-radius:6px; }
+    .home-operator-button-group[data-c123-bar-ready="true"] > .c123-helper-toolbar > [data-toolbar-direct="true"]:last-child { border-top-right-radius:0; border-bottom-right-radius:0; }
+    /* 官方条里第一个没被收起来的按钮补左圆角（官方自己的 :first-child 常常是被收起来的那颗） */
+    .file-operator-group > .file-operator-group-button[data-c123-bar-head="true"] { border-top-left-radius:6px; border-bottom-left-radius:6px; }
+    /* 官方选中条自带「更多」，助手的紧凑「更多」这时是多余的：以前要等 90ms 防抖那轮才移除，
+       中间就有一个孤立的「更多」飘在右侧。这里同帧藏掉，节点仍交给防抖轮回收。 */
+    .home-operator-button-group[data-c123-bar-ready="true"] > .c123-compact-more { display:none !important; }
+    /* 官方换装空档 / 选中条空壳阶段：官方自己这一帧也没有任何可见按钮，助手就一起藏，
+       让这一帧和没装脚本时完全一致（不留「秒传 + 更多」两个孤立按钮跳来跳去）。 */
+    .home-operator-button-group[data-c123-bar-blank="true"] > .c123-helper-toolbar,
+    .home-operator-button-group[data-c123-bar-blank="true"] > .c123-compact-more { display:none !important; }
+    .home-operator-button-group[data-c123-bar-ready="true"] > .c123-helper-toolbar > [data-toolbar-direct="true"]:first-child { border-top-left-radius:6px; border-bottom-left-radius:6px; }
+    .home-operator-button-group[data-c123-bar-ready="true"] > .c123-helper-toolbar > [data-toolbar-direct="true"]:last-child { border-top-right-radius:0; border-bottom-right-radius:0; margin-right:-1px; }
+    /* 官方条里第一个没被收起来的按钮补左圆角（官方自己的 :first-child 常常是被收起来的那颗） */
+    .file-operator-group > .file-operator-group-button[data-c123-bar-head="true"] { border-top-left-radius:6px; border-bottom-left-radius:6px; }
     .c123-helper-toolbar[hidden] { display:none !important; }
     .c123-helper-toolbar > [data-command][hidden] { display:none !important; }
+    /* 勾选类按钮的显隐交给 CSS：官方选中条在场即显示，不等 JS 读选中快照（那是闪烁的另一半）。
+       「转存秒传」不带此标记——它还要判断勾选的是不是秒传种子文件，只能由 JS 控制。
+       不认 :has() 的老内核走 data-c123-bar-selected 兜底（同一个绘制前同步阶段写入，两者等价）。 */
+    .c123-helper-toolbar > [data-c123-bar-gate="true"] { display:none !important; }
+    .home-operator-button-group[data-c123-bar-ready="true"] .c123-helper-toolbar > [data-c123-bar-gate="true"] { display:inline-flex !important; }
+    /* 官方选中条里自带重命名时助手那颗不重复出现（标记在绘制前打好）。
+       权重比上一条高一级，顺序上也在其后，两条保险。 */
+    .home-operator-button-group[data-c123-official-rename="true"] .c123-helper-toolbar > [data-c123-bar-gate="true"][data-command="rename"] { display:none !important; }
     .c123-helper-toolbar [data-command] { white-space:nowrap; letter-spacing:0; }
     .c123-helper-toolbar [aria-disabled="true"] { opacity:.45; cursor:not-allowed; pointer-events:none; }
     .c123-official-more-extension { display:contents; }
@@ -4954,6 +5130,10 @@
     }
     .c123-official-more-item:hover, .c123-official-more-item:focus-visible,
     .c123-compact-more-item:hover, .c123-compact-more-item:focus-visible { color:var(--c123-accent); background:var(--c123-accent-soft); outline:0; }
+    /* 克隆官方菜单项：官方 hover 是 React 加的类，克隆节点没有事件，这里补一条 */
+    [data-c123-cloned-item] { cursor:pointer; }
+    [data-c123-cloned-item]:hover, [data-c123-cloned-item]:focus-visible { background-color:rgba(0,0,0,.04); outline:0; }
+    [data-c123-menu-trimmed="true"] { display:none !important; }
     .c123-compact-more { position:relative; display:flex; align-items:stretch; flex:0 0 auto; order:1000; }
     .c123-compact-more-menu {
       position:absolute; z-index:1000; top:calc(100% + 8px); right:0; width:max-content; min-width:168px;
@@ -6199,6 +6379,10 @@
   var DEFAULT_CHUNK_SIZE = 2 * 1024 * 1024;
   var NETWORK_WINDOW_SIZE = 4 * 1024 * 1024;
   var MAX_NETWORK_WINDOWS = 3;
+  // 123 直链偶发瞬时拒绝（实测：8.7GB 大文件的尾部窗口 Range 请求会随机拿到 HTTP 403，
+  // 重取直链再试就好了）。可重试错误的额外尝试次数与退避。
+  var MAX_RANGE_RETRIES = 2;
+  var RANGE_RETRY_BACKOFF_MS = [600, 1500];
   var MAX_RESULT_CACHE = 100;
   var MAX_REDIRECT_HOPS = 3;
   var MEDIAINFO_WASM_URL = "https://cdn.jsdelivr.net/npm/mediainfo.js@0.3.7/dist/MediaInfoModule.wasm";
@@ -6238,7 +6422,11 @@
     if (text2.includes("av1")) return "AV1";
     if (text2.includes("mpeg-2") || text2.includes("mpeg2")) return "MPEG2";
     if (text2.includes("vc-1") || text2.includes("vc1")) return "VC1";
-    return String(value || "").toUpperCase();
+    if (text2.includes("avs3")) return "AVS3";
+    if (text2.includes("avs2")) return "AVS2";
+    if (text2.includes("avs+")) return "AVS+";
+    // MediaInfo 原始串（"ISO Media / AVC"、"MPEG-4 Visual" 之类）不是命名用词，认不出就不写
+    return "";
   }
   function normalizeAudioChannels(value) {
     // MediaInfo 的 Channels 可能是数字或「6 channels」这类字符串，取第一个数字
@@ -6266,12 +6454,16 @@
     } else if (value.includes("aac")) codec = "AAC";
     else if (value.includes("flac")) codec = "FLAC";
     else if (value.includes("opus")) codec = "Opus";
-    else return firstText(track.Format_Commercial, track.Format_String, track.Format).toUpperCase();
+    else if (/\bpcm\b|s16le|s24le|\bpcm_s\b/.test(value)) codec = "LPCM";
+    else return "";   // 认不出的音轨格式不写进命名（避免 "A_AAC"、"V_MPEG4" 这类原始字段名）
     const parts = [codec];
     if (channels) parts.push(channels);
     if (hasAtmos) parts.push("Atmos");
     return parts.join(".");
   }
+  // PT 命名里只会出现这几档帧率：23.976 / 29.97 / 59.94 / 119.88 按惯例进位写成整数，
+  // 48、100 这类不常见的直接不写（宁可少一个字段，也不要一个没人这么标的值）。
+  var PT_FRAME_RATES = /* @__PURE__ */ new Set([24, 25, 30, 50, 60, 120]);
   function normalizeFrameRate(value) {
     const raw = String(value || "").trim();
     if (!raw || raw === "0/0") return "";
@@ -6281,14 +6473,15 @@
     const leading = fraction ? null : raw.match(/^(\d+(?:\.\d+)?)(?:\s*fps)?/i);
     if (fraction) rate = Number(fraction[1]) / Number(fraction[2]);
     else if (leading) rate = Number(leading[1]);
-    return Number.isFinite(rate) && rate > 0 && rate < 1000 ? `${rate.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")}fps` : "";
+    if (!Number.isFinite(rate) || rate <= 0 || rate >= 1000) return "";
+    const rounded = Math.round(rate);
+    return PT_FRAME_RATES.has(rounded) ? `${rounded}fps` : "";
   }
   function normalizeBitDepth(track = {}) {
     const value = firstText(track.BitDepth, track.BitDepth_Detected, track.BitDepth_Stored, track.Format_Profile);
     if (value.includes("12")) return "12bit";
     if (value.includes("10")) return "10bit";
-    if (value.includes("8")) return "8bit";
-    return "";
+    return "";   // 8bit 是默认值，PT 命名不标
   }
   function normalizeDynamicRange(track = {}) {
     // HDR_Format_String 可能是「Dolby Vision, …, dvhe.08.06, BL+RPU / SMPTE ST 2084,
@@ -6362,13 +6555,32 @@
   function preferAutomaticRedirect(value) {
     try {
       const url = new URL(value);
-      if (url.hostname === "123295.com" || url.hostname.endsWith(".123295.com")) {
+      if ((url.hostname === "123295.com" || url.hostname.endsWith(".123295.com")) && !url.searchParams.has("auto_redirect")) {
+        // 官方直链的 query 是签过名的（实测同一链接带 auto_redirect=0 时 206 正常）：
+        // 已经给了这个参数就按原样用，改写它可能让 CDN 判签名不匹配直接 403。
         url.searchParams.set("auto_redirect", "1");
         return url.toString();
       }
     } catch {
     }
     return value;
+  }
+  // 分段读取失败的分类：只有「服务器真的不按 Range 返回」才说「不支持分段读取」；
+  // 403/401/429/5xx/超时/网络错误都是暂时性拒绝（旧写法一律断言不支持分段读取，把用户带偏——
+  // 实测同一个文件再点一次就成功了）。retryable 交给 createRangeReader 退避重试。
+  function rangeFailure(url, start, end, status, headers = {}) {
+    const code = Number(status || 0);
+    const endpoint = (() => {
+      try {
+        return new URL(url).host;
+      } catch {
+        return "\u672A\u77E5\u4E3B\u673A";
+      }
+    })();
+    if (code === 416) return { message: `\u4E0B\u8F7D\u670D\u52A1\u5668\u62D2\u7EDD\u8BE5\u5206\u6BB5\u8BFB\u53D6\uFF1ARange bytes=${start}-${end} \u8FD4\u56DE HTTP 416\uFF08\u8D85\u51FA\u6587\u4EF6\u8303\u56F4\uFF09`, retryable: false };
+    if (code >= 200 && code < 300) return { message: `\u4E0B\u8F7D\u670D\u52A1\u5668\u4E0D\u652F\u6301\u5206\u6BB5\u8BFB\u53D6\uFF1ARange bytes=${start}-${end} \u8FD4\u56DE HTTP ${code}\uFF08Accept-Ranges: ${headers["accept-ranges"] || "\u672A\u58F0\u660E"}\uFF09`, retryable: false };
+    const hint = code === 403 || code === 401 ? "\uFF08\u76F4\u94FE\u53EF\u80FD\u5DF2\u8FC7\u671F\uFF09" : "";
+    return { message: `${endpoint} \u6682\u65F6\u62D2\u7EDD\u4E86\u5206\u6BB5\u8BFB\u53D6\uFF1ARange bytes=${start}-${end} \u8FD4\u56DE ${code ? `HTTP ${code}` : "\u65E0\u54CD\u5E94"}${hint}`, retryable: true };
   }
   function gmRangeRequest(url, start, end, signal) {
     const isPartialStatus = (status) => [206, 210].includes(Number(status));
@@ -6384,7 +6596,8 @@
         fetch(url, { headers: { Range: `bytes=${start}-${end}`, Accept: "*/*" }, signal }).then(async (response) => {
           const headers = Object.fromEntries(response.headers.entries());
           if (!isPartialStatus(response.status)) {
-            throw new Error(`\u4E0B\u8F7D\u670D\u52A1\u5668\u4E0D\u652F\u6301\u5206\u6BB5\u8BFB\u53D6\uFF1ARange bytes=${start}-${end} \u8FD4\u56DE HTTP ${response.status}\uFF08Accept-Ranges: ${headers["accept-ranges"] || "\u672A\u58F0\u660E"}\uFF09`);
+            const failure = rangeFailure(url, start, end, response.status, headers);
+            throw Object.assign(new Error(failure.message), { retryable: failure.retryable, status: response.status });
           }
           resolve({ status: response.status, headers, bytes: new Uint8Array(await response.arrayBuffer()) });
         }).catch(reject);
@@ -6411,15 +6624,18 @@
         timeout: 45e3,
         onload: (response) => {
           const headers = parseHeaderMap(response.responseHeaders);
-          if (!isPartialStatus(response.status)) return finish(reject, new Error(`\u4E0B\u8F7D\u670D\u52A1\u5668\u4E0D\u652F\u6301\u5206\u6BB5\u8BFB\u53D6\uFF1ARange bytes=${start}-${end} \u8FD4\u56DE HTTP ${response.status}\uFF08Accept-Ranges: ${headers["accept-ranges"] || "\u672A\u58F0\u660E"}\uFF09`));
+          if (!isPartialStatus(response.status)) {
+            const failure = rangeFailure(url, start, end, response.status, headers);
+            return finish(reject, Object.assign(new Error(failure.message), { retryable: failure.retryable, status: response.status }));
+          }
           finish(resolve, { status: response.status, headers, bytes: new Uint8Array(response.response) });
         },
         onerror: (response) => {
           const status = Number(response?.status || 0);
           const suffix = status ? `\uFF08HTTP ${status}\uFF09` : "";
-          finish(reject, new Error(`${endpoint} \u7684 Range bytes=${start}-${end} \u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25${suffix}`));
+          finish(reject, Object.assign(new Error(`${endpoint} \u7684 Range bytes=${start}-${end} \u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25${suffix}`), { retryable: true }));
         },
-        ontimeout: () => finish(reject, new Error(`${endpoint} \u7684 Range bytes=${start}-${end} \u8BF7\u6C42\u8D85\u65F6`)),
+        ontimeout: () => finish(reject, Object.assign(new Error(`${endpoint} \u7684 Range bytes=${start}-${end} \u8BF7\u6C42\u8D85\u65F6`), { retryable: true })),
         onabort: () => finish(reject, abortError())
       });
       if (signal?.aborted) abort();
@@ -6433,6 +6649,8 @@
     let limited = false;
     let limitNotified = false;
     const maxWindows = Math.max(1, Number(options.maxWindows || MAX_NETWORK_WINDOWS));
+    const retries = Number.isFinite(Number(options.retries)) ? Math.max(0, Number(options.retries)) : MAX_RANGE_RETRIES;
+    const refreshUrl = typeof options.refreshUrl === "function" ? options.refreshUrl : null;
     const cache = /* @__PURE__ */ new Map();
     const inFlight = /* @__PURE__ */ new Map();
     const admittedWindows = /* @__PURE__ */ new Set();
@@ -6458,8 +6676,7 @@
       }
       admittedWindows.add(start);
       const end = Math.min(fileSize - 1, start + NETWORK_WINDOW_SIZE - 1);
-      const pending = (async () => {
-        onProgress?.({ phase: `\u8BFB\u53D6\u5A92\u4F53\u5206\u6BB5 ${requestCount + 1}`, requestCount, bytesRead, start, end });
+      const oneAttempt = async () => {
         let response;
         for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop += 1) {
           response = await gmRangeRequest(resolvedUrl, start, end, signal);
@@ -6483,6 +6700,35 @@
         touch(start, record);
         onProgress?.({ phase: `\u5DF2\u8BFB\u53D6 ${requestCount}/${maxWindows} \u4E2A\u5A92\u4F53\u5206\u7247`, requestCount, bytesRead, start, end: range.end, windowLimit: maxWindows });
         return record;
+      };
+      const pending = (async () => {
+        onProgress?.({ phase: `\u8BFB\u53D6\u5A92\u4F53\u5206\u6BB5 ${requestCount + 1}`, requestCount, bytesRead, start, end });
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            return await oneAttempt();
+          } catch (error) {
+            if (error?.name === "AbortError") throw error;
+            // 暂时性拒绝（直链过期/CDN 抖动/限流）：退避后重取一条新直链再试；
+            // 真不支持分段（200 整包/416 越界）不重试，直接给出准确原因。
+            if (!error?.retryable || attempt >= retries) {
+              admittedWindows.delete(start);
+              if (error?.retryable) error.message = `${error.message}\uFF08\u5DF2\u91CD\u8BD5 ${attempt} \u6B21\u4ECD\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5\u6216\u51CF\u5C11\u4E00\u6B21\u8BC6\u522B\u7684\u6587\u4EF6\u6570\uFF09`;
+              throw error;
+            }
+            const wait = Number(RANGE_RETRY_BACKOFF_MS[attempt] || RANGE_RETRY_BACKOFF_MS.at(-1) || 600);
+            onProgress?.({ phase: `\u5206\u6BB5\u88AB\u62D2\uFF0C${wait}ms \u540E\u6362\u65B0\u76F4\u94FE\u91CD\u8BD5\uFF08\u7B2C ${attempt + 1}/${retries} \u6B21\uFF09`, requestCount, bytesRead, start, end });
+            await new Promise((resolve) => setTimeout(resolve, wait));
+            ensureNotAborted(signal);
+            if (refreshUrl) {
+              try {
+                const fresh = await refreshUrl();
+                if (fresh) resolvedUrl = preferAutomaticRedirect(fresh);
+              } catch (refreshError) {
+                if (refreshError?.name === "AbortError") throw refreshError;
+              }
+            }
+          }
+        }
       })().finally(() => inFlight.delete(start));
       inFlight.set(start, pending);
       return pending;
@@ -6556,7 +6802,27 @@
         const mediaInfo = await this.engineFactory();
         ensureNotAborted(signal);
         onProgress?.({ phase: "\u5206\u6790\u5A92\u4F53\u5BB9\u5668", requestCount: 0, bytesRead: 0 });
-        const reader = createRangeReader(downloadUrl, fileSize, signal, onProgress, { maxWindows: MAX_NETWORK_WINDOWS });
+        var candidates = [];
+        var usedUrls = /* @__PURE__ */ new Set();
+        const reader = createRangeReader(downloadUrl, fileSize, signal, onProgress, {
+          maxWindows: MAX_NETWORK_WINDOWS,
+          // 重试前先换一条直链：优先换官方 dispatchList 里的另一个节点（实测同一节点会连续 403、
+          // 换节点就通），节点都用过了再重新取一批。
+          refreshUrl: this.api?.getDownloadUrl ? async () => {
+            if (!this.api.getDownloadUrlCandidates) {
+              const fresh = await this.api.getDownloadUrl(file, signal);
+              if (fresh) file.downloadUrl = fresh;
+              return fresh;
+            }
+            if (!usedUrls.size) usedUrls.add(downloadUrl);
+            if (!candidates.length) candidates = (await this.api.getDownloadUrlCandidates(file, signal)).filter((url) => !usedUrls.has(url));
+            const next = candidates.shift();
+            if (!next) return null;
+            usedUrls.add(next);
+            file.downloadUrl = next;
+            return next;
+          } : null
+        });
         const result2 = await mediaInfo.analyzeData(fileSize, reader);
         ensureNotAborted(signal);
         const fields = normalizeMediaInfo(result2);
@@ -6648,6 +6914,20 @@
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.4.5",
+      notes: [
+        "\u52FE\u9009\u6587\u4EF6\u540E\u5DE5\u5177\u680F\u4E0D\u518D\u8DF3\u52A8\u4E86",
+        "\u300C\u79D2\u4F20\u300D\u632A\u5230\u300C\u6574\u7406\u300D\u65C1\u8FB9\uFF0C\u300C\u4E0B\u8F7D\u300D\u300C\u6536\u85CF\u300D\u7B49\u6536\u8FDB\u300C\u66F4\u591A\u300D\uFF0C\u6392\u7248\u8DDF\u5B98\u65B9\u63A5\u6210\u4E00\u6761",
+        "\u79BB\u7EBF\u4E0B\u8F7D\u83DC\u5355\u53EA\u7559\u300C\u65B0\u5EFA BT \u4EFB\u52A1\u300D\u300C\u6279\u91CF\u79BB\u7EBF\u4E0B\u8F7D\u300D\u300C\u67E5\u770B\u79BB\u7EBF\u4E0B\u8F7D\u4EFB\u52A1\u300D",
+        "\u6574\u7406\u65F6\u624B\u52A8\u586B\u4E86\u5B63\u53F7\u5C31\u4EE5\u4F60\u586B\u7684\u4E3A\u51C6\uFF0C\u7279\u5178\uFF08\u7B2C 0 \u5B63\uFF09\u4E5F\u80FD\u6B63\u5E38\u5BF9\u4E0A",
+        "\u8BC6\u522B\u6587\u4EF6\u5143\u6570\u636E\u88AB\u4E0B\u8F7D\u8282\u70B9\u62D2\u7EDD\u65F6\u4F1A\u81EA\u52A8\u6362\u4E00\u53F0\u8282\u70B9\u91CD\u8BD5\uFF0C\u4E0D\u518D\u8BEF\u62A5\u300C\u4E0D\u652F\u6301\u5206\u6BB5\u8BFB\u53D6\u300D",
+        "\u8BC6\u522B\u51FA\u6765\u7684\u5E27\u7387\u6539\u6210\u6574\u6570\uFF0823.976 \u5199 24fps\uFF09\uFF0C\u53EA\u4FDD\u7559 24/25/30/50/60/120 \u8FD9\u51E0\u6863\uFF1B\u5176\u4ED6\u8FA8\u8BC6\u7ED3\u679C\u4E5F\u6539\u6210\u7AD9\u91CC\u5E38\u7528\u7684\u5199\u6CD5\uFF0C\u8BA4\u4E0D\u51FA\u7684\u4E0D\u518D\u5199\u8FDB\u53BB",
+        "\u65B0\u589E\u300C\u6279\u91CF\u79BB\u7EBF\u4E0B\u8F7D\u300D\uFF1A\u4E00\u6B21\u7C98\u8D34\u591A\u6761\u76F4\u94FE\u6216\u78C1\u529B\u94FE\u63A5\u9010\u6761\u63D0\u4EA4\uFF0C\u53EF\u505C\u6B62\u540E\u7EE7\u7EED",
+        "\u52FE\u4E86\u300C\u53BB\u9664\u6587\u4EF6\u540D\u53D1\u5E03\u7EC4\u300D\u518D\u6295\u79D2\u4F20\uFF0C\u5BA2\u6237\u7AEF\u4ECD\u80FD\u6309\u539F\u672C\u7684\u53D1\u5E03\u7EC4\u5206\u7C7B\u6295\u9012",
+        "Netflix \u7B49\u6D41\u5A92\u4F53\u547D\u540D\uFF08\u5982 \u2026H.264-NF\uFF09\u4E0D\u518D\u88AB\u8BEF\u8BA4\u6210\u53D1\u5E03\u7EC4\uFF0C\u53BB\u7EC4\u5BFC\u51FA\u548C\u6295\u7A3F\u5206\u7C7B\u90FD\u66F4\u51C6"
+      ]
+    },
     {
       version: "1.4.4",
       notes: [
@@ -7379,6 +7659,19 @@
       if (records[index].fileName) records[index].fileName = item.path.split("/").at(-1);
     });
     return records;
+  }
+  // 秒传直投路由用：从原始（去组前）文件名里把发布组提取出来。开「导出时去除文件名发布组」后，
+  // 种子内容里组名已被抹掉，客户端识别不到、发布组路由就会瞎；这里在扫描阶段趁原名还在先算好，
+  // 随 meta 结构化带给客户端（多版本组名用 "/" 连接，与客户端 join_variants 同格式、逐条去重）。
+  function collectFastlinkReleaseGroups(files, configured = []) {
+    const groups = [];
+    for (const file of Array.isArray(files) ? files : []) {
+      const base = String(file?.path || file?.fileName || file?.name || "").split("/").pop() || "";
+      const group = extractReleaseGroupName(base, configured);
+      if (group && !groups.some((item) => item.toLowerCase() === group.toLowerCase())) groups.push(group);
+      if (groups.length >= 6) break;
+    }
+    return groups.slice(0, 6).join("/");
   }
   function buildFastlinkData(files, options = {}) {
     if (!Array.isArray(files) || !files.length) throw new Error("\u79D2\u4F20\u5185\u5BB9\u6CA1\u6709\u6587\u4EF6\u8BB0\u5F55");
@@ -9363,6 +9656,7 @@
       checkpointRoots: items.map((item, index) => index)
     });
     const { fileName, useJson } = buildSecondarySeedName(items, options);
+    const strippedReleaseGroups = options.stripReleaseGroup ? collectFastlinkReleaseGroups(files, options.releaseGroups) : "";
     const content = useJson ? buildFastlinkJson(files, options) : buildFastlinkText(files, options);
     const parentId = normalizeSeedFolderId(options.seedFolderId) || String(options.currentDir || "0");
     options.onProgress?.(1, 2, `\u4E0A\u4F20\u79CD\u5B50\u6587\u4EF6\uFF1A${fileName}`);
@@ -9371,7 +9665,7 @@
     // 全链成功才清扫描断点（对齐 exportFastlinkItems）：不清的话下次打开面板还提示「继续/放弃上次扫描」
     options.checkpoint?.clear();
     options.onProgress?.(2, 2, "\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210");
-    return { item: { name: fileName }, fileCount: files.length, filename: fileName, text: content, link, seedFile: { id: seed.id, name: fileName, etag: seed.etag, size: seed.size } };
+    return { item: { name: fileName }, fileCount: files.length, filename: fileName, text: content, link, strippedReleaseGroups, seedFile: { id: seed.id, name: fileName, etag: seed.etag, size: seed.size } };
   }
   async function saveSecondaryFastlink(api, value, rootId, options = {}) {
     const parsed = typeof value === "string" ? parseFastlink(value) : value;
@@ -9707,7 +10001,7 @@
     }
     return out.join("/");
   }
-  function buildFastlinkSubmissionMeta(text, mappings) {
+  function buildFastlinkSubmissionMeta(text, mappings, options = {}) {
     const content = String(text || "");
     if (!content) return null;
     const paths = [];
@@ -9768,6 +10062,13 @@
     for (const [key, values] of Object.entries(technical)) {
       const joined = fastlinkMetaJoinVariants(key, values);
       if (joined) meta[key] = joined;
+    }
+    // 去组直投时把扫描阶段算好的原始发布组带过去（客户端据此做发布组路由），并标 stripped 三态；
+    // 没有组名也要标，客户端才不会把已洗过的文件名尾段误猜成发布组
+    const strippedGroups = String(options.strippedReleaseGroups || "").trim();
+    if (options.stripReleaseGroup) {
+      if (strippedGroups) meta.releaseGroup = strippedGroups;
+      meta.releaseGroupStripped = "1";
     }
     return Object.keys(meta).length ? meta : null;
   }
@@ -11203,6 +11504,9 @@
       const index = base.lastIndexOf(delimiter);
       if (index < 0 || !hasTechnicalContext(base.slice(0, index))) continue;
       const candidate = base.slice(index + 1).trim();
+      // 候选含连字符就拒绝：连字符分支已按尾段判过（流媒体来源标签如 NF 会被它正确拒掉），
+      // 点/空格段里带连字符的是「编码-来源」组合（H.264-NF → "264-NF"），不是真发布组，别误捞。
+      if (candidate.includes("-")) continue;
       if (GENERIC_GROUP.test(candidate) && !knownMediaTerm(candidate)) return result(candidate, index + 1, base.length, delimiter === "." ? "dot" : "space", index);
     }
     return null;
@@ -19136,7 +19440,7 @@ ${end.comment}` : end.comment;
     const time = Date.parse(`${text2}T00:00:00Z`);
     return Number.isFinite(time) ? time : null;
   }
-  function relatedSpecialEpisodes(specials, targetSeason, fileNames, seasonAliases = null) {
+  function relatedSpecialEpisodes(specials, targetSeason, fileNames, seasonAliases = null, includeAllSpecials = false) {
     const regular = [];
     const special = [];
     for (const episode of specials) {
@@ -19144,6 +19448,7 @@ ${end.comment}` : end.comment;
       else if (episode.seasonNumber === 0) special.push(episode);
     }
     if (!special.length) return regular;
+    if (includeAllSpecials) return [...regular, ...special];
     // Match the desktop organizer: only explicit special-type keywords from
     // the source files are allowed to pull in an undated S00 entry. Generic
     // contextual words (for example “舞台” or “完整版”) must not make every
@@ -19166,13 +19471,14 @@ ${end.comment}` : end.comment;
     });
     return [...regular, ...related];
   }
-  function filterEpisodeCandidatesForTargetSeason(episodes, targetSeason, fileNames = [], seasonAliases = null) {
+  function filterEpisodeCandidatesForTargetSeason(episodes, targetSeason, fileNames = [], seasonAliases = null, includeAllSpecials = false) {
     const normalized = [...episodes || []].map(normalizedEpisode);
     const season = Number(targetSeason || 0);
-    if (season > 0) return relatedSpecialEpisodes(normalized, season, fileNames, seasonAliases);
+    if (season > 0) return relatedSpecialEpisodes(normalized, season, fileNames, seasonAliases, includeAllSpecials);
     const regular = normalized.filter((episode) => episode.seasonNumber !== 0);
     const specials = normalized.filter((episode) => episode.seasonNumber === 0);
     if (!specials.length) return regular;
+    if (includeAllSpecials) return [...regular, ...specials];
     const sourceContexts = (fileNames || []).map((name) => ({
       hint: parseEpisodeHint(name, 0),
       context: specialContext(name),
@@ -19557,7 +19863,7 @@ ${end.comment}` : end.comment;
       vcbSpecial: tag
     };
   }
-  function matchEpisodeCandidates(files, episodes, season, targetSeason = 0, seasonRemap = null) {
+  function matchEpisodeCandidates(files, episodes, season, targetSeason = 0, seasonRemap = null, options = {}) {
     const sortedEpisodes = [...episodes].map(normalizedEpisode).sort((left, right) => left.seasonNumber - right.seasonNumber || left.episodeNumber - right.episodeNumber);
     const output = /* @__PURE__ */ new Map();
     const pilotOffset = detectPilotEpisodeOffset(files, sortedEpisodes, targetSeason || season, seasonRemap);
@@ -19568,6 +19874,14 @@ ${end.comment}` : end.comment;
         // calibrated target season is authoritative (see reconcileCalibrationSeason).
         hint.season = seasonRemap.to;
         hint.seasonEpisode = hint.seasonEpisode ? hint.seasonEpisode.replace(/^S\d{1,3}/i, `S${String(seasonRemap.to).padStart(2, "0")}`) : hint.seasonEpisode;
+      }
+      if (options.forceTargetSeason === true && Number(targetSeason) >= 0 && hint.season !== Number(targetSeason) && (hasExplicitSeasonEpisode(file.name) || Number(targetSeason) === 0)) {
+        // 用户显式指定目标季时优先于文件名 Sxx 记号：季号归目标季、集号不变，
+        // 否则校准会一直按文件名里的旧季对位（S01 文件手动指定 S02 仍出 S01）。
+        // 指定 S0（特典）时条件放宽：没有显式季记号的文件（如 Special E01 / EP01）
+        // 的 hint.season 是推断兜底值，也一并归到第 0 季，否则永远匹配不上 S00 条目。
+        hint.season = Number(targetSeason);
+        hint.seasonEpisode = hint.seasonEpisode ? hint.seasonEpisode.replace(/^S\d{1,3}/i, `S${String(targetSeason).padStart(2, "0")}`) : hint.seasonEpisode;
       }
       const context = withVcbSpecialContext(specialContext(file.name), file.name, file.relativePath);
       const pilotOnlyLabel = context.strongKeywords.length > 0 && context.strongKeywords.every((kind) => kind === SPECIAL_KIND_TOKENS.pilot);
@@ -21287,7 +21601,7 @@ ${end.comment}` : end.comment;
     }));
     return { ...batchResult(details, [root, snapshot.currentDir]), rows, discardedFiles: tasks.filter((task) => task.discarded).length, deletedFolders };
   }
-  async function previewEpisodeCalibration(tmdb, group, seasonNumbers = []) {
+  async function previewEpisodeCalibration(tmdb, group, seasonNumbers = [], options = {}) {
     const warnings = [];
     const groupMediaType = group?.fields?.mediaType || group?.media?.mediaType;
     if (!group || groupMediaType !== "tv") return { episodes: [], matches: {}, warnings: ["\u5F53\u524D\u5206\u7EC4\u4E0D\u662F\u5267\u96C6\u6216\u7EFC\u827A"] };
@@ -21300,15 +21614,22 @@ ${end.comment}` : end.comment;
         warnings.push(`TMDB \u5267\u96C6\u8BE6\u60C5\u8BFB\u53D6\u5931\u8D25\uFF0C\u5DF2\u6309\u5F53\u524D\u8BC6\u522B\u5B63\u5EA6\u7EE7\u7EED\uFF08${error.message}\uFF09`);
       }
     }
-    const seasonRemap = reconcileCalibrationSeason(group, media);
-    const targetSeason = seasonRemap ? seasonRemap.to : inferCalibrationTargetSeason(group);
+    // 手动指定季包含 0（S00 特典）：原来用 `manualTargetSeason > 0` 判定，
+    // 导致手动填 0 被当成「没填」直接落回文件名季推断，校准永远匹配不到 S00。
+    const manualSeasonRaw = group?.manualTargetSeason;
+    const manualSeasonParsed = Number(manualSeasonRaw);
+    const hasManualSeason = manualSeasonRaw !== undefined && manualSeasonRaw !== null && String(manualSeasonRaw).trim() !== "" && Number.isInteger(manualSeasonParsed) && manualSeasonParsed >= 0;
+    const manualTargetSeason = hasManualSeason ? manualSeasonParsed : 0;
+    const seasonRemap = hasManualSeason ? null : reconcileCalibrationSeason(group, media);
+    const targetSeason = hasManualSeason ? manualTargetSeason : seasonRemap ? seasonRemap.to : inferCalibrationTargetSeason(group);
     const requested = [...seasonNumbers.length ? seasonNumbers : group.files.map((file) => {
       const parsed = parseSeasonEpisode(file.name, 0);
       if (hasExplicitSeasonEpisode(file.name)) return remapCalibrationSeasonValue(parsed.season, seasonRemap);
       const fieldSeason = Number(file.fields?.season);
       return Number.isInteger(fieldSeason) && fieldSeason >= 0 ? fieldSeason : 1;
     })];
-    if (targetSeason > 0) requested.push(targetSeason);
+    // 手动指定 S0 时 targetSeason === 0 也要请求第 0 季（原来 0 直接跳过不请求）。
+    if (targetSeason > 0 || (hasManualSeason && targetSeason === 0)) requested.push(targetSeason);
     const mediaSeasons = Array.isArray(media.seasons) ? media.seasons.map((season) => Number(season.season_number ?? season.seasonNumber)).filter((season) => Number.isInteger(season) && season >= 0) : [];
     const hasS00 = mediaSeasons.includes(0);
     // A positive target season is always paired with S00 when TMDB exposes it.
@@ -21318,12 +21639,20 @@ ${end.comment}` : end.comment;
     if (targetSeason <= 0 && group.files.some((file) => isSpecialEpisodeHint(file.name) || hasVcbSpecial(file.name, file.relativePath))) requested.push(0);
     const seasons = availableSeasons(media, requested, { exact: true });
     const episodeGroups = await mapLimit([...new Set(seasons)], 3, async (season) => {
-      try {
-        return await tmdb.season(media.id, season);
-      } catch (error) {
-        warnings.push(`TMDB \u4E2D\u4E0D\u5B58\u5728\u6216\u65E0\u6CD5\u8BFB\u53D6\u7B2C ${season} \u5B63\uFF08${error.message}\uFF09`);
-        return [];
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          return await tmdb.season(media.id, season);
+        } catch (error) {
+          // 网络抖动/限流导致整季缺席时先重试一次，再失败才降级为 warning
+          if (attempt === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 800));
+            continue;
+          }
+          warnings.push(`TMDB \u4E2D\u4E0D\u5B58\u5728\u6216\u65E0\u6CD5\u8BFB\u53D6\u7B2C ${season} \u5B63\uFF08${error.message}\uFF09`);
+          return [];
+        }
       }
+      return [];
     });
     const rawEpisodes = episodeGroups.flat();
     // Keep the user-selected/inferred target authoritative.  If TMDB has no
@@ -21340,18 +21669,19 @@ ${end.comment}` : end.comment;
       if (aliases.length) seasonAliasesByNumber.set(number, [...new Set(aliases)]);
     }
     const aliasesFor = (season) => seasonAliasesByNumber.get(Number(season)) || [];
+    const includeAllSpecials = options.includeAllSpecials === true;
     const positiveSeasons = [...new Set([...requested, effectiveTargetSeason].map(Number).filter((season) => Number.isInteger(season) && season > 0))];
     let episodes;
     if (positiveSeasons.length > 1) {
       const merged = new Map();
       for (const season of positiveSeasons) {
-        for (const episode of filterEpisodeCandidatesForTargetSeason(rawEpisodes, season, fileNames, aliasesFor(season))) merged.set(String(episode.id), episode);
+        for (const episode of filterEpisodeCandidatesForTargetSeason(rawEpisodes, season, fileNames, aliasesFor(season), includeAllSpecials)) merged.set(String(episode.id), episode);
       }
       episodes = [...merged.values()];
     } else {
-      episodes = filterEpisodeCandidatesForTargetSeason(rawEpisodes, effectiveTargetSeason, fileNames, aliasesFor(effectiveTargetSeason));
+      episodes = filterEpisodeCandidatesForTargetSeason(rawEpisodes, effectiveTargetSeason, fileNames, aliasesFor(effectiveTargetSeason), includeAllSpecials);
     }
-    const matches = matchEpisodeCandidates(group.files.filter((file) => isVideoFile(file.name)), episodes, Number(group.fields?.season || 1), effectiveTargetSeason, seasonRemap);
+    const matches = matchEpisodeCandidates(group.files.filter((file) => isVideoFile(file.name)), episodes, Number(group.fields?.season || 1), effectiveTargetSeason, seasonRemap, { forceTargetSeason: hasManualSeason });
     return { episodes, matches: Object.fromEntries(matches), warnings };
   }
   function inferCalibrationTargetSeason(group) {
@@ -23910,7 +24240,7 @@ ${end.comment}` : end.comment;
     const draft = ui.settings.draft;
     if (ui.settings.picker) return renderFolderPicker(ui);
       if (ui.settings.tab === "general") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("settings", 17)}</span><div><h3>\u5916\u89C2\u4E0E\u4EFB\u52A1</h3><p>\u4E3B\u9898\u4F1A\u5E94\u7528\u5230\u6240\u6709\u52A9\u624B\u5F39\u7A97\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u4E3B\u9898</span><select data-config="appearance.theme"><option value="system" ${draft.appearance.theme === "system" ? "selected" : ""}>\u8DDF\u968F\u7CFB\u7EDF</option><option value="light" ${draft.appearance.theme === "light" ? "selected" : ""}>\u6D45\u8272</option><option value="dark" ${draft.appearance.theme === "dark" ? "selected" : ""}>\u6DF1\u8272</option></select></label><label class="check-line"><input type="checkbox" data-config="appearance.compactRows" ${draft.appearance.compactRows ? "checked" : ""}>\u4F7F\u7528\u7D27\u51D1\u8868\u683C\u884C</label></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("waveform", 17)}</span><div><h3>\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B</h3><p>\u4EC5\u5728\u6D4F\u89C8\u5668\u672C\u5730\u901A\u8FC7 123 \u76F4\u94FE\u3001Range \u5206\u6BB5\u548C MediaInfo WASM \u89E3\u6790\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u5A92\u4F53\u5185\u5BB9\u3002</p></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("share", 17)}</span><div><h3>\u5206\u4EAB\u4E0E\u79D2\u4F20</h3><p>\u53EF\u5728\u5206\u4EAB\u521B\u5EFA\u6210\u529F\u540E\u76F4\u63A5\u53D1\u9001\u5230\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\uFF0C\u7531\u670D\u52A1\u751F\u6210\u5E76\u63A8\u9001\u6295\u7A3F\u8349\u7A3F\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u5206\u4EAB\u5230\u671F\u65F6\u95F4</span><input data-config="share.expiration" value="${escapeHtml(draft.share.expiration)}"></label><label class="field"><span>\u968F\u673A\u53E3\u4EE4\u957F\u5EA6</span><input type="number" min="1" max="8" data-config="share.passwordLength" value="${draft.share.passwordLength}"></label><label class="check-line full"><input type="checkbox" data-config="share.autoSubmitEnabled" ${draft.share.autoSubmitEnabled ? "checked" : ""}>\u5206\u4EAB\u540E\u81EA\u52A8\u63A8\u9001\u5230\u6295\u7A3F\u673A\u5668\u4EBA</label><label class="field full"><span>\u6295\u7A3F\u5730\u5740</span><input data-config="share.submissionUrl" value="${escapeHtml(draft.share.submissionUrl || "")}" placeholder="\u8BF7\u8F93\u5165\u5B8C\u6574\u6295\u7A3F\u63A5\u53E3\u5730\u5740"><small>\u811A\u672C\u4F1A\u5411\u6B64\u5730\u5740\u53D1\u9001 POST \u8BF7\u6C42\uFF1B\u53EF\u586B\u5199 123Cloud \u6216\u5176\u4ED6\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\u7684\u5B8C\u6574\u63A5\u53E3\u5730\u5740\u3002</small></label><label class="field full"><span>\u5F71\u5E93\u63A5\u53E3\u5730\u5740\uFF08123Cloud \u5BA2\u6237\u7AEF\uFF09</span><input data-config="share.libraryUrl" value="${escapeHtml(draft.share.libraryUrl || "")}" placeholder="\u4F8B\u5982 http://127.0.0.1:62156\uFF0C\u53EF\u5E26 ?token="><small>\u586B\u5BA2\u6237\u7AEF\u5730\u5740\u5373\u53EF\uFF0C\u7AEF\u53E3\u770B\u5BA2\u6237\u7AEF\u300C\u8BBE\u7F6E \u2192 \u670D\u52A1\u7AEF\u53E3\u300D\uFF08\u540C\u6295\u7A3F\u7AEF\u53E3\uFF09\uFF1B\u54EA\u91CC\u80FD\u8FDE\u4E0A\u5C31\u586B\u54EA\u91CC\uFF0C\u7528\u4E8E\u79D2\u4F20\u5DE5\u5177\u7BB1\u7684\u300C\u5F71\u5E93\u641C\u7D22\u300D\u3002</small></label><label class="field"><span>\u5F71\u5E93\u8BBF\u95EE\u4EE4\u724C</span><input data-config="share.libraryToken" value="${escapeHtml(draft.share.libraryToken || "")}" placeholder="\u5BA2\u6237\u7AEF\u300C\u5F71\u5E93\uFF0D\u5F71\u5E93\u8BBE\u7F6E\u300D\u91CC\u751F\u6210\uFF0C\u672A\u8BBE\u7F6E\u53EF\u7559\u7A7A"></label></div></div></div>`;
-    if (ui.settings.tab === "tmdb") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("cloud", 17)}</span><div><h3>TMDB \u8FDE\u63A5</h3><p>\u7528\u4E8E\u5A92\u4F53\u6D77\u62A5\u3001\u6807\u9898\u3001\u5E74\u4EFD\u548C\u5267\u96C6\u4FE1\u606F\u3002</p></div></div>${notice("\u4EE5 ey \u5F00\u5934\u7684\u503C\u6309 Read Access Token \u4F7F\u7528\uFF0C\u5176\u4ED6\u503C\u6309 v3 API Key \u4F7F\u7528\u3002\u65E0\u6CD5\u76F4\u8FDE TMDB \u65F6\u53EF\u586B\u5199\u4E0B\u65B9\u7684\u7B2C\u4E09\u65B9\u66FF\u4EE3\u6E90\uFF08\u81EA\u5EFA\u53CD\u4EE3/\u955C\u50CF\u5730\u5740\uFF0C\u586B\u5230\u542B /3 \u4E3A\u6B62\uFF1B\u53EA\u586B\u57DF\u540D\u4F1A\u81EA\u52A8\u8865 /3\uFF0Chttps:// \u524D\u7F00\u53EF\u7701\u7565\uFF09\uFF0C\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9\u6E90\u3002", "", "cloud")}<div class="form-card"><div class="form-grid"><label class="field full"><span>API Key / Read Access Token</span><input type="password" autocomplete="off" data-config="tmdb.credential" value="${escapeHtml(draft.tmdb.credential)}"></label><label class="field full"><span>TMDB \u66FF\u4EE3\u6E90\uFF08\u65E0\u6CD5\u76F4\u8FDE\u65F6\u4F7F\u7528\uFF09</span><input data-config="tmdb.apiBase" value="${escapeHtml(draft.tmdb.apiBase || "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9 api.themoviedb.org" spellcheck="false" autocomplete="off"></label><label class="field"><span>\u8BED\u8A00</span><input data-config="tmdb.language" value="${escapeHtml(draft.tmdb.language)}"></label><label class="field"><span>\u5730\u533A</span><input data-config="tmdb.region" value="${escapeHtml(draft.tmdb.region)}"></label></div></div><button class="button" data-action="tmdb-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>`;
+    if (ui.settings.tab === "tmdb") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("cloud", 17)}</span><div><h3>TMDB \u8FDE\u63A5</h3><p>\u7528\u4E8E\u5A92\u4F53\u6D77\u62A5\u3001\u6807\u9898\u3001\u5E74\u4EFD\u548C\u5267\u96C6\u4FE1\u606F\u3002</p></div></div>${notice("\u4EE5 ey \u5F00\u5934\u7684\u503C\u6309 Read Access Token \u4F7F\u7528\uFF0C\u5176\u4ED6\u503C\u6309 v3 API Key \u4F7F\u7528\u3002\u65E0\u6CD5\u76F4\u8FDE TMDB \u65F6\u53EF\u586B\u5199\u4E0B\u65B9\u7684\u7B2C\u4E09\u65B9\u66FF\u4EE3\u6E90\uFF08\u81EA\u5EFA\u53CD\u4EE3/\u955C\u50CF\u5730\u5740\uFF0C\u586B\u5230\u542B /3 \u4E3A\u6B62\uFF1B\u53EA\u586B\u57DF\u540D\u4F1A\u81EA\u52A8\u8865 /3\uFF0Chttps:// \u524D\u7F00\u53EF\u7701\u7565\uFF09\uFF0C\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9\u6E90\u3002", "", "cloud")}<div class="form-card"><div class="form-grid"><label class="field full"><span>API Key / Read Access Token</span><input type="password" autocomplete="off" data-config="tmdb.credential" value="${escapeHtml(draft.tmdb.credential)}"></label><label class="field full"><span>TMDB \u66FF\u4EE3\u6E90\uFF08\u65E0\u6CD5\u76F4\u8FDE\u65F6\u4F7F\u7528\uFF09</span><input data-config="tmdb.apiBase" value="${escapeHtml(draft.tmdb.apiBase || "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9 api.themoviedb.org" spellcheck="false" autocomplete="off"></label><label class="field"><span>\u8BED\u8A00</span><input data-config="tmdb.language" value="${escapeHtml(draft.tmdb.language)}"></label><label class="field"><span>\u5730\u533A</span><input data-config="tmdb.region" value="${escapeHtml(draft.tmdb.region)}"></label><label class="check-line full"><input type="checkbox" data-config="tmdb.showAllSpecials" ${draft.tmdb.showAllSpecials ? "checked" : ""}>\u6821\u51C6\u5019\u9009\u663E\u793A\u5168\u90E8 S00 \u7279\u5178\uFF08\u4E0D\u6309\u65E5\u671F/\u5173\u952E\u8BCD\u8FC7\u6EE4\uFF09</label></div></div><button class="button" data-action="tmdb-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>`;
     if (ui.settings.tab === "library") return renderLibrary(ui);
     if (ui.settings.tab === "naming") return renderNaming(ui);
     return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("save", 17)}</span><div><h3>\u914D\u7F6E\u5907\u4EFD</h3><p>\u5BFC\u51FA\u6587\u4EF6\u9ED8\u8BA4\u4E0D\u5305\u542B TMDB \u51ED\u636E\u3002</p></div></div>${notice("\u9700\u8981\u8FC1\u79FB\u51ED\u636E\u65F6\u53EF\u4E34\u65F6\u52FE\u9009\uFF0C\u5BFC\u51FA\u540E\u8BF7\u59A5\u5584\u4FDD\u7BA1\u3002", "", "alert")}<div class="form-card"><label class="check-line"><input id="backup-secrets" type="checkbox">\u5BFC\u51FA\u65F6\u5305\u542B TMDB \u51ED\u636E</label><div class="button-row"><button class="button" data-action="config-export">${icon("download", 15)}\u5BFC\u51FA\u914D\u7F6E</button><button class="button" data-action="config-import">${icon("import", 15)}\u5BFC\u5165\u914D\u7F6E</button><button class="button danger" data-action="config-reset">${icon("trash", 15)}\u6062\u590D\u9ED8\u8BA4</button><input id="config-file" type="file" accept="application/json" hidden></div></div></div>`;
@@ -24995,7 +25325,8 @@ ${end.comment}` : end.comment;
           { label: "\u6587\u4EF6\u6E05\u7406", command: "fileCleaner" }
         ],
         mountToolbar: (container, context) => this.mountToolbar(container, context),
-        mountShareToolbar: (container, context) => this.mountShareToolbar(container, context)
+        mountShareToolbar: (container, context) => this.mountShareToolbar(container, context),
+        updateToolbarState: () => this.updateToolbarState()
       });
       this.render();
     }
@@ -25014,10 +25345,15 @@ ${end.comment}` : end.comment;
       this.toolbar = container;
       this.toolbarContext = context;
       // 「秒传」与「更多」同为常驻按钮：不要求勾选、恒可点（显示/隐藏跟随工具栏本身），
-      // data-c123-pin-more 由样式固定到「更多」按钮左侧（「离线下载」旁）且不参与溢出/挤压隐藏；
+      // data-c123-pin-more 现在只作「常驻、不随勾选消失」的语义标记（pinnedVisible 读它）；
+      // 位置不再单独钉到「更多」旁边，按 DOM 顺序紧跟「整理」（1.4.5 起，维护者定）。
       // 无勾选时打开秒传工具箱默认落在「转存」页签（openFastlink 的空选中兜底）。
+      // 「重命名」恒定创建：官方选中条里也有重命名时由 CSS（host[data-c123-official-rename]）
+      // 把助手这颗藏掉，而不是重建整条——重建本身就是一次可见的跳动。
+      // data-c123-bar-gate 标记「显隐交给官方选中条」的按钮（「转存秒传」除外：它还要看勾选的是
+      // 不是秒传种子文件，只能由 JS 判定，继续走 hidden）。
       const direct = [
-        ...!context.hasOfficialRename ? [["rename", "\u91CD\u547D\u540D", true]] : [],
+        ["rename", "\u91CD\u547D\u540D", true],
         ["organize", "\u6574\u7406", true],
         ["fastlink", "\u79D2\u4F20", false, ' data-c123-pin-more="true"'],
         ["fastlinkImport", "\u8F6C\u5B58\u79D2\u4F20", true],
@@ -25027,7 +25363,8 @@ ${end.comment}` : end.comment;
         const buttonClass = context.buttonClassName ? ` class="${escapeHtml(context.buttonClassName)}"` : "";
         const fallback = context.buttonClassName ? "" : ' data-c123-fallback="true"';
         const semantics = tagName === "div" ? ' role="button" tabindex="0"' : ' type="button"';
-        return `<${tagName}${semantics}${buttonClass}${fallback} ${requiresSelection ? 'data-requires-selection="true"' : ""} ${attributes} title="${label}"><span>${label}</span></${tagName}>`;
+        const gate = requiresSelection && command !== "fastlinkImport" ? ' data-c123-bar-gate="true"' : "";
+        return `<${tagName}${semantics}${buttonClass}${fallback} ${requiresSelection ? 'data-requires-selection="true"' : ""}${gate} ${attributes} title="${label}"><span>${label}</span></${tagName}>`;
       };
       container.innerHTML = direct.map(([command, label, requiresSelection, extra = ""]) => control(command, label, requiresSelection, `data-command="${command}" data-toolbar-direct="true"${extra}`)).join("");
       for (const commandControl of container.querySelectorAll("[data-command]")) {
@@ -25135,12 +25472,22 @@ ${end.comment}` : end.comment;
       }
       const seedButton = this.toolbar.querySelector('[data-command="fastlinkImport"]');
       for (const button of this.toolbar.querySelectorAll("[data-requires-selection]")) {
+        // 带 data-c123-bar-gate 的按钮：出不出现由 CSS 跟官方选中条同帧决定，那一刻选中快照常常还没
+        // 更新（要等 rAF/防抖），照旧写 disabled 就会「先灰一下再变黑」——维护者截图看到的闪就是这个。
+        // 这类按钮可见即说明已经勾选，不做置灰；点击路径本来就现读勾选，空勾选也点不出东西。
+        if (button.dataset?.c123BarGate === "true") {
+          if ("disabled" in button) button.disabled = false;
+          button.setAttribute("aria-disabled", "false");
+          continue;
+        }
         if ("disabled" in button) button.disabled = !this.selection.hasSelection;
         button.setAttribute("aria-disabled", this.selection.hasSelection ? "false" : "true");
         // 没有勾选时直接把整颗按钮隐藏掉（样式 .c123-helper-toolbar > [data-command][hidden]{display:none !important}），
         // 避免删除/清空后页面里残留置灰的「重命名/整理/转存秒传」（「秒传」常驻，不在此列）。
         // 注意：种子按钮（fastlinkImport）由下方专属逻辑按 seedReady 进一步覆盖 hidden 状态。
-        if (button !== seedButton) button.hidden = !this.selection.hasSelection;
+        // 带 data-c123-bar-gate 的按钮显隐交给 CSS（跟官方选中条同帧），JS 迟到也不影响观感；
+        // 这里只留 disabled/aria-disabled。没带标记的（分享页工具栏等）保持原语义。
+        if (button !== seedButton && button.dataset?.c123BarGate !== "true") button.hidden = !this.selection.hasSelection;
       }
       if (seedButton) {
         // 只在校验通过时（勾选了 1 个或多个秒传种子文件 .123fastlink.json / .txt）
@@ -26490,8 +26837,12 @@ ${end.comment}` : end.comment;
         // 客户端按尾段乱猜反而会把画质/编码等尾缀当成发布组
         const skipReleaseGroup = (this.config.fastlinkTools || {}).stripReleaseGroup === true;
         // 脚本全量算好的技术识别（季集范围/画质/来源/编码等），客户端逐字段优先采用；
-        // 自定义映射表与整理同源
-        const meta = buildFastlinkSubmissionMeta(artifact?.text, (this.config.library || {}).recognition?.fixedMappings);
+        // 自定义映射表与整理同源。开「去除文件名发布组」时把扫描阶段留存的原始发布组一并带给
+        // 客户端做发布组路由（种子名已被洗掉组名，客户端自己识别不到）
+        const meta = buildFastlinkSubmissionMeta(artifact?.text, (this.config.library || {}).recognition?.fixedMappings, {
+          stripReleaseGroup: skipReleaseGroup,
+          strippedReleaseGroups: artifact?.strippedReleaseGroups || ""
+        });
         const results = await this.submissionClient.submitShares(submissionUrl, [{ name, url: link, sourceText, skipReleaseGroup, meta }]);
         const failed = results.find((item) => item.status === "failed");
         return failed ? `投稿草稿推送失败：${failed.message || "客户端没有返回结果"}` : "";
@@ -27842,11 +28193,11 @@ ${end.comment}` : end.comment;
             return;
           }
           const group = this.organize.preview.groups.find((item) => item.id === control.dataset.group);
-          const planTargetSeason = String(this.organize.episodePlans?.[group?.id]?.targetSeason || "").trim();
+          const planTargetSeason = String(this.organize.episodePlans?.[group?.id]?.targetSeason ?? "").trim();
           const calibrationGroup = planTargetSeason ? { ...group, manualTargetSeason: planTargetSeason, fields: { ...group.fields, targetSeason: planTargetSeason } } : group;
           const calibration = await this.runTask(async (signal) => {
             this.setProgress(0, 1, "\u6821\u51C6 TMDB \u5B63\u96C6");
-            const result2 = await previewEpisodeCalibration(this.tmdb, calibrationGroup);
+            const result2 = await previewEpisodeCalibration(this.tmdb, calibrationGroup, [], { includeAllSpecials: this.config.tmdb?.showAllSpecials === true });
             if (signal.aborted) throw new DOMException("\u64CD\u4F5C\u5DF2\u53D6\u6D88", "AbortError");
             return result2;
           });
@@ -29002,5 +29353,456 @@ ${end.comment}` : end.comment;
     if (document.documentElement) start();
     else if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
     else start();
+  })();
+
+  // src/batch-offline.js — 批量离线下载（直链 / 磁力逐条解析提交）
+  // 入口：原生「离线下载」菜单里追加一项；弹窗复用助手的 UI_STYLES / dialogFrame（Shadow DOM 隔离）。
+  // 接口一律走 Pan123Api：签名 query、鉴权头、超时、退避重试、线路故障回退全部继承，
+  // 不再裸 fetch 硬编码镜像域名（把 authorToken 发去写死域名是会话外泄风险）。
+  (function () {
+    "use strict";
+    var RESOLVE_PATH = "/b/api/v2/offline_download/task/resolve";
+    var SUBMIT_PATH = "/b/api/v2/offline_download/task/submit";
+    var SETTINGS_KEY = "Cloud123.Helper.BatchOffline";
+    var MENU_FLAG = "data-c123-batch-offline";
+    var ENTRY_LABEL = "\u6279\u91CF\u79BB\u7EBF\u4E0B\u8F7D";
+    var ANCHOR_LABEL = "\u67E5\u770B\u79BB\u7EBF\u4E0B\u8F7D\u4EFB\u52A1";
+    var DEFAULTS = { interval: 1, retry: 3, retryWait: 10 };
+    var RATE_RE = /\u9891\u7E41|\u7E41\u5FD9|\u9650\u6D41|\u6392\u961F|too\s*many|rate\s*limit|throttl/i;
+    var RESOLVE_ERROR_TEXT = { 1: "\u94FE\u63A5\u65E0\u6CD5\u8BBF\u95EE\u6216\u4E0D\u652F\u6301", 2: "\u94FE\u63A5\u5DF2\u5931\u6548", 4: "\u94FE\u63A5\u683C\u5F0F\u9519\u8BEF", 5: "\u5DF2\u5728\u79BB\u7EBF\u4EFB\u52A1\u91CC" };
+
+    var api = null;
+    function offlineApi() {
+      if (!api) api = new Pan123Api({ host: location.origin, retryAttempts: 3, requestTimeout: 3e4 });
+      return api;
+    }
+    // 只在网盘内页、且已登录时挂入口：分享页/登录页不需要，也别在全站挂 body 级观察器
+    function batchOfflineEligible() {
+      try {
+        return isOfficialPanPortalHost() && Boolean(readCredentialStorage("authorToken"));
+      } catch {
+        return false;
+      }
+    }
+    function clampNumber(value, min, max, fallback) {
+      const num = Math.round(Number(value));
+      return Number.isFinite(num) ? Math.min(max, Math.max(min, num)) : fallback;
+    }
+    function loadSettings() {
+      const settings = { ...DEFAULTS };
+      try {
+        const raw = typeof GM_getValue === "function" ? GM_getValue(SETTINGS_KEY, null) : JSON.parse(globalThis.localStorage?.getItem(SETTINGS_KEY) || "null");
+        if (raw && typeof raw === "object") {
+          settings.interval = clampNumber(raw.interval, 1, 120, DEFAULTS.interval);
+          settings.retry = clampNumber(raw.retry, 0, 10, DEFAULTS.retry);
+          settings.retryWait = clampNumber(raw.retryWait, 1, 120, DEFAULTS.retryWait);
+        }
+      } catch {
+      }
+      return settings;
+    }
+    function saveSettings(settings) {
+      try {
+        if (typeof GM_setValue === "function") GM_setValue(SETTINGS_KEY, settings);
+        else globalThis.localStorage?.setItem(SETTINGS_KEY, JSON.stringify(settings));
+      } catch {
+      }
+    }
+    function parseLinks(text) {
+      const seen = /* @__PURE__ */ new Set();
+      const links = [];
+      for (const line of String(text || "").split(/\r?\n/)) {
+        const url = line.trim();
+        if (!url || seen.has(url)) continue;
+        if (!/^https?:\/\//i.test(url) && !/^magnet:/i.test(url) && !/^ed2k:\/\//i.test(url)) continue;
+        seen.add(url);
+        links.push(url);
+      }
+      return links;
+    }
+    // 解析失败的分类：123 对无效链接也会回 err_code=3（实测），所以只有文案像限流才当限流处理，
+    // 其余按服务端 err_msg 报真实原因，不再一律「服务繁忙」误导用户。
+    function resolveFailure(item) {
+      const code = Number(item?.err_code ?? item?.errCode ?? 0);
+      const message = String(item?.err_msg || item?.errMsg || "").trim();
+      if (code === 5 || /\u5DF2\u5B58\u5728|\u91CD\u590D/.test(message)) return { exists: true, message: message || RESOLVE_ERROR_TEXT[5] };
+      if (RATE_RE.test(message)) return { limited: true, message };
+      return { message: message || RESOLVE_ERROR_TEXT[code] || `\u89E3\u6790\u5931\u8D25\uFF08\u9519\u8BEF\u7801 ${code}\uFF09` };
+    }
+    async function resolveLink(url, signal) {
+      const data = await offlineApi().request("POST", RESOLVE_PATH, { signal, body: { urls: url } });
+      if (isAuthFailure(data?.status, data?.code, data?.message)) throw Object.assign(new Error("\u767B\u5F55\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5237\u65B0\u9875\u9762\u91CD\u65B0\u767B\u5F55"), { expired: true });
+      const item = data?.data?.list?.[0];
+      if (!item) throw new Error("\u670D\u52A1\u5668\u6CA1\u6709\u8FD4\u56DE\u89E3\u6790\u7ED3\u679C");
+      if (Number(item.result ?? 1) === 0 && item.id) {
+        // fileId 0 是根目录、不是可下载文件，跟着提交会让整条失败
+        const fileIds = (item.files || []).map((file) => file.id).filter((id) => id !== void 0 && id !== null && id !== "" && String(id) !== "0");
+        if (!fileIds.length) throw new Error("\u89E3\u6790\u6210\u529F\u4F46\u6CA1\u6709\u53EF\u4E0B\u8F7D\u7684\u6587\u4EF6");
+        return { resourceId: item.id, fileIds, name: String(item.name || "").trim() || url.slice(0, 60), size: Number(item.size || 0) };
+      }
+      const failure = resolveFailure(item);
+      throw Object.assign(new Error(failure.message), { limited: Boolean(failure.limited), exists: Boolean(failure.exists) });
+    }
+    async function submitTask(resolved, signal) {
+      const data = await offlineApi().request("POST", SUBMIT_PATH, { signal, body: { resource_list: [{ resource_id: resolved.resourceId, select_file_id: resolved.fileIds }] } });
+      if (isAuthFailure(data?.status, data?.code, data?.message)) throw Object.assign(new Error("\u767B\u5F55\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5237\u65B0\u9875\u9762\u91CD\u65B0\u767B\u5F55"), { expired: true });
+      const task = data?.data?.task_list?.[0];
+      if (!task || Number(task.result ?? 1) === 0) return task?.task_id || true;
+      const message = String(task.err_msg || task.errMsg || "").trim();
+      throw Object.assign(new Error(message || `\u63D0\u4EA4\u5931\u8D25\uFF08\u9519\u8BEF\u7801 ${task.err_code ?? task.errCode ?? "?"}\uFF09`), { limited: RATE_RE.test(message) });
+    }
+
+    var state = { tasks: [], running: false, stop: false, tab: "download", settings: loadSettings(), controller: null };
+    var root = null;
+
+    function adoptStyles(shadow) {
+      if (typeof CSSStyleSheet === "function" && shadow.adoptedStyleSheets) {
+        try {
+          const sheet = new CSSStyleSheet();
+          sheet.replaceSync(UI_STYLES);
+          shadow.adoptedStyleSheets = [...shadow.adoptedStyleSheets, sheet];
+          return;
+        } catch {
+        }
+      }
+      const style = document.createElement("style");
+      style.textContent = UI_STYLES;
+      shadow.append(style);
+    }
+    function buildDialog() {
+      if (root) return root;
+      const host = document.createElement("div");
+      host.dataset.cloud123Helper = "batch-offline";
+      const shadow = host.attachShadow({ mode: "open" });
+      adoptStyles(shadow);
+      document.body.append(host);
+      const nav = `<div class="fastlink-tool-grid"><button class="button tool-button active" data-wbo-tab="download">${icon("download", 14)}\u79BB\u7EBF\u4E0B\u8F7D</button><button class="button tool-button" data-wbo-tab="settings">${icon("settings", 14)}\u79BB\u7EBF\u8BBE\u7F6E</button></div>`;
+      const downloadPage = `
+        ${notice("\u6BCF\u884C\u4E00\u6761\u76F4\u94FE\u6216\u78C1\u529B\u94FE\u63A5\uFF0C\u53BB\u91CD\u540E\u9010\u6761\u89E3\u6790\u63D0\u4EA4\uFF1B\u505C\u6B62\u540E\u518D\u6B21\u70B9\u300C\u5F00\u59CB / \u7EE7\u7EED\u300D\u4ECE\u6CA1\u5B8C\u7684\u4E00\u6761\u7EE7\u7EED\u3002", "", "download")}
+        <div class="editor-surface"><textarea data-wbo-links placeholder="https://example.com/file1.mkv&#10;magnet:?xt=urn:btih:..."></textarea></div>
+        <div class="progress-track" style="margin:0 0 14px"><div class="progress-bar" data-wbo-bar></div></div>
+        <div class="header-metrics" data-wbo-sum style="margin:0 0 14px"></div>
+        <div class="form-card" data-wbo-card hidden></div>`;
+      const settings = state.settings;
+      const settingsPage = `
+        ${notice("\u53EA\u5F71\u54CD\u6279\u91CF\u79BB\u7EBF\u7684\u63D0\u4EA4\u8282\u594F\u4E0E\u5931\u8D25\u91CD\u8BD5\uFF0C\u4FDD\u5B58\u5728\u811A\u672C\u5B58\u50A8\u91CC\u3002", "", "settings")}
+        <div class="form-grid">
+          <label class="field"><span>\u6BCF\u6761\u95F4\u9694(\u79D2)</span><input type="number" data-wbo-set="interval" value="${settings.interval}" min="1" max="120"></label>
+          <label class="field"><span>\u5931\u8D25\u91CD\u8BD5(\u6B21)</span><input type="number" data-wbo-set="retry" value="${settings.retry}" min="0" max="10"></label>
+          <label class="field"><span>\u91CD\u8BD5\u7B49\u5F85(\u79D2)</span><input type="number" data-wbo-set="retryWait" value="${settings.retryWait}" min="1" max="120"></label>
+        </div>`;
+      const body = `${nav}<div class="fastlink-pane"><div data-wbo-page="download">${downloadPage}</div><div data-wbo-page="settings" hidden>${settingsPage}</div></div>`;
+      const footer = `<span class="footer-note" data-wbo-status>\u5C31\u7EEA</span><div class="footer-actions"><button class="button" data-wbo-act="retry" disabled>\u91CD\u8BD5\u5931\u8D25</button><button class="button danger" data-wbo-act="stop" disabled>\u505C\u6B62</button><button class="button primary" data-wbo-act="start">${icon("play", 15)}\u5F00\u59CB / \u7EE7\u7EED</button><button class="button" data-wbo-close style="display:none">\u5173\u95ED</button><button class="button primary" data-wbo-act="save" style="display:none">\u4FDD\u5B58\u8BBE\u7F6E</button></div>`;
+      const container = document.createElement("div");
+      container.innerHTML = dialogFrame({ state: {}, backgroundTask: null }, { title: ENTRY_LABEL, subtitle: "\u76F4\u94FE / \u78C1\u529B\u9010\u6761\u89E3\u6790\u63D0\u4EA4", iconName: "download", className: "fastlink-window", contentClass: "fastlink-content", body, footer });
+      shadow.append(container.firstElementChild);
+      const $ = (selector) => shadow.querySelector(selector);
+      $("[data-wbo-links]").addEventListener("input", render);
+      $('[data-wbo-act="start"]').addEventListener("click", () => { void run(); });
+      $('[data-wbo-act="stop"]').addEventListener("click", requestStop);
+      $('[data-wbo-act="retry"]').addEventListener("click", () => { void retryFailed(); });
+      $('[data-wbo-act="save"]').addEventListener("click", () => {
+        state.settings = {
+          interval: clampNumber($('[data-wbo-set="interval"]').value, 1, 120, DEFAULTS.interval),
+          retry: clampNumber($('[data-wbo-set="retry"]').value, 0, 10, DEFAULTS.retry),
+          retryWait: clampNumber($('[data-wbo-set="retryWait"]').value, 1, 120, DEFAULTS.retryWait)
+        };
+        saveSettings(state.settings);
+        setStatus("\u6279\u91CF\u79BB\u7EBF\u8BBE\u7F6E\u5DF2\u4FDD\u5B58");
+      });
+      for (const btn of shadow.querySelectorAll("[data-wbo-tab]")) btn.addEventListener("click", () => switchTab(btn.dataset.wboTab));
+      shadow.addEventListener("click", (event) => {
+        if (event.target?.closest?.('[data-action="close"], [data-wbo-close]') || event.target?.dataset?.action === "overlay-close") closeDialog();
+      });
+      shadow.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closeDialog();
+      });
+      root = { host, shadow };
+      return root;
+    }
+    function $(selector) {
+      return root?.shadow.querySelector(selector) || null;
+    }
+    function switchTab(tab) {
+      state.tab = tab === "settings" ? "settings" : "download";
+      for (const btn of root.shadow.querySelectorAll("[data-wbo-tab]")) btn.classList.toggle("active", btn.dataset.wboTab === state.tab);
+      for (const page of root.shadow.querySelectorAll("[data-wbo-page]")) page.hidden = page.dataset.wboPage !== state.tab;
+      // .button 的 display:inline-flex 会盖掉 [hidden]，按钮显隐必须走 style.display
+      const onDownload = state.tab === "download";
+      for (const act of ["start", "stop", "retry"]) $(`[data-wbo-act="${act}"]`).style.display = onDownload ? "" : "none";
+      $('[data-wbo-act="save"]').style.display = onDownload ? "none" : "";
+      $("[data-wbo-close]").style.display = onDownload ? "none" : "";
+    }
+    function closeDialog() {
+      if (!root) return;
+      requestStop();
+      root.host.remove();
+      root = null;
+    }
+    function openBatchOfflineDialog() {
+      try {
+        openDialog();
+      } catch (error) {
+        console.error("[123 \u52A9\u624B] \u6279\u91CF\u79BB\u7EBF\u5F39\u7A93\u6253\u5F00\u5931\u8D25", error);
+      }
+    }
+    function openDialog() {
+      buildDialog();
+      const settings = state.settings;
+      $('[data-wbo-set="interval"]').value = settings.interval;
+      $('[data-wbo-set="retry"]').value = settings.retry;
+      $('[data-wbo-set="retryWait"]').value = settings.retryWait;
+      switchTab("download");
+      render();
+    }
+    function setStatus(text) {
+      const el = $("[data-wbo-status]");
+      if (el) el.textContent = text;
+    }
+    function setBusy(busy) {
+      const start = $('[data-wbo-act="start"]');
+      const stop = $('[data-wbo-act="stop"]');
+      if (start) start.disabled = busy;
+      if (stop) stop.disabled = !busy;
+    }
+    function render() {
+      if (!root) return;
+      const shadow = root.shadow;
+      const card = shadow.querySelector("[data-wbo-card]");
+      card.hidden = !state.tasks.length;
+      card.replaceChildren(...state.tasks.map((task, index) => {
+        const row = document.createElement("div");
+        row.className = "check-line";
+        const name = document.createElement("span");
+        name.textContent = `${index + 1}. ${task.name}`;
+        const spacer = document.createElement("span");
+        spacer.className = "spacer";
+        const status = document.createElement("span");
+        status.className = "footer-note";
+        status.textContent = task.statusText;
+        row.append(name, spacer, status);
+        return row;
+      }));
+      const done = state.tasks.filter((task) => task.status === "ok" || task.status === "fail").length;
+      shadow.querySelector("[data-wbo-bar]").style.width = state.tasks.length ? `${Math.round(done / state.tasks.length * 100)}%` : "0%";
+      const ok = state.tasks.filter((task) => task.status === "ok").length;
+      const fail = state.tasks.filter((task) => task.status === "fail").length;
+      shadow.querySelector("[data-wbo-sum]").innerHTML = metric("\u603B\u6570", String(state.tasks.length), "list") + metric("\u6210\u529F", String(ok), "check", ok ? "success" : "") + metric("\u5931\u8D25", String(fail), "alert", fail ? "danger" : "") + metric("\u5904\u7406\u4E2D", String(state.tasks.length - done), "loading");
+    }
+    function requestStop() {
+      if (!state.running) {
+        state.stop = true;
+        return;
+      }
+      state.stop = true;
+      state.controller?.abort();
+      setStatus("\u5DF2\u505C\u6B62\uFF0C\u518D\u6B21\u70B9\u300C\u5F00\u59CB / \u7EE7\u7EED\u300D\u4ECE\u6CA1\u5B8C\u7684\u4E00\u6761\u7EE7\u7EED");
+    }
+    async function processTask(task) {
+      const signal = state.controller.signal;
+      task.status = "running";
+      task.statusText = "\u89E3\u6790\u4E2D\u2026";
+      render();
+      for (let attempt = 0; attempt <= state.settings.retry; attempt += 1) {
+        if (state.stop) {
+          task.status = "pending";
+          task.statusText = "\u5DF2\u505C\u6B62";
+          return;
+        }
+        if (attempt > 0) {
+          task.status = "wait";
+          task.statusText = `\u7B49\u5F85\u91CD\u8BD5\uFF08${attempt}/${state.settings.retry}\uFF09\u2026`;
+          render();
+          await new Promise((resolve) => setTimeout(resolve, state.settings.retryWait * 1000));
+        }
+        try {
+          const resolved = await resolveLink(task.url, signal);
+          task.name = resolved.name;
+          task.statusText = "\u63D0\u4EA4\u4E2D\u2026";
+          render();
+          await submitTask(resolved, signal);
+          task.status = "ok";
+          task.statusText = "\u5DF2\u521B\u5EFA";
+          render();
+          return;
+        } catch (error) {
+          if (error?.name === "AbortError" || state.stop) {
+            task.status = "pending";
+            task.statusText = "\u5DF2\u505C\u6B62";
+            return;
+          }
+          if (error?.expired) {
+            task.status = "fail";
+            task.statusText = error.message;
+            render();
+            setStatus(error.message);
+            return;
+          }
+          if (error?.exists) {
+            task.status = "ok";
+            task.statusText = "\u5DF2\u5728\u4EFB\u52A1\u5217\u8868\u91CC";
+            render();
+            return;
+          }
+          task.statusText = String(error?.message || "\u5931\u8D25");
+          if (error?.limited) {
+            setStatus("\u89E6\u53D1\u9650\u6D41\uFF0C\u81EA\u52A8\u7B49\u5F85\u540E\u91CD\u8BD5\u2026");
+            await new Promise((resolve) => setTimeout(resolve, 5000));
+          }
+          render();
+        }
+      }
+      task.status = "fail";
+      task.statusText = `${task.statusText || "\u5931\u8D25"}`;
+      render();
+    }
+    async function run() {
+      if (state.running) return;
+      if (!batchOfflineEligible()) {
+        setStatus("\u8BF7\u5148\u767B\u5F55 123 \u4E91\u76D8\u518D\u4F7F\u7528\u6279\u91CF\u79BB\u7EBF\u4E0B\u8F7D");
+        return;
+      }
+      const links = parseLinks($("[data-wbo-links]")?.value);
+      const existing = new Set(state.tasks.map((task) => task.url));
+      const sameInput = state.tasks.length > 0 && links.length === state.tasks.length && links.every((url) => existing.has(url));
+      if (!sameInput) {
+        if (!links.length) {
+          setStatus("\u8BF7\u5148\u7C98\u8D34\u81F3\u5C11\u4E00\u6761\u94FE\u63A5");
+          return;
+        }
+        state.tasks = links.map((url) => ({ url, status: "pending", statusText: "\u7B49\u5F85\u4E2D", name: url.slice(0, 60) }));
+      }
+      const start = state.tasks.findIndex((task) => task.status === "pending" || task.status === "wait");
+      if (start === -1) {
+        render();
+        setStatus(state.tasks.some((task) => task.status === "fail") ? "\u6CA1\u6709\u5F85\u5904\u7406\u7684\u6761\u76EE\uFF0C\u53EF\u4EE5\u70B9\u300C\u91CD\u8BD5\u5931\u8D25\u300D" : "\u5168\u90E8\u5B8C\u6210");
+        return;
+      }
+      state.running = true;
+      state.stop = false;
+      state.controller = new AbortController();
+      setBusy(true);
+      render();
+      setStatus(start === 0 ? `\u5F00\u59CB\u5904\u7406 ${state.tasks.length} \u6761\uFF0C\u6BCF\u6761\u95F4\u9694 ${state.settings.interval} \u79D2` : `\u4ECE\u7B2C ${start + 1}/${state.tasks.length} \u6761\u7EE7\u7EED`);
+      try {
+        for (let index = start; index < state.tasks.length; index += 1) {
+          if (state.stop) break;
+          await processTask(state.tasks[index]);
+          if (index < state.tasks.length - 1 && !state.stop) await new Promise((resolve) => setTimeout(resolve, state.settings.interval * 1000));
+        }
+      } finally {
+        state.running = false;
+        state.controller = null;
+        setBusy(false);
+        const ok = state.tasks.filter((task) => task.status === "ok").length;
+        const fail = state.tasks.filter((task) => task.status === "fail").length;
+        const left = state.tasks.filter((task) => task.status === "pending" || task.status === "wait").length;
+        $('[data-wbo-act="retry"]').disabled = fail === 0;
+        setStatus(left > 0 ? `\u5DF2\u505C\u6B62\uFF0C\u5269\u4F59 ${left} \u6761\u672A\u5904\u7406` : `\u5B8C\u6210\uFF1A\u6210\u529F ${ok}\uFF0C\u5931\u8D25 ${fail}`);
+        render();
+      }
+    }
+    async function retryFailed() {
+      if (state.running) {
+        setStatus("\u8BF7\u5148\u505C\u6B62\u5F53\u524D\u4EFB\u52A1");
+        return;
+      }
+      const fails = state.tasks.filter((task) => task.status === "fail");
+      if (!fails.length) {
+        setStatus("\u5F53\u524D\u6CA1\u6709\u5931\u8D25\u7684\u6761\u76EE");
+        return;
+      }
+      for (const task of fails) {
+        task.status = "pending";
+        task.statusText = "\u7B49\u5F85\u91CD\u8BD5";
+      }
+      render();
+      await run();
+    }
+
+    /* ---------- \u539F\u751F\u83DC\u5355\u5165\u53E3 ---------- */
+    function closeNativeDropdown() {
+      if (typeof MouseEvent !== "function") return;
+      for (const type of ["mousedown", "mouseup", "click"]) {
+        document.documentElement.dispatchEvent(new MouseEvent(type, { bubbles: true }));
+      }
+    }
+    function injectMenuItem(anchor, list) {
+      const clone = anchor.cloneNode(true);
+      clone.setAttribute(MENU_FLAG, "1");
+      for (const attr of ["id", "data-menu-id", "aria-selected", "aria-current"]) clone.removeAttribute(attr);
+      // 克隆件里只留文字：官方项内层还挂着图标/子节点，整颗换成文字才不会带出旧交互
+      clone.textContent = ENTRY_LABEL;
+      // 直接挂监听（文档级委托只作官方重渲染后的兜底）：官方菜单项是 React 节点，
+      // 克隆件没有它的事件，靠委托在某些层级上接不到点击。
+      clone.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openBatchOfflineDialog();
+      });
+      anchor.after(clone);
+    }
+    // 菜单里只留三项：新建BT任务、批量离线下载、查看离线下载任务（维护者 2026-10-01 定）。
+    // 「新建链接下载任务」不删节点，只打标记藏起来，官方改版或用户想恢复都不丢东西。
+    function trimLinkTaskItem(list) {
+      for (const element of list.children) {
+        if (element.nodeType !== 1) continue;
+        if (element.getAttribute(MENU_FLAG) !== null) continue;
+        if (String(element.textContent || "").replace(/\s+/g, "") !== "\u65b0\u5efa\u94fe\u63a5\u4e0b\u8f7d\u4efb\u52a1") continue;
+        element.setAttribute("data-c123-menu-trimmed", "true");
+      }
+    }
+    function scanMenus() {
+      if (!batchOfflineEligible()) return;
+      const anchors = [...document.querySelectorAll("li, [role='menuitem']")].filter((element) => {
+        if (String(element.textContent || "").trim() !== ANCHOR_LABEL) return false;
+        // 只认最外层那一个：内层 span 的 textContent 与 li 相同，两处都注入就会出现重复项
+        return !element.querySelector("li, [role='menuitem']");
+      });
+      for (const anchor of anchors) {
+        // 列表容器就取真实父节点：官方菜单项自己的 class 里也带 menu 字样，
+        // 用 closest([class*=menu]) 会命中 li 本身，去重判断查错地方 → 每帧多插一份。
+        const list = anchor.parentElement;
+        if (!list || list.querySelector(`:scope > [${MENU_FLAG}]`)) continue;
+        injectMenuItem(anchor, list);
+        trimLinkTaskItem(list);
+      }
+    }
+    var scanQueued = false;
+    function scheduleScan() {
+      if (scanQueued || typeof requestAnimationFrame !== "function") {
+        if (!scanQueued) scanMenus();
+        return;
+      }
+      scanQueued = true;
+      requestAnimationFrame(() => {
+        scanQueued = false;
+        try {
+          scanMenus();
+        } catch (error) {
+          console.error("[123 \u52A9\u624B] \u6279\u91CF\u79BB\u7EBF\u5165\u53E3\u6CE8\u5165\u5931\u8D25", error);
+        }
+      });
+    }
+    function onDocumentClickCapture(event) {
+      const item = event.target?.closest?.(`[${MENU_FLAG}]`);
+      if (!item) return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeNativeDropdown();
+      openBatchOfflineDialog();
+    }
+    function startWatch() {
+      if (!document.body) {
+        setTimeout(startWatch, 300);
+        return;
+      }
+      if (typeof MutationObserver === "function") {
+        new MutationObserver(scheduleScan).observe(document.body, { childList: true, subtree: true });
+      }
+      document.addEventListener("click", onDocumentClickCapture, true);
+      scheduleScan();
+    }
+    startWatch();
   })();
 })();

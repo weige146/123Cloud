@@ -22,7 +22,7 @@ const code = [
 const driver = `;
 globalThis.__recognition = { parseEpisodeHint, specialContext, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration, isVideoFile, extractKeywordKinds, applySpecialKeywordMappings, defaultSpecialKeywordPatterns, normalizeConfig, getSpecialKindTokens: () => SPECIAL_KIND_TOKENS };
 `;
-const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException };
+const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException, setTimeout, clearTimeout };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
 const { parseEpisodeHint, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration, extractKeywordKinds, applySpecialKeywordMappings, defaultSpecialKeywordPatterns, specialContext, normalizeConfig, getSpecialKindTokens } = sandbox.__recognition;
@@ -380,6 +380,87 @@ test("特别篇关键词：老配置自动补齐词表，旧英文类型名改�
   assert.ok(pilot, "用户编辑过的特别篇条目保留");
   assert.equal(pilot.output, "先导片", "旧英文类型名应改写为类型名");
   assert.ok(!Array.from(rewritten.library.recognition.fixedMappings).some((item) => item.field === "specialKind" && item.output === "加更"), "已留有特别篇条目时不再强制补齐（尊重用户编辑）");
+});
+
+// —— 1.4.5：手动指定季优先 / S0 特典 / 季详情重试 / showAllSpecials 开关 ——
+test("手动指定季优先于文件名：S01 记号强制归位到第 2 季、集号不变", async () => {
+  const g = { ...group([regularFile]), manualTargetSeason: "2" };
+  const result = await previewEpisodeCalibration(stubTmdb, g);
+  assert.equal(result.warnings.length, 0, `不应有警告：${JSON.stringify(result.warnings)}`);
+  const match = result.matches["1"];
+  assert.ok(match, "手动指定第 2 季后应仍被校准");
+  assert.equal(match.seasonNumber, 2);
+  assert.equal(match.episodeNumber, 4, "季号改写、集号保持文件名里的 E04");
+});
+
+test("未手动指定季时不强制改写（反向验证：S01 记号仍按原季参与匹配）", () => {
+  const pool = [ep(1, 4, "第一季第四期", "2021-09-01"), ep(2, 4, "第二季第四期", "2022-08-27")];
+  const forced = matchEpisodeCandidates(files([regularFile]), pool, 1, 2, null, { forceTargetSeason: true });
+  const plain = matchEpisodeCandidates(files([regularFile]), pool, 1, 2, null);
+  assert.equal(forced.get("1").seasonNumber, 2, "带 forceTargetSeason 时归第 2 季");
+  assert.equal(plain.get("1").seasonNumber, 1, "不带该选项时仍按文件名 S01 匹配第 1 季");
+});
+
+test("手动填 0（S00 特典）也算手动指定：无季记号的 Special E01 归到第 0 季", () => {
+  const pool = [ep(0, 1, "先导片", "2021-08-14"), ep(1, 1, "正片第一期", "2021-08-21")];
+  const file = "Have.Fun.Special.E01.1080p.WEB-DL.H264.AAC.mp4";
+  const forced = matchEpisodeCandidates(files([file]), pool, 1, 0, null, { forceTargetSeason: true });
+  assert.ok(forced.get("1"), "指定 S0 时应命中第 0 季条目");
+  assert.equal(forced.get("1").seasonNumber, 0);
+  assert.equal(forced.get("1").episodeNumber, 1);
+  const plain = matchEpisodeCandidates(files([file]), pool, 1, 0, null);
+  assert.notEqual(plain.get("1") && plain.get("1").seasonNumber, 0, "未开启手动指定时不落到 S00（证明改写确实生效）");
+});
+
+test("手动指定 S0 端到端：先导片文件校准到 S00 条目而不是弹回第 1 季", async () => {
+  const g = { ...group(["[20210814][嗨放派 先导片].Have.Fun.2021.E01.1080p.WEB-DL.H264.AAC.mp4"]), manualTargetSeason: "0" };
+  const result = await previewEpisodeCalibration(stubTmdb, g);
+  const match = result.matches["1"];
+  assert.ok(match, `指定 S0 后应命中特典条目，警告：${JSON.stringify(result.warnings)}`);
+  assert.equal(match.seasonNumber, 0);
+});
+
+test("showAllSpecials：开启后别的季的特典也进候选，默认关闭时按季标记过滤掉", () => {
+  const pool = [...SEASON_2, ep(0, 50, "第4季 先导片", "2025-01-01")];
+  const names = ["[20220827][嗨放派 第二季 第04期].Have.Fun.2022.S01E04.1080p.WEB-DL.H264.AAC.mp4"];
+  const filtered = filterEpisodeCandidatesForTargetSeason(pool, 2, names, null);
+  const all = filterEpisodeCandidatesForTargetSeason(pool, 2, names, null, true);
+  assert.ok(!filtered.some((episode) => episode.id === "s0e50"), "默认按季标记过滤，第4季先导片不进第2季候选");
+  assert.ok(all.some((episode) => episode.id === "s0e50"), "开启后 S00 特典全量进候选");
+});
+
+test("季详情首次失败自动重试一次，不再静默丢整季", async () => {
+  let calls = 0;
+  const flaky = {
+    details: async () => TMDB_MEDIA,
+    async season(_id, season) {
+      if (season === 2 && calls++ === 0) throw new Error("网络抖动");
+      return EPISODE_POOL[season] || [];
+    }
+  };
+  const result = await previewEpisodeCalibration(flaky, group([regularFile], { season: "2" }));
+  assert.equal(calls >= 2, true, "第 2 季应被请求两次");
+  assert.equal(result.warnings.length, 0, `重试成功不应留警告：${JSON.stringify(result.warnings)}`);
+  assert.ok(result.matches["1"], "重试后第 2 季集数应齐全并校准成功");
+});
+
+test("季详情重试仍失败才降级为警告（不整包抛错）", async () => {
+  const broken = {
+    details: async () => TMDB_MEDIA,
+    async season(_id, season) {
+      if (season === 2) throw new Error("持续失败");
+      return EPISODE_POOL[season] || [];
+    }
+  };
+  const result = await previewEpisodeCalibration(broken, group([regularFile], { season: "2" }));
+  assert.ok(result.warnings.some((warning) => /无法读取第 2 季/.test(warning)), `应给出第 2 季读取失败警告：${JSON.stringify(result.warnings)}`);
+});
+
+test("showAllSpecials 配置：默认关、只认严格 true", () => {
+  const base = normalizeConfig({});
+  assert.equal(base.tmdb.showAllSpecials, false, "首装默认关闭");
+  assert.equal(normalizeConfig({ tmdb: { credential: "", language: "zh-CN", region: "CN", apiBase: "", showAllSpecials: true } }).tmdb.showAllSpecials, true);
+  assert.equal(normalizeConfig({ tmdb: { showAllSpecials: "1" } }).tmdb.showAllSpecials, false, "字符串 1 不算开启");
 });
 
 await chain;

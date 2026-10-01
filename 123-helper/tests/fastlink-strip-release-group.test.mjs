@@ -89,6 +89,24 @@ const paths = (json) => sorted(data(json).files.map((file) => file.path));
   console.log("ok 特殊发布组名单生效，名单外与整名即组名都不误伤");
 }
 
+// —— 用例 3b：流媒体 WEB-DL 命名里「编码/音效-来源」组合不是发布组，别误去（与 Python 端同步）——
+{
+  const files = [
+    entry("剧/Fakhar.S01E01.1080p.WEB-DL.AAC2.0.H.264-NF.mkv"),
+    entry("剧/Fakhar.S01E02.2026.1080p.WEB-DL.AVC.DDP.5.1.Atmos-NF.mkv"),
+    entry("剧/Fakhar.S01E03.1080p.WEB-DL.x264-DSNP.mkv")
+  ];
+  assert.deepEqual(paths(buildFastlinkJson(files, ON)), sorted([
+    "Fakhar.S01E01.1080p.WEB-DL.AAC2.0.H.264-NF.mkv",
+    "Fakhar.S01E02.2026.1080p.WEB-DL.AVC.DDP.5.1.Atmos-NF.mkv",
+    "Fakhar.S01E03.1080p.WEB-DL.x264-DSNP.mkv"
+  ]), "来源标签 NF/DSNP 与前面编码/音效粘成的段不是发布组，勾选去组也不该动");
+  // 真发布组（连字符尾段 NTb）照常去掉
+  const real = buildFastlinkJson([entry("剧/Show.S01E01.1080p.WEB-DL.H264-NTb.mkv")], ON);
+  assert.deepEqual(paths(real), ["Show.S01E01.1080p.WEB-DL.H264.mkv"], "真发布组 NTb 仍被去掉");
+  console.log("ok 流媒体来源标签不误判为发布组，真发布组照常去");
+}
+
 // —— 用例 4：只动文件名末段，目录名原样保留（公共前缀里带组名也不改）——
 {
   const json = buildFastlinkJson([entry("Show.S01.AAWeb/Season 01.HiveWeb/E01.1080p-WEB2.mkv")], { stripReleaseGroup: true, releaseGroups: ["HiveWeb"] });
@@ -153,11 +171,13 @@ const paths = (json) => sorted(data(json).files.map((file) => file.path));
   const artifact = await generateSecondaryFastlink(api, items, { ...ON, useJson: true, useFolderName: true, seedFolderId: "9" });
   assert.equal(uploaded[0].parentId, "9");
   assert.deepEqual(data(uploaded[0].content).files.map((file) => file.path).sort(), sorted(["Show.S01E01.1080p.WEB-DL.H264.mkv", "Show.S01E02.1080p.WEB-DL.H264.mkv"]), "种子内容里的文件名应去掉发布组");
+  assert.equal(artifact.strippedReleaseGroups, "GROUP1/GROUP2", "去组时要在原名被洗掉前把发布组收集出来，供直投 meta 带回客户端做路由");
   assert.equal(artifact.link.split("#").at(-1), uploaded[0].fileName, "短链指向的名字必须就是实际上传的种子文件名");
   const txtArtifact = await generateSecondaryFastlink(api, items, { ...ON, useJson: false, useFolderName: true, seedFolderId: "9" });
   assert.ok(!/GROUP1|GROUP2/.test(txtArtifact.text), "txt 形态的种子内容同样去掉发布组");
   const plainArtifact = await generateSecondaryFastlink(api, items, { useJson: true, useFolderName: true, seedFolderId: "9" });
   assert.ok(plainArtifact.text.includes("GROUP1"), "不勾选时种子内容保持原名");
+  assert.equal(plainArtifact.strippedReleaseGroups, "", "不勾选时不收集发布组（客户端照常自己识别）");
   console.log("ok 二级链接：内容去组名，短链文件名与实际种子一致");
 }
 

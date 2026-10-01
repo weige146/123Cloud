@@ -421,8 +421,25 @@ test("直投 meta：多版本变体用 / 汇总、自定义映射表生效", () 
 
 test("直投 meta 接线：push 按自定义映射计算并随条目提交，submitShares 只在有条目对象时带上", () => {
   const bundle = lines.join("\n");
-  assert.ok(bundle.includes("const meta = buildFastlinkSubmissionMeta(artifact?.text, (this.config.library || {}).recognition?.fixedMappings);"), "直投要计算 meta（带自定义映射表）");
+  assert.ok(bundle.includes("const meta = buildFastlinkSubmissionMeta(artifact?.text, (this.config.library || {}).recognition?.fixedMappings, {"), "直投要计算 meta（带自定义映射表）");
+  assert.ok(bundle.includes("strippedReleaseGroups: artifact?.strippedReleaseGroups || \"\""), "去组直投要把扫描阶段留存的原始发布组传给 meta");
   assert.ok(bundle.includes("...(item.meta && typeof item.meta === \"object\" ? { meta: item.meta } : {})"), "submitShares 要透传 meta 且不误导老后端");
+});
+
+test("buildFastlinkSubmissionMeta：开去组时带原始发布组与 stripped 标记，不开时不加这两键", () => {
+  const files = [
+    { path: "S1/Show.S01E01.2160p.WEB-DL.HiveWeb.mkv", fileName: "Show.S01E01.2160p.WEB-DL.HiveWeb.mkv", etag: md5("a"), size: 1 }
+  ];
+  // 种子内容已被 applyFastlinkReleaseGroupStrip 洗掉组名（模拟直投拿到的 artifact.text）
+  const strippedText = buildFastlinkText([{ path: "S1/Show.S01E01.2160p.WEB-DL.mkv", fileName: "Show.S01E01.2160p.WEB-DL.mkv", etag: md5("a"), size: 1 }]);
+  const withGroup = buildFastlinkSubmissionMeta(strippedText, undefined, { stripReleaseGroup: true, strippedReleaseGroups: "HiveWeb" });
+  assert.equal(withGroup.releaseGroup, "HiveWeb", "meta 带原始发布组供客户端路由");
+  assert.equal(withGroup.releaseGroupStripped, "1", "标 stripped 三态，客户端不再乱猜尾段");
+  const strippedOnly = buildFastlinkSubmissionMeta(strippedText, undefined, { stripReleaseGroup: true, strippedReleaseGroups: "" });
+  assert.equal(strippedOnly.releaseGroupStripped, "1", "没搜到组名也要标 stripped");
+  assert.ok(!("releaseGroup" in strippedOnly), "没组名就不写 releaseGroup 键");
+  const noStrip = buildFastlinkSubmissionMeta(buildFastlinkText(files));
+  assert.ok(!("releaseGroupStripped" in noStrip) && !("releaseGroup" in noStrip), "未开去组时这两个键都不出现（客户端照常自己识别发布组）");
 });
 
 test("二级链接成功要清扫描断点，上传种子失败保留断点可续扫", async () => {
