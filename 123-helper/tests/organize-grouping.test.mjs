@@ -25,13 +25,16 @@ globalThis.__organize = {
   inferTitle, mediaKey, buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle,
   looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames,
   applyVariantTagsForCollisions, parseSeasonEpisode, specialContext, isVideoFile, collectOrganizeGroups,
-  inferFields, inferFileFields, refreshOrganizeGroupTargets, fileHasExplicitSeasonEpisode
+  inferFields, inferFileFields, refreshOrganizeGroupTargets, fileHasExplicitSeasonEpisode,
+  tmdbCandidateHasExactTitle, titleExtraWords, assignFileVariantLabels,
+  matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, rawSectorWord, fileSectorWord
 };
 `;
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle, parseSeasonEpisode, collectOrganizeGroups, inferFields, inferFileFields, refreshOrganizeGroupTargets, fileHasExplicitSeasonEpisode } = sandbox.__organize;
+const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle, parseSeasonEpisode, collectOrganizeGroups, inferFields, inferFileFields, refreshOrganizeGroupTargets, fileHasExplicitSeasonEpisode, tmdbCandidateHasExactTitle, titleExtraWords, assignFileVariantLabels, matchEpisodeCandidates,
+  filterEpisodeCandidatesForTargetSeason, rawSectorWord, fileSectorWord } = sandbox.__organize;
 
 const config = { library: { recognition: { customWords: [] } } };
 const file = (name, id = name) => ({ id, name });
@@ -367,6 +370,140 @@ test("单电影/剧集目录（子目录都是季目录）仍按整目录一组"
   const groups = await collectOrganizeGroups(api, [{ id: "top", name: "三体 (2023) {tmdb-808}", type: 1 }], config, { tmdb });
   assert.equal(groups.length, 1);
   assert.equal(groups[0].id, "folder:top", "季目录不算强片名子目录，维持整目录一组");
+});
+
+
+// —— 综艺目录「中英文名并排写 + 本季年」整目录一组（维护者 2026-10-02 实测《脱口秀和Ta的朋友们》S03）——
+const VARIETY_FOLDER = "脱口秀和Ta的朋友们.Stand-Up.Comedy.S03.2026.2160p.WEB-DL.H265.AAC-ADWeb";
+const VARIETY_FILES = [
+  "脱口秀和Ta的朋友们.Stand-Up.Comedy.S03E17.2026.2160p.WEB-DL.H265.AAC.mkv",
+  "脱口秀和Ta的朋友们.Stand-Up.Comedy.S03E18.2026.2160p.WEB-DL.H265.AAC.mkv",
+  "脱口秀和Ta的朋友们.直播.Stand-Up.Comedy.S03E07.Live.2026.2160p.WEB-DL.H265.AAC.mkv",
+  "脱口秀和Ta的朋友们.豫见她们.Stand-Up.Comedy.S03E05.Interview.2026.2160p.WEB-DL.H265.AAC.mkv",
+  "脱口秀和Ta的朋友们.花絮特辑.Stand-Up.Comedy.S03E09.Special.2026.2160p.WEB-DL.H265.AAC.mkv",
+  "脱口秀和Ta的朋友们.好好玩公园.Stand-Up.Comedy.S03E08.Park.2026.2160p.WEB-DL.H265.AAC.mkv",
+  "脱口秀和Ta的朋友们.外传.Stand-Up.Comedy.S03E01.Bonus.2026.2160p.WEB-DL.H265.AAC.mkv"
+];
+// TMDB 上中文名与英文名是分开的两条标题、首播年 2024（目录名里的 2026 是本季年）
+const VARIETY_MEDIA = {
+  id: 261471, mediaType: "tv", title: "脱口秀和Ta的朋友们", originalTitle: "Stand-up Comedy",
+  aliases: [], chineseTitles: [], englishTitles: [], year: "2024", genres: [], overview: "",
+  posterUrl: "", backdropUrl: "", voteAverage: 6, seasons: [{ season_number: 3, air_date: "2026-07-21" }]
+};
+const varietyTree = { top: VARIETY_FILES.map((name, index) => mkFile(`v${index}`, name, 1000 + index)) };
+const varietyApi = { listAll: async (id) => varietyTree[id] || [] };
+
+test("主标题词精确命中候选即算校验通过（中英文名并排写不再判不过）", () => {
+  assert.equal(tmdbCandidateHasExactTitle(VARIETY_MEDIA, "脱口秀和Ta的朋友们 Stand-Up Comedy"), true,
+    "PT 命名把中英文片名并排写时，中文名精确命中就该认");
+  assert.equal(tmdbCandidateHasExactTitle(VARIETY_MEDIA, "黑猫警长 上海美术电影制片厂"), false,
+    "标题毫无关系仍算不通过");
+  assert.equal(tmdbTitleTokensMatchGuard(), true, "碎词（Stand/Up）不得单独当主标题命中");
+});
+function tmdbTitleTokensMatchGuard() {
+  return !tmdbCandidateHasExactTitle(
+    { id: 1, mediaType: "tv", title: "Stand", originalTitle: "", aliases: [], chineseTitles: [], englishTitles: [], year: "2024", seasons: [] },
+    "脱口秀和Ta的朋友们 Stand-Up Comedy");
+}
+
+test("综艺整目录一个分组：本季年与首播年不符不再散成十几个组", async () => {
+  const tmdb = { search: async () => [VARIETY_MEDIA], details: async () => VARIETY_MEDIA };
+  const groups = await collectOrganizeGroups(varietyApi, [{ id: "top", name: VARIETY_FOLDER, type: 1 }], config, { tmdb });
+  assert.equal(groups.length, 1, `一部综艺一季应整目录一组，实际 ${groups.length} 组：${groups.map((g) => g.title).join("|")}`);
+  assert.equal(groups[0].id, "folder:top");
+  assert.equal(groups[0].files.length, VARIETY_FILES.length);
+  assert.equal(groups[0].targetSeason, 3, "目录名里的 S03 仍要当目标季");
+  assert.equal(groups[0].media && groups[0].media.id, 261471);
+});
+
+test("板块名自动记进 variantLabel，同集号多版本改名不撞车", async () => {
+  const tmdb = { search: async () => [VARIETY_MEDIA], details: async () => VARIETY_MEDIA };
+  const [group] = await collectOrganizeGroups(varietyApi, [{ id: "top", name: VARIETY_FOLDER, type: 1 }], config, { tmdb });
+  const labelOf = (part) => (group.files.find((file) => file.name.includes(part)) || {}).variantLabel || "";
+  assert.equal(labelOf("豫见她们"), "豫见她们", "词表外的自创板块名也要记下来");
+  assert.equal(labelOf("好好玩公园"), "好好玩公园");
+  assert.equal(labelOf("外传"), "外传");
+  assert.equal(labelOf("S03E17"), "", "正片没有多余板块名");
+  const tasks = group.files.map((file) => ({
+    id: file.id, variantTag: organizeVariantTag(file, { variantLabel: file.variantLabel, specialStrong: false, matchedToSpecial: false }),
+    normalizedName: `脱口秀和Ta的朋友们.S03E07.2026.2160p.WEB-DL.H265.AAC.mkv`, newName: "", fields: {}, folderParts: []
+  }));
+  const tagged = applyVariantTagsForCollisions(tasks);
+  assert.ok(new Set(tagged.map((task) => task.normalizedName)).size > 1,
+    `同集号撞车时板块名要插进文件名区分开：${tagged.map((task) => task.normalizedName).join(" | ")}`);
+});
+
+test("TMDB 认不出目录时退回散文件分组，夹在中间的板块名也并回主组", async () => {
+  const tmdb = { search: async () => [] };
+  const groups = await collectOrganizeGroups(varietyApi, [{ id: "top", name: VARIETY_FOLDER, type: 1 }], config, { tmdb });
+  assert.ok(groups.length < 5, `板块名夹在中间不再一个板块一个组，实际 ${groups.length} 组：${groups.map((g) => g.title).join("|")}`);
+  const withVariants = groups.filter((group) => group.files.some((file) => file.variantLabel));
+  assert.ok(withVariants.length >= 1, "衍生板块应并进某个主组并带上板块名");
+  assert.ok(withVariants.flatMap((group) => group.files).some((file) => file.variantLabel === "豫见她们"),
+    "词表外的板块名同样并进主组");
+});
+
+test("无关标题仍按散文件分组兜底（不放宽到乱认作品）", async () => {
+  const wrong = { ...VARIETY_MEDIA, title: "飞越集中营", originalTitle: "The Camp" };
+  const tmdb = { search: async () => [wrong], details: async () => wrong };
+  const groups = await collectOrganizeGroups(varietyApi, [{ id: "top", name: VARIETY_FOLDER, type: 1 }], config, { tmdb });
+  assert.ok(groups.every((group) => !group.id.startsWith("folder:top")),
+    "标题对不上时不得把整目录认成那部作品");
+});
+
+
+// —— 特典板块名匹配（维护者 2026-10-02：纯享/加更/好好玩公园 被识别成正片集号）——
+const issueEp = (season, ep, name) => ({ id: `s${season}e${ep}`, seasonNumber: season, episodeNumber: ep, name, airDate: "" });
+// 正片一期拆上/中/下三集（发布组给特典打的是正片流水号，与「第N期」错位）
+const VARIETY_POOL = [
+  issueEp(3, 1, "第1期上：脱口秀的夏天回归"), issueEp(3, 2, "第1期中：小奇进化小学生"), issueEp(3, 3, "第1期下：技能五子棋"),
+  issueEp(3, 4, "第2期上：广岛志恋"), issueEp(3, 5, "第2期下：贾耗死亡之组"),
+  issueEp(0, 116, "第3季 外传"),
+  issueEp(0, 118, "第3季 第1期上中纯享版"), issueEp(0, 119, "第3季 第1期下纯享版"),
+  issueEp(0, 121, "第3季 加更"), issueEp(0, 129, "第3季 加更"),
+  issueEp(0, 123, "第3季 第1期好好玩公园"), issueEp(0, 131, "第3季 第2期好好玩公园"),
+  issueEp(0, 167, "第3季 第1期豫见她们")
+];
+const varietyName = (sector, ep) => `脱口秀和Ta的朋友们${sector ? "." + sector : ""}.Stand-Up.Comedy.S03E${String(ep).padStart(2, "0")}.2026.2160p.WEB-DL.H265.AAC.mkv`;
+const calibrate = (names) => {
+  const files = names.map((name, index) => ({ id: String(index + 1), name, sectorWord: rawSectorWord(name, VARIETY_FOLDER) }));
+  const pool = filterEpisodeCandidatesForTargetSeason(VARIETY_POOL, 3, names, null, false);
+  return { files, matches: matchEpisodeCandidates(files, pool, 1, 3) };
+};
+
+test("板块词取文件名原词，不用 inferTitle 结果也不用关键词代号", () => {
+  assert.equal(rawSectorWord(varietyName("纯享", 1), VARIETY_FOLDER), "纯享", "词表内板块 inferTitle 会剥掉，必须走原始词差集");
+  assert.equal(rawSectorWord(varietyName("好好玩公园", 8), VARIETY_FOLDER), "好好玩公园");
+  assert.equal(rawSectorWord(varietyName("", 17), VARIETY_FOLDER), "", "正片文件没有多余板块词");
+  assert.equal(rawSectorWord("脱口秀和Ta的朋友们.第2期.2026.1080p.mkv", VARIETY_FOLDER), "", "带数字的词不当板块名");
+});
+
+test("板块名在 S00 唯一 → 直接命中特别篇，不再被正片流水号抓走", () => {
+  const { files, matches } = calibrate([varietyName("外传", 1), varietyName("好好玩公园", 8)]);
+  const bonus = matches.get("1");
+  assert.ok(bonus && bonus.seasonNumber === 0 && bonus.episodeNumber === 116, `外传应命中 S00E116，实际 ${JSON.stringify(bonus)}`);
+  assert.equal(bonus.reason, "TMDB 特别篇板块名匹配");
+  const park = matches.get("2");
+  assert.ok(park && park.seasonNumber === 0, `好好玩公园不该落成正片，实际 ${JSON.stringify(park && park.seasonEpisode)}`);
+});
+
+test("板块名同名多条 → 标 S00 待人工选集，绝不落成正片集号", () => {
+  const { matches } = calibrate([varietyName("纯享", 1), varietyName("加更", 4)]);
+  for (const [id, word] of [["1", "纯享"], ["2", "加更"]]) {
+    const hit = matches.get(id);
+    assert.ok(hit, `${word} 应给出特典待定而不是未匹配`);
+    assert.equal(hit.seasonNumber, 0, `${word} 留在第 0 季，不占正片集号`);
+    assert.equal(hit.episodeNumber, 0, `${word} 集号待定，不猜上/下`);
+    assert.match(hit.reason, /请手动选集/);
+  }
+});
+
+test("反例：S00 里没有这个板块词时，正片文件仍按正片流水号匹配", () => {
+  const { matches } = calibrate([varietyName("琅琊榜之风起长林", 2)]);
+  const hit = matches.get("1");
+  assert.ok(hit && hit.seasonNumber === 3, `没有对应特典条目时不该改判，实际 ${JSON.stringify(hit && hit.seasonEpisode)}`);
+  const regular = calibrate([varietyName("", 1)]).matches.get("1");
+  assert.ok(regular && regular.seasonNumber === 3 && regular.episodeNumber === 1, "正片照旧对上正片");
 });
 
 // —— 同条目一组：跨季散文件/分季目录合并（维护者 2026-09-22） ——

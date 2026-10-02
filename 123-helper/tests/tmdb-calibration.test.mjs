@@ -429,6 +429,23 @@ test("showAllSpecials：开启后别的季的特典也进候选，默认关闭�
   assert.ok(all.some((episode) => episode.id === "s0e50"), "开启后 S00 特典全量进候选");
 });
 
+test("S00 批量英文名（S3 Episode N）不把整批特典塞进第 3 季候选，中文季标记照常认", () => {
+  // TMDB 的 S00 条目常被批量命名为 "S3 Episode 1 …"：旧写法按 S 数字记号判归属，
+  // 整批都会被算成第 3 季所属，关着「显示全部特典」也照样放行（看着像过滤没生效）。
+  const mislabeled = [
+    ep(0, 1, "S3 Episode 1 Comment", "2019-01-01"),
+    ep(0, 2, "S3 Episode 2 Making Of", "2019-01-02")
+  ];
+  const names = ["[20240830][嗨放派 第三季 第01期].Have.Fun.2024.S03E01.1080p.WEB-DL.H264.AAC.mp4"];
+  const filtered = filterEpisodeCandidatesForTargetSeason([...SEASON_3, ...mislabeled], 3, names, null);
+  assert.ok(!filtered.some((episode) => episode.id === "s0e1"), "特典英文名里的 S3 记号不再当作第 3 季归属");
+  assert.ok(!filtered.some((episode) => episode.id === "s0e2"), "同期批量命名的整批特典都不该被带进第 3 季候选");
+  const all = filterEpisodeCandidatesForTargetSeason([...SEASON_3, ...mislabeled], 3, names, null, true);
+  assert.ok(all.some((episode) => episode.id === "s0e1"), "开启「显示全部特典」时仍然全量给到");
+  const named = filterEpisodeCandidatesForTargetSeason([...SEASON_3, ep(0, 9, "第3季 先导片", "2019-01-05")], 3, names, null);
+  assert.ok(named.some((episode) => episode.id === "s0e9"), "中文「第3季」季标记仍按归属保留");
+});
+
 test("季详情首次失败自动重试一次，不再静默丢整季", async () => {
   let calls = 0;
   const flaky = {

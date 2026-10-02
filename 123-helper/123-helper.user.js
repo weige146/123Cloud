@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.4.5
+// @version      1.4.7
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -4299,10 +4299,18 @@
       this.observer = new MutationObserver((mutations) => {
         // 官方翻牌（子按钮 display:none → 可见）改的是 class/style 属性，不是新增节点；
         // 只盯 addedNodes 就会漏掉那一帧，助手按钮早一拍出现 → 空壳中间帧。
+        // 助手自身写入（按钮 hidden、过渡样式等）必须忽略：它们同样落在监听属性里，不跳过就是
+        // 「写 → 观察者 → 防抖 syncPage → 再写」的自反馈空转（实测稳态每秒上百次无谓写入）。
         let touch = false;
+        let relevant = false;
         for (const mutation of mutations) {
+          const node = mutation.target;
+          const element = node instanceof Element ? node : node?.parentElement;
+          if (element?.closest?.("[data-cloud123-helper]")) continue;
+          relevant = true;
           if (mutation.addedNodes.length || (mutation.type === "attributes" && mutation.target !== document.body)) { touch = true; break; }
         }
+        if (!relevant) return;
         if (touch) this.syncOfficialBarLayout();
         this.syncPage();
       });
@@ -6914,6 +6922,25 @@
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.4.7",
+      notes: [
+        "整理剧集时，别的季的特典不再混进当前季",
+        "特典标题里写着别的季编号时，也不再整批放行",
+        "综艺一整季不再被拆成十几个分组，整个目录认成一部作品",
+        "目录名里中英文片名并排写、或写的是本季年份时，也能认对作品",
+        "纯享、加更、花絮、外传这类特典不再被认成正片集数",
+        "TMDB 上同名特典有多条时标成特别篇，等你自己选集，不再乱猜"
+      ]
+    },
+    {
+      version: "1.4.6",
+      notes: [
+        "\u4FEE\u590D\u5DE5\u5177\u680F\u5728\u540E\u53F0\u53CD\u590D\u505A\u65E0\u7528\u5237\u65B0\u3001\u767D\u767D\u5360\u7528\u7535\u8111\u8D44\u6E90\u7684\u95EE\u9898",
+        "\u957F\u65F6\u95F4\u6302\u7740\u7F51\u76D8\u9875\u9762\u65F6\uFF0C\u811A\u672C\u66F4\u7701\u8D44\u6E90\u3001\u66F4\u7701\u7535",
+        "\u52FE\u9009\u3001\u53D6\u6D88\u7B49\u64CD\u4F5C\u4E0D\u518D\u89E6\u53D1\u591A\u4F59\u7684\u540E\u53F0\u5237\u65B0\uFF0C\u7528\u8D77\u6765\u66F4\u8F7B\u5FEB"
+      ]
+    },
     {
       version: "1.4.5",
       notes: [
@@ -19336,6 +19363,28 @@ ${end.comment}` : end.comment;
       const key = tmdbTitleKey(name);
       const simplifiedKey = wantedBase ? tmdbTitleKey(toSimplified(name)) : "";
       return key === wanted || tmdbEquivalentTitleKey(name) === wantedEquivalent || wantedBase && wantedBase.length >= 4 && simplifiedKey === wantedBase;
+    }) || tmdbTitleTokensMatchCandidate(media, title);
+  }
+  var TMDB_TITLE_TOKEN_SPLIT_RE = /[\s._·\-/\\|()[\]{}]+/;
+  // PT 站命名习惯把中英文片名并排写（《脱口秀和Ta的朋友们.Stand-Up.Comedy.S03.2026...》识别成
+  // 「脱口秀和Ta的朋友们 Stand-Up Comedy」），而 TMDB 上中文名与英文名是分开的两条标题：
+  // 整串谁都比对不上，强片名目录就被判「校验不过」，一部剧退回按文件名散成十几个分组。
+  // 这里只看「主标题词」（首词或最长词，且含中文 ≥3 字 / 纯字母 ≥5 字）是否精确命中候选标题，
+  // 位置不限但不放过 Stand、Up 这类碎词，避免把无关条目误判成命中。
+  function tmdbTitleMainTokens(title) {
+    const tokens = String(title || "").split(TMDB_TITLE_TOKEN_SPLIT_RE).map((token) => token.trim()).filter(Boolean);
+    if (tokens.length < 2) return [];
+    const strong = (token) => /[\u3400-\u9fff]/.test(token) ? token.length >= 3 : token.replace(/[^A-Za-z]/g, "").length >= 5;
+    const longest = tokens.reduce((left, right) => (right.length > left.length ? right : left), "");
+    return [...new Set([tokens[0], longest])].filter(strong);
+  }
+  function tmdbTitleTokensMatchCandidate(media, title) {
+    const names = tmdbCandidateTitles(media);
+    return tmdbTitleMainTokens(title).some((token) => {
+      const key = tmdbTitleKey(token);
+      const equivalent = tmdbEquivalentTitleKey(token);
+      if (!key && !equivalent) return false;
+      return names.some((name) => tmdbTitleKey(name) === key || tmdbEquivalentTitleKey(name) === equivalent);
     });
   }
   function baseTitleWithoutSeasonAlias(title) {
@@ -19375,9 +19424,13 @@ ${end.comment}` : end.comment;
     });
     if (exact) score += 220;
     else if (aliasExact) score += 200;
+    // 中英文名并排写（PT 站常见）：主标题词精确命中候选，与「主标题·命名季」同档
+    else if (tmdbTitleTokensMatchCandidate(media, fields.title)) score += 200;
     else if (contains) score += 35;
     else if (compactWanted) score -= 60;
-    if (fields.year) score += media.year === fields.year ? 140 : media.year ? seasonYearMatchesAlias ? 0 : -100 : -25;
+    // 文件名带显式季号（S03）时，名字里的年份是本季播出年，与剧集首播年对不上属正常，
+    // 不能按年份不符扣成负分——否则整个强片名目录过不了校验，一部剧散成十几个分组。
+    if (fields.year) score += media.year === fields.year ? 140 : media.year ? seasonYearMatchesAlias || Number(fields.season) > 0 ? 0 : -100 : -25;
     if (fields.mediaType && fields.mediaType !== "unknown") score += media.mediaType === fields.mediaType ? 80 : -160;
     const wantedSeason = Number(fields.season || 0);
     if (media.mediaType === "tv" && wantedSeason > 0 && Array.isArray(media.seasons) && media.seasons.length) {
@@ -19461,7 +19514,11 @@ ${end.comment}` : end.comment;
     const targetAliases = new Set((seasonAliases || []).map((alias) => String(alias || "").replace(/[\s._·-]+/g, "")).filter(Boolean));
     const related = special.filter((episode) => {
       const context = specialContext(episode.name);
-      if (context.seasonMarkers.length) return context.seasonMarkers.includes(targetSeason);
+      // TMDB 的 S00 条目常被批量命名为“S3 Episode 1 …”式英文名，S 数字记号会把
+      // 整批同期特典误判为本季所属，开关关闭时也整批放行（看起来像没过滤）。
+      // 归属判定只认中文“第X季”式季标记；S 数字记号交给日期窗口/关键词通道。
+      const namedMarkers = namedSeasonMarkers(episode.name);
+      if (namedMarkers.length) return namedMarkers.includes(targetSeason);
       const episodeAliases = namedSeasonAliasToken(episode.name);
       if (episodeAliases.length) return episodeAliases.some((alias) => targetAliases.has(alias));
       const airDate = parseEpisodeAirDate(episode.airDate);
@@ -19863,6 +19920,66 @@ ${end.comment}` : end.comment;
       vcbSpecial: tag
     };
   }
+  // 板块名 = 文件名里比主标题多出来的中文词（纯享/加更/外传/好好玩公园/豫见她们…）。
+  // 必须用原始点分词差集：inferTitle 会把词表内的通用板块剥掉（拿不到 variantLabel），
+  // 特典关键词又是代号（表里存「纯享直拍」「直播演出」，TMDB 条目名写的是「纯享」「直播」，
+  // 拿代号匹配条目名永远对不上）。两个来源都不管用，直接对文件名与目录名做词差集取中文词。
+  function rawSectorWord(name, baseName) {
+    const split = (value) => String(value || "").replace(/\.[^.]+$/, "").split(/[._\s·-]+/).filter(Boolean);
+    const base = new Set(split(baseName).map((token) => token.toLocaleLowerCase()));
+    for (const token of split(name)) {
+      if (base.has(token.toLocaleLowerCase())) continue;
+      if (!/[\u3400-\u9fff]/.test(token)) continue;
+      if (/\d/.test(token) || token.length > 12) continue;
+      if (SECTOR_WORD_EXCLUSIONS.has(token.toLocaleLowerCase())) continue;
+      return token;
+    }
+    return "";
+  }
+  function fileSectorWord(file) {
+    return String(file?.sectorWord || file?.variantLabel || "").trim();
+  }
+  // 板块词只有在 S00 里真有条目时才有意义：拿它当「这是特典」的证据才放行绕开正片锚定，
+  // 否则带中文副标题的正片文件（如「琅琊榜之风起长林」）会被误当特典挂到待定上。
+  function sectorWordHasSpecial(sectorWord, episodes) {
+    const needle = String(sectorWord || "").replace(/[\s._\u00B7-]+/g, "");
+    if (!needle) return false;
+    return (episodes || []).some((episode) => episode.seasonNumber === 0
+      && String(episode.name || "").replace(/[\s._\u00B7-]+/g, "").includes(needle));
+  }
+  function specialEpisodeBySectorWord(word, episodes) {
+    const needle = String(word || "").replace(/[\s._·-]+/g, "");
+    if (!needle) return { matched: null, ambiguous: false };
+    const hits = (episodes || []).filter((episode) => episode.seasonNumber === 0
+      && String(episode.name || "").replace(/[\s._·-]+/g, "").includes(needle));
+    // 只认「板块名在 S00 里唯一」的情况。按期数再筛看着能多救几条，实际不可靠：
+    // 综艺一期常拆成 S03E01/E02/E03（上/中/下），文件名里的集号不等于 TMDB 的「第N期」，
+    // 拿集号当 period 反查会把特典对到别的期上。多条一律留给用户手动选集。
+    if (hits.length === 1) return { matched: hits[0], ambiguous: false };
+    return { matched: null, ambiguous: hits.length > 1 };
+  }
+  // 板块名特典兜底：词表外的自创板块名（外传/好好玩公园/豫见她们…）此前根本不算特典，会被
+  // 正片通道按「文件名季集/绝对集数」抓成正片集号；词表内的（纯享/加更）在 S00 有多条同名时
+  // 整条链放弃，结果同样是留着文件名里的正片流水号，看着就是「特典被识别成正片」。
+  // 板块名在 S00 唯一 → 直接采用；同名多条 → 标成 S00 待人工选集（集号留空），绝不落正片集号。
+  function applySectorWordFallback(entry2, sectorWord, sortedEpisodes, output) {
+    if (!sectorWord || Number(entry2.hint.season || 0) === 0 || output.has(String(entry2.file.id))) return false;
+    if (!sectorWordHasSpecial(sectorWord, sortedEpisodes)) return false;
+    const sector = specialEpisodeBySectorWord(sectorWord, sortedEpisodes);
+    if (sector.matched) {
+      output.set(String(entry2.file.id), { ...sector.matched, reason: "TMDB \u7279\u522B\u7BC7\u677F\u5757\u540D\u5339\u914D", confidence: "high" });
+      return true;
+    }
+    if (sector.ambiguous) {
+      output.set(String(entry2.file.id), {
+        id: `sector:${entry2.file.id}`, seasonNumber: 0, episodeNumber: 0, seasonEpisode: "S00",
+        name: sectorWord, airDate: "", confidence: "low",
+        reason: "TMDB \u7279\u522B\u7BC7\u677F\u5757\u540D\u6709\u591A\u6761\u540C\u540D\u6761\u76EE\uFF0C\u8BF7\u624B\u52A8\u9009\u96C6"
+      });
+      return true;
+    }
+    return false;
+  }
   function matchEpisodeCandidates(files, episodes, season, targetSeason = 0, seasonRemap = null, options = {}) {
     const sortedEpisodes = [...episodes].map(normalizedEpisode).sort((left, right) => left.seasonNumber - right.seasonNumber || left.episodeNumber - right.episodeNumber);
     const output = /* @__PURE__ */ new Map();
@@ -19909,11 +20026,15 @@ ${end.comment}` : end.comment;
       }
       const regularEpisode = regularSourceEpisode(entry2);
       const tokenAnchored = entry2.hint.season > 0 && hasExplicitSeasonEpisode(entry2.file.name);
+      const sectorWord = fileSectorWord(entry2.file);
+      const sectorSpecial = sectorWordHasSpecial(sectorWord, sortedEpisodes);
       // An explicit positive-season SxxExx token is authoritative for
       // regular files: it maps onto the matching regular episode or stays
       // unresolved so the source identity is retained — never onto an S00
       // entry.
-      if (tokenAnchored && !entry2.context.strong) {
+      // 带板块名的文件例外：发布组给特典打的是正片流水号（S03E05 其实是「第5期豫见她们」），
+      // 这条分支末尾是无条件 continue，会把特典整批拦死在正片通道里，必须放行给特典通道。
+      if (tokenAnchored && !entry2.context.strong && !(sectorWord && sectorSpecial)) {
         // 命名季的衍生段（如“中医季 药食同源第 1 期”）发布组仍会打上正片的
         // SxxExx 记号；若 S00 里存在同命名季、同期数/日期的衍生条目，优先于
         // 正片记号。期数以文件名标题里的「第N期」为准（发布组的记号沿用的是
@@ -19972,6 +20093,7 @@ ${end.comment}` : end.comment;
             output.set(String(entry2.file.id), variantLast ? { ...episodeRangeMatch(variantEpisode, variantLast, "TMDB 会员版 变体期数映射"), confidence: "medium" } : { ...variantEpisode, reason: "TMDB 会员版 变体期数映射", confidence: "medium" });
           }
         }
+        applySectorWordFallback(entry2, sectorWord, sortedEpisodes, output);
         continue;
       }
       const label = specialEpisodeByLabel(entry2.hint, entry2.context, sortedEpisodes, entry2.file.name);
@@ -20001,6 +20123,7 @@ ${end.comment}` : end.comment;
           continue;
         }
       }
+      applySectorWordFallback(entry2, sectorWord, sortedEpisodes, output);
     }
     // When a season starts with a TMDB pilot, source E00 is the first logical
     // regular episode. Feed the shifted numbers to the desktop-style
@@ -20260,15 +20383,60 @@ ${end.comment}` : end.comment;
     const season = seasonNumberFromText(text);
     return Number.isInteger(season) ? `${normalized}:s${String(season).padStart(3, "0")}` : normalized;
   }
-  function looseVariantRemainder(title, baseTitle) {
-    const value = String(title || "").trim();
-    const base = String(baseTitle || "").trim();
-    if (!base || !value.toLocaleLowerCase().startsWith(base.toLocaleLowerCase()) || value.length <= base.length) return "";
-    const rest = value.slice(base.length).replace(/^[\s._·-]+/, "").trim();
+  var VARIANT_TOKEN_SPLIT_RE = /[\s._·\-]+/;
+  // 板块名候选里先排掉这些常见版本/规格词（它们不是板块，是规格）
+  var SECTOR_WORD_EXCLUSIONS = new Set(["正片", "完整版", "未删减", "国配", "双语", "中字", "无字", "高清", "标清", "超清", "精校", "无修"]);
+  function looseVariantExtraWords(value) {
+    const rest = String(value || "").trim();
     if (!rest || rest.length > 12 || isWeakLooseTitle(rest)) return "";
     if (/(?:19|20)\d{2}|S\d{1,3}(?:E\d{1,5})?(?=$|[^A-Za-z0-9])/i.test(rest)) return "";
     if (seasonNumberFromText(rest) !== null) return "";
     return rest;
+  }
+  // 「标题里多出来的短词」：base 的词依次出现在 title 中时，中间/末尾夹进来的那些词就是
+  // 衍生板块名（综艺最常见：`剧名.直播.Stand-Up.Comedy.S03E07.Live`，主组是 `剧名.Stand-Up.Comedy`）。
+  // 严格前缀只认紧贴的写法，夹在中间的对不上会让一部剧散成十几个分组。
+  function titleExtraWords(title, baseTitle) {
+    const value = String(title || "").trim();
+    const base = String(baseTitle || "").trim();
+    if (!base || value.length <= base.length) return "";
+    if (value.toLocaleLowerCase().startsWith(base.toLocaleLowerCase())) {
+      return value.slice(base.length).replace(/^[\s._·-]+/, "").trim();
+    }
+    const valueTokens = value.split(VARIANT_TOKEN_SPLIT_RE).filter(Boolean);
+    const baseTokens = base.split(VARIANT_TOKEN_SPLIT_RE).filter(Boolean);
+    if (!baseTokens.length || valueTokens.length <= baseTokens.length) return "";
+    const valueLower = valueTokens.map((token) => token.toLocaleLowerCase());
+    const extra = [];
+    let cursor = 0;
+    for (const token of baseTokens.map((item) => item.toLocaleLowerCase())) {
+      const found = valueLower.indexOf(token, cursor);
+      if (found < 0) return "";
+      extra.push(...valueTokens.slice(cursor, found));
+      cursor = found + 1;
+    }
+    extra.push(...valueTokens.slice(cursor));
+    return extra.join(" ").trim();
+  }
+  function looseVariantRemainder(title, baseTitle) {
+    return looseVariantExtraWords(titleExtraWords(title, baseTitle));
+  }
+  // 整目录一组的场景：把每个文件名里比目录标题多出来的板块名记成 variantLabel。
+  // 命名阶段只在目标名真撞车时才插入（applyVariantTagsForCollisions），不撞名等于没这回事，
+  // 但少了这一步，同一集号的正片/直播/花絮会算出同一个目标文件名、后写的被清进回收站。
+  function assignFileVariantLabels(files, groupTitle, config) {
+    const customWords = config?.library?.recognition?.customWords || [];
+    const mappings = config?.library?.recognition?.fixedMappings;
+    const baseTitle = inferTitle(String(groupTitle || ""), mappings);
+    if (!baseTitle || isWeakLooseTitle(baseTitle)) return;
+    for (const file of files || []) {
+      const text2 = looseRecognitionText(file, customWords);
+      const title = inferTitle(text2, mappings);
+      const extra = looseVariantExtraWords(titleExtraWords(title, baseTitle));
+      if (extra && !file.variantLabel) file.variantLabel = extra;
+      // sectorWord 走原始词差集，覆盖 inferTitle 会剥掉的词表内板块（纯享/加更/直播）
+      if (!file.sectorWord) file.sectorWord = rawSectorWord(file.name, groupTitle);
+    }
   }
   // 「01 郭女侠怒砸同福店 佟掌柜秒点迷路人」这类「集号+集名」文件名：前导 1-4 位集号
   // （可带范围）+ 集名文本，文件名里没有剧名。集名带年份/分辨率/来源/SxxEyy 等真剧名
@@ -20600,6 +20768,7 @@ ${end.comment}` : end.comment;
             if (!childFiles.some((file) => isVideoFile(file.name))) continue;
             const validation = await validateStrongFolderTitle(options.tmdb, child.name, config, options);
             if (!validation.available || validation.media) {
+              assignFileVariantLabels(childFiles, child.name, config);
               groups.push({
                 id: `folder:${child.id}`,
                 title: child.name,
@@ -20622,6 +20791,7 @@ ${end.comment}` : end.comment;
         if (!isWeakOrganizeFolderTitle(item.name, config?.library?.recognition?.fixedMappings)) {
           const validation = await validateStrongFolderTitle(options.tmdb, item.name, config, options);
           if (!validation.available || validation.media) {
+            assignFileVariantLabels(scanned.files, item.name, config);
             groups.push({
               id: `folder:${item.id}`,
               title: item.name,
@@ -25460,10 +25630,28 @@ ${end.comment}` : end.comment;
     }
     updateToolbarState() {
       if (!this.toolbar) return;
+      // 写入前先与现值比对：setAttribute / .hidden / dataset 同值重写也会产生 MutationRecord，
+      // 而它们又落在 body 观察者的 attributeFilter 里，会被自己喂出「防抖 syncPage → 再写」的
+      // 自反馈空转（实测稳态每秒上百次）。值守卫是空转修复的一半，另一半在观察者跳过助手子树。
+      const setHidden = (element, value) => {
+        const next = Boolean(value);
+        if (element && element.hidden !== next) element.hidden = next;
+      };
+      const setDisabled = (element, value) => {
+        const next = Boolean(value);
+        if (element && "disabled" in element && element.disabled !== next) element.disabled = next;
+      };
+      const setAriaDisabled = (element, notDisabled) => {
+        const next = notDisabled ? "false" : "true";
+        if (element && element.getAttribute("aria-disabled") !== next) element.setAttribute("aria-disabled", next);
+      };
+      const setDataFlag = (element, key, value) => {
+        if (element && element.dataset[key] !== value) element.dataset[key] = value;
+      };
       // 工具栏里有「秒传」这类常驻按钮时，无勾选也要保持显示（与「更多」按钮的显隐条件一致）。
       const pinnedVisible = Boolean(this.toolbar.querySelector('[data-c123-pin-more="true"]'));
-      this.toolbar.hidden = !this.selection.hasSelection && !pinnedVisible;
-      this.toolbar.dataset.hasSelection = this.selection.hasSelection ? "true" : "false";
+      setHidden(this.toolbar, !this.selection.hasSelection && !pinnedVisible);
+      setDataFlag(this.toolbar, "hasSelection", this.selection.hasSelection ? "true" : "false");
       let seedReady = false;
       if (this.selection.hasSelection && !this.selection.selectAll && this.selection.selectedIds.size >= 1) {
         const records = readTableSelectionRecords();
@@ -25476,29 +25664,30 @@ ${end.comment}` : end.comment;
         // 更新（要等 rAF/防抖），照旧写 disabled 就会「先灰一下再变黑」——维护者截图看到的闪就是这个。
         // 这类按钮可见即说明已经勾选，不做置灰；点击路径本来就现读勾选，空勾选也点不出东西。
         if (button.dataset?.c123BarGate === "true") {
-          if ("disabled" in button) button.disabled = false;
-          button.setAttribute("aria-disabled", "false");
+          setDisabled(button, false);
+          setAriaDisabled(button, true);
           continue;
         }
-        if ("disabled" in button) button.disabled = !this.selection.hasSelection;
-        button.setAttribute("aria-disabled", this.selection.hasSelection ? "false" : "true");
+        setDisabled(button, !this.selection.hasSelection);
+        setAriaDisabled(button, this.selection.hasSelection);
         // 没有勾选时直接把整颗按钮隐藏掉（样式 .c123-helper-toolbar > [data-command][hidden]{display:none !important}），
         // 避免删除/清空后页面里残留置灰的「重命名/整理/转存秒传」（「秒传」常驻，不在此列）。
         // 注意：种子按钮（fastlinkImport）由下方专属逻辑按 seedReady 进一步覆盖 hidden 状态。
         // 带 data-c123-bar-gate 的按钮显隐交给 CSS（跟官方选中条同帧），JS 迟到也不影响观感；
         // 这里只留 disabled/aria-disabled。没带标记的（分享页工具栏等）保持原语义。
-        if (button !== seedButton && button.dataset?.c123BarGate !== "true") button.hidden = !this.selection.hasSelection;
+        if (button !== seedButton && button.dataset?.c123BarGate !== "true") setHidden(button, !this.selection.hasSelection);
       }
       if (seedButton) {
         // 只在校验通过时（勾选了 1 个或多个秒传种子文件 .123fastlink.json / .txt）
         // 才显示「转存秒传」按钮；选中文件夹、掺了普通文件或未选中时直接隐藏。
         // 这样避免出现"置灰却点不出提示"的迷惑交互。
-        seedButton.hidden = !seedReady;
-        seedButton.disabled = !seedReady;
-        seedButton.setAttribute("aria-disabled", seedReady ? "false" : "true");
-        seedButton.dataset.seedReady = seedReady ? "true" : "false";
-        seedButton.style.opacity = "";
-        seedButton.title = "\u8F6C\u5B58\u9009\u4E2D\u7684\u79D2\u4F20\u6587\u4EF6\uFF08\u652F\u6301\u666E\u901A\u4E0E\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u53EF\u591A\u9009\uFF09";
+        setHidden(seedButton, !seedReady);
+        setDisabled(seedButton, !seedReady);
+        setAriaDisabled(seedButton, seedReady);
+        setDataFlag(seedButton, "seedReady", seedReady ? "true" : "false");
+        if (seedButton.style.opacity) seedButton.style.opacity = "";
+        const seedTitle = "\u8F6C\u5B58\u9009\u4E2D\u7684\u79D2\u4F20\u6587\u4EF6\uFF08\u652F\u6301\u666E\u901A\u4E0E\u4E8C\u7EA7\u79D2\u4F20\uFF0C\u53EF\u591A\u9009\uFF09";
+        if (seedButton.title !== seedTitle) seedButton.title = seedTitle;
       }
     }
     toast(message, type = "") {

@@ -285,13 +285,35 @@ test("契约：助手组恒定一个盒子，位置只由 order 决定且不重�
 
 test("契约：折叠与标记在 MutationObserver 同步阶段跑，属性变化也要触发", () => {
   const start = lines.findIndex((line) => line.includes("this.observer = new MutationObserver("));
-  const block = lines.slice(start, start + 12).join("\n");
+  const end = lines.findIndex((line, index) => index > start && line.includes("this.observer.observe("));
+  const block = lines.slice(start, end).join("\n");
   assert.ok(start > 0 && block.includes("this.syncOfficialBarLayout()"), "MO 回调里应同步跑排版");
   assert.ok(block.includes('mutation.type === "attributes"'), "官方翻牌改的是 class/style，只听 addedNodes 会漏那一帧");
   assert.ok(block.includes("this.syncPage()"), "重活仍走防抖 syncPage");
   const ensureStart = lines.findIndex((line) => line.includes("ensureFileToolbar() {"));
   const ensure = lines.slice(ensureStart, ensureStart + 30).join("\n");
   assert.ok(ensure.includes('host.dataset.c123BarReady === "true" ? Boolean(officialGroup) : false'), "折叠跟着 bar-ready 走：官方条没翻出可见按钮前不动它的按钮");
+});
+
+test("契约：观察者跳过助手子树自写，杜绝「写→观察者→再写」自反馈空转", () => {
+  const start = lines.findIndex((line) => line.includes("this.observer = new MutationObserver("));
+  const end = lines.findIndex((line, index) => index > start && line.includes("this.observer.observe("));
+  const block = lines.slice(start, end).join("\n");
+  assert.ok(start > 0 && end > start, "应能定位观察者回调");
+  assert.ok(block.includes('closest?.("[data-cloud123-helper]")'), "助手子树里的自写变更必须跳过（hidden 等也在监听属性里，不跳过就会自己喂自己）");
+  assert.ok(block.includes("if (!relevant) return;"), "整批都是自写时直接返回，不再无条件 syncPage");
+});
+
+test("契约：updateToolbarState 写入带值守卫（同值重写也会产生 MutationRecord）", () => {
+  const start = lines.findIndex((line) => line.trim().startsWith("updateToolbarState() {"));
+  const end = lines.findIndex((line, index) => index > start && line.trim().startsWith("toast(message, type"));
+  const state = lines.slice(start, end).join("\n");
+  assert.ok(start > 0 && end > start, "应能定位 updateToolbarState");
+  assert.ok(state.includes("if (element && element.hidden !== next) element.hidden = next;"), "hidden 写入必须带值守卫");
+  assert.ok(state.includes('setDataFlag(this.toolbar, "hasSelection"'), "hasSelection 等标记写入也要走守卫");
+  assert.ok(!/^\s*seedButton\.hidden = /m.test(state), "不该再有裸写的 seedButton.hidden");
+  assert.ok(!/^\s*this\.toolbar\.hidden = /m.test(state), "不该再有裸写的 toolbar.hidden");
+  assert.ok(!/^\s*seedButton\.style\.opacity = "";/m.test(state), "过渡样式清除也要先判空");
 });
 
 let failed = 0;

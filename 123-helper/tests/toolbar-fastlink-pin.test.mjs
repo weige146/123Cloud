@@ -72,6 +72,9 @@ function makeButton(extra = {}) {
     setAttribute(name, value) {
       this.attrs[name] = value;
     },
+    getAttribute(name) {
+      return name in this.attrs ? this.attrs[name] : null;
+    },
     ...extra
   };
 }
