@@ -15,6 +15,7 @@ import {
   type LibraryDuplicateGroup,
   type LibraryEnrichStats,
   type LibraryFacets,
+  type LibraryFastlinkImportResult,
   type LibraryFile,
   type LibraryIdentifyCandidate,
   type LibraryLibInfo,
@@ -55,6 +56,12 @@ const config = ref<LibraryConfig | null>(null);
 const configTransferConcurrency = ref(5);
 const importing = ref(false);
 const importingDir = ref(false);
+// 粘贴秒传链接导入（123 助手式）：一次可贴多条，二级链接可联网展开种子内容
+const fastlinkImportOpen = ref(false);
+const fastlinkText = ref("");
+const fastlinkExpand = ref(true);
+const fastlinkImporting = ref(false);
+const fastlinkResults = ref<LibraryFastlinkImportResult | null>(null);
 const sources = ref<LibraryLibInfo[]>([]);
 const configTokenInput = ref("");
 const configClearToken = ref(false);
@@ -69,6 +76,7 @@ const enrichUntaggedInput = ref(false);
 const playerPathInput = ref("");
 const autoTrashInput = ref(true);
 const playCachePathInput = ref("秒传");
+const seedTempPathInput = ref("秒传");
 const pickingPlayer = ref(false);
 const openingExportDir = ref(false);
 
@@ -107,6 +115,7 @@ async function loadConfig() {
   playerPathInput.value = data.config.playerPath || "";
   autoTrashInput.value = data.config.autoTrash !== false;
   playCachePathInput.value = data.config.playCachePath || "秒传";
+  seedTempPathInput.value = data.config.seedTempPath || "秒传";
   // 本机直接回填明文令牌，重启后一眼可见它还在；留空保存=保留现有令牌
   if (data.config.token) {
     configTokenInput.value = data.config.token;
@@ -126,6 +135,7 @@ async function saveConfig() {
       playerPath: playerPathInput.value.trim(),
       autoTrash: autoTrashInput.value,
       playCachePath: playCachePathInput.value.trim(),
+      seedTempPath: seedTempPathInput.value.trim(),
       token: configTokenInput.value.trim(),
       clearToken: configClearToken.value,
     });
@@ -212,6 +222,30 @@ async function importFromFolder() {
     notifyError(`批量导入失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
     importingDir.value = false;
+  }
+}
+
+// 粘贴导入：秒传链接一行一条（或多份 JSON 连着贴），逐条入库；单条失败不影响其余
+async function importPastedFastlinks() {
+  const text = fastlinkText.value.trim();
+  if (!text) {
+    notifyError("请先粘贴秒传链接或影库 JSON");
+    return;
+  }
+  fastlinkImporting.value = true;
+  try {
+    const data = await libraryApi.importFastlink(text, apiToken.value, fastlinkExpand.value);
+    fastlinkResults.value = data;
+    const failedHint = data.failed ? ` · 失败 ${data.failed} 条` : "";
+    notifySuccess(
+      `秒传导入完成：新增 ${data.added} 个作品 · 并入已有作品 ${data.mergedWorks} 个 · `
+      + `重复跳过 ${data.skipped} 个 · 共 ${data.fileCount} 个文件${failedHint}`,
+    );
+    await Promise.all([loadStatus(), loadCategories(), loadSources(), loadFacets(), loadEnrich()]);
+  } catch (error) {
+    notifyError(`秒传导入失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    fastlinkImporting.value = false;
   }
 }
 
@@ -2190,6 +2224,7 @@ onUnmounted(() => {
         <div class="button-row">
           <v-btn color="primary" prepend-icon="mdi-file-multiple-outline" :loading="importing" @click="pickAndImportFiles">选择影库文件（可多选）…</v-btn>
           <v-btn variant="outlined" prepend-icon="mdi-folder-multiple-outline" :loading="importingDir" @click="importFromFolder">从文件夹批量导入…</v-btn>
+          <v-btn variant="outlined" prepend-icon="mdi-text-box-outline" @click="fastlinkImportOpen = true">粘贴秒传链接导入…</v-btn>
           <input ref="libraryFileInput" type="file" accept=".json,.txt,.123share,.123fastlink" multiple hidden @change="importLibraryFiles" />
         </div>
         <div class="muted-hint">
@@ -2208,6 +2243,19 @@ onUnmounted(() => {
               item-title="title"
               item-value="value"
               label="重复作品导入策略"
+              variant="outlined"
+              density="compact"
+              hide-details
+              class="grow"
+            />
+          </div>
+        </FormField>
+        <FormField label="二级链接临时目录（网盘根目录下，展开短链时种子文件的落脚处，读完自动移入回收站）">
+          <div class="port-row">
+            <v-text-field
+              v-model="seedTempPathInput"
+              label="二级链接临时目录"
+              placeholder="秒传"
               variant="outlined"
               density="compact"
               hide-details
@@ -2609,6 +2657,61 @@ onUnmounted(() => {
     </v-dialog>
 
     <!-- ====================== 手动识别修正（Emby 式 Identify） ====================== -->
+    <v-dialog v-model="fastlinkImportOpen" max-width="720" scrollable>
+      <v-card class="dir-picker-card detail-card">
+        <v-card-text>
+          <div class="identify-head">
+            <strong>粘贴秒传链接导入</strong>
+            <v-spacer />
+            <v-btn size="small" variant="text" @click="fastlinkImportOpen = false">关闭</v-btn>
+          </div>
+          <div class="muted-hint">
+            认 123 助手的全部导出格式：秒传链接（123FLCPV2$ / 123FLCPV1$ / 123FSLinkV2$ / 123FSLinkV1$）、
+            标准秒传 JSON、.123share。一次可以贴多条：秒传链接一行一条，多份 JSON 一份接一份。
+          </div>
+          <v-textarea
+            v-model="fastlinkText"
+            label="粘贴秒传链接 / 影库 JSON"
+            placeholder="123FLCPV2$%…#35970#某作品.123fastlink.json"
+            variant="outlined"
+            density="compact"
+            rows="8"
+            hide-details
+            class="mt-2"
+          />
+          <v-switch
+            v-model="fastlinkExpand"
+            color="primary"
+            density="compact"
+            hide-details
+            label="自动展开二级链接（短链）"
+          />
+          <div class="muted-hint">
+            展开短链会把种子文件临时秒传到网盘（默认落在「秒传」下的临时目录），读回真实清单后立即移入回收站，
+            要在「设置 → 123 网盘授权」授权过才行；某条展开失败只影响那一条，其余照常入库。
+          </div>
+          <div class="button-row mt-2">
+            <v-btn color="primary" :loading="fastlinkImporting" @click="importPastedFastlinks">导入</v-btn>
+          </div>
+          <template v-if="fastlinkResults">
+            <div class="muted-hint mt-2">
+              共 {{ fastlinkResults.total }} 条：新增 {{ fastlinkResults.added }} 个作品 · 并入已有作品
+              {{ fastlinkResults.mergedWorks }} 个 · 重复跳过 {{ fastlinkResults.skipped }} 个 · 失败
+              {{ fastlinkResults.failed }} 条
+            </div>
+            <div v-for="(row, index) in fastlinkResults.results" :key="index" class="fastlink-import-row">
+              <span :class="row.ok ? 'fastlink-import-ok' : 'fastlink-import-fail'">{{ row.ok ? "完成" : "失败" }}</span>
+              <span class="fastlink-import-label" :title="row.error || row.label">{{ row.label }}</span>
+              <span class="muted-hint">
+                {{ row.ok ? `新增 ${row.added || 0} · 并入 ${row.mergedWorks || 0} · ${row.fileCount || 0} 个文件` : row.error }}
+              </span>
+            </div>
+            <div v-for="note in fastlinkResults.notes" :key="note" class="muted-hint">{{ note }}</div>
+          </template>
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="identifyOpen" max-width="720" scrollable>
       <v-card class="dir-picker-card detail-card">
         <v-card-text>
@@ -2792,6 +2895,30 @@ onUnmounted(() => {
 .muted-hint {
   color: var(--text-secondary);
   font-size: 12px;
+}
+
+/* 粘贴秒传导入的逐条结果 */
+.fastlink-import-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+.fastlink-import-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fastlink-import-ok {
+  color: var(--success);
+}
+
+.fastlink-import-fail {
+  color: var(--error);
 }
 
 .error-text {

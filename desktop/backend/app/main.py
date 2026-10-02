@@ -32,7 +32,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
 setup_logging(DATA_DIR)
 
 from .directlink import read_directlink_status, serve_directlink_file, submit_arbitrary_urls_offline, submit_directlink_offline
-from . import library_playback, library_transfer, movie_library, movie_library_db
+from . import library_playback, library_transfer, library_fastlink_import, movie_library, movie_library_db
 from .pan115 import CODE_RE as PAN123_CODE_RE, empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
 from .pan115_cookie import (
     PAN115_QR_DEVICES,
@@ -2103,6 +2103,7 @@ class LibraryConfigRequest(BaseModel):
     playerPath: Optional[str] = None
     autoTrash: Optional[bool] = None
     playCachePath: Optional[str] = None
+    seedTempPath: Optional[str] = None
     importMode: Optional[str] = None
     enrichUntagged: Optional[bool] = None
     token: str = ""
@@ -2135,6 +2136,8 @@ def normalize_movie_library_config(raw: Dict[str, Any]) -> Dict[str, Any]:
             if str(cfg.get("playCachePath") or "").strip() == library_playback.LEGACY_PLAY_CACHE_PATH
             else str(cfg.get("playCachePath") or "").strip() or library_playback.DEFAULT_PLAY_CACHE_PATH
         ),
+        # 二级链接展开时种子文件的临时落脚目录（用完移入回收站），默认网盘「秒传」目录
+        "seedTempPath": str(cfg.get("seedTempPath") or "").strip() or library_fastlink_import.DEFAULT_SEED_TEMP_PATH,
         # 重复作品导入策略：merge=只增不减（新文件并入已有作品，保留整理成果）；skip=旧行为（整作品跳过）
         "importMode": "skip" if str(cfg.get("importMode") or "").strip().lower() == "skip" else "merge",
         # 无 {tmdb-N} 标记的作品是否用标题+年份搜 TMDB 自动匹配（有匹配错风险，默认关）
@@ -2268,6 +2271,7 @@ async def read_library_config(request: Request) -> Dict[str, Any]:
             "playerPath": cfg.get("playerPath", ""),
             "autoTrash": bool(cfg.get("autoTrash", True)),
             "playCachePath": cfg.get("playCachePath", library_playback.DEFAULT_PLAY_CACHE_PATH),
+            "seedTempPath": cfg.get("seedTempPath", library_fastlink_import.DEFAULT_SEED_TEMP_PATH),
             "importMode": cfg.get("importMode", "merge"),
             "enrichUntagged": bool(cfg.get("enrichUntagged", False)),
             "tokenSet": bool(token),
@@ -2299,6 +2303,7 @@ async def write_library_config(request: LibraryConfigRequest, request_obj: Reque
             "playerPath": current.get("playerPath", "") if request.playerPath is None else str(request.playerPath).strip(),
             "autoTrash": bool(current.get("autoTrash", True)) if request.autoTrash is None else bool(request.autoTrash),
             "playCachePath": current.get("playCachePath", library_playback.DEFAULT_PLAY_CACHE_PATH) if request.playCachePath is None else (str(request.playCachePath).strip() or library_playback.DEFAULT_PLAY_CACHE_PATH),
+            "seedTempPath": current.get("seedTempPath", library_fastlink_import.DEFAULT_SEED_TEMP_PATH) if request.seedTempPath is None else (str(request.seedTempPath).strip() or library_fastlink_import.DEFAULT_SEED_TEMP_PATH),
             "importMode": current.get("importMode", "merge") if request.importMode is None else ("skip" if str(request.importMode).strip().lower() == "skip" else "merge"),
             "enrichUntagged": bool(current.get("enrichUntagged", False)) if request.enrichUntagged is None else bool(request.enrichUntagged),
             "token": new_token,
@@ -2319,6 +2324,7 @@ async def write_library_config(request: LibraryConfigRequest, request_obj: Reque
         "playerPath": saved_cfg.get("playerPath", ""),
         "autoTrash": bool(saved_cfg.get("autoTrash", True)),
         "playCachePath": saved_cfg.get("playCachePath", library_playback.DEFAULT_PLAY_CACHE_PATH),
+        "seedTempPath": saved_cfg.get("seedTempPath", library_fastlink_import.DEFAULT_SEED_TEMP_PATH),
         "importMode": saved_cfg.get("importMode", "merge"),
         "enrichUntagged": bool(saved_cfg.get("enrichUntagged", False)),
         "tokenSet": bool(saved_cfg["token"]),
@@ -2347,9 +2353,85 @@ class LibraryTransferTaskRequest(BaseModel):
     token: str = ""
 
 
+def _library_seed_temp_parts() -> List[str]:
+    """二级链接展开时种子文件的临时落脚目录（网盘路径拆段）。"""
+    return library_fastlink_import.seed_temp_parts(_library_config())
+
+
+class _FastlinkSeedExpander:
+    """一批导入共用的二级链接展开器：123 客户端懒加载（不粘贴种子就绝不碰网盘），
+    未授权时把原因记下来，同批后续条目直接复用文案，不重复弹授权异常。"""
+
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = bool(enabled)
+        self.client: Any = None
+        self.notes: List[str] = []
+        self._attempted = False
+        self._reason = ""
+
+    async def expand(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        seed = movie_library.fastlink_seed_entry(payload)
+        if not seed or not self.enabled:
+            return payload
+        if not self._attempted:
+            self._attempted = True
+            try:
+                self.client = await _authorized_pan123_client()
+            except Exception as error:
+                self._reason = (
+                    "展开二级链接需要先在「设置 → 123 网盘授权」完成授权（与 123→115 搬运同一套登录态）"
+                    f"：{error or '未授权'}"
+                )
+        if self.client is None:
+            raise library_fastlink_import.SeedResolveError(
+                self._reason or "展开二级链接需要先在「设置 → 123 网盘授权」完成授权")
+        expanded, notes = await library_fastlink_import.expand_payload(
+            payload, client=self.client, temp_parts=_library_seed_temp_parts())
+        self.notes.extend(notes)
+        return expanded
+
+
+# 二级链接粗筛只读小文件（短链本身必然很小，大文件直接走原有流式路径）
+_SEED_PRECHECK_LIMIT = library_fastlink_import.SEED_FILE_PRECHECK_LIMIT
+
+
+def _read_text_head(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read(_SEED_PRECHECK_LIMIT + 1)
+
+
+async def _import_library_file(
+    path: str, name: str, video_ext: Any, mode: str, expander: _FastlinkSeedExpander
+) -> Dict[str, Any]:
+    """单个影库文件入库。小文件先粗筛是不是二级链接（种子），是就联网展开清单再入库。
+
+    预检只在「确实解析出一条种子」时才接管导入，其余（含 GB 级巨型 JSON、带 BOM 的导出、
+    非影库文件）一律回落到原有流式/整读路径，行为与改动前一字不变。"""
+    if expander.enabled:
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        if 0 < size <= _SEED_PRECHECK_LIMIT:
+            text = await asyncio.to_thread(_read_text_head, path)
+            if movie_library.looks_like_fastlink_seed_text(text):
+                try:
+                    parsed = movie_library.parse_library_content(text.lstrip("\ufeff"))
+                except ValueError:
+                    parsed = None
+                seed = movie_library.fastlink_seed_entry(parsed)
+                if seed:
+                    payload = await expander.expand(parsed)
+                    result = await asyncio.to_thread(
+                        movie_library_db.import_payload, name, payload, video_ext, mode)
+                    await asyncio.to_thread(movie_library_db.recount_source, name)
+                    return result
+    return await asyncio.to_thread(_import_library_from_path, path, name, video_ext, mode)
+
+
 @app.post("/api/library/import")
-async def import_library_file(request: Request, name: str = Query(""), token: str = "") -> Dict[str, Any]:
-    """上传影库文件入库（支持 123 助手全部格式：JSON / 秒传文本 / .123share）。解析后直接写数据库。"""
+async def import_library_file(
+    request: Request, name: str = Query(""), token: str = "", expand: bool = True
+) -> Dict[str, Any]:
+    """上传影库文件入库（支持 123 助手全部格式：JSON / 秒传文本 / .123share / 二级链接）。
+    解析后直接写数据库；贴的是二级链接时自动展开种子内容（expand=false 关闭）。"""
     _guard_library_token(request, token)
     body = await request.body()
     if not body:
@@ -2360,6 +2442,8 @@ async def import_library_file(request: Request, name: str = Query(""), token: st
         raise HTTPException(status_code=400, detail="文件不是 UTF-8 文本")
     try:
         payload = movie_library.parse_library_content(text)
+        expander = _FastlinkSeedExpander(enabled=expand)
+        payload = await expander.expand(payload)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
     safe_name = os.path.basename(str(name or "").strip()) or "导入"
@@ -2367,6 +2451,8 @@ async def import_library_file(request: Request, name: str = Query(""), token: st
         movie_library_db.import_payload, safe_name, payload, _library_video_ext(), _library_config().get("importMode", "merge"))
     await asyncio.to_thread(movie_library_db.recount_source, safe_name)
     library_enrich_kick.set()
+    if expander.notes:
+        result["notes"] = expander.notes
     return result
 
 
@@ -2408,14 +2494,20 @@ async def import_library_paths(request: LibraryImportPathsRequest, request_obj: 
     video_ext = _library_video_ext()
     import_mode = str(_library_config().get("importMode") or "merge")
     results = []
+    expander = _FastlinkSeedExpander()
     for raw_path in request.paths[:50]:
         path = os.path.abspath(os.path.expanduser(str(raw_path or "").strip()))
         base = os.path.basename(path)
         try:
-            result = await asyncio.to_thread(_import_library_from_path, path, base, video_ext, import_mode)
+            result = await _import_library_file(path, base, video_ext, import_mode, expander)
             results.append({"file": base, **result})
         except OSError as error:
             results.append({"file": base, "ok": False, "error": f"读取失败：{error}"})
+            continue
+        except library_fastlink_import.SeedResolveError as error:
+            # 二级链接展开失败（未授权/秒传未命中/下载失败）：算真失败，不能混进「非影库文件已跳过」
+            results.append({"file": base, "ok": False, "added": 0, "skipped": 0, "fileCount": 0,
+                            "error": str(error)})
             continue
         except ValueError as error:
             # 非影库文件/内容无法解析：默认跳过，不算失败
@@ -2470,13 +2562,19 @@ async def import_library_dir(request: LibraryImportDirRequest, request_obj: Requ
     merged_works = merged_files = 0
     video_ext = _library_video_ext()
     import_mode = str(_library_config().get("importMode") or "merge")
+    expander = _FastlinkSeedExpander()
     for path in sorted(walked):
         base = os.path.basename(path)
         try:
-            r = await asyncio.to_thread(_import_library_from_path, path, source_name, video_ext, import_mode)
+            r = await _import_library_file(path, source_name, video_ext, import_mode, expander)
         except OSError as error:
             failed += 1
             results.append({"file": base, "status": "失败", "info": f"读取失败：{error}"})
+            continue
+        except library_fastlink_import.SeedResolveError as error:
+            # 二级链接展开失败：算真失败（未授权/秒传未命中），不冒充「非影库文件已跳过」
+            failed += 1
+            results.append({"file": base, "status": "失败", "info": str(error)})
             continue
         except ValueError as error:
             # 非影库文件/内容无法解析：默认跳过，不算失败
@@ -2493,7 +2591,59 @@ async def import_library_dir(request: LibraryImportDirRequest, request_obj: Requ
     library_enrich_kick.set()
     return {"ok": True, "total": len(walked), "added": added, "skipped": skipped,
             "mergedWorks": merged_works, "mergedFiles": merged_files, "failed": failed,
-            "source": source_name, "results": results}
+            "source": source_name, "results": results, "notes": expander.notes}
+
+
+class LibraryImportFastlinkRequest(BaseModel):
+    text: str = ""
+    expand: bool = True
+    token: str = ""
+
+
+@app.post("/api/library/import/fastlink")
+async def import_library_fastlink(request: LibraryImportFastlinkRequest, request_obj: Request) -> Dict[str, Any]:
+    """粘贴 123 助手秒传导入：一次可贴多条（秒传链接一行一条、JSON 一份一块），
+    逐条入库；贴的是二级链接（短链）时联网展开种子内容后再入库。"""
+    _guard_library_token(request_obj, request.token)
+    text = str(request.text or "")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="请先粘贴秒传链接或影库 JSON")
+    if len(text.encode("utf-8")) > library_fastlink_import.MAX_PASTE_BYTES:
+        raise HTTPException(status_code=400, detail="粘贴内容过大，请改用「选择影库文件」导入")
+    segments = movie_library.split_fastlink_payloads(text)
+    if len(segments) > library_fastlink_import.MAX_PAYLOADS:
+        raise HTTPException(status_code=400,
+                            detail=f"一次最多导入 {library_fastlink_import.MAX_PAYLOADS} 条，请分批粘贴")
+    video_ext = _library_video_ext()
+    import_mode = str(_library_config().get("importMode") or "merge")
+    expander = _FastlinkSeedExpander(enabled=request.expand)
+    results: List[Dict[str, Any]] = []
+    for index, segment in enumerate(segments, start=1):
+        label = movie_library.fastlink_payload_label(segment) or f"第 {index} 条"
+        try:
+            payload = movie_library.parse_library_content(segment)
+            payload = await expander.expand(payload)
+            result = await asyncio.to_thread(movie_library_db.import_payload, label, payload, video_ext, import_mode)
+            await asyncio.to_thread(movie_library_db.recount_source, label)
+            results.append({"label": label, **result, "ok": True})
+        except ValueError as error:
+            # 单条失败记下来继续跑其余（对齐油猴批量导入的失败隔离语义）
+            results.append({"label": label, "ok": False, "added": 0, "skipped": 0,
+                            "fileCount": 0, "error": str(error)})
+    added = sum(r.get("added", 0) for r in results)
+    skipped = sum(r.get("skipped", 0) for r in results)
+    merged_works = sum(r.get("mergedWorks", 0) for r in results)
+    merged_files = sum(r.get("mergedFiles", 0) for r in results)
+    file_count = sum(r.get("fileCount", 0) for r in results)
+    failed = sum(1 for r in results if not r.get("ok"))
+    logger.info(
+        f"影库导入：粘贴秒传 {len(segments)} 条 — 新增 {added} 个作品、并入已有作品 {merged_works} 个"
+        f"（新文件 {merged_files} 个）、重复跳过 {skipped} 个、失败 {failed} 条",
+    )
+    library_enrich_kick.set()
+    return {"ok": True, "results": results, "total": len(segments), "added": added, "skipped": skipped,
+            "mergedWorks": merged_works, "mergedFiles": merged_files, "fileCount": file_count,
+            "failed": failed, "notes": expander.notes}
 
 
 TMDB_BUILTIN_KEY = "8265bd1679663a7ea12ac168da84d2e8"

@@ -72,6 +72,10 @@ FASTLINK_PREFIXES = {
 
 SCAN_EXTENSIONS = (".json", ".txt", ".123share", ".123fastlink")
 
+# 二级链接（短链种子）解析后的唯一条目就是种子文件本身，文件名以这两种后缀结尾；
+# 真实文件清单在种子内容里，要展开才知道（展开流程见 library_fastlink_import.py）
+SECONDARY_SEED_NAME_RE = re.compile(r"\.123fastlink\.(?:json|txt)$", re.IGNORECASE)
+
 SCAN_STABLE_SECONDS = 2  # 文件修改后至少静置这么久才加载，避免读到复制一半的文件
 DEFAULT_SCAN_INTERVAL = 30
 MIN_SCAN_INTERVAL = 5
@@ -315,6 +319,145 @@ def parse_library_content(text: str) -> Dict[str, Any]:
     except Exception:
         pass
     raise ValueError("不是影库文件（无法按 123 助手任何格式解析）")
+
+
+def fastlink_seed_entry(parsed: Any) -> Optional[Dict[str, Any]]:
+    """解析结果只有 1 个条目且文件名像秒传种子 → 判定为二级链接，返回该种子条目。
+
+    与油猴脚本 importResolvedFastlink 的判据一致（单条 + `.123fastlink.json/.txt`）。
+    真只有 1 个视频文件的作品不会被误判：后缀不像种子。
+    """
+    files = (parsed or {}).get("files") if isinstance(parsed, dict) else None
+    if not isinstance(files, list) or len(files) != 1:
+        return None
+    entry = files[0]
+    if not isinstance(entry, dict):
+        return None
+    path = str(entry.get("path") or entry.get("fileName") or "").replace("\\", "/")
+    name = path.rsplit("/", 1)[-1]
+    if not SECONDARY_SEED_NAME_RE.search(name):
+        return None
+    normalized = dict(entry)
+    normalized["fileName"] = name
+    normalized["path"] = path
+    return normalized
+
+
+def looks_like_fastlink_seed_text(text: str) -> bool:
+    """二级链接的粗筛：整段内容里连 `.123fastlink` 都没有就绝不可能是种子，
+    省掉对每个普通影库文件的二次全量解析（文件夹批量导入时逐文件都走这里）。"""
+    return ".123fastlink" in str(text or "").lower()
+
+
+_JSON_DECODER = json.JSONDecoder()
+
+
+def split_fastlink_payloads(value: str) -> List[str]:
+    """把粘贴框内容切成多个导入段（与油猴脚本 splitFastlinkImportPayloads 同语义）。
+
+    切段依据：行首是已知秒传前缀 → 新起一段；行首是 `{` / `[` → 按 JSON 括号配平
+    整块取走（多行美化 JSON 也算一条）；其余行并入当前段。
+    只切出 1 段时原样返回整段，保证解析报错文案与单条粘贴完全一致。
+    """
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    lines = text.split("\n")
+    offsets: List[int] = []
+    walk = 0
+    for line in lines:
+        offsets.append(walk)
+        walk += len(line) + 1
+    segments: List[str] = []
+    current: List[str] = []
+
+    def flush() -> None:
+        chunk = "\n".join(current).strip()
+        if chunk:
+            segments.append(chunk)
+        current.clear()
+
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        trimmed = line.strip()
+        if not trimmed:
+            index += 1
+            continue
+        if any(trimmed.startswith(prefix) for prefix in FASTLINK_PREFIXES):
+            flush()
+            current.append(line)
+            index += 1
+            continue
+        if trimmed[:1] in ("{", "["):
+            flush()
+            start = offsets[index] + line.index(trimmed[:1])
+            try:
+                _decoded, end = _JSON_DECODER.raw_decode(text, start)
+            except ValueError:
+                # 截断的 JSON：剩余内容全归本段，交给解析器按原样报错
+                segments.append(text[start:])
+                break
+            segments.append(text[start:end])
+            while index < len(lines) and offsets[index] < end:
+                index += 1
+            continue
+        current.append(line)
+        index += 1
+    flush()
+    if len(segments) <= 1:
+        return [text]
+    return segments
+
+
+def fastlink_payload_label(value: str) -> str:
+    """一段导入内容的展示名/来源名。
+
+    优先级：二级链接的种子文件名 > 作品名（JSON 的 `name` / 秒传里的 commonPath）
+    > 首个文件名 / 首行。种子名带 `.123fastlink.json` 后缀的会去掉后缀。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    prefix = next((candidate for candidate in FASTLINK_PREFIXES if text.startswith(candidate)), "")
+    if prefix:
+        body = text[len(prefix):]
+        separator = body.find("%")
+        common_path = body[:separator] if separator >= 0 else ""
+        entries = body[separator + 1:] if separator >= 0 else body
+        first = (entries.split("$")[0] or "").strip()
+        parts = first.split("#")
+        name = "#".join(parts[2:]).strip() if len(parts) >= 3 else (parts[0] or "").strip()
+        base = name.rsplit("/", 1)[-1]
+        if SECONDARY_SEED_NAME_RE.search(base):
+            return _strip_seed_suffix(base) or _last_path_segment(common_path) or "二级链接"
+        return _last_path_segment(common_path) or base or prefix
+    if text[:1] in ("{", "["):
+        match = re.search(r'"name"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+        if match:
+            try:
+                decoded = str(json.loads(f'"{match.group(1)}"') or "")
+            except ValueError:
+                decoded = match.group(1)
+            cleaned = _strip_seed_suffix(decoded)
+            if cleaned:
+                return cleaned
+        common = re.search(r'"commonPath"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+        if common:
+            return _last_path_segment(common.group(1))
+        return "秒传 JSON"
+    return text.split("\n", 1)[0][:80]
+
+
+def _last_path_segment(value: str) -> str:
+    """路径末段（两端斜杠与空白都去掉），空路径返回空串。"""
+    return str(value or "").replace("\\", "/").strip().strip("/").rsplit("/", 1)[-1].strip()
+
+
+def _strip_seed_suffix(name: str) -> str:
+    """`某作品 2024.123fastlink.json` → `某作品 2024`（来源名不带种子后缀）。"""
+    clean = str(name or "").strip()
+    return SECONDARY_SEED_NAME_RE.sub("", clean).strip()
 
 
 class LibraryFullParseFallback(Exception):

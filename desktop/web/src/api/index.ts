@@ -287,6 +287,28 @@ export interface LibraryImportResult {
   fileCount: number;
 }
 
+/** 粘贴秒传链接导入：逐条结果（二级链接展开失败只坏那一条，其余照常入库） */
+export interface LibraryFastlinkImportResult {
+  ok: boolean;
+  total: number;
+  added: number;
+  skipped: number;
+  mergedWorks: number;
+  mergedFiles: number;
+  fileCount: number;
+  failed: number;
+  notes: string[];
+  results: Array<{
+    label: string;
+    ok: boolean;
+    added?: number;
+    skipped?: number;
+    mergedWorks?: number;
+    fileCount?: number;
+    error?: string;
+  }>;
+}
+
 export interface LibraryIdentifyCandidate {
   type: "tv" | "movie";
   id: number;
@@ -309,6 +331,7 @@ export interface LibraryConfig {
   playerPath: string;
   autoTrash: boolean;
   playCachePath: string;
+  seedTempPath: string;
   importMode: "merge" | "skip";
   enrichUntagged: boolean;
   tokenSet: boolean;
@@ -498,6 +521,8 @@ export const libraryApi = {
       "/api/library/import/dir",
       { path, token },
     ),
+  importFastlink: (text: string, token: string, expand = true) =>
+    api.post<LibraryFastlinkImportResult>("/api/library/import/fastlink", { text, token, expand }),
   sources: () => api.get<{ ok: boolean; sources: LibraryLibInfo[] }>("/api/library/sources"),
   sourcesMerge: (fromNames: string[], toName: string, token: string) =>
     api.post<{ ok: boolean; moved: number; sources: LibraryLibInfo[] }>("/api/library/sources/merge", { fromNames, toName, token }),
