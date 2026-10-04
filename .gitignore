@@ -38,6 +38,17 @@ HarmonyOS/entry/build/
 HarmonyOS/entry/oh_modules/
 HarmonyOS/local.properties
 
+# 鸿蒙原生工程（harmony/，区别于旧的 HarmonyOS/）
+harmony/.hvigor/
+harmony/.idea/
+harmony/.sdk-local/
+harmony/.signing/
+harmony/build/
+harmony/entry/build/
+harmony/entry/oh_modules/
+harmony/local.properties
+harmony/**/node_modules/
+
 # Desktop app build outputs
 desktop/node_modules/
 desktop/release/
@@ -51,3 +62,6 @@ desktop/sha1db.env
 desktop/backend-build-verify/
 desktop/backend-dist-verify/
 pytest.out
+
+# AI 助手本地工作区数据（会话记忆等，与代码无关）
+.workbuddy/
