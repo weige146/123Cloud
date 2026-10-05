@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.4.7
+// @version      1.4.8
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -6932,6 +6932,14 @@
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.4.8",
+      notes: [
+        "整理后的名字不再把 HDR Vivid 写两遍，新文件名与目标路径都已修正",
+        "原地整理的分季目录名也不会再重复写动态范围",
+        "命名模板里只保留「特效版本」时，杜比视界、HDR、高规格不会再被整段丢掉"
+      ]
+    },
     {
       version: "1.4.7",
       notes: [
@@ -21037,10 +21045,25 @@ ${end.comment}` : end.comment;
     return cleanRenderedName(renderTemplate(template, filenameTemplateValues(fields, template), { path: true }));
   }
   function filenameTemplateValues(fields, blocks = []) {
+    // {effect} 是杜比视界 / 动态范围 / 高规格 / 3D 的汇总字段。模板里若另有
+    // {dolbyVision}、{dynamicRange}、{highQuality}，这些值会被单独输出，effect 里就要
+    // 去掉，免得同一个词写两遍；模板里没放这些字段时（例如只留 {effect}）原样保留，
+    // 否则杜比视界、HDR、高规格会被整段丢掉。
+    const templateKeys = new Set((Array.isArray(blocks) ? blocks : [])
+      .filter((block) => block && block.type === "field")
+      .map((block) => block.key));
+    const covered = ["highQuality", "dolbyVision", "dynamicRange"].filter((key) => templateKeys.has(key));
     // highQuality 可能是「HQ MAXPLUS」多词，逐词展开再比对，否则整串与 effect 里的
     // 单个 HQ 不相等，模板里会同时出现 {highQuality} 的 HQ 和 {effect} 的 HQ。
-    const represented = new Set([fields.highQuality, fields.dolbyVision, fields.dynamicRange]
-      .flatMap((value) => String(value || "").split(/[\s._-]+/))
+    // 逐词之外还要保留整串：HDR.Vivid 在 effect 里是**一个** token（只按空格/斜杠切分），
+    // 逐词展开后只剩 HDR / VIVID，整串 HDRVIVID 匹配不上，{dynamicRange} 的 HDR.Vivid
+    // 会和 {effect} 里的再输出一遍。
+    const represented = new Set(covered
+      .map((key) => fields[key])
+      .flatMap((value) => {
+        const raw = String(value || "");
+        return [...raw.split(/[\s._-]+/), raw.replace(/[\s._-]+/g, "")];
+      })
       .map((value) => value.replace(/[\s._-]+/g, "").toUpperCase())
       .filter(Boolean));
     const effect = String(fields.effect || "").split(/[\s/]+/).filter((token) => {
